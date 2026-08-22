@@ -1,19 +1,25 @@
 mod catalog_writer;
 mod discover;
 mod events;
+mod reconcile;
 mod scanner;
 mod scheduler;
+mod watch;
 
 use std::path::PathBuf;
 
 pub use catalog_writer::CatalogWriter;
 pub use discover::find_sidecar;
 pub use events::{IndexEvent, ScanSummary};
+pub use reconcile::{
+    RealReconcileSource, ReconcileError, ReconcileOutcome, ReconcileSource, Reconciler,
+};
 pub use scanner::{Indexer, MetadataReader, ScanHandle, ScanRequest};
 pub use scheduler::{
     CancellationToken, IndexJob, IndexScheduler, InteractionMode, JobPriority, SchedulerConfig,
 };
 use thiserror::Error;
+pub use watch::{ChangeHint, WatchService};
 
 #[derive(Debug, Error)]
 pub enum IndexError {

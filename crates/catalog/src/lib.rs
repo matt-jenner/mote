@@ -1,5 +1,6 @@
 mod asset_repo;
 mod connection;
+mod generation_repo;
 mod index_repo;
 mod library_repo;
 mod migrate;
@@ -9,6 +10,7 @@ use std::num::ParseIntError;
 use std::path::Path;
 
 pub use asset_repo::{AssetRecord, NewAsset};
+pub use generation_repo::GenerationCompletion;
 pub use index_repo::{
     AssetMetadataUpdate, AssetShapeUpdate, CatalogIndexRecord, CatalogKeyword, CatalogProvenance,
     CatalogWarningRecord,
