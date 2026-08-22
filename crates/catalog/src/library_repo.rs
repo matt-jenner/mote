@@ -80,6 +80,75 @@ impl Catalog {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(records)
     }
+
+    pub fn find_library(&self, id: LibraryId) -> Result<Option<LibraryRootRecord>, CatalogError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, kind, display_name, canonical_root_key, display_path, availability, last_seen_at \
+             FROM library_roots WHERE id = ?1",
+        )?;
+        let mut rows = statement.query([id.as_uuid().as_bytes()])?;
+        rows.next()?
+            .map(decode_library)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub fn promote_library(
+        &mut self,
+        id: LibraryId,
+        display_name: &str,
+    ) -> Result<LibraryRootRecord, CatalogError> {
+        self.connection.execute(
+            "UPDATE library_roots SET kind = 'configured', display_name = ?2 WHERE id = ?1",
+            params![id.as_uuid().as_bytes(), display_name],
+        )?;
+        self.find_library(id)?.ok_or_else(|| {
+            CatalogError::InvalidData(format!("library {} does not exist", id.as_uuid()))
+        })
+    }
+
+    pub fn set_library_availability(
+        &mut self,
+        id: LibraryId,
+        availability: Availability,
+    ) -> Result<(), CatalogError> {
+        let changed = self.connection.execute(
+            "UPDATE library_roots SET availability = ?2 WHERE id = ?1",
+            params![id.as_uuid().as_bytes(), encode_availability(availability)],
+        )?;
+        if changed == 0 {
+            return Err(CatalogError::InvalidData(format!(
+                "library {} does not exist",
+                id.as_uuid()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn relink_library(
+        &mut self,
+        id: LibraryId,
+        canonical_root: &Path,
+        display_root: &Path,
+    ) -> Result<LibraryRootRecord, CatalogError> {
+        let key = NativePathKey::from_path(canonical_root);
+        let display_path = display_root.to_string_lossy();
+        let changed = self.connection.execute(
+            "UPDATE library_roots \
+             SET canonical_root_key = ?2, display_path = ?3, availability = 'available', last_seen_at = NULL \
+             WHERE id = ?1",
+            params![id.as_uuid().as_bytes(), key.as_bytes(), display_path],
+        )?;
+        if changed == 0 {
+            return Err(CatalogError::InvalidData(format!(
+                "library {} does not exist",
+                id.as_uuid()
+            )));
+        }
+        self.find_library(id)?.ok_or_else(|| {
+            CatalogError::InvalidData(format!("library {} does not exist", id.as_uuid()))
+        })
+    }
 }
 
 fn decode_library(row: &rusqlite::Row<'_>) -> Result<LibraryRootRecord, rusqlite::Error> {
@@ -139,5 +208,14 @@ fn decode_availability(value: &str, column: usize) -> Result<Availability, rusql
             column,
             crate::CatalogError::InvalidData(format!("unknown availability {other}")),
         )),
+    }
+}
+
+fn encode_availability(availability: Availability) -> &'static str {
+    match availability {
+        Availability::Available => "available",
+        Availability::RootOffline => "root_offline",
+        Availability::Missing => "missing",
+        Availability::Unreadable => "unreadable",
     }
 }
