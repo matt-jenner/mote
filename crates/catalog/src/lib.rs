@@ -1,5 +1,6 @@
 mod asset_repo;
 mod connection;
+mod index_repo;
 mod library_repo;
 mod migrate;
 mod policy_repo;
@@ -8,6 +9,10 @@ use std::num::ParseIntError;
 use std::path::Path;
 
 pub use asset_repo::{AssetRecord, NewAsset};
+pub use index_repo::{
+    AssetMetadataUpdate, AssetShapeUpdate, CatalogIndexRecord, CatalogKeyword, CatalogProvenance,
+    CatalogWarningRecord,
+};
 pub use library_repo::{LibraryRootRecord, NewLibrary};
 use rusqlite::Connection;
 use thiserror::Error;

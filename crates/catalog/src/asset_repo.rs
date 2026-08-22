@@ -46,45 +46,24 @@ pub struct AssetRecord {
     pub media_kind: MediaKind,
     pub signature: FileSignature,
     pub availability: Availability,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub orientation: Option<u16>,
+    pub representative_rgb: Option<u32>,
+    pub captured_at_utc: Option<String>,
+    pub rating: Option<u8>,
 }
 
 impl Catalog {
     pub fn upsert_asset(&mut self, value: &NewAsset) -> Result<(), CatalogError> {
-        let size_bytes =
-            i64::try_from(value.signature.size_bytes).map_err(|_| CatalogError::ValueOutOfRange)?;
-        self.connection.execute(
-            "INSERT INTO assets (\
-                id, library_id, relative_path_key, display_path, media_kind, size_bytes, \
-                modified_unix_ns, sidecar_modified_unix_ns, availability \
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available') \
-             ON CONFLICT(id) DO UPDATE SET \
-                display_path = excluded.display_path, \
-                media_kind = excluded.media_kind, \
-                size_bytes = excluded.size_bytes, \
-                modified_unix_ns = excluded.modified_unix_ns, \
-                sidecar_modified_unix_ns = excluded.sidecar_modified_unix_ns, \
-                availability = excluded.availability",
-            params![
-                value.id.as_uuid().as_bytes(),
-                value.library_id.as_uuid().as_bytes(),
-                value.relative_path.as_bytes(),
-                value.display_path,
-                encode_media_kind(value.media_kind),
-                size_bytes,
-                value.signature.modified_unix_ns.to_string(),
-                value
-                    .signature
-                    .sidecar_modified_unix_ns
-                    .map(|timestamp| timestamp.to_string()),
-            ],
-        )?;
-        Ok(())
+        upsert_asset_on(&self.connection, value)
     }
 
     pub fn find_asset(&self, id: AssetId) -> Result<Option<AssetRecord>, CatalogError> {
         let mut statement = self.connection.prepare(
             "SELECT id, library_id, relative_path_key, display_path, media_kind, size_bytes, \
-                    modified_unix_ns, sidecar_modified_unix_ns, availability \
+                    modified_unix_ns, sidecar_modified_unix_ns, availability, width, height, \
+                    orientation, representative_rgb, captured_at_utc, rating \
              FROM assets WHERE id = ?1",
         )?;
         let mut rows = statement.query([id.as_uuid().as_bytes()])?;
@@ -100,7 +79,7 @@ impl Catalog {
         after: Option<(String, AssetId)>,
         limit: u32,
     ) -> Result<Vec<AssetRecord>, CatalogError> {
-        const COLUMNS: &str = "id, library_id, relative_path_key, display_path, media_kind, size_bytes, modified_unix_ns, sidecar_modified_unix_ns, availability";
+        const COLUMNS: &str = "id, library_id, relative_path_key, display_path, media_kind, size_bytes, modified_unix_ns, sidecar_modified_unix_ns, availability, width, height, orientation, representative_rgb, captured_at_utc, rating";
         let records = if let Some((display_path, id)) = after {
             let sql = format!(
                 "SELECT {COLUMNS} FROM assets \
@@ -136,6 +115,41 @@ impl Catalog {
     }
 }
 
+pub(crate) fn upsert_asset_on(
+    connection: &rusqlite::Connection,
+    value: &NewAsset,
+) -> Result<(), CatalogError> {
+    let size_bytes =
+        i64::try_from(value.signature.size_bytes).map_err(|_| CatalogError::ValueOutOfRange)?;
+    connection.execute(
+        "INSERT INTO assets (\
+                id, library_id, relative_path_key, display_path, media_kind, size_bytes, \
+                modified_unix_ns, sidecar_modified_unix_ns, availability \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available') \
+             ON CONFLICT(id) DO UPDATE SET \
+                display_path = excluded.display_path, \
+                media_kind = excluded.media_kind, \
+                size_bytes = excluded.size_bytes, \
+                modified_unix_ns = excluded.modified_unix_ns, \
+                sidecar_modified_unix_ns = excluded.sidecar_modified_unix_ns, \
+                availability = excluded.availability",
+        params![
+            value.id.as_uuid().as_bytes(),
+            value.library_id.as_uuid().as_bytes(),
+            value.relative_path.as_bytes(),
+            value.display_path,
+            encode_media_kind(value.media_kind),
+            size_bytes,
+            value.signature.modified_unix_ns.to_string(),
+            value
+                .signature
+                .sidecar_modified_unix_ns
+                .map(|timestamp| timestamp.to_string()),
+        ],
+    )?;
+    Ok(())
+}
+
 fn decode_asset(row: &rusqlite::Row<'_>) -> Result<AssetRecord, rusqlite::Error> {
     let id: Vec<u8> = row.get(0)?;
     let library_id: Vec<u8> = row.get(1)?;
@@ -160,7 +174,40 @@ fn decode_asset(row: &rusqlite::Row<'_>) -> Result<AssetRecord, rusqlite::Error>
             sidecar_modified_unix_ns: sidecar_modified.map(parse_i128).transpose()?,
         },
         availability: decode_availability(&availability, 8)?,
+        width: optional_u32(row, 9)?,
+        height: optional_u32(row, 10)?,
+        orientation: optional_u16(row, 11)?,
+        representative_rgb: optional_u32(row, 12)?,
+        captured_at_utc: row.get(13)?,
+        rating: optional_u8(row, 14)?,
     })
+}
+
+fn optional_u32(row: &rusqlite::Row<'_>, column: usize) -> Result<Option<u32>, rusqlite::Error> {
+    row.get::<_, Option<i64>>(column)?
+        .map(|value| {
+            u32::try_from(value)
+                .map_err(|error| conversion_error(column, rusqlite::types::Type::Integer, error))
+        })
+        .transpose()
+}
+
+fn optional_u16(row: &rusqlite::Row<'_>, column: usize) -> Result<Option<u16>, rusqlite::Error> {
+    row.get::<_, Option<i64>>(column)?
+        .map(|value| {
+            u16::try_from(value)
+                .map_err(|error| conversion_error(column, rusqlite::types::Type::Integer, error))
+        })
+        .transpose()
+}
+
+fn optional_u8(row: &rusqlite::Row<'_>, column: usize) -> Result<Option<u8>, rusqlite::Error> {
+    row.get::<_, Option<i64>>(column)?
+        .map(|value| {
+            u8::try_from(value)
+                .map_err(|error| conversion_error(column, rusqlite::types::Type::Integer, error))
+        })
+        .transpose()
 }
 
 fn conversion_error(
