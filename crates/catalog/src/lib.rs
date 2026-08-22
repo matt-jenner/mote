@@ -1,0 +1,88 @@
+mod asset_repo;
+mod connection;
+mod library_repo;
+mod migrate;
+
+use std::num::ParseIntError;
+use std::path::Path;
+
+pub use asset_repo::{AssetRecord, NewAsset};
+pub use library_repo::{LibraryRootRecord, NewLibrary};
+use rusqlite::Connection;
+use thiserror::Error;
+
+pub struct Catalog {
+    pub(crate) connection: Connection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SqliteVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+}
+
+impl SqliteVersion {
+    pub const fn new(major: u32, minor: u32, patch: u32) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum CatalogError {
+    #[error("catalog I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("SQLite operation failed: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("catalog migration failed: {0}")]
+    MigrationFailed(String),
+    #[error("SQLite {found:?} is older than the required {minimum:?}")]
+    UnsafeSqliteVersion {
+        found: SqliteVersion,
+        minimum: SqliteVersion,
+    },
+    #[error("invalid SQLite version string: {0}")]
+    InvalidSqliteVersion(String),
+    #[error("catalog contains invalid data: {0}")]
+    InvalidData(String),
+    #[error("numeric value cannot be stored in SQLite")]
+    ValueOutOfRange,
+}
+
+impl Catalog {
+    pub fn open(path: &Path) -> Result<Self, CatalogError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let connection = migrate::migrate_with(path, migrate::MIGRATIONS)?;
+        Ok(Self { connection })
+    }
+
+    pub fn open_in_memory() -> Result<Self, CatalogError> {
+        let mut connection = Connection::open_in_memory()?;
+        connection::ensure_safe_sqlite(&connection)?;
+        connection::configure(&connection, false)?;
+        migrate::apply_migrations(&mut connection, migrate::MIGRATIONS)?;
+        Ok(Self { connection })
+    }
+
+    pub fn sqlite_version(&self) -> Result<SqliteVersion, CatalogError> {
+        connection::sqlite_version(&self.connection)
+    }
+
+    pub fn journal_mode(&self) -> Result<String, CatalogError> {
+        self.connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .map_err(CatalogError::from)
+    }
+}
+
+pub(crate) fn parse_i128(value: String) -> Result<i128, rusqlite::Error> {
+    value.parse().map_err(|error: ParseIntError| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })
+}

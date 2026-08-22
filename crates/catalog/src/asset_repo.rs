@@ -1,0 +1,219 @@
+use photo_domain::{AssetId, Availability, FileSignature, LibraryId, MediaKind, RelativePathKey};
+use rusqlite::params;
+
+use crate::library_repo::decode_uuid;
+use crate::{Catalog, CatalogError, parse_i128};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewAsset {
+    pub id: AssetId,
+    pub library_id: LibraryId,
+    pub relative_path: RelativePathKey,
+    pub display_path: String,
+    pub media_kind: MediaKind,
+    pub signature: FileSignature,
+}
+
+impl NewAsset {
+    pub fn minimal(
+        library: LibraryId,
+        path: RelativePathKey,
+        display_path: impl Into<String>,
+        kind: MediaKind,
+        size_bytes: u64,
+    ) -> Self {
+        Self {
+            id: AssetId::for_path(library, &path),
+            library_id: library,
+            relative_path: path,
+            display_path: display_path.into(),
+            media_kind: kind,
+            signature: FileSignature {
+                size_bytes,
+                modified_unix_ns: 0,
+                sidecar_modified_unix_ns: None,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetRecord {
+    pub id: AssetId,
+    pub library_id: LibraryId,
+    pub relative_path: RelativePathKey,
+    pub display_path: String,
+    pub media_kind: MediaKind,
+    pub signature: FileSignature,
+    pub availability: Availability,
+}
+
+impl Catalog {
+    pub fn upsert_asset(&mut self, value: &NewAsset) -> Result<(), CatalogError> {
+        let size_bytes =
+            i64::try_from(value.signature.size_bytes).map_err(|_| CatalogError::ValueOutOfRange)?;
+        self.connection.execute(
+            "INSERT INTO assets (\
+                id, library_id, relative_path_key, display_path, media_kind, size_bytes, \
+                modified_unix_ns, sidecar_modified_unix_ns, availability \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available') \
+             ON CONFLICT(id) DO UPDATE SET \
+                display_path = excluded.display_path, \
+                media_kind = excluded.media_kind, \
+                size_bytes = excluded.size_bytes, \
+                modified_unix_ns = excluded.modified_unix_ns, \
+                sidecar_modified_unix_ns = excluded.sidecar_modified_unix_ns, \
+                availability = excluded.availability",
+            params![
+                value.id.as_uuid().as_bytes(),
+                value.library_id.as_uuid().as_bytes(),
+                value.relative_path.as_bytes(),
+                value.display_path,
+                encode_media_kind(value.media_kind),
+                size_bytes,
+                value.signature.modified_unix_ns.to_string(),
+                value
+                    .signature
+                    .sidecar_modified_unix_ns
+                    .map(|timestamp| timestamp.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn find_asset(&self, id: AssetId) -> Result<Option<AssetRecord>, CatalogError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, library_id, relative_path_key, display_path, media_kind, size_bytes, \
+                    modified_unix_ns, sidecar_modified_unix_ns, availability \
+             FROM assets WHERE id = ?1",
+        )?;
+        let mut rows = statement.query([id.as_uuid().as_bytes()])?;
+        rows.next()?
+            .map(decode_asset)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub fn list_assets_page(
+        &self,
+        library: LibraryId,
+        after: Option<(String, AssetId)>,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, CatalogError> {
+        const COLUMNS: &str = "id, library_id, relative_path_key, display_path, media_kind, size_bytes, modified_unix_ns, sidecar_modified_unix_ns, availability";
+        let records = if let Some((display_path, id)) = after {
+            let sql = format!(
+                "SELECT {COLUMNS} FROM assets \
+                 WHERE library_id = ?1 AND (display_path > ?2 OR (display_path = ?2 AND id > ?3)) \
+                 ORDER BY display_path, id LIMIT ?4"
+            );
+            let mut statement = self.connection.prepare(&sql)?;
+            statement
+                .query_map(
+                    params![
+                        library.as_uuid().as_bytes(),
+                        display_path,
+                        id.as_uuid().as_bytes(),
+                        i64::from(limit)
+                    ],
+                    decode_asset,
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let sql = format!(
+                "SELECT {COLUMNS} FROM assets WHERE library_id = ?1 \
+                 ORDER BY display_path, id LIMIT ?2"
+            );
+            let mut statement = self.connection.prepare(&sql)?;
+            statement
+                .query_map(
+                    params![library.as_uuid().as_bytes(), i64::from(limit)],
+                    decode_asset,
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(records)
+    }
+}
+
+fn decode_asset(row: &rusqlite::Row<'_>) -> Result<AssetRecord, rusqlite::Error> {
+    let id: Vec<u8> = row.get(0)?;
+    let library_id: Vec<u8> = row.get(1)?;
+    let relative_path: Vec<u8> = row.get(2)?;
+    let media_kind: String = row.get(4)?;
+    let size_bytes: i64 = row.get(5)?;
+    let modified: String = row.get(6)?;
+    let sidecar_modified: Option<String> = row.get(7)?;
+    let availability: String = row.get(8)?;
+
+    Ok(AssetRecord {
+        id: AssetId::from_uuid(decode_uuid(id, 0)?),
+        library_id: LibraryId::from_uuid(decode_uuid(library_id, 1)?),
+        relative_path: RelativePathKey::from_bytes(relative_path)
+            .map_err(|error| conversion_error(2, rusqlite::types::Type::Blob, error))?,
+        display_path: row.get(3)?,
+        media_kind: decode_media_kind(&media_kind, 4)?,
+        signature: FileSignature {
+            size_bytes: u64::try_from(size_bytes)
+                .map_err(|error| conversion_error(5, rusqlite::types::Type::Integer, error))?,
+            modified_unix_ns: parse_i128(modified)?,
+            sidecar_modified_unix_ns: sidecar_modified.map(parse_i128).transpose()?,
+        },
+        availability: decode_availability(&availability, 8)?,
+    })
+}
+
+fn conversion_error(
+    column: usize,
+    data_type: rusqlite::types::Type,
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(column, data_type, Box::new(error))
+}
+
+fn encode_media_kind(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Jpeg => "jpeg",
+        MediaKind::Png => "png",
+        MediaKind::Tiff => "tiff",
+        MediaKind::Heif => "heif",
+        MediaKind::Webp => "webp",
+        MediaKind::Avif => "avif",
+        MediaKind::Raw => "raw",
+        MediaKind::Video => "video",
+        MediaKind::Unknown => "unknown",
+    }
+}
+
+fn decode_media_kind(value: &str, column: usize) -> Result<MediaKind, rusqlite::Error> {
+    match value {
+        "jpeg" => Ok(MediaKind::Jpeg),
+        "png" => Ok(MediaKind::Png),
+        "tiff" => Ok(MediaKind::Tiff),
+        "heif" => Ok(MediaKind::Heif),
+        "webp" => Ok(MediaKind::Webp),
+        "avif" => Ok(MediaKind::Avif),
+        "raw" => Ok(MediaKind::Raw),
+        "video" => Ok(MediaKind::Video),
+        "unknown" => Ok(MediaKind::Unknown),
+        other => Err(conversion_error(
+            column,
+            rusqlite::types::Type::Text,
+            CatalogError::InvalidData(format!("unknown media kind {other}")),
+        )),
+    }
+}
+
+fn decode_availability(value: &str, column: usize) -> Result<Availability, rusqlite::Error> {
+    match value {
+        "available" => Ok(Availability::Available),
+        "root_offline" => Ok(Availability::RootOffline),
+        "missing" => Ok(Availability::Missing),
+        "unreadable" => Ok(Availability::Unreadable),
+        other => Err(conversion_error(
+            column,
+            rusqlite::types::Type::Text,
+            CatalogError::InvalidData(format!("unknown availability {other}")),
+        )),
+    }
+}
