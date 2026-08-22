@@ -2,6 +2,7 @@ mod catalog_writer;
 mod discover;
 mod events;
 mod scanner;
+mod scheduler;
 
 use std::path::PathBuf;
 
@@ -9,6 +10,9 @@ pub use catalog_writer::CatalogWriter;
 pub use discover::find_sidecar;
 pub use events::{IndexEvent, ScanSummary};
 pub use scanner::{Indexer, MetadataReader, ScanHandle, ScanRequest};
+pub use scheduler::{
+    CancellationToken, IndexJob, IndexScheduler, InteractionMode, JobPriority, SchedulerConfig,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
