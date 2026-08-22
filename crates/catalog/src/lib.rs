@@ -2,6 +2,7 @@ mod asset_repo;
 mod connection;
 mod library_repo;
 mod migrate;
+mod policy_repo;
 
 use std::num::ParseIntError;
 use std::path::Path;
@@ -38,6 +39,8 @@ pub enum CatalogError {
     Io(#[from] std::io::Error),
     #[error("SQLite operation failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("catalog JSON is invalid: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("catalog migration failed: {0}")]
     MigrationFailed(String),
     #[error("SQLite {found:?} is older than the required {minimum:?}")]
