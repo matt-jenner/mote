@@ -60,11 +60,15 @@ impl ServerConfig {
     }
 
     pub fn validate_source_roots(&self, source_roots: &[PathBuf]) -> Result<(), ConfigError> {
-        let data = normalize_absolute(&self.data_dir)?;
-        let cache = normalize_absolute(&self.cache_dir)?;
+        let data = resolve_for_comparison(&self.data_dir)?;
+        let cache = resolve_for_comparison(&self.cache_dir)?;
+        let catalog = resolve_for_comparison(&self.catalog_path())?;
         for source in source_roots {
-            let source = normalize_absolute(source)?;
-            if data.starts_with(&source) || cache.starts_with(&source) {
+            let source = resolve_for_comparison(source)?;
+            if path_starts_with(&data, &source)
+                || path_starts_with(&cache, &source)
+                || path_starts_with(&catalog, &source)
+            {
                 return Err(ConfigError::InsideSourceRoot);
             }
         }
@@ -109,6 +113,50 @@ fn normalize_absolute(path: &Path) -> Result<PathBuf, std::io::Error> {
         }
     }
     Ok(normalized)
+}
+
+fn resolve_for_comparison(path: &Path) -> Result<PathBuf, std::io::Error> {
+    let absolute = normalize_absolute(path)?;
+    let mut ancestor = absolute.clone();
+    let mut missing = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(component) = ancestor.file_name().map(ToOwned::to_owned) else {
+                    return Err(error);
+                };
+                missing.push(component);
+                if !ancestor.pop() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn path_starts_with(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+}
+
+#[cfg(windows)]
+fn path_starts_with(path: &Path, root: &Path) -> bool {
+    let mut path_components = path.components();
+    root.components().all(|root_component| {
+        path_components.next().is_some_and(|path_component| {
+            path_component
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&root_component.as_os_str().to_string_lossy())
+        })
+    })
 }
 
 fn create_private_directory(path: &Path) -> Result<(), std::io::Error> {

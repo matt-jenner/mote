@@ -5,7 +5,7 @@ use photo_core::{AddLibraryError, LibraryService, RealSourceFs, RelinkError};
 use photo_domain::{Availability, LibraryKind, RelativePathKey};
 
 fn service() -> LibraryService<RealSourceFs> {
-    LibraryService::new(Catalog::open_in_memory().unwrap(), RealSourceFs)
+    LibraryService::new(Catalog::open_in_memory().unwrap(), RealSourceFs, Vec::new())
 }
 
 fn relative(path: &str) -> RelativePathKey {
@@ -45,6 +45,31 @@ fn configured_roots_cannot_overlap_existing_roots() {
             Err(AddLibraryError::Overlaps { existing_id }) if existing_id == library.id
         ));
     }
+}
+
+#[test]
+fn sources_and_relinks_cannot_overlap_local_state_roots() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("Photos/.photo-viewer-state");
+    let old_root = temp.path().join("Old Photos");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir(&old_root).unwrap();
+    let mut service = LibraryService::new(
+        Catalog::open_in_memory().unwrap(),
+        RealSourceFs,
+        vec![state.canonicalize().unwrap()],
+    );
+
+    assert!(matches!(
+        service.add_configured(temp.path().join("Photos").as_path(), "Unsafe"),
+        Err(AddLibraryError::OverlapsLocalState)
+    ));
+
+    let library = service.add_configured(&old_root, "Old").unwrap();
+    assert!(matches!(
+        service.relink(library.id, temp.path().join("Photos").as_path(), &[]),
+        Err(RelinkError::OverlapsLocalState)
+    ));
 }
 
 #[test]

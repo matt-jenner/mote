@@ -113,9 +113,22 @@ pub fn run_benchmark(config: BenchmarkConfig) -> Result<BenchmarkReport, Benchma
         });
     }
 
+    let retained = catalog.mark_root_offline(library.id)?;
+    if retained != config.assets {
+        return Err(BenchmarkError::IncorrectRowCount {
+            expected: config.assets,
+            actual: retained,
+        });
+    }
     let unavailable_started = Instant::now();
-    let _unavailable = catalog.unavailable_asset_count(library.id)?;
+    let unavailable = catalog.unavailable_asset_count(library.id)?;
     let unavailable_count_ms = elapsed_ms(unavailable_started);
+    if unavailable != config.assets {
+        return Err(BenchmarkError::IncorrectRowCount {
+            expected: config.assets,
+            actual: unavailable,
+        });
+    }
 
     let eviction_started = Instant::now();
     let _plan = EvictionPlanner::plan(
@@ -201,7 +214,7 @@ fn insert_cache_groups(
         let path = format!("cache-group-{group_index:07}");
         let group_uuid = uuid::Uuid::new_v5(&GROUP_NAMESPACE, path.as_bytes());
         let group_id = FolderGroupId::from_uuid(group_uuid);
-        catalog.upsert_folder_group(&NewFolderGroup {
+        let group_id = catalog.upsert_folder_group(&NewFolderGroup {
             id: group_id,
             library_id: library,
             relative_path: RelativePathKey::from_relative_path(Path::new(&path))

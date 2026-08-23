@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+photo-cache = { path = "../cache" }
 photo-catalog = { path = "../catalog" }
 photo-domain = { path = "../domain" }
 axum.workspace = true
@@ -21,4 +22,3 @@ http-body-util.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tower.workspace = true
-

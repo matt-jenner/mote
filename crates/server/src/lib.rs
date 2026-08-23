@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use axum::Router;
 use axum::extract::State;
 use axum::routing::get;
+use photo_cache::{CacheReconcileReport, CacheWriter};
 use photo_catalog::Catalog;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
@@ -22,12 +23,47 @@ pub struct AppState {
     pub(crate) cache_root: Arc<PathBuf>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum StartupError {
+    #[error("server configuration failed: {0}")]
+    Config(#[from] ConfigError),
+    #[error("catalog startup failed: {0}")]
+    Catalog(#[from] photo_catalog::CatalogError),
+    #[error("cache startup failed: {0}")]
+    Cache(#[from] photo_cache::CacheError),
+    #[error("cataloged source root has invalid native encoding")]
+    InvalidCatalogPath,
+}
+
 impl AppState {
     pub fn new(catalog: Catalog, cache_root: PathBuf) -> Self {
         Self {
             catalog: Arc::new(Mutex::new(catalog)),
             cache_root: Arc::new(cache_root),
         }
+    }
+
+    pub fn open(config: &ServerConfig) -> Result<(Self, CacheReconcileReport), StartupError> {
+        let preflight_roots = Catalog::read_library_root_paths(&config.catalog_path())?;
+        config.validate_source_roots(&preflight_roots)?;
+        config.prepare()?;
+
+        let mut catalog = Catalog::open(&config.catalog_path())?;
+        let cataloged_roots = catalog
+            .list_libraries()?
+            .into_iter()
+            .map(|library| {
+                library
+                    .canonical_root_key
+                    .to_path_buf()
+                    .map_err(|_| StartupError::InvalidCatalogPath)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        config.validate_source_roots(&cataloged_roots)?;
+
+        let writer = CacheWriter::new(config.cache_dir())?;
+        let report = writer.reconcile_catalog(&mut catalog)?;
+        Ok((Self::new(catalog, config.cache_dir().to_owned()), report))
     }
 }
 

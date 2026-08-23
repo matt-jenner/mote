@@ -3,9 +3,9 @@ use std::path::Path;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
-use photo_catalog::{Catalog, NewLibrary};
-use photo_domain::Availability;
-use photo_server::{AppState, ConfigError, ServerConfig, build_router};
+use photo_catalog::{Catalog, NewAsset, NewDerivative, NewFolderGroup, NewLibrary};
+use photo_domain::{Availability, DerivativeId, FolderGroupId, MediaKind, RelativePathKey};
+use photo_server::{AppState, ConfigError, ServerConfig, StartupError, build_router};
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -92,6 +92,31 @@ fn config_defaults_to_loopback_and_rejects_local_state_inside_a_source() {
 
 #[cfg(unix)]
 #[test]
+fn config_rejects_a_symlink_alias_into_a_source_root() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let alias = temp.path().join("photo-alias");
+    std::fs::create_dir(&source).unwrap();
+    symlink(&source, &alias).unwrap();
+    let config = ServerConfig::new(
+        alias.join("app-data"),
+        temp.path().join("cache"),
+        None,
+        vec![source.clone()],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        config.prepare(),
+        Err(ConfigError::InsideSourceRoot)
+    ));
+    assert!(!source.join("app-data").exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn config_creates_private_local_directories() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -123,10 +148,133 @@ fn config_creates_private_local_directories() {
     );
 }
 
+#[test]
+fn application_startup_repairs_cache_before_serving() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let data = temp.path().join("data");
+    let cache = temp.path().join("cache");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&cache).unwrap();
+    let config = ServerConfig::new(data, cache.clone(), None, vec![]).unwrap();
+    let (group, missing_id) = catalog_with_missing_derivative(&config, &source);
+    std::fs::write(cache.join("orphan.partial-test"), b"partial").unwrap();
+
+    let (state, report) = AppState::open(&config).unwrap();
+
+    assert_eq!(report.partial_files_removed, 1);
+    assert_eq!(report.missing_rows_removed, 1);
+    drop(state);
+    let catalog = Catalog::open(&config.catalog_path()).unwrap();
+    assert_eq!(catalog.derivative_count(group, false).unwrap(), 0);
+    assert!(
+        catalog
+            .all_derivatives()
+            .unwrap()
+            .iter()
+            .all(|record| record.id != missing_id)
+    );
+}
+
+#[test]
+fn application_preflights_cataloged_roots_before_creating_cache_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let data_inside_source = source.join("viewer-data");
+    let cache = temp.path().join("cache-not-created");
+    std::fs::create_dir_all(&data_inside_source).unwrap();
+    let config = ServerConfig::new(data_inside_source, cache.clone(), None, vec![]).unwrap();
+    let mut catalog = Catalog::open(&config.catalog_path()).unwrap();
+    catalog
+        .add_library(&NewLibrary::configured("Photos", &source))
+        .unwrap();
+    drop(catalog);
+
+    let result = AppState::open(&config);
+
+    assert!(matches!(
+        result,
+        Err(StartupError::Config(ConfigError::InsideSourceRoot))
+    ));
+    assert!(!cache.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn application_rejects_a_catalog_symlink_into_a_source_root() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let source_catalog = source.join("catalog.sqlite");
+    let data = temp.path().join("data");
+    let cache = temp.path().join("cache-not-created");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&data).unwrap();
+    let mut catalog = Catalog::open(&source_catalog).unwrap();
+    catalog
+        .add_library(&NewLibrary::configured("Photos", &source))
+        .unwrap();
+    drop(catalog);
+    symlink(&source_catalog, data.join("catalog.sqlite")).unwrap();
+    let config = ServerConfig::new(data, cache.clone(), None, vec![]).unwrap();
+
+    let result = AppState::open(&config);
+
+    assert!(matches!(
+        result,
+        Err(StartupError::Config(ConfigError::InsideSourceRoot))
+    ));
+    assert!(!cache.exists());
+}
+
 fn add_library(catalog: &mut Catalog, root: &str, availability: Availability) {
     let library = NewLibrary::configured(root, Path::new(root));
     catalog.add_library(&library).unwrap();
     catalog
         .set_library_availability(library.id, availability)
         .unwrap();
+}
+
+fn catalog_with_missing_derivative(
+    config: &ServerConfig,
+    source: &Path,
+) -> (FolderGroupId, DerivativeId) {
+    let mut catalog = Catalog::open(&config.catalog_path()).unwrap();
+    let library = NewLibrary::configured("Photos", source);
+    catalog.add_library(&library).unwrap();
+    let relative = RelativePathKey::from_relative_path(Path::new("collection/image.jpg")).unwrap();
+    let asset = NewAsset::minimal(
+        library.id,
+        relative,
+        "collection/image.jpg",
+        MediaKind::Jpeg,
+        100,
+    );
+    catalog.upsert_asset(&asset).unwrap();
+    let proposed_group = FolderGroupId::new();
+    let group = catalog
+        .upsert_folder_group(&NewFolderGroup {
+            id: proposed_group,
+            library_id: library.id,
+            relative_path: RelativePathKey::from_relative_path(Path::new("collection")).unwrap(),
+            display_path: "collection".to_owned(),
+            last_viewed_at: Some(1),
+        })
+        .unwrap();
+    let derivative = DerivativeId::new();
+    catalog
+        .insert_derivative(&NewDerivative {
+            id: derivative,
+            asset_id: asset.id,
+            folder_group_id: group,
+            kind: "screen_preview".to_owned(),
+            cache_key: "missing-preview".to_owned(),
+            relative_cache_path: "aa/bb/missing.preview".into(),
+            size_bytes: 10,
+            durable: false,
+            created_at: 1,
+        })
+        .unwrap();
+    (group, derivative)
 }

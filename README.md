@@ -48,7 +48,7 @@ cargo run -p photo-server
 
 ## Run the catalog benchmark
 
-The benchmark deterministically generates catalog rows in 500-asset transactions, then measures insertion, the first natural-path page, unavailable-asset counting, and cache-group eviction planning. It records timings without enforcing hardware-dependent limits.
+The benchmark deterministically generates catalog rows in 500-asset transactions, marks the generated root offline while retaining every asset, then measures insertion, the first natural-path page, unavailable-asset counting, and cache-group eviction planning. It records timings without enforcing hardware-dependent limits.
 
 Run the million-asset profile in release mode:
 

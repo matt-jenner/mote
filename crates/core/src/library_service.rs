@@ -9,6 +9,7 @@ use crate::SourceFs;
 pub struct LibraryService<F> {
     catalog: Catalog,
     source_fs: F,
+    local_state_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,6 +33,8 @@ pub enum AddLibraryError {
     InvalidCatalogPath(String),
     #[error("selected folder could not be made relative to its library")]
     InvalidSelection,
+    #[error("source overlaps a local catalog or cache root")]
+    OverlapsLocalState,
 }
 
 #[derive(Debug, Error)]
@@ -50,11 +53,17 @@ pub enum RelinkError {
     Overlaps { existing_id: LibraryId },
     #[error("cataloged root has invalid native encoding: {0}")]
     InvalidCatalogPath(String),
+    #[error("replacement overlaps a local catalog or cache root")]
+    OverlapsLocalState,
 }
 
 impl<F: SourceFs> LibraryService<F> {
-    pub fn new(catalog: Catalog, source_fs: F) -> Self {
-        Self { catalog, source_fs }
+    pub fn new(catalog: Catalog, source_fs: F, local_state_roots: Vec<PathBuf>) -> Self {
+        Self {
+            catalog,
+            source_fs,
+            local_state_roots,
+        }
     }
 
     pub fn catalog(&self) -> &Catalog {
@@ -67,6 +76,9 @@ impl<F: SourceFs> LibraryService<F> {
         name: &str,
     ) -> Result<LibraryRootRecord, AddLibraryError> {
         let canonical = self.canonical_directory(root)?;
+        if self.overlaps_local_state(&canonical) {
+            return Err(AddLibraryError::OverlapsLocalState);
+        }
         for existing in self.catalog.list_libraries()? {
             let existing_path = existing
                 .canonical_root_key
@@ -88,6 +100,9 @@ impl<F: SourceFs> LibraryService<F> {
 
     pub fn open_recent(&mut self, folder: &Path) -> Result<SourceSelection, AddLibraryError> {
         let canonical = self.canonical_directory(folder)?;
+        if self.overlaps_local_state(&canonical) {
+            return Err(AddLibraryError::OverlapsLocalState);
+        }
         let libraries = self.catalog.list_libraries()?;
         for existing in libraries {
             let existing_path = existing
@@ -151,6 +166,9 @@ impl<F: SourceFs> LibraryService<F> {
         if !self.source_fs.is_dir(&canonical) {
             return Err(RelinkError::NotDirectory(canonical));
         }
+        if self.overlaps_local_state(&canonical) {
+            return Err(RelinkError::OverlapsLocalState);
+        }
 
         for existing in self.catalog.list_libraries()? {
             if existing.id == id {
@@ -191,6 +209,12 @@ impl<F: SourceFs> LibraryService<F> {
             return Err(AddLibraryError::NotDirectory(canonical));
         }
         Ok(canonical)
+    }
+
+    fn overlaps_local_state(&self, source: &Path) -> bool {
+        self.local_state_roots
+            .iter()
+            .any(|state| paths_overlap(source, state))
     }
 }
 

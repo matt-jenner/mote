@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use photo_domain::{Availability, LibraryId, LibraryKind, NativePathKey};
-use rusqlite::params;
+use rusqlite::{Connection, OpenFlags, params};
 
 use crate::{Catalog, CatalogError};
 
@@ -46,6 +46,38 @@ pub struct LibraryRootRecord {
 }
 
 impl Catalog {
+    pub fn read_library_root_paths(path: &Path) -> Result<Vec<std::path::PathBuf>, CatalogError> {
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        crate::connection::ensure_safe_sqlite(&connection)?;
+        let has_roots: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'library_roots')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_roots {
+            return Ok(Vec::new());
+        }
+        let mut statement =
+            connection.prepare("SELECT canonical_root_key FROM library_roots ORDER BY id")?;
+        statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+            .map(|bytes| {
+                let key = NativePathKey::from_bytes(bytes?).map_err(|error| {
+                    CatalogError::InvalidData(format!("invalid cataloged source root: {error}"))
+                })?;
+                key.to_path_buf().map_err(|error| {
+                    CatalogError::InvalidData(format!("invalid cataloged source root: {error}"))
+                })
+            })
+            .collect()
+    }
+
     pub fn add_library(&mut self, value: &NewLibrary) -> Result<LibraryRootRecord, CatalogError> {
         self.connection.execute(
             "INSERT INTO library_roots (id, kind, display_name, canonical_root_key, display_path, availability) \
