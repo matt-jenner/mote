@@ -228,6 +228,31 @@ fn application_rejects_a_catalog_symlink_into_a_source_root() {
     assert!(!cache.exists());
 }
 
+#[test]
+fn application_rejects_a_source_nested_inside_the_cache_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let cache = temp.path().join("cache");
+    let source = cache.join("photos");
+    let source_file = source.join("original.partial-camera.jpg");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(&source_file, b"source").unwrap();
+    let config = ServerConfig::new(data, cache, None, vec![]).unwrap();
+    let mut catalog = Catalog::open(&config.catalog_path()).unwrap();
+    catalog
+        .add_library(&NewLibrary::configured("Photos", &source))
+        .unwrap();
+    drop(catalog);
+
+    let result = AppState::open(&config);
+
+    assert!(matches!(
+        result,
+        Err(StartupError::Config(ConfigError::InsideSourceRoot))
+    ));
+    assert_eq!(std::fs::read(source_file).unwrap(), b"source");
+}
+
 fn add_library(catalog: &mut Catalog, root: &str, availability: Availability) {
     let library = NewLibrary::configured(root, Path::new(root));
     catalog.add_library(&library).unwrap();

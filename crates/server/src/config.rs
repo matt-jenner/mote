@@ -65,9 +65,9 @@ impl ServerConfig {
         let catalog = resolve_for_comparison(&self.catalog_path())?;
         for source in source_roots {
             let source = resolve_for_comparison(source)?;
-            if path_starts_with(&data, &source)
-                || path_starts_with(&cache, &source)
-                || path_starts_with(&catalog, &source)
+            if paths_overlap(&data, &source)
+                || paths_overlap(&cache, &source)
+                || paths_overlap(&catalog, &source)
             {
                 return Err(ConfigError::InsideSourceRoot);
             }
@@ -144,6 +144,10 @@ fn resolve_for_comparison(path: &Path) -> Result<PathBuf, std::io::Error> {
 #[cfg(not(windows))]
 fn path_starts_with(path: &Path, root: &Path) -> bool {
     path.starts_with(root)
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    path_starts_with(left, right) || path_starts_with(right, left)
 }
 
 #[cfg(windows)]

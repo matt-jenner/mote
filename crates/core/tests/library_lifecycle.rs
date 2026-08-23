@@ -5,7 +5,7 @@ use photo_core::{AddLibraryError, LibraryService, RealSourceFs, RelinkError};
 use photo_domain::{Availability, LibraryKind, RelativePathKey};
 
 fn service() -> LibraryService<RealSourceFs> {
-    LibraryService::new(Catalog::open_in_memory().unwrap(), RealSourceFs, Vec::new())
+    LibraryService::new(Catalog::open_in_memory().unwrap(), RealSourceFs, Vec::new()).unwrap()
 }
 
 fn relative(path: &str) -> RelativePathKey {
@@ -58,7 +58,8 @@ fn sources_and_relinks_cannot_overlap_local_state_roots() {
         Catalog::open_in_memory().unwrap(),
         RealSourceFs,
         vec![state.canonicalize().unwrap()],
-    );
+    )
+    .unwrap();
 
     assert!(matches!(
         service.add_configured(temp.path().join("Photos").as_path(), "Unsafe"),
@@ -68,6 +69,38 @@ fn sources_and_relinks_cannot_overlap_local_state_roots() {
     let library = service.add_configured(&old_root, "Old").unwrap();
     assert!(matches!(
         service.relink(library.id, temp.path().join("Photos").as_path(), &[]),
+        Err(RelinkError::OverlapsLocalState)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn local_state_aliases_are_canonicalized_before_add_and_relink() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let photos = temp.path().join("physical/Photos");
+    let state = photos.join(".photo-viewer-state");
+    let state_alias = temp.path().join("state-alias");
+    let old_root = temp.path().join("Old Photos");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir(&old_root).unwrap();
+    symlink(&state, &state_alias).unwrap();
+    let mut service = LibraryService::new(
+        Catalog::open_in_memory().unwrap(),
+        RealSourceFs,
+        vec![state_alias],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        service.add_configured(&photos, "Unsafe"),
+        Err(AddLibraryError::OverlapsLocalState)
+    ));
+
+    let library = service.add_configured(&old_root, "Old").unwrap();
+    assert!(matches!(
+        service.relink(library.id, &photos, &[]),
         Err(RelinkError::OverlapsLocalState)
     ));
 }

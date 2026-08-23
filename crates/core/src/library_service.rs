@@ -58,12 +58,20 @@ pub enum RelinkError {
 }
 
 impl<F: SourceFs> LibraryService<F> {
-    pub fn new(catalog: Catalog, source_fs: F, local_state_roots: Vec<PathBuf>) -> Self {
-        Self {
+    pub fn new(
+        catalog: Catalog,
+        source_fs: F,
+        local_state_roots: Vec<PathBuf>,
+    ) -> Result<Self, std::io::Error> {
+        let local_state_roots = local_state_roots
+            .iter()
+            .map(|root| source_fs.canonicalize(root))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
             catalog,
             source_fs,
             local_state_roots,
-        }
+        })
     }
 
     pub fn catalog(&self) -> &Catalog {
