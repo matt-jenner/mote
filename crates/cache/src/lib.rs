@@ -2,7 +2,7 @@ mod eviction;
 mod key;
 mod writer;
 
-pub use eviction::{EvictionPlan, EvictionPlanner, ProtectedGroups};
+pub use eviction::{ActiveWriteGuard, EvictionPlan, EvictionPlanner, ProtectedGroups};
 pub use key::{DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget};
 pub use writer::{CacheReconcileReport, CacheWrite, CacheWriter};
 
@@ -18,4 +18,8 @@ pub enum CacheError {
     Catalog(#[from] photo_catalog::CatalogError),
     #[error("cache size cannot be represented on this platform")]
     SizeOutOfRange,
+    #[error("cache protection state is unavailable")]
+    ProtectionUnavailable,
+    #[error("an eviction group became protected before deletion")]
+    GroupBecameProtected,
 }

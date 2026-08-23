@@ -40,8 +40,8 @@ impl CacheWriter {
     where
         F: FnOnce(&mut File) -> std::io::Result<()>,
     {
-        let final_path = self.resolve(&relative_path)?;
-        if final_path.is_file() {
+        let final_path = self.resolve_checked(&relative_path)?;
+        if is_regular_file(&final_path)? {
             return Ok(CacheWrite {
                 relative_path,
                 size_bytes: final_path.metadata()?.len(),
@@ -74,24 +74,32 @@ impl CacheWriter {
         let size_bytes = partial.metadata()?.len();
         drop(partial);
 
-        if final_path.exists() {
-            std::fs::remove_file(&partial_path)?;
-            return Ok(CacheWrite {
-                relative_path,
-                size_bytes: final_path.metadata()?.len(),
-                reused: true,
-            });
+        match std::fs::hard_link(&partial_path, &final_path) {
+            Ok(()) => {
+                std::fs::remove_file(&partial_path)?;
+                Ok(CacheWrite {
+                    relative_path,
+                    size_bytes,
+                    reused: false,
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::fs::remove_file(&partial_path)?;
+                self.resolve_checked(&relative_path)?;
+                if !is_regular_file(&final_path)? {
+                    return Err(CacheError::PathEscape);
+                }
+                Ok(CacheWrite {
+                    relative_path,
+                    size_bytes: final_path.metadata()?.len(),
+                    reused: true,
+                })
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&partial_path);
+                Err(CacheError::Write(error))
+            }
         }
-
-        if let Err(error) = std::fs::rename(&partial_path, &final_path) {
-            let _ = std::fs::remove_file(&partial_path);
-            return Err(CacheError::Write(error));
-        }
-        Ok(CacheWrite {
-            relative_path,
-            size_bytes,
-            reused: false,
-        })
     }
 
     pub fn reconcile_catalog(
@@ -119,8 +127,9 @@ impl CacheWriter {
             .all_derivatives()?
             .into_iter()
             .filter_map(|record| {
-                self.resolve(&record.relative_cache_path)
-                    .map(|path| (!path.is_file()).then_some(record.id))
+                self.resolve_checked(&record.relative_cache_path)
+                    .and_then(|path| is_regular_file(&path))
+                    .map(|present| (!present).then_some(record.id))
                     .transpose()
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -132,9 +141,37 @@ impl CacheWriter {
         })
     }
 
-    pub(crate) fn resolve(&self, relative_path: &Path) -> Result<PathBuf, CacheError> {
+    pub(crate) fn resolve_checked(&self, relative_path: &Path) -> Result<PathBuf, CacheError> {
         validate_relative(relative_path)?;
-        Ok(self.root.join(relative_path))
+        let final_path = self.root.join(relative_path);
+        let mut current = self.root.clone();
+        let component_count = relative_path.components().count();
+        for (index, component) in relative_path.components().enumerate() {
+            current.push(component.as_os_str());
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(CacheError::PathEscape);
+                }
+                Ok(metadata) if index + 1 < component_count && !metadata.is_dir() => {
+                    return Err(CacheError::PathEscape);
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(final_path);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(final_path)
+    }
+
+    pub(crate) fn remove_relative_file(&self, relative_path: &Path) -> Result<(), CacheError> {
+        let path = self.resolve_checked(relative_path)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn create_safe_directories(&self, parent: &Path) -> Result<(), CacheError> {
@@ -150,12 +187,29 @@ impl CacheWriter {
                 }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::create_dir(&current)?;
+                    match std::fs::create_dir(&current) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            let metadata = std::fs::symlink_metadata(&current)?;
+                            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                                return Err(CacheError::PathEscape);
+                            }
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                 }
                 Err(error) => return Err(error.into()),
             }
         }
         Ok(())
+    }
+}
+
+fn is_regular_file(path: &Path) -> Result<bool, CacheError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 

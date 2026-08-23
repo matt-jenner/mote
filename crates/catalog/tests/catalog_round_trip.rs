@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use photo_catalog::{Catalog, NewAsset, NewLibrary, SqliteVersion};
-use photo_domain::{MediaKind, RelativePathKey};
+use photo_catalog::{Catalog, NewAsset, NewFolderGroup, NewLibrary, SqliteVersion};
+use photo_domain::{FolderGroupId, MediaKind, RelativePathKey};
 
 #[test]
 fn opens_with_safe_sqlite_and_round_trips_library_and_asset() {
@@ -105,4 +105,37 @@ fn unavailable_asset_count_tracks_retained_offline_rows() {
     assert_eq!(catalog.unavailable_asset_count(library.id).unwrap(), 0);
     assert_eq!(catalog.mark_root_offline(library.id).unwrap(), 3);
     assert_eq!(catalog.unavailable_asset_count(library.id).unwrap(), 3);
+}
+
+#[test]
+fn repeated_folder_group_upsert_returns_the_stored_id() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured(
+            "Pictures",
+            Path::new("/mounted/Pictures"),
+        ))
+        .unwrap();
+    let path = RelativePathKey::from_relative_path(Path::new("2026/Trip")).unwrap();
+    let first = catalog
+        .upsert_folder_group(&NewFolderGroup {
+            id: FolderGroupId::new(),
+            library_id: library.id,
+            relative_path: path.clone(),
+            display_path: "2026/Trip".to_owned(),
+            last_viewed_at: Some(1),
+        })
+        .unwrap();
+
+    let second = catalog
+        .upsert_folder_group(&NewFolderGroup {
+            id: FolderGroupId::new(),
+            library_id: library.id,
+            relative_path: path,
+            display_path: "Trip".to_owned(),
+            last_viewed_at: Some(2),
+        })
+        .unwrap();
+
+    assert_eq!(second, first);
 }

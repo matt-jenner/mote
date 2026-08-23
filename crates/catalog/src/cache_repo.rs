@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
 use photo_domain::{AssetId, DerivativeId, FolderGroupId, LibraryId, RelativePathKey};
 use rusqlite::{OptionalExtension, params};
@@ -45,12 +45,16 @@ pub struct DerivativeRecord {
 }
 
 impl Catalog {
-    pub fn upsert_folder_group(&mut self, value: &NewFolderGroup) -> Result<(), CatalogError> {
-        self.connection.execute(
+    pub fn upsert_folder_group(
+        &mut self,
+        value: &NewFolderGroup,
+    ) -> Result<FolderGroupId, CatalogError> {
+        let id = self.connection.query_row(
             "INSERT INTO folder_groups (id, library_id, relative_path_key, display_path, last_viewed_at) \
              VALUES (?1, ?2, ?3, ?4, ?5) \
              ON CONFLICT(library_id, relative_path_key) DO UPDATE SET \
-                display_path = excluded.display_path, last_viewed_at = excluded.last_viewed_at",
+                display_path = excluded.display_path, last_viewed_at = excluded.last_viewed_at \
+             RETURNING id",
             params![
                 value.id.as_uuid().as_bytes(),
                 value.library_id.as_uuid().as_bytes(),
@@ -58,11 +62,23 @@ impl Catalog {
                 value.display_path,
                 value.last_viewed_at,
             ],
+            |row| row.get::<_, Vec<u8>>(0),
         )?;
-        Ok(())
+        Ok(FolderGroupId::from_uuid(decode_uuid(id, 0)?))
     }
 
     pub fn insert_derivative(&mut self, value: &NewDerivative) -> Result<(), CatalogError> {
+        if value.relative_cache_path.as_os_str().is_empty()
+            || value.relative_cache_path.is_absolute()
+            || value
+                .relative_cache_path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(CatalogError::InvalidData(
+                "cache path must remain relative to the cache root".to_owned(),
+            ));
+        }
         let relative_cache_path = value.relative_cache_path.to_str().ok_or_else(|| {
             CatalogError::InvalidData("cache path is not valid Unicode".to_owned())
         })?;

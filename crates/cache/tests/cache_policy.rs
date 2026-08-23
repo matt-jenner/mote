@@ -1,12 +1,12 @@
-use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Barrier};
 
 use photo_cache::{
     CacheError, CacheWriter, DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget,
     EvictionPlanner, ProtectedGroups,
 };
-use photo_catalog::{Catalog, NewDerivative, NewFolderGroup, NewLibrary};
+use photo_catalog::{Catalog, CatalogError, NewDerivative, NewFolderGroup, NewLibrary};
 use photo_domain::{
     AssetId, DerivativeId, FileSignature, FolderGroupId, LibraryId, MediaKind, RelativePathKey,
 };
@@ -89,6 +89,44 @@ fn writer_commits_atomically_and_reuses_immutable_output() {
 }
 
 #[test]
+fn concurrent_writers_publish_exactly_one_immutable_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let writer = CacheWriter::new(temp.path()).unwrap();
+    std::fs::create_dir_all(temp.path().join("ab/cd")).unwrap();
+    let barrier = Arc::new(Barrier::new(16));
+    let writes = std::thread::scope(|scope| {
+        let handles = (0_u8..16)
+            .map(|value| {
+                let writer = writer.clone();
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    writer
+                        .write_atomic(PathBuf::from("ab/cd/race.bin"), |file| {
+                            file.write_all(&[value])?;
+                            barrier.wait();
+                            Ok(())
+                        })
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+
+    assert_eq!(writes.iter().filter(|write| !write.reused).count(), 1);
+    assert_eq!(
+        std::fs::read(temp.path().join("ab/cd/race.bin"))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(partial_files(temp.path()).is_empty());
+}
+
+#[test]
 fn interrupted_write_leaves_no_final_or_partial_file() {
     let temp = tempfile::tempdir().unwrap();
     let writer = CacheWriter::new(temp.path()).unwrap();
@@ -118,6 +156,28 @@ fn relative_path_escape_is_rejected_before_writing() {
 }
 
 #[test]
+fn catalog_rejects_an_escaping_derivative_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut fixture = CacheFixture::new(temp.path());
+    let group = fixture.group("collection", Some(1));
+
+    let result = fixture.catalog.insert_derivative(&NewDerivative {
+        id: DerivativeId::new(),
+        asset_id: fixture.asset_id,
+        folder_group_id: group,
+        kind: "screen_preview".to_owned(),
+        cache_key: "escape".to_owned(),
+        relative_cache_path: PathBuf::from("../source-original.jpg"),
+        size_bytes: 6,
+        durable: false,
+        created_at: 1,
+    });
+
+    assert!(matches!(result, Err(CatalogError::InvalidData(_))));
+    assert_eq!(fixture.catalog.derivative_count(group, false).unwrap(), 0);
+}
+
+#[test]
 fn eviction_removes_oldest_whole_group_and_keeps_durable_thumbnails() {
     let temp = tempfile::tempdir().unwrap();
     let mut fixture = CacheFixture::new(temp.path());
@@ -132,7 +192,13 @@ fn eviction_removes_oldest_whole_group_and_keeps_durable_thumbnails() {
     assert_eq!(plan.groups, vec![old]);
     assert_eq!(plan.reclaimable_bytes, 40);
 
-    EvictionPlanner::execute(&mut fixture.catalog, temp.path(), &plan).unwrap();
+    EvictionPlanner::execute(
+        &mut fixture.catalog,
+        temp.path(),
+        &plan,
+        &ProtectedGroups::default(),
+    )
+    .unwrap();
     assert_eq!(fixture.catalog.derivative_count(old, false).unwrap(), 0);
     assert_eq!(fixture.catalog.derivative_count(old, true).unwrap(), 1);
     assert_eq!(fixture.catalog.derivative_count(new, false).unwrap(), 1);
@@ -150,14 +216,78 @@ fn eviction_skips_protected_and_active_groups() {
     fixture.derivative(protected, "protected", 20, false);
     fixture.derivative(active, "active", 20, false);
     fixture.derivative(eligible, "eligible", 20, false);
-    let groups = ProtectedGroups {
-        protected: HashSet::from([protected]),
-        active_writes: HashSet::from([active]),
-    };
+    let groups = ProtectedGroups::default();
+    groups.protect(protected).unwrap();
+    let _active_write = groups.begin_write(active).unwrap();
 
     let plan = EvictionPlanner::plan(&fixture.catalog, 10, &groups).unwrap();
 
     assert_eq!(plan.groups, vec![eligible]);
+}
+
+#[test]
+fn eviction_rechecks_activity_after_planning() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut fixture = CacheFixture::new(temp.path());
+    let group = fixture.group("collection", Some(1));
+    fixture.derivative(group, "preview", 20, false);
+    let groups = ProtectedGroups::default();
+    let plan = EvictionPlanner::plan(&fixture.catalog, 10, &groups).unwrap();
+    let _active_write = groups.begin_write(group).unwrap();
+
+    let result = EvictionPlanner::execute(&mut fixture.catalog, temp.path(), &plan, &groups);
+
+    assert!(matches!(result, Err(CacheError::GroupBecameProtected)));
+    assert!(temp.path().join("preview.bin").exists());
+    assert_eq!(fixture.catalog.derivative_count(group, false).unwrap(), 1);
+}
+
+#[test]
+fn zero_byte_eviction_request_selects_no_groups() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut fixture = CacheFixture::new(temp.path());
+    let group = fixture.group("collection", Some(1));
+    fixture.derivative(group, "preview", 20, false);
+
+    let plan = EvictionPlanner::plan(&fixture.catalog, 0, &ProtectedGroups::default()).unwrap();
+
+    assert!(plan.groups.is_empty());
+    assert_eq!(plan.reclaimable_bytes, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn eviction_rejects_symlinked_cache_ancestors_before_deleting() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("source-original.jpg"), b"source").unwrap();
+    symlink(outside.path(), temp.path().join("linked")).unwrap();
+    let mut fixture = CacheFixture::new(temp.path());
+    let group = fixture.group("collection", Some(1));
+    fixture.derivative_row_at(
+        group,
+        "symlink-row",
+        PathBuf::from("linked/source-original.jpg"),
+        6,
+        false,
+    );
+    let plan = EvictionPlanner::plan(&fixture.catalog, 1, &ProtectedGroups::default()).unwrap();
+
+    let result = EvictionPlanner::execute(
+        &mut fixture.catalog,
+        temp.path(),
+        &plan,
+        &ProtectedGroups::default(),
+    );
+
+    assert!(matches!(result, Err(CacheError::PathEscape)));
+    assert_eq!(
+        std::fs::read(outside.path().join("source-original.jpg")).unwrap(),
+        b"source"
+    );
+    assert_eq!(fixture.catalog.derivative_count(group, false).unwrap(), 1);
 }
 
 #[test]
@@ -230,8 +360,7 @@ impl CacheFixture {
                 display_path: name.to_owned(),
                 last_viewed_at,
             })
-            .unwrap();
-        id
+            .unwrap()
     }
 
     fn derivative(&mut self, group: FolderGroupId, name: &str, bytes: u64, durable: bool) {
@@ -244,6 +373,23 @@ impl CacheFixture {
     }
 
     fn derivative_row_only(&mut self, group: FolderGroupId, name: &str, bytes: u64, durable: bool) {
+        self.derivative_row_at(
+            group,
+            name,
+            PathBuf::from(format!("{name}.bin")),
+            bytes,
+            durable,
+        );
+    }
+
+    fn derivative_row_at(
+        &mut self,
+        group: FolderGroupId,
+        name: &str,
+        relative_cache_path: PathBuf,
+        bytes: u64,
+        durable: bool,
+    ) {
         self.catalog
             .insert_derivative(&NewDerivative {
                 id: DerivativeId::new(),
@@ -255,7 +401,7 @@ impl CacheFixture {
                     "screen_preview".to_owned()
                 },
                 cache_key: name.to_owned(),
-                relative_cache_path: PathBuf::from(format!("{name}.bin")),
+                relative_cache_path,
                 size_bytes: bytes,
                 durable,
                 created_at: 1,
