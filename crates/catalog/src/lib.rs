@@ -1,4 +1,5 @@
 mod asset_repo;
+mod cache_repo;
 mod connection;
 mod generation_repo;
 mod index_repo;
@@ -10,6 +11,7 @@ use std::num::ParseIntError;
 use std::path::Path;
 
 pub use asset_repo::{AssetRecord, NewAsset};
+pub use cache_repo::{CacheEvictionGroup, DerivativeRecord, NewDerivative, NewFolderGroup};
 pub use generation_repo::GenerationCompletion;
 pub use index_repo::{
     AssetMetadataUpdate, AssetShapeUpdate, CatalogIndexRecord, CatalogKeyword, CatalogProvenance,

@@ -1,0 +1,17 @@
+[package]
+name = "photo-cache"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+photo-catalog = { path = "../catalog" }
+photo-domain = { path = "../domain" }
+blake3.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
