@@ -26,6 +26,18 @@ impl Catalog {
             active_warnings: checked_count(active_warnings)?,
         })
     }
+
+    pub fn unavailable_asset_count(
+        &self,
+        library: photo_domain::LibraryId,
+    ) -> Result<u64, CatalogError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM assets WHERE library_id = ?1 AND availability <> 'available'",
+            [library.as_uuid().as_bytes()],
+            |row| row.get(0),
+        )?;
+        checked_count(count)
+    }
 }
 
 fn checked_count(value: i64) -> Result<u64, CatalogError> {

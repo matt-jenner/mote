@@ -6,7 +6,10 @@ use rusqlite::Connection;
 use crate::CatalogError;
 use crate::connection;
 
-pub(crate) const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_catalog.sql")];
+pub(crate) const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_catalog.sql"),
+    include_str!("../migrations/0002_unavailable_assets.sql"),
+];
 
 pub(crate) fn migrate_with(path: &Path, migrations: &[&str]) -> Result<Connection, CatalogError> {
     let mut database = Connection::open(path)?;

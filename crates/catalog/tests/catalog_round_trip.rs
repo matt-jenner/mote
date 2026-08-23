@@ -79,3 +79,30 @@ fn lists_assets_with_stable_keyset_pagination() {
     );
     assert_eq!(second[0].display_path, "c.jpg");
 }
+
+#[test]
+fn unavailable_asset_count_tracks_retained_offline_rows() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured(
+            "Pictures",
+            Path::new("/mounted/Pictures"),
+        ))
+        .unwrap();
+    for display_path in ["a.jpg", "b.jpg", "c.jpg"] {
+        let relative = RelativePathKey::from_relative_path(Path::new(display_path)).unwrap();
+        catalog
+            .upsert_asset(&NewAsset::minimal(
+                library.id,
+                relative,
+                display_path,
+                MediaKind::Jpeg,
+                1,
+            ))
+            .unwrap();
+    }
+
+    assert_eq!(catalog.unavailable_asset_count(library.id).unwrap(), 0);
+    assert_eq!(catalog.mark_root_offline(library.id).unwrap(), 3);
+    assert_eq!(catalog.unavailable_asset_count(library.id).unwrap(), 3);
+}
