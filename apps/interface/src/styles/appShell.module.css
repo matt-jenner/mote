@@ -1,0 +1,382 @@
+.appShell {
+	display: grid;
+	grid-template-columns: 72px minmax(0, 1fr);
+	height: calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+	min-height: 420px;
+	background: var(--canvas);
+	color: var(--text-primary);
+}
+
+.workspace {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	min-height: 0;
+}
+
+.toolbar {
+	position: relative;
+	z-index: 3;
+	display: flex;
+	flex: 0 0 72px;
+	align-items: center;
+	gap: var(--space-3);
+	min-width: 0;
+	padding: 0 var(--space-6);
+	background: color-mix(in srgb, var(--canvas-elevated) 91%, var(--canvas));
+	border-bottom: 1px solid var(--separator);
+}
+
+.titleGroup {
+	display: flex;
+	align-items: baseline;
+	gap: var(--space-3);
+	min-width: 0;
+	margin-right: auto;
+}
+
+.eyebrow {
+	color: var(--text-secondary);
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: 0.07em;
+	text-transform: uppercase;
+}
+
+.sourceTitle {
+	overflow: hidden;
+	font-size: 15px;
+	font-weight: 580;
+	letter-spacing: -0.01em;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.rail {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: var(--space-2);
+	padding: 84px var(--space-2) var(--space-4);
+	background: var(--rail);
+	border-right: 1px solid var(--separator);
+}
+
+.railButton,
+.iconButton,
+.primaryButton {
+	border: 0;
+	border-radius: var(--radius-small);
+	cursor: pointer;
+	transition: background-color var(--fade-duration) ease;
+}
+
+.railButton:disabled,
+.primaryButton:disabled {
+	color: var(--unavailable);
+	cursor: default;
+}
+
+.railButton {
+	display: grid;
+	place-items: center;
+	width: 44px;
+	height: 44px;
+	padding: 0;
+	color: var(--text-secondary);
+	background: transparent;
+}
+
+.railButtonSelected {
+	color: var(--text-primary);
+	background: var(--selection);
+}
+
+.railLabel {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	white-space: nowrap;
+	border: 0;
+}
+
+.iconButton {
+	display: grid;
+	place-items: center;
+	width: 36px;
+	height: 36px;
+	padding: 0;
+	background: transparent;
+}
+
+.primaryButton {
+	min-height: 36px;
+	padding: 0 15px;
+	color: #ffffff;
+	font-size: 13px;
+	font-weight: 580;
+	background: var(--progress-accent);
+}
+
+@media (hover: hover) {
+	.railButton:not(:disabled):hover,
+	.iconButton:hover {
+		background: var(--control-hover);
+	}
+
+	.primaryButton:not(:disabled):hover {
+		background: color-mix(
+			in srgb,
+			var(--progress-accent) 86%,
+			var(--text-primary)
+		);
+	}
+}
+
+.canvas {
+	display: grid;
+	flex: 1 1 auto;
+	place-items: center;
+	min-width: 0;
+	min-height: 0;
+	background: var(--canvas);
+}
+
+.emptyState {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	max-width: 380px;
+	padding: 40px var(--space-6);
+	text-align: center;
+}
+
+.emptyIcon {
+	display: grid;
+	place-items: center;
+	width: 62px;
+	height: 62px;
+	margin-bottom: 20px;
+	color: var(--text-secondary);
+	background: var(--canvas-elevated);
+	border: 1px solid var(--separator);
+	border-radius: 16px;
+}
+
+.canvasTitle {
+	margin: 0;
+	font-size: 20px;
+	font-weight: 590;
+	letter-spacing: -0.025em;
+}
+
+.canvasCopy {
+	margin: var(--space-2) 0 20px;
+	color: var(--text-secondary);
+	font-size: 13px;
+	line-height: 1.5;
+}
+
+.appearance {
+	position: relative;
+}
+
+.appearanceMenu {
+	position: absolute;
+	top: calc(100% + 8px);
+	right: 0;
+	z-index: 10;
+	width: 184px;
+	padding: var(--space-2);
+	background: var(--canvas-elevated);
+	border: 1px solid var(--separator);
+	border-radius: var(--radius-medium);
+	box-shadow: 0 12px 36px rgb(0 0 0 / 18%);
+}
+
+.menuTitle {
+	padding: var(--space-2) var(--space-2) var(--space-1);
+	color: var(--text-secondary);
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: 0.05em;
+	text-transform: uppercase;
+}
+
+.radioGroup {
+	display: grid;
+}
+
+.radioOption {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	min-height: 38px;
+	padding: 0 var(--space-2);
+	font-size: 13px;
+	border-radius: var(--radius-small);
+	cursor: pointer;
+}
+
+.radioOption:has(input:checked) {
+	background: var(--selection);
+}
+
+.radioOption input {
+	margin: 0;
+	accent-color: var(--progress-accent);
+}
+
+.errorBanner {
+	padding: var(--space-2) var(--space-4);
+	color: var(--text-primary);
+	font-size: 13px;
+	background: var(--selection);
+	border-bottom: 1px solid var(--separator);
+}
+
+.drawerTrigger,
+.drawerBackdrop {
+	display: none;
+}
+
+.drawerHeader {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	height: 64px;
+	padding: 0 var(--space-4) 0 var(--space-6);
+	font-size: 15px;
+	font-weight: 600;
+	border-bottom: 1px solid var(--separator);
+}
+
+.visuallyHidden {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	white-space: nowrap;
+	border: 0;
+}
+
+@media (min-width: 640px) and (max-width: 899px) {
+	.appShell {
+		grid-template-columns: 56px minmax(0, 1fr);
+	}
+
+	.rail {
+		padding-inline: 6px;
+	}
+}
+
+@media (max-width: 639px) {
+	.appShell {
+		display: block;
+		min-height: calc(
+			100dvh -
+			env(safe-area-inset-top) -
+			env(safe-area-inset-bottom)
+		);
+	}
+
+	.workspace {
+		height: 100%;
+		min-height: 100dvh;
+	}
+
+	.toolbar {
+		flex-basis: 64px;
+	}
+
+	.permanentRail {
+		display: none;
+	}
+
+	.toolbar {
+		padding: 0 var(--space-3);
+	}
+
+	.drawerTrigger {
+		display: grid;
+	}
+
+	.eyebrow {
+		display: none;
+	}
+
+	.sourceTitle {
+		font-size: 14px;
+	}
+
+	.iconButton {
+		width: 44px;
+		height: 44px;
+	}
+
+	.primaryButton {
+		min-height: 44px;
+		padding-inline: 18px;
+	}
+
+	.emptyState {
+		padding-inline: 28px;
+	}
+
+	.drawerBackdrop {
+		position: fixed;
+		inset: 0;
+		z-index: 20;
+		display: block;
+		background: rgb(0 0 0 / 38%);
+	}
+
+	.drawer {
+		width: min(292px, calc(100% - 48px));
+		height: 100%;
+		background: var(--rail);
+		border-right: 1px solid var(--separator);
+		box-shadow: 12px 0 40px rgb(0 0 0 / 18%);
+	}
+
+	.drawerNavigation {
+		align-items: stretch;
+		padding: var(--space-3);
+		border: 0;
+	}
+
+	.drawerNavigation .railButton {
+		display: flex;
+		justify-content: flex-start;
+		gap: var(--space-3);
+		width: 100%;
+		padding: 0 var(--space-3);
+	}
+
+	.drawerNavigation .railLabel {
+		position: static;
+		width: auto;
+		height: auto;
+		margin: 0;
+		overflow: visible;
+		clip: auto;
+		white-space: normal;
+	}
+
+	.appearanceMenu {
+		position: fixed;
+		top: 58px;
+		right: 12px;
+	}
+
+	.radioOption {
+		min-height: 48px;
+	}
+}

@@ -1,0 +1,65 @@
+* {
+	box-sizing: border-box;
+}
+
+html {
+	background: var(--canvas);
+	color: var(--text-primary);
+	font-family:
+		-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+	font-synthesis: none;
+	-webkit-font-smoothing: antialiased;
+	text-rendering: optimizeLegibility;
+}
+
+html,
+body,
+#root {
+	height: 100%;
+	min-height: 100%;
+}
+
+body {
+	margin: 0;
+	min-width: 320px;
+	min-height: 100dvh;
+	padding: env(safe-area-inset-top) env(safe-area-inset-right)
+		env(safe-area-inset-bottom) env(safe-area-inset-left);
+	overflow: hidden;
+}
+
+button,
+input {
+	font: inherit;
+}
+
+button {
+	color: inherit;
+}
+
+button:focus-visible,
+input:focus-visible {
+	outline: 2px solid var(--focus-ring);
+	outline-offset: 2px;
+}
+
+@media (max-width: 639px) {
+	button,
+	input[type="radio"] {
+		min-width: 44px;
+		min-height: 44px;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	:root {
+		--fade-duration: 0ms;
+		scroll-behavior: auto;
+	}
+
+	html,
+	body,
+	* {
+		scroll-behavior: auto;
+	}
+}
