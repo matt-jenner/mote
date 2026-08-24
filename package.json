@@ -1,0 +1,21 @@
+{
+  "name": "photo-viewer",
+  "private": true,
+  "workspaces": ["apps/*"],
+  "engines": {
+    "node": ">=24.18.0",
+    "npm": ">=11.16.0"
+  },
+  "scripts": {
+    "check": "biome check apps",
+    "check:write": "biome check --write apps",
+    "typecheck": "npm run typecheck --workspace @photo-viewer/interface",
+    "test": "npm run test --workspace @photo-viewer/interface",
+    "test:browser": "npm run test:browser --workspace @photo-viewer/interface"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.2",
+    "@biomejs/biome": "2.5.10"
+  }
+}
