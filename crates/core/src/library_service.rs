@@ -78,6 +78,10 @@ impl<F: SourceFs> LibraryService<F> {
         &self.catalog
     }
 
+    pub fn catalog_mut(&mut self) -> &mut Catalog {
+        &mut self.catalog
+    }
+
     pub fn add_configured(
         &mut self,
         root: &Path,
