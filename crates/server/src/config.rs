@@ -1,11 +1,12 @@
 use std::env;
 use std::net::{AddrParseError, SocketAddr};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
+
+use photo_core::{LocalStateError, LocalStatePaths};
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
-    data_dir: PathBuf,
-    cache_dir: PathBuf,
+    local: LocalStatePaths,
     bind: SocketAddr,
     source_roots: Vec<PathBuf>,
 }
@@ -32,8 +33,7 @@ impl ServerConfig {
         source_roots: Vec<PathBuf>,
     ) -> Result<Self, ConfigError> {
         Ok(Self {
-            data_dir,
-            cache_dir,
+            local: LocalStatePaths::new(data_dir, cache_dir),
             bind: bind.unwrap_or("127.0.0.1:8080").parse()?,
             source_roots,
         })
@@ -53,42 +53,40 @@ impl ServerConfig {
     }
 
     pub fn prepare(&self) -> Result<(), ConfigError> {
-        self.validate_source_roots(&self.source_roots)?;
-        create_private_directory(&self.data_dir)?;
-        create_private_directory(&self.cache_dir)?;
-        Ok(())
+        self.local
+            .prepare(&self.source_roots)
+            .map_err(ConfigError::from_local_state)
     }
 
     pub fn validate_source_roots(&self, source_roots: &[PathBuf]) -> Result<(), ConfigError> {
-        let data = resolve_for_comparison(&self.data_dir)?;
-        let cache = resolve_for_comparison(&self.cache_dir)?;
-        let catalog = resolve_for_comparison(&self.catalog_path())?;
-        for source in source_roots {
-            let source = resolve_for_comparison(source)?;
-            if paths_overlap(&data, &source)
-                || paths_overlap(&cache, &source)
-                || paths_overlap(&catalog, &source)
-            {
-                return Err(ConfigError::InsideSourceRoot);
-            }
-        }
-        Ok(())
+        self.local
+            .validate_source_roots(source_roots)
+            .map_err(ConfigError::from_local_state)
     }
 
     pub fn data_dir(&self) -> &Path {
-        &self.data_dir
+        self.local.data_dir()
     }
 
     pub fn cache_dir(&self) -> &Path {
-        &self.cache_dir
+        self.local.cache_dir()
     }
 
     pub fn catalog_path(&self) -> PathBuf {
-        self.data_dir.join("catalog.sqlite")
+        self.local.catalog_path()
     }
 
     pub const fn bind(&self) -> SocketAddr {
         self.bind
+    }
+}
+
+impl ConfigError {
+    fn from_local_state(error: LocalStateError) -> Self {
+        match error {
+            LocalStateError::InsideSourceRoot => Self::InsideSourceRoot,
+            LocalStateError::Io(error) => Self::Io(error),
+        }
     }
 }
 
@@ -98,77 +96,4 @@ fn required_path(name: &'static str) -> Result<PathBuf, ConfigError> {
         Err(env::VarError::NotPresent) => Err(ConfigError::MissingEnvironment(name)),
         Err(env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidEnvironment(name)),
     }
-}
-
-fn normalize_absolute(path: &Path) -> Result<PathBuf, std::io::Error> {
-    let absolute = std::path::absolute(path)?;
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    Ok(normalized)
-}
-
-fn resolve_for_comparison(path: &Path) -> Result<PathBuf, std::io::Error> {
-    let absolute = normalize_absolute(path)?;
-    let mut ancestor = absolute.clone();
-    let mut missing = Vec::new();
-    loop {
-        match ancestor.canonicalize() {
-            Ok(mut resolved) => {
-                for component in missing.iter().rev() {
-                    resolved.push(component);
-                }
-                return Ok(resolved);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let Some(component) = ancestor.file_name().map(ToOwned::to_owned) else {
-                    return Err(error);
-                };
-                missing.push(component);
-                if !ancestor.pop() {
-                    return Err(error);
-                }
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn path_starts_with(path: &Path, root: &Path) -> bool {
-    path.starts_with(root)
-}
-
-fn paths_overlap(left: &Path, right: &Path) -> bool {
-    path_starts_with(left, right) || path_starts_with(right, left)
-}
-
-#[cfg(windows)]
-fn path_starts_with(path: &Path, root: &Path) -> bool {
-    let mut path_components = path.components();
-    root.components().all(|root_component| {
-        path_components.next().is_some_and(|path_component| {
-            path_component
-                .as_os_str()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(&root_component.as_os_str().to_string_lossy())
-        })
-    })
-}
-
-fn create_private_directory(path: &Path) -> Result<(), std::io::Error> {
-    std::fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
 }
