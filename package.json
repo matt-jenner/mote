@@ -9,6 +9,8 @@
   "scripts": {
     "check": "biome check apps",
     "check:write": "biome check --write apps",
+    "desktop:dev": "npm exec --workspace @photo-viewer/desktop -- tauri dev",
+    "desktop:build": "npm exec --workspace @photo-viewer/desktop -- tauri build",
     "typecheck": "npm run typecheck --workspace @photo-viewer/interface",
     "test": "npm run test --workspace @photo-viewer/interface",
     "test:browser": "npm run test:browser --workspace @photo-viewer/interface"

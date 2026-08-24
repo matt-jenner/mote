@@ -1,0 +1,25 @@
+[package]
+name = "photo-viewer-desktop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+
+[workspace]
+
+[lib]
+name = "photo_viewer_desktop_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+photo-app-service = { path = "../../../crates/app-service" }
+photo-core = { path = "../../../crates/core" }
+photo-domain = { path = "../../../crates/domain" }
+serde = { version = "1.0.229", features = ["derive"] }
+tauri = { version = "2.11.5", features = [] }
+tauri-plugin-dialog = "2.7.2"
+thiserror = "2.0.20"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
