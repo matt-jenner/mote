@@ -90,6 +90,25 @@ fn config_defaults_to_loopback_and_rejects_local_state_inside_a_source() {
     assert!(!source.join("app-data").exists());
 }
 
+#[test]
+fn server_config_translates_shared_local_state_overlap_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    let config = ServerConfig::new(
+        source.join("app-data"),
+        temp.path().join("cache"),
+        None,
+        vec![],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        config.validate_source_roots(&[source]),
+        Err(ConfigError::InsideSourceRoot)
+    ));
+}
+
 #[cfg(unix)]
 #[test]
 fn config_rejects_a_symlink_alias_into_a_source_root() {
