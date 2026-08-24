@@ -29,6 +29,18 @@ export function AppShell() {
 		}
 	}, [drawerOpen]);
 
+	useEffect(() => {
+		const phoneViewport = window.matchMedia("(max-width: 639px)");
+		const closeDrawerAbovePhoneWidth = (event: MediaQueryListEvent) => {
+			if (!event.matches) setDrawerOpen(false);
+		};
+
+		phoneViewport.addEventListener("change", closeDrawerAbovePhoneWidth);
+		return () => {
+			phoneViewport.removeEventListener("change", closeDrawerAbovePhoneWidth);
+		};
+	}, []);
+
 	const handleDrawerKeyDown = (event: KeyboardEvent<HTMLElement>) => {
 		if (event.key === "Escape") {
 			event.preventDefault();

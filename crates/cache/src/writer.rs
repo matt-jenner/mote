@@ -107,7 +107,13 @@ impl CacheWriter {
         catalog: &mut Catalog,
     ) -> Result<CacheReconcileReport, CacheError> {
         let mut partial_files_removed = 0_u64;
-        for entry in walkdir::WalkDir::new(&self.root).follow_links(false) {
+        // Named desktop profiles own independent cache roots below this namespace.
+        let profiles_namespace = self.root.join("profiles");
+        for entry in walkdir::WalkDir::new(&self.root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| entry.path() != profiles_namespace.as_path())
+        {
             let entry = entry.map_err(|error| {
                 CacheError::Io(
                     error

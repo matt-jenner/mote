@@ -132,12 +132,17 @@ impl<F: SourceFs> LibraryService<F> {
                     created_recent_root: false,
                 });
             }
+            if existing_path.starts_with(&canonical) {
+                return Err(AddLibraryError::Overlaps {
+                    existing_id: existing.id,
+                });
+            }
         }
 
         let display_name = canonical
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| canonical.to_string_lossy().into_owned());
+            .unwrap_or_else(|| "Selected folder".to_owned());
         let mut recent = NewLibrary::recent(display_name, &canonical);
         recent.display_path = folder.to_string_lossy().into_owned();
         let library = self.catalog.add_library(&recent)?;

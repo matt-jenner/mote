@@ -1,7 +1,7 @@
 # Canvas First shell design QA
 
 - Source visual truth: `docs/superpowers/specs/assets/2026-08-24-macos-canvas-first.png`
-- Implementation screenshot: `.superpowers/sdd/2026-08-24-macos-open-and-return/task-5-desktop.png`
+- Implementation screenshot: [checkpoint 1 implementation capture](docs/superpowers/specs/assets/2026-08-24-macos-open-and-return-implementation.jpg)
 - Viewport: 1440 x 1024 CSS pixels
 - Source pixels: 1487 x 1058
 - Implementation pixels: 1440 x 1024

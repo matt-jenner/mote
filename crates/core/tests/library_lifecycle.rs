@@ -32,6 +32,24 @@ fn folder_inside_existing_library_becomes_a_selection_not_a_second_root() {
 }
 
 #[test]
+fn folder_containing_an_existing_library_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("Photos");
+    let existing_root = parent.join("2026");
+    std::fs::create_dir_all(&existing_root).unwrap();
+    let mut service = service();
+    let library = service.add_configured(&existing_root, "2026").unwrap();
+
+    let result = service.open_recent(&parent);
+
+    assert!(matches!(
+        result,
+        Err(AddLibraryError::Overlaps { existing_id }) if existing_id == library.id
+    ));
+    assert_eq!(service.catalog().list_libraries().unwrap().len(), 1);
+}
+
+#[test]
 fn configured_roots_cannot_overlap_existing_roots() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("Photos");
@@ -120,6 +138,21 @@ fn standalone_folder_starts_recent_and_can_be_promoted() {
     assert!(selection.created_recent_root);
     assert_eq!(promoted.kind, LibraryKind::Configured);
     assert_eq!(promoted.display_name, "Archive");
+}
+
+#[cfg(unix)]
+#[test]
+fn filesystem_root_uses_a_path_free_display_name() {
+    let mut service = service();
+
+    let selection = service.open_recent(Path::new("/")).unwrap();
+    let library = service
+        .catalog()
+        .find_library(selection.library_id)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(library.display_name, "Selected folder");
 }
 
 #[test]

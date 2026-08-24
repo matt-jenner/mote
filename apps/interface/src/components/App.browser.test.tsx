@@ -162,6 +162,36 @@ describe("open and return shell", () => {
 		expect((workspace.element() as HTMLElement).inert).toBe(false);
 	});
 
+	it("closes the phone drawer when the viewport grows to tablet width", async () => {
+		await page.viewport(390, 844);
+		const screen = await renderApp();
+		await screen.getByRole("button", { name: "Open sources" }).click();
+		const workspace = screen.getByRole("region", {
+			name: "Photo workspace",
+			includeHidden: true,
+		});
+		expect((workspace.element() as HTMLElement).inert).toBe(true);
+
+		await page.viewport(834, 1194);
+
+		await expect
+			.poll(() =>
+				screen
+					.getByRole("dialog", { name: "Sources drawer", includeHidden: true })
+					.query(),
+			)
+			.toBeNull();
+		expect((workspace.element() as HTMLElement).inert).toBe(false);
+		await expect
+			.element(
+				screen.getByRole("navigation", {
+					name: "Sources",
+					includeHidden: true,
+				}),
+			)
+			.toBeVisible();
+	});
+
 	it("keeps the phone canvas and drawer inside nonzero safe areas", async () => {
 		await page.viewport(390, 844);
 		document.documentElement.style.setProperty("--safe-area-top", "20px");

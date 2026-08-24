@@ -45,15 +45,28 @@ impl AppService {
     pub fn bootstrap(&self) -> Result<BootstrapState, AppServiceError> {
         let stored = self.libraries.catalog().load_app_state()?;
         let active_source = match stored.active_selection {
-            Some(selection) => self
+            Some(selection) => match self
                 .libraries
                 .catalog()
                 .find_library(selection.library_id)?
-                .map(|library| SourceSummary {
-                    id: library.id.as_uuid().hyphenated().to_string(),
-                    display_name: library.display_name,
-                    availability: map_availability(library.availability),
-                }),
+            {
+                Some(library) => {
+                    let relative_folder =
+                        selection.relative_folder.to_path_buf().map_err(|error| {
+                            CatalogError::InvalidData(format!("invalid active folder key: {error}"))
+                        })?;
+                    let display_name = relative_folder
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or(library.display_name);
+                    Some(SourceSummary {
+                        id: library.id.as_uuid().hyphenated().to_string(),
+                        display_name,
+                        availability: map_availability(library.availability),
+                    })
+                }
+                None => None,
+            },
             None => None,
         };
         Ok(BootstrapState {
