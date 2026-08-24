@@ -1,14 +1,13 @@
 # Photo Viewer
 
-This repository currently implements the headless catalog foundation for a cross-platform photo viewer. It indexes local folders and mounted network shares into a local SQLite catalog, normalizes useful metadata, tracks offline sources without discarding their records, schedules progressive background work, and manages local derivative-cache accounting.
+This repository implements the catalog foundation and the first macOS desktop checkpoint for a cross-platform photo viewer. It indexes local folders and mounted network shares into a local SQLite catalog, normalizes useful metadata, tracks offline sources without discarding their records, schedules progressive background work, and manages local derivative-cache accounting.
 
 Source media is read-only. Production code never writes, renames, or deletes files under a configured photo root. SQLite state and generated derivatives stay in explicit local data and cache directories; do not place either directory inside a photo source.
-
-The desktop and web interfaces are deliberately outside this foundation slice.
 
 ## Requirements
 
 - Rust 1.97.1 installed through [rustup](https://rustup.rs/)
+- Node.js 24.18.0 and npm 11.16.0 or newer
 - A local filesystem location for SQLite state
 - A separate local filesystem location for derivative cache data
 
@@ -25,6 +24,49 @@ cargo test --workspace --all-features
 ```
 
 CI runs these checks, plus the 10,000-asset benchmark smoke test, on Ubuntu, macOS, and Windows.
+
+## Install and verify the interface
+
+Install the locked Node dependencies and Playwright's WebKit browser:
+
+```bash
+npm ci
+npm exec playwright install webkit
+```
+
+Run the interface checks:
+
+```bash
+npm run check
+npm run typecheck
+npm test
+npm run test:browser
+npm run --workspace @photo-viewer/interface build
+```
+
+## Run the macOS desktop app
+
+For normal desktop development, use the default profile:
+
+```bash
+npm run desktop:dev
+```
+
+The default profile keeps its SQLite catalog and generated cache under the operating system's standard application data and cache directories. For a clean, isolated run, name a profile:
+
+```bash
+PHOTO_VIEWER_PROFILE=clean-demo npm run desktop:dev
+```
+
+A named profile isolates local SQLite and cache state below profile-specific application directories. It does not copy, rename, delete, or otherwise modify photos in a selected source folder.
+
+To create an unsigned macOS application bundle:
+
+```bash
+npm run desktop:build -- --bundles app
+```
+
+The bundle is written to `apps/desktop/src-tauri/target/release/bundle/macos/Photo Viewer.app`. Because it is unsigned, macOS may require you to approve it through the normal local-app security flow before first launch.
 
 ## Start the health service
 
