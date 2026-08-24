@@ -1,7 +1,7 @@
 .appShell {
 	display: grid;
 	grid-template-columns: 72px minmax(0, 1fr);
-	height: calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+	height: calc(100dvh - var(--safe-area-top) - var(--safe-area-bottom));
 	min-height: 420px;
 	background: var(--canvas);
 	color: var(--text-primary);
@@ -116,7 +116,7 @@
 .primaryButton {
 	min-height: 36px;
 	padding: 0 15px;
-	color: #ffffff;
+	color: var(--primary-control-text);
 	font-size: 13px;
 	font-weight: 580;
 	background: var(--progress-accent);
@@ -280,16 +280,12 @@
 @media (max-width: 639px) {
 	.appShell {
 		display: block;
-		min-height: calc(
-			100dvh -
-			env(safe-area-inset-top) -
-			env(safe-area-inset-bottom)
-		);
+		min-height: calc(100dvh - var(--safe-area-top) - var(--safe-area-bottom));
 	}
 
 	.workspace {
 		height: 100%;
-		min-height: 100dvh;
+		min-height: 100%;
 	}
 
 	.toolbar {
@@ -332,7 +328,8 @@
 
 	.drawerBackdrop {
 		position: fixed;
-		inset: 0;
+		inset: var(--safe-area-top) var(--safe-area-right) var(--safe-area-bottom)
+			var(--safe-area-left);
 		z-index: 20;
 		display: block;
 		background: rgb(0 0 0 / 38%);
@@ -372,8 +369,8 @@
 
 	.appearanceMenu {
 		position: fixed;
-		top: 58px;
-		right: 12px;
+		top: calc(var(--safe-area-top) + 58px);
+		right: calc(var(--safe-area-right) + 12px);
 	}
 
 	.radioOption {

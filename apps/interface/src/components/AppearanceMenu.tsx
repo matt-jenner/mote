@@ -18,11 +18,19 @@ export function AppearanceMenu({ value, onChange }: AppearanceMenuProps) {
 	const [open, setOpen] = useState(false);
 	const menuId = useId();
 	const containerRef = useRef<HTMLDivElement>(null);
+	const triggerRef = useRef<HTMLButtonElement>(null);
+	const closeAndRestoreFocus = () => {
+		setOpen(false);
+		triggerRef.current?.focus();
+	};
 
 	useEffect(() => {
 		if (!open) return;
 		const closeOnEscape = (event: KeyboardEvent) => {
-			if (event.key === "Escape") setOpen(false);
+			if (event.key === "Escape") {
+				setOpen(false);
+				triggerRef.current?.focus();
+			}
 		};
 		const closeOutside = (event: PointerEvent) => {
 			if (!containerRef.current?.contains(event.target as Node)) setOpen(false);
@@ -43,6 +51,7 @@ export function AppearanceMenu({ value, onChange }: AppearanceMenuProps) {
 				aria-haspopup="dialog"
 				className={styles.iconButton}
 				onClick={() => setOpen((current) => !current)}
+				ref={triggerRef}
 				type="button"
 			>
 				<SunMoon aria-hidden="true" size={19} strokeWidth={1.7} />
@@ -69,7 +78,7 @@ export function AppearanceMenu({ value, onChange }: AppearanceMenuProps) {
 									name="appearance"
 									onChange={() => {
 										onChange(appearance.value);
-										setOpen(false);
+										closeAndRestoreFocus();
 									}}
 									type="radio"
 									value={appearance.value}

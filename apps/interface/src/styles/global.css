@@ -23,8 +23,8 @@ body {
 	margin: 0;
 	min-width: 320px;
 	min-height: 100dvh;
-	padding: env(safe-area-inset-top) env(safe-area-inset-right)
-		env(safe-area-inset-bottom) env(safe-area-inset-left);
+	padding: var(--safe-area-top) var(--safe-area-right) var(--safe-area-bottom)
+		var(--safe-area-left);
 	overflow: hidden;
 }
 

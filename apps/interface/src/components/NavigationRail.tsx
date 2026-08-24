@@ -5,15 +5,21 @@ interface NavigationRailProps {
 	onChooseFolder: () => void;
 	chooseFolderAvailable: boolean;
 	className?: string;
+	inert?: boolean;
 }
 
 export function NavigationRail({
 	onChooseFolder,
 	chooseFolderAvailable,
 	className = "",
+	inert = false,
 }: NavigationRailProps) {
 	return (
-		<nav aria-label="Sources" className={`${styles.rail} ${className}`}>
+		<nav
+			aria-label="Sources"
+			className={`${styles.rail} ${className}`}
+			inert={inert}
+		>
 			<button
 				aria-label="Folders"
 				className={`${styles.railButton} ${styles.railButtonSelected}`}

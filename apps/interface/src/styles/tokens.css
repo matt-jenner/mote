@@ -10,6 +10,7 @@
 	--selection: #dce6f2;
 	--focus-ring: #245f99;
 	--progress-accent: #326aa3;
+	--primary-control-text: #ffffff;
 	--control: #ffffff;
 	--control-hover: #e3e1db;
 	--unavailable: #858780;
@@ -25,6 +26,7 @@
 	--selection: #283a4f;
 	--focus-ring: #7fb5f0;
 	--progress-accent: #6c9edb;
+	--primary-control-text: #121313;
 	--control: #2a2c2b;
 	--control-hover: #363937;
 	--unavailable: #777b76;
@@ -41,6 +43,7 @@
 		--selection: #283a4f;
 		--focus-ring: #7fb5f0;
 		--progress-accent: #6c9edb;
+		--primary-control-text: #121313;
 		--control: #2a2c2b;
 		--control-hover: #363937;
 		--unavailable: #777b76;
@@ -57,4 +60,8 @@
 	--radius-medium: 10px;
 	--image-gap: 4px;
 	--fade-duration: 160ms;
+	--safe-area-top: env(safe-area-inset-top);
+	--safe-area-right: env(safe-area-inset-right);
+	--safe-area-bottom: env(safe-area-inset-bottom);
+	--safe-area-left: env(safe-area-inset-left);
 }
