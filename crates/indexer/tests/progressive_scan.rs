@@ -173,6 +173,44 @@ async fn enrichment_admission_tracks_shared_scheduler_interaction_mode() {
     scan.join().await.unwrap();
 }
 
+#[tokio::test]
+async fn enrichment_admission_tracks_mode_changes_during_one_scan() {
+    let fixture = tempfile::tempdir().unwrap();
+    for index in 0..8 {
+        write_png(&fixture.path().join(format!("{index:02}.png")), [1, 2, 3]);
+    }
+    let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig {
+        idle_workers: 4,
+        active_workers: 1,
+    }));
+    let (reader, notifications, release) = AdmissionReader::new();
+    let indexer = Indexer::with_scheduler(reader.clone(), empty_policy_engine(), scheduler.clone());
+    let scan = indexer.start(ScanRequest::new(fixture.path())).unwrap();
+    let notifications = wait_for_starts(notifications, 2).await;
+
+    scheduler
+        .set_interaction_mode(InteractionMode::Active)
+        .await;
+    release.release();
+    let notifications = tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::task::spawn_blocking(move || {
+            notifications.recv().unwrap();
+            notifications
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(reader.starts.load(Ordering::SeqCst), 3);
+
+    scheduler.set_interaction_mode(InteractionMode::Idle).await;
+    let _notifications = wait_for_starts(notifications, 2).await;
+    assert!(reader.starts.load(Ordering::SeqCst) >= 5);
+    scan.cancel().unwrap();
+    scan.join().await.unwrap();
+}
+
 impl ReleaseMetadata {
     fn release(self) {
         let (lock, changed) = &*self.gate;
@@ -257,6 +295,123 @@ async fn cancellation_stops_a_large_scan_at_a_bounded_partial_result() {
 
     assert!(summary.cancelled);
     assert!(summary.discovered < 1_000);
+}
+
+#[tokio::test]
+async fn cancellation_completes_when_enrichment_queue_is_backpressured() {
+    let fixture = tempfile::tempdir().unwrap();
+    for index in 0..160 {
+        write_png(&fixture.path().join(format!("{index:04}.png")), [1, 2, 3]);
+    }
+    let (reader, _notifications, _release) = AdmissionReader::new();
+    let mut scan = Indexer::new(reader, empty_policy_engine())
+        .start(ScanRequest::new(fixture.path()))
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(1), scan.events.recv()).await;
+    scan.cancel().unwrap();
+    tokio::time::timeout(Duration::from_secs(1), scan.join())
+        .await
+        .expect("cancelled scan must not deadlock")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn malformed_sidecar_is_warning_event_and_metadata_still_arrives() {
+    let fixture = tempfile::tempdir().unwrap();
+    let media = fixture.path().join("photo.png");
+    write_png(&media, [1, 2, 3]);
+    std::fs::write(
+        fixture.path().join("photo.xmp"),
+        b"<rdf:RDF><rdf:Description>",
+    )
+    .unwrap();
+    let mut scan = Indexer::new(DefaultMetadataReader, empty_policy_engine())
+        .start(ScanRequest::new(fixture.path()))
+        .unwrap();
+    let mut warning = false;
+    let mut metadata = false;
+    while let Some(event) = scan.events.recv().await {
+        match event {
+            IndexEvent::Warning {
+                code: "malformed_xmp",
+                message,
+                ..
+            } => warning = !message.is_empty(),
+            IndexEvent::MetadataReady { .. } => metadata = true,
+            IndexEvent::Completed(_) => break,
+            _ => {}
+        }
+    }
+    scan.join().await.unwrap();
+    assert!(warning);
+    assert!(metadata);
+
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured("Pictures", Path::new("/Pictures")))
+        .unwrap();
+    let generation = catalog.begin_generation(library.id).unwrap();
+    let asset = NewAsset::minimal(
+        library.id,
+        RelativePathKey::from_relative_path(Path::new("photo.png")).unwrap(),
+        "photo.png",
+        MediaKind::Png,
+        3,
+    );
+    CatalogWriter::new(&mut catalog, library.id, generation)
+        .apply_batch(&[
+            IndexEvent::Discovered {
+                asset: asset.clone(),
+            },
+            IndexEvent::Warning {
+                asset_id: Some(asset.id),
+                code: "malformed_xmp",
+                message: "sidecar ended before all elements were closed".into(),
+            },
+        ])
+        .unwrap();
+    assert_eq!(catalog.warning_count().unwrap(), 1);
+}
+
+#[test]
+fn fallback_shape_then_colour_preserves_fallback_state_and_geometry() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured("Pictures", Path::new("/Pictures")))
+        .unwrap();
+    let generation = catalog.begin_generation(library.id).unwrap();
+    let asset = NewAsset::minimal(
+        library.id,
+        RelativePathKey::from_relative_path(Path::new("broken.jpg")).unwrap(),
+        "broken.jpg",
+        MediaKind::Jpeg,
+        3,
+    );
+    CatalogWriter::new(&mut catalog, library.id, generation)
+        .apply_batch(&[
+            IndexEvent::Discovered {
+                asset: asset.clone(),
+            },
+            IndexEvent::ShapeFallback {
+                asset_id: asset.id,
+                width: 4,
+                height: 3,
+                code: "shape_read_failed",
+                message: "bad image".into(),
+            },
+            IndexEvent::ColourReady {
+                asset_id: asset.id,
+                representative_rgb: RepresentativeRgb {
+                    red: 1,
+                    green: 2,
+                    blue: 3,
+                },
+            },
+        ])
+        .unwrap();
+    let stored = catalog.find_asset(asset.id).unwrap().unwrap();
+    assert_eq!((stored.width, stored.height), (Some(4), Some(3)));
+    assert_eq!(stored.shape_status, photo_catalog::ShapeStatus::Fallback);
 }
 
 #[test]
@@ -387,6 +542,77 @@ fn catalog_writer_rolls_back_an_invalid_record_in_a_batch() {
     ]);
     assert!(result.is_err());
     assert_eq!(catalog.asset_count(library.id).unwrap(), 0);
+}
+
+#[test]
+fn generation_writer_rejects_foreign_shape_colour_metadata_and_warning_targets() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured("Pictures", Path::new("/Pictures")))
+        .unwrap();
+    let foreign_library = catalog
+        .add_library(&NewLibrary::configured("Other", Path::new("/Other")))
+        .unwrap();
+    let local = NewAsset::minimal(
+        library.id,
+        RelativePathKey::from_relative_path(Path::new("local.jpg")).unwrap(),
+        "local.jpg",
+        MediaKind::Jpeg,
+        1,
+    );
+    let foreign = NewAsset::minimal(
+        foreign_library.id,
+        RelativePathKey::from_relative_path(Path::new("foreign.jpg")).unwrap(),
+        "foreign.jpg",
+        MediaKind::Jpeg,
+        1,
+    );
+    catalog.upsert_asset(&local).unwrap();
+    catalog.upsert_asset(&foreign).unwrap();
+    let generation = catalog.begin_generation(library.id).unwrap();
+    let foreign_events = [
+        IndexEvent::ShapeReady {
+            asset_id: foreign.id,
+            width: 1,
+            height: 1,
+            orientation: 1,
+        },
+        IndexEvent::ColourReady {
+            asset_id: foreign.id,
+            representative_rgb: RepresentativeRgb {
+                red: 1,
+                green: 2,
+                blue: 3,
+            },
+        },
+        IndexEvent::MetadataReady {
+            asset_id: foreign.id,
+            metadata: ResolvedMetadata {
+                rating: Some(5),
+                ..ResolvedMetadata::default()
+            },
+        },
+        IndexEvent::Warning {
+            asset_id: Some(foreign.id),
+            code: "foreign",
+            message: "foreign".into(),
+        },
+    ];
+    for foreign_event in foreign_events {
+        let result = CatalogWriter::new(&mut catalog, library.id, generation).apply_batch(&[
+            IndexEvent::MetadataReady {
+                asset_id: local.id,
+                metadata: ResolvedMetadata {
+                    rating: Some(4),
+                    ..ResolvedMetadata::default()
+                },
+            },
+            foreign_event,
+        ]);
+        assert!(result.is_err());
+        assert_eq!(catalog.find_asset(local.id).unwrap().unwrap().rating, None);
+        assert_eq!(catalog.warning_count().unwrap(), 0);
+    }
 }
 
 #[test]

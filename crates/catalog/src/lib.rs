@@ -18,8 +18,8 @@ pub use cache_repo::{CacheEvictionGroup, DerivativeRecord, NewDerivative, NewFol
 pub use generation_repo::GenerationCompletion;
 pub use health_repo::CatalogHealthSnapshot;
 pub use index_repo::{
-    AssetMetadataUpdate, AssetShapeUpdate, CatalogIndexRecord, CatalogKeyword, CatalogProvenance,
-    CatalogWarningRecord,
+    AssetColourUpdate, AssetMetadataUpdate, AssetShapeUpdate, CatalogIndexRecord, CatalogKeyword,
+    CatalogProvenance, CatalogWarningRecord,
 };
 pub use library_repo::{LibraryRootRecord, NewLibrary};
 use rusqlite::Connection;
@@ -90,6 +90,15 @@ impl Catalog {
 
     pub fn sqlite_version(&self) -> Result<SqliteVersion, CatalogError> {
         connection::sqlite_version(&self.connection)
+    }
+
+    pub fn warning_count(&self) -> Result<u64, CatalogError> {
+        self.connection
+            .query_row("SELECT COUNT(*) FROM warnings", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|count| count as u64)
+            .map_err(CatalogError::from)
     }
 
     pub fn journal_mode(&self) -> Result<String, CatalogError> {

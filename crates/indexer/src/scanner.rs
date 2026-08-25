@@ -131,6 +131,7 @@ impl<R: MetadataReader> Indexer<R> {
         let reader = self.reader.clone();
         let policy_engine = self.policy_engine.clone();
         let enrichment_workers = self.scheduler.available_background_permits().min(2).max(1);
+        let scheduler = self.scheduler.clone();
         let discovery_root = root.clone();
         let discovery_cancel = cancel_rx.clone();
         let library_id = request.library_id;
@@ -149,6 +150,7 @@ impl<R: MetadataReader> Indexer<R> {
         let join = tokio::spawn(async move {
             let summary = Arc::new(Mutex::new(ScanSummary::default()));
             let progress = Arc::new((AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)));
+            let admissions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let (enrich_tx, enrich_rx) = mpsc::channel::<DiscoveredAsset>(64);
             let shared_discovered = Arc::new(Mutex::new(discovered_rx));
             let shared_enrich = Arc::new(Mutex::new(enrich_rx));
@@ -157,12 +159,15 @@ impl<R: MetadataReader> Indexer<R> {
                 let rx = shared_discovered.clone();
                 let tx = enrich_tx.clone();
                 let events = events_tx.clone();
-                let cancel = cancel_rx.clone();
+                let mut cancel = cancel_rx.clone();
                 let summary = summary.clone();
                 let progress = progress.clone();
                 workers.push(tokio::spawn(async move {
                     loop {
-                        let item = { rx.lock().await.recv().await };
+                        let item = tokio::select! {
+                            item = async { rx.lock().await.recv().await } => item,
+                            _ = cancel.changed() => None,
+                        };
                         let Some(item) = item else { break };
                         if *cancel.borrow() {
                             break;
@@ -260,8 +265,9 @@ impl<R: MetadataReader> Indexer<R> {
                             }
                             Err(_) => {}
                         }
-                        if tx.send(item).await.is_err() {
-                            break;
+                        tokio::select! {
+                            result = tx.send(item) => if result.is_err() { break },
+                            _ = cancel.changed() => break,
                         }
                     }
                 }));
@@ -271,21 +277,38 @@ impl<R: MetadataReader> Indexer<R> {
                 let rx = shared_enrich.clone();
                 let events = events_tx.clone();
                 let reader = reader.clone();
-                let cancel = cancel_rx.clone();
+                let mut cancel = cancel_rx.clone();
                 let summary = summary.clone();
                 let progress = progress.clone();
+                let admissions = admissions.clone();
+                let scheduler = scheduler.clone();
                 workers.push(tokio::spawn(async move {
                     loop {
-                        let item = { rx.lock().await.recv().await };
+                        let item = tokio::select! {
+                            item = async { rx.lock().await.recv().await } => item,
+                            _ = cancel.changed() => None,
+                        };
                         let Some(item) = item else { break };
                         if *cancel.borrow() {
                             break;
                         }
                         let id = item.asset.id;
+                        if !admit_enrichment(&cancel, &scheduler, &admissions).await {
+                            break;
+                        }
                         let reader = reader.clone();
                         match tokio::task::spawn_blocking(move || process_asset(reader, item)).await
                         {
                             Ok(Ok(p)) => {
+                                for warning in &p.metadata.warnings {
+                                    let _ = events
+                                        .send(IndexEvent::Warning {
+                                            asset_id: Some(id),
+                                            code: warning.code,
+                                            message: warning.message.clone(),
+                                        })
+                                        .await;
+                                }
                                 if let Some(rgb) = p.representative_rgb {
                                     let _ = events
                                         .send(IndexEvent::ColourReady {
@@ -334,6 +357,7 @@ impl<R: MetadataReader> Indexer<R> {
                             }
                             Err(_) => {}
                         }
+                        admissions.fetch_sub(1, Ordering::Release);
                     }
                 }));
             }
@@ -369,6 +393,28 @@ impl<R: MetadataReader> Indexer<R> {
             cancel,
             join,
         })
+    }
+}
+
+async fn admit_enrichment(
+    cancel: &watch::Receiver<bool>,
+    scheduler: &Arc<IndexScheduler>,
+    admissions: &Arc<std::sync::atomic::AtomicUsize>,
+) -> bool {
+    loop {
+        if *cancel.borrow() {
+            return false;
+        }
+        let limit = scheduler.available_background_permits().min(2).max(1);
+        let current = admissions.load(Ordering::Acquire);
+        if current < limit
+            && admissions
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return true;
+        }
+        tokio::task::yield_now().await;
     }
 }
 

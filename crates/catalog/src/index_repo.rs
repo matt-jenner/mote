@@ -1,5 +1,5 @@
 use photo_domain::{AssetId, LibraryId};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::ShapeStatus;
 use crate::asset_repo::upsert_asset_on;
@@ -13,6 +13,12 @@ pub struct AssetShapeUpdate {
     pub orientation: Option<u16>,
     pub representative_rgb: Option<u32>,
     pub shape_status: ShapeStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetColourUpdate {
+    pub asset_id: AssetId,
+    pub representative_rgb: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,6 +57,7 @@ pub struct CatalogWarningRecord {
 pub enum CatalogIndexRecord {
     Discovered(NewAsset),
     Shaped(AssetShapeUpdate),
+    Coloured(AssetColourUpdate),
     Metadata(AssetMetadataUpdate),
     Warning(CatalogWarningRecord),
 }
@@ -119,6 +126,7 @@ fn apply_record(
             }
         }
         CatalogIndexRecord::Shaped(shape) => {
+            ensure_asset_library(connection, shape.asset_id, generation)?;
             connection.execute(
                 "UPDATE assets SET width = CASE WHEN ?2 > 0 THEN ?2 ELSE width END, height = CASE WHEN ?3 > 0 THEN ?3 ELSE height END, orientation = COALESCE(?4, orientation), representative_rgb = COALESCE(?5, representative_rgb), shape_status = ?6 \
                  WHERE id = ?1",
@@ -133,8 +141,25 @@ fn apply_record(
             )?;
             Ok(())
         }
-        CatalogIndexRecord::Metadata(metadata) => apply_metadata(connection, metadata),
+        CatalogIndexRecord::Coloured(colour) => {
+            ensure_asset_library(connection, colour.asset_id, generation)?;
+            connection.execute(
+                "UPDATE assets SET representative_rgb = ?2 WHERE id = ?1",
+                params![
+                    colour.asset_id.as_uuid().as_bytes(),
+                    i64::from(colour.representative_rgb)
+                ],
+            )?;
+            Ok(())
+        }
+        CatalogIndexRecord::Metadata(metadata) => {
+            ensure_asset_library(connection, metadata.asset_id, generation)?;
+            apply_metadata(connection, metadata)
+        }
         CatalogIndexRecord::Warning(warning) => {
+            if let Some(asset_id) = warning.asset_id {
+                ensure_asset_library(connection, asset_id, generation)?;
+            }
             connection.execute(
                 "INSERT INTO warnings (library_id, asset_id, code, message, occurred_at) \
                  VALUES (?1, ?2, ?3, ?4, unixepoch())",
@@ -148,6 +173,34 @@ fn apply_record(
             Ok(())
         }
     }
+}
+
+fn ensure_asset_library(
+    connection: &Connection,
+    asset_id: AssetId,
+    generation: Option<(LibraryId, i64)>,
+) -> Result<(), CatalogError> {
+    let Some((library_id, _generation)) = generation else {
+        return Ok(());
+    };
+    let found: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT library_id FROM assets WHERE id = ?1",
+            [asset_id.as_uuid().as_bytes()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(found) = found else {
+        return Err(CatalogError::InvalidData(
+            "index update targets an unknown asset".into(),
+        ));
+    };
+    if found.as_slice() != library_id.as_uuid().as_bytes() {
+        return Err(CatalogError::InvalidData(
+            "index update targets an asset from another library".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn apply_metadata(

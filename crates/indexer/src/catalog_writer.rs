@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use photo_catalog::{
-    AssetMetadataUpdate, AssetShapeUpdate, Catalog, CatalogError, CatalogIndexRecord,
-    CatalogKeyword, CatalogProvenance, CatalogWarningRecord, ShapeStatus,
+    AssetColourUpdate, AssetMetadataUpdate, AssetShapeUpdate, Catalog, CatalogError,
+    CatalogIndexRecord, CatalogKeyword, CatalogProvenance, CatalogWarningRecord, ShapeStatus,
 };
 use photo_domain::LibraryId;
 use tokio::sync::mpsc;
@@ -91,17 +91,11 @@ fn to_catalog_record(event: &IndexEvent, library_id: LibraryId) -> Option<Catalo
         IndexEvent::ColourReady {
             asset_id,
             representative_rgb,
-        } => Some(CatalogIndexRecord::Shaped(AssetShapeUpdate {
+        } => Some(CatalogIndexRecord::Coloured(AssetColourUpdate {
             asset_id: *asset_id,
-            width: 0,
-            height: 0,
-            orientation: None,
-            representative_rgb: Some(
-                (u32::from(representative_rgb.red) << 16)
-                    | (u32::from(representative_rgb.green) << 8)
-                    | u32::from(representative_rgb.blue),
-            ),
-            shape_status: ShapeStatus::Ready,
+            representative_rgb: (u32::from(representative_rgb.red) << 16)
+                | (u32::from(representative_rgb.green) << 8)
+                | u32::from(representative_rgb.blue),
         })),
         IndexEvent::MetadataReady { asset_id, metadata } => {
             Some(CatalogIndexRecord::Metadata(AssetMetadataUpdate {
