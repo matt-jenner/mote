@@ -14,6 +14,15 @@ export interface WallState {
 	scanComplete: boolean;
 	pagesExhausted: boolean;
 	settled: boolean;
+	activeRequest: PageRequest | null;
+}
+
+export type WallRequestId = string | number;
+
+export interface PageRequest {
+	id: WallRequestId;
+	cursor: string | null;
+	epoch: number;
 }
 
 export type WallAction =
@@ -29,6 +38,13 @@ export type WallAction =
 			nextCursor: string | null;
 			requestCursor: string | null;
 			requestEpoch: number;
+			requestId: WallRequestId;
+	  }
+	| {
+			type: "pageRequestStarted";
+			requestId: WallRequestId;
+			requestCursor: string | null;
+			requestEpoch: number;
 	  }
 	| { type: "derivativesReady"; derivatives: readonly DerivativeReference[] }
 	| {
@@ -36,6 +52,8 @@ export type WallAction =
 			assets: readonly WallAsset[];
 			nextCursor: string | null;
 			requestEpoch: number;
+			requestCursor: string | null;
+			requestId: WallRequestId;
 	  }
 	| { type: "setDirection"; direction: SortDirection };
 
@@ -48,12 +66,29 @@ export const initialWallState: WallState = {
 	scanComplete: false,
 	pagesExhausted: false,
 	settled: false,
+	activeRequest: null,
 };
 
 export function isWallLayoutComplete(
 	state: Pick<WallState, "scanComplete" | "pagesExhausted">,
 ): boolean {
 	return state.scanComplete && state.pagesExhausted;
+}
+
+function matchesActiveRequest(
+	state: WallState,
+	requestId: WallRequestId,
+	requestCursor: string | null,
+	requestEpoch: number,
+): boolean {
+	const active = state.activeRequest;
+	return (
+		active !== null &&
+		active.id === requestId &&
+		active.cursor === requestCursor &&
+		active.epoch === requestEpoch &&
+		requestEpoch === state.scrollEpoch
+	);
 }
 
 interface MergeResult {
@@ -149,6 +184,28 @@ function reuseSequence(previous: WallAsset[], next: WallAsset[]): WallAsset[] {
 
 export function wallReducer(state: WallState, action: WallAction): WallState {
 	switch (action.type) {
+		case "pageRequestStarted": {
+			if (action.requestEpoch !== state.scrollEpoch) return state;
+			if (
+				action.requestCursor !== null &&
+				action.requestCursor !== state.cursor
+			) {
+				return state;
+			}
+			const activeRequest: PageRequest = {
+				id: action.requestId,
+				cursor: action.requestCursor,
+				epoch: action.requestEpoch,
+			};
+			if (
+				state.activeRequest?.id === activeRequest.id &&
+				state.activeRequest.cursor === activeRequest.cursor &&
+				state.activeRequest.epoch === activeRequest.epoch
+			) {
+				return state;
+			}
+			return { ...state, activeRequest };
+		}
 		case "catalogBatch": {
 			const merged = mergeAssets(state.items, action.assets);
 			const orderState = state.settled ? "settled" : action.orderState;
@@ -165,13 +222,15 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			};
 		}
 		case "pageLoaded": {
-			if (action.requestEpoch !== state.scrollEpoch) return state;
 			if (
-				action.requestCursor !== null &&
-				action.requestCursor !== state.cursor
-			) {
+				!matchesActiveRequest(
+					state,
+					action.requestId,
+					action.requestCursor,
+					action.requestEpoch,
+				)
+			)
 				return state;
-			}
 			const firstPage = action.requestCursor === null;
 			const settledPage = action.orderState === "settled";
 			const merged = firstPage
@@ -189,7 +248,8 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				!merged.changed &&
 				state.orderState === orderState &&
 				state.cursor === action.nextCursor &&
-				state.pagesExhausted === pagesExhausted
+				state.pagesExhausted === pagesExhausted &&
+				state.activeRequest === null
 			) {
 				return state;
 			}
@@ -201,6 +261,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				pagesExhausted,
 				scanComplete: state.scanComplete || settledPage,
 				settled: state.settled || settledPage,
+				activeRequest: null,
 			};
 		}
 		case "derivativesReady": {
@@ -230,8 +291,16 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			return changed ? { ...state, items } : state;
 		}
 		case "metadataSettled": {
-			if (action.requestEpoch !== state.scrollEpoch) return state;
-			if (state.settled) return state;
+			if (
+				!matchesActiveRequest(
+					state,
+					action.requestId,
+					action.requestCursor,
+					action.requestEpoch,
+				)
+			)
+				return state;
+			if (state.settled) return { ...state, activeRequest: null };
 			const merged = mergeAssets([], action.assets);
 			return {
 				...state,
@@ -241,6 +310,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				scanComplete: true,
 				pagesExhausted: action.nextCursor === null,
 				settled: true,
+				activeRequest: null,
 			};
 		}
 		case "setDirection": {
@@ -250,6 +320,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				items: [],
 				cursor: null,
 				pagesExhausted: false,
+				activeRequest: null,
 				direction: action.direction,
 				scrollEpoch: state.scrollEpoch + 1,
 			};
