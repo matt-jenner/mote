@@ -27,12 +27,15 @@ export type WallAction =
 			assets: readonly WallAsset[];
 			orderState: OrderState;
 			nextCursor: string | null;
+			requestCursor: string | null;
+			requestEpoch: number;
 	  }
 	| { type: "derivativesReady"; derivatives: readonly DerivativeReference[] }
 	| {
 			type: "metadataSettled";
 			assets: readonly WallAsset[];
 			nextCursor: string | null;
+			requestEpoch: number;
 	  }
 	| { type: "setDirection"; direction: SortDirection };
 
@@ -162,9 +165,16 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			};
 		}
 		case "pageLoaded": {
+			if (action.requestEpoch !== state.scrollEpoch) return state;
+			if (
+				action.requestCursor !== null &&
+				action.requestCursor !== state.cursor
+			) {
+				return state;
+			}
+			const firstPage = action.requestCursor === null;
 			const settledPage = action.orderState === "settled";
-			const replaceWithSettledPage = settledPage && !state.settled;
-			const merged = replaceWithSettledPage
+			const merged = firstPage
 				? mergeAssets([], action.assets)
 				: mergeAssets(state.items, action.assets);
 			const orderState =
@@ -220,6 +230,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			return changed ? { ...state, items } : state;
 		}
 		case "metadataSettled": {
+			if (action.requestEpoch !== state.scrollEpoch) return state;
 			if (state.settled) return state;
 			const merged = mergeAssets([], action.assets);
 			return {

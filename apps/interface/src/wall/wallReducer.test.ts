@@ -61,6 +61,7 @@ describe("wallReducer", () => {
 			type: "metadataSettled",
 			assets: refined.items.slice().reverse(),
 			nextCursor: null,
+			requestEpoch: 0,
 		});
 		expect(settled.items.map((item) => item.id)).toEqual(["a", "b"]);
 		expect(
@@ -68,6 +69,7 @@ describe("wallReducer", () => {
 				type: "metadataSettled",
 				assets: settled.items.slice().reverse(),
 				nextCursor: null,
+				requestEpoch: 0,
 			}),
 		).toBe(settled);
 
@@ -114,6 +116,8 @@ describe("wallReducer", () => {
 			assets: [wallAsset("a", 1, 1)],
 			orderState: "provisional",
 			nextCursor: "page-2",
+			requestCursor: null,
+			requestEpoch: 0,
 		});
 		expect(firstPage.cursor).toBe("page-2");
 		expect(firstPage.pagesExhausted).toBe(false);
@@ -124,6 +128,7 @@ describe("wallReducer", () => {
 			type: "metadataSettled",
 			assets: firstPage.items,
 			nextCursor: firstPage.cursor,
+			requestEpoch: firstPage.scrollEpoch,
 		});
 		expect(settledFirstPage.scanComplete).toBe(true);
 		expect(settledFirstPage.pagesExhausted).toBe(false);
@@ -134,6 +139,8 @@ describe("wallReducer", () => {
 			assets: [wallAsset("b", 1, 2)],
 			orderState: "provisional",
 			nextCursor: null,
+			requestCursor: firstPage.cursor,
+			requestEpoch: firstPage.scrollEpoch,
 		});
 		expect(terminalPage.cursor).toBeNull();
 		expect(terminalPage.pagesExhausted).toBe(true);
@@ -149,11 +156,14 @@ describe("wallReducer", () => {
 				assets: [wallAsset("provisional", 1, 1)],
 				orderState: "provisional",
 				nextCursor: "provisional-next",
+				requestCursor: null,
+				requestEpoch: 0,
 			}),
 			{
 				type: "metadataSettled",
 				assets: [wallAsset("b", 1, 2), wallAsset("a", 1, 1)],
 				nextCursor: "settled-next",
+				requestEpoch: 0,
 			},
 		);
 
@@ -171,6 +181,8 @@ describe("wallReducer", () => {
 			assets: [wallAsset("b", 1, 2), wallAsset("a", 1, 1)],
 			orderState: "settled",
 			nextCursor: "cached-next",
+			requestCursor: null,
+			requestEpoch: 0,
 		});
 		expect(cached.settled).toBe(true);
 		expect(cached.scanComplete).toBe(true);
@@ -194,6 +206,8 @@ describe("wallReducer", () => {
 			assets: [wallAsset("b", 1, 2), wallAsset("a", 1, 1)],
 			orderState: "settled",
 			nextCursor: null,
+			requestCursor: null,
+			requestEpoch: 0,
 		});
 
 		expect(cached.settled).toBe(true);
@@ -202,11 +216,113 @@ describe("wallReducer", () => {
 		expect(isWallLayoutComplete(cached)).toBe(true);
 	});
 
+	it("replaces a settled first page after direction reset in the current epoch", () => {
+		const cached = reduce(initialWallState, {
+			type: "pageLoaded",
+			assets: [wallAsset("old-b", 1, 2), wallAsset("old-a", 1, 1)],
+			orderState: "settled",
+			nextCursor: "old-next",
+			requestCursor: null,
+			requestEpoch: 0,
+		});
+		const reset = reduce(cached, {
+			type: "setDirection",
+			direction: "newestFirst",
+		});
+		const provisional = reduce(reset, {
+			type: "catalogBatch",
+			assets: [wallAsset("c", 1, 0)],
+			orderState: "provisional",
+		});
+		const settledFirstPage = reduce(provisional, {
+			type: "pageLoaded",
+			assets: [wallAsset("b", 1, 2), wallAsset("a", 1, 1)],
+			orderState: "settled",
+			nextCursor: "new-next",
+			requestCursor: null,
+			requestEpoch: reset.scrollEpoch,
+		});
+
+		expect(settledFirstPage.items.map((item) => item.id)).toEqual(["b", "a"]);
+		expect(settledFirstPage.cursor).toBe("new-next");
+		expect(settledFirstPage.scrollEpoch).toBe(reset.scrollEpoch);
+	});
+
+	it("ignores a stale first page response after direction reset by object identity", () => {
+		const cached = reduce(initialWallState, {
+			type: "pageLoaded",
+			assets: [wallAsset("old", 1, 1)],
+			orderState: "settled",
+			nextCursor: "old-next",
+			requestCursor: null,
+			requestEpoch: 0,
+		});
+		const reset = reduce(cached, {
+			type: "setDirection",
+			direction: "newestFirst",
+		});
+		const stale = reduce(reset, {
+			type: "pageLoaded",
+			assets: [wallAsset("stale", 1, 1)],
+			orderState: "settled",
+			nextCursor: "stale-next",
+			requestCursor: null,
+			requestEpoch: cached.scrollEpoch,
+		});
+
+		expect(stale).toBe(reset);
+	});
+
+	it("appends a current-epoch settled second page in server order", () => {
+		const first = reduce(initialWallState, {
+			type: "pageLoaded",
+			assets: [wallAsset("b", 1, 2), wallAsset("a", 1, 1)],
+			orderState: "settled",
+			nextCursor: "page-2",
+			requestCursor: null,
+			requestEpoch: 0,
+		});
+		const second = reduce(first, {
+			type: "pageLoaded",
+			assets: [wallAsset("d", 1, 4), wallAsset("c", 1, 3)],
+			orderState: "settled",
+			nextCursor: null,
+			requestCursor: first.cursor,
+			requestEpoch: first.scrollEpoch,
+		});
+
+		expect(second.items.map((item) => item.id)).toEqual(["b", "a", "d", "c"]);
+	});
+
+	it("ignores stale metadata settlement after direction reset", () => {
+		const provisional = reduce(initialWallState, {
+			type: "pageLoaded",
+			assets: [wallAsset("old", 1, 1)],
+			orderState: "provisional",
+			nextCursor: "old-next",
+			requestCursor: null,
+			requestEpoch: 0,
+		});
+		const reset = reduce(provisional, {
+			type: "setDirection",
+			direction: "newestFirst",
+		});
+		const stale = reduce(reset, {
+			type: "metadataSettled",
+			assets: [wallAsset("stale", 1, 1)],
+			nextCursor: null,
+			requestEpoch: provisional.scrollEpoch,
+		});
+
+		expect(stale).toBe(reset);
+	});
+
 	it("keeps source completion and settlement latched across streamed updates", () => {
 		const settled = reduce(initialWallState, {
 			type: "metadataSettled",
 			assets: [wallAsset("a", 1, 1)],
 			nextCursor: null,
+			requestEpoch: 0,
 		});
 		const streamed = reduce(settled, {
 			type: "catalogBatch",
@@ -221,6 +337,7 @@ describe("wallReducer", () => {
 				type: "metadataSettled",
 				assets: [wallAsset("c", 1, 3)],
 				nextCursor: null,
+				requestEpoch: 0,
 			}),
 		).toBe(streamed);
 	});
@@ -254,7 +371,8 @@ describe("wallReducer", () => {
 		const settled = reduce(initialWallState, {
 			type: "metadataSettled",
 			assets: [wallAsset("b", 1, 1), wallAsset("a", 1, 2)],
-			nextCursor: null,
+			nextCursor: "page-2",
+			requestEpoch: 0,
 		});
 		expect(settled.items.map((item) => item.id)).toEqual(["b", "a"]);
 
@@ -278,6 +396,8 @@ describe("wallReducer", () => {
 			assets: [wallAsset("d", 1, -1)],
 			orderState: "provisional",
 			nextCursor: null,
+			requestCursor: "page-2",
+			requestEpoch: 0,
 		});
 		expect(paged.orderState).toBe("settled");
 		expect(paged.items.map((item) => item.id)).toEqual(["b", "a", "c", "d"]);
@@ -327,12 +447,15 @@ describe("wallReducer", () => {
 				type: "metadataSettled",
 				assets: [wallAsset("a", 1, 1)],
 				nextCursor: null,
+				requestEpoch: 0,
 			}),
 			{
 				type: "pageLoaded",
 				assets: [],
 				orderState: "settled",
 				nextCursor: null,
+				requestCursor: null,
+				requestEpoch: 0,
 			},
 		);
 		expect(isWallLayoutComplete(complete)).toBe(true);
