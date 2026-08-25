@@ -66,6 +66,7 @@ impl ImageDerivativeGenerator {
         self.generate_allowed(source, spec)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_screen_preview(
         &self,
         source: &Path,

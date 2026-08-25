@@ -180,6 +180,7 @@ fn benchmark_asset(library: LibraryId, index: u64) -> Result<NewAsset, Benchmark
             modified_unix_ns: i128::from(index).saturating_mul(1_000_000_000),
             sidecar_modified_unix_ns: None,
         },
+        folder_group_id: None,
     })
 }
 

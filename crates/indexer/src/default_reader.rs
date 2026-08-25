@@ -28,25 +28,25 @@ impl MetadataReader for DefaultMetadataReader {
             }
         }
         if let Ok(metadata) = media_path.metadata() {
-            if let Ok(created) = metadata.created() {
-                if let Some(value) = to_datetime(created) {
-                    let raw_value = value.to_rfc3339();
-                    bundle.capture_dates.push(MetadataCandidate {
-                        value,
-                        source: MetadataSource::FilesystemBirth,
-                        raw_value,
-                    });
-                }
+            if let Ok(created) = metadata.created()
+                && let Some(value) = to_datetime(created)
+            {
+                let raw_value = value.to_rfc3339();
+                bundle.capture_dates.push(MetadataCandidate {
+                    value,
+                    source: MetadataSource::FilesystemBirth,
+                    raw_value,
+                });
             }
-            if let Ok(modified) = metadata.modified() {
-                if let Some(value) = to_datetime(modified) {
-                    let raw_value = value.to_rfc3339();
-                    bundle.capture_dates.push(MetadataCandidate {
-                        value,
-                        source: MetadataSource::FilesystemModified,
-                        raw_value,
-                    });
-                }
+            if let Ok(modified) = metadata.modified()
+                && let Some(value) = to_datetime(modified)
+            {
+                let raw_value = value.to_rfc3339();
+                bundle.capture_dates.push(MetadataCandidate {
+                    value,
+                    source: MetadataSource::FilesystemModified,
+                    raw_value,
+                });
             }
         }
         Ok(bundle)

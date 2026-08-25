@@ -133,7 +133,7 @@ impl<R: MetadataReader> Indexer<R> {
         let (cancel, cancel_rx) = watch::channel(false);
         let reader = self.reader.clone();
         let policy_engine = self.policy_engine.clone();
-        let enrichment_workers = self.scheduler.available_background_permits().min(2).max(1);
+        let enrichment_workers = self.scheduler.available_background_permits().clamp(1, 2);
         let scheduler = self.scheduler.clone();
         let discovery_root = root.clone();
         let discovery_cancel = cancel_rx.clone();
@@ -181,7 +181,7 @@ impl<R: MetadataReader> Indexer<R> {
                             s.discovered += 1;
                         }
                         let discovered = progress.0.fetch_add(1, Ordering::Relaxed) + 1;
-                        if discovered % 32 == 0 {
+                        if discovered.is_multiple_of(32) {
                             let _ = events
                                 .send(IndexEvent::Progress(ScanProgress {
                                     stage: ScanStage::Discovering,
@@ -223,7 +223,7 @@ impl<R: MetadataReader> Indexer<R> {
                                     })
                                     .await;
                                 let shaped = progress.1.fetch_add(1, Ordering::Relaxed) + 1;
-                                if shaped % 32 == 0 {
+                                if shaped.is_multiple_of(32) {
                                     let _ = events
                                         .send(IndexEvent::Progress(ScanProgress {
                                             stage: ScanStage::Shaping,
@@ -254,7 +254,7 @@ impl<R: MetadataReader> Indexer<R> {
                                     })
                                     .await;
                                 let shaped = progress.1.fetch_add(1, Ordering::Relaxed) + 1;
-                                if shaped % 32 == 0 {
+                                if shaped.is_multiple_of(32) {
                                     let _ = events
                                         .send(IndexEvent::Progress(ScanProgress {
                                             stage: ScanStage::Shaping,
@@ -343,7 +343,7 @@ impl<R: MetadataReader> Indexer<R> {
                                     })
                                     .await;
                                 let enriched = progress.2.fetch_add(1, Ordering::Relaxed) + 1;
-                                if enriched % 32 == 0 {
+                                if enriched.is_multiple_of(32) {
                                     let _ = events
                                         .send(IndexEvent::Progress(ScanProgress {
                                             stage: ScanStage::Enriching,
@@ -374,7 +374,7 @@ impl<R: MetadataReader> Indexer<R> {
             for worker in workers {
                 let _ = worker.await;
             }
-            let mut summary = summary.lock().await.clone();
+            let mut summary = *summary.lock().await;
             if *cancel_rx.borrow() {
                 summary.cancelled = true;
             }
@@ -415,7 +415,7 @@ async fn admit_enrichment(
         if *cancel.borrow() {
             return false;
         }
-        let limit = scheduler.available_background_permits().min(2).max(1);
+        let limit = scheduler.available_background_permits().clamp(1, 2);
         let current = admissions.load(Ordering::Acquire);
         if current < limit
             && admissions
