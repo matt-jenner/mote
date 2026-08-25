@@ -62,3 +62,21 @@ Passed all 6 focused wall and generation tests.
 `cargo test -p photo-catalog`
 
 Passed the full package suite: catalog unit tests, 5 round-trip tests, 2 settings tests, 6 wall-query tests, and doc tests.
+
+## Fix round 2
+
+Changes made: added coverage for descending equal-date path ties across a page boundary and exact equal-date/equal-display-path ID ties across page boundaries in both ascending and descending orders. Production code was unchanged because the existing keyset implementation passed these cases.
+
+Covering tests: `crates/catalog/tests/wall_query.rs`, specifically `descending_equal_date_path_ties_paginate_without_skip_or_duplication` and `equal_date_and_display_path_ties_use_ids_in_both_directions`.
+
+RED: no production RED occurred. Per review direction, this was a coverage-only round. The new tests were run against the current implementation and one initial incorrect test expectation exposed a test assertion mistake, not a production defect; the expectation was corrected to the specified ascending ID tie-breaker.
+
+GREEN:
+
+`cargo test -p photo-catalog --test wall_query`
+
+Passed all 8 focused tests.
+
+`cargo test -p photo-catalog`
+
+Passed the full package suite, including all 8 wall-query tests and doc tests.

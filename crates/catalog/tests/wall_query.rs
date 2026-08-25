@@ -6,6 +6,10 @@ use photo_catalog::{
 };
 use photo_domain::{FolderGroupId, MediaKind, RelativePathKey};
 
+fn id_key(id: photo_domain::AssetId) -> [u8; 16] {
+    *id.as_uuid().as_bytes()
+}
+
 fn ready_group(catalog: &mut Catalog, library: photo_domain::LibraryId) -> FolderGroupId {
     catalog
         .upsert_folder_group(&NewFolderGroup {
@@ -150,6 +154,39 @@ impl WallFixture {
         }
         id
     }
+    fn add_with_display(
+        &mut self,
+        relative: &str,
+        display: &str,
+        status: ShapeStatus,
+        date: &str,
+    ) -> photo_domain::AssetId {
+        let key = RelativePathKey::from_relative_path(Path::new(relative)).unwrap();
+        let mut asset = NewAsset::minimal(self.library, key, display, MediaKind::Jpeg, 1);
+        asset.folder_group_id = Some(self.group);
+        let id = asset.id;
+        self.catalog.upsert_asset(&asset).unwrap();
+        self.catalog
+            .apply_index_batch(&[
+                CatalogIndexRecord::Shaped(AssetShapeUpdate {
+                    asset_id: id,
+                    width: 16,
+                    height: 9,
+                    orientation: Some(1),
+                    representative_rgb: None,
+                    shape_status: status,
+                }),
+                CatalogIndexRecord::Metadata(AssetMetadataUpdate {
+                    asset_id: id,
+                    captured_at_utc: Some(date.into()),
+                    rating: None,
+                    keywords: vec![],
+                    provenance: vec![],
+                }),
+            ])
+            .unwrap();
+        id
+    }
     fn ready(&mut self, path: &str, date: &str) -> photo_domain::AssetId {
         self.add(path, Some(ShapeStatus::Ready), Some(date), 16, 9)
     }
@@ -243,6 +280,91 @@ fn settled_pages_use_path_ties_in_both_directions() {
             .map(|item| item.id)
             .collect::<Vec<_>>(),
         [first, second]
+    );
+}
+
+#[test]
+fn descending_equal_date_path_ties_paginate_without_skip_or_duplication() {
+    let mut fixture = WallFixture::new();
+    let first = fixture.ready("a.jpg", "2024-01-01T00:00:00Z");
+    let second = fixture.ready("b.jpg", "2024-01-01T00:00:00Z");
+    let third = fixture.ready("c.jpg", "2024-01-01T00:00:00Z");
+    let page = fixture
+        .catalog
+        .wall_page(fixture.group, WallOrder::CapturedDescending, None, 2)
+        .unwrap();
+    assert_eq!(
+        page.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+        [first, second]
+    );
+    let tail = fixture
+        .catalog
+        .wall_page(fixture.group, WallOrder::CapturedDescending, page.next, 2)
+        .unwrap();
+    assert_eq!(
+        tail.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+        [third]
+    );
+}
+
+#[test]
+fn equal_date_and_display_path_ties_use_ids_in_both_directions() {
+    let mut fixture = WallFixture::new();
+    let first = fixture.add_with_display(
+        "one.jpg",
+        "same.jpg",
+        ShapeStatus::Ready,
+        "2024-01-01T00:00:00Z",
+    );
+    let second = fixture.add_with_display(
+        "two.jpg",
+        "same.jpg",
+        ShapeStatus::Ready,
+        "2024-01-01T00:00:00Z",
+    );
+    let ascending = fixture
+        .catalog
+        .wall_page(fixture.group, WallOrder::CapturedAscending, None, 1)
+        .unwrap();
+    let ascending_tail = fixture
+        .catalog
+        .wall_page(
+            fixture.group,
+            WallOrder::CapturedAscending,
+            ascending.next,
+            1,
+        )
+        .unwrap();
+    assert_eq!(
+        id_key(ascending.items[0].id),
+        [id_key(first), id_key(second)].into_iter().min().unwrap()
+    );
+    assert_ne!(ascending.items[0].id, ascending_tail.items[0].id);
+    assert_eq!(
+        id_key(ascending_tail.items[0].id),
+        [id_key(first), id_key(second)].into_iter().max().unwrap()
+    );
+    let descending = fixture
+        .catalog
+        .wall_page(fixture.group, WallOrder::CapturedDescending, None, 1)
+        .unwrap();
+    let descending_tail = fixture
+        .catalog
+        .wall_page(
+            fixture.group,
+            WallOrder::CapturedDescending,
+            descending.next,
+            1,
+        )
+        .unwrap();
+    assert_eq!(
+        id_key(descending.items[0].id),
+        [id_key(first), id_key(second)].into_iter().min().unwrap()
+    );
+    assert_ne!(descending.items[0].id, descending_tail.items[0].id);
+    assert_eq!(
+        id_key(descending_tail.items[0].id),
+        [id_key(first), id_key(second)].into_iter().max().unwrap()
     );
 }
 
