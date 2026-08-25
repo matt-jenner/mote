@@ -136,46 +136,28 @@ impl ImageDerivativeGenerator {
         };
         let key = DerivativeKey::compute(spec);
         let relative_path = key.sharded_path("jpg");
-        let mut representative_rgb = RepresentativeRgb {
-            red: 0,
-            green: 0,
-            blue: 0,
-        };
         let quality = match spec.kind {
             DerivativeKind::WallThumbnail => 82,
             DerivativeKind::ScreenPreview => 90,
             _ => return Err(ImageDerivativeError::UnsupportedTarget),
         };
         let durable = spec.kind == DerivativeKind::WallThumbnail;
+        let image = apply_orientation(
+            ImageReader::open(source)?.with_guessed_format()?.decode()?,
+            spec.orientation,
+        );
+        let representative_rgb = average_rgb(&image.thumbnail(32, 32).to_rgb8());
+        let resized = resize_without_upscale(image, edge).to_rgb8();
+        let mut encoded = Vec::new();
+        JpegEncoder::new_with_quality(&mut encoded, quality).encode(
+            &resized,
+            resized.width(),
+            resized.height(),
+            image::ExtendedColorType::Rgb8,
+        )?;
         let write = self.writer.write_atomic(relative_path.clone(), |file| {
-            let image = ImageReader::open(source)
-                .map_err(std::io::Error::other)?
-                .with_guessed_format()
-                .map_err(std::io::Error::other)?
-                .decode()
-                .map_err(std::io::Error::other)?;
-            let image = apply_orientation(image, spec.orientation);
-            let sample = image.thumbnail(32, 32).to_rgb8();
-            representative_rgb = average_rgb(&sample);
-            let resized = resize_without_upscale(image, edge).to_rgb8();
-            let mut encoder = JpegEncoder::new_with_quality(file, quality);
-            encoder
-                .encode(
-                    &resized,
-                    resized.width(),
-                    resized.height(),
-                    image::ExtendedColorType::Rgb8,
-                )
-                .map_err(std::io::Error::other)
+            std::io::Write::write_all(file, &encoded)
         })?;
-        if write.reused {
-            let image = ImageReader::open(source)?.with_guessed_format()?.decode()?;
-            representative_rgb = average_rgb(
-                &apply_orientation(image, spec.orientation)
-                    .thumbnail(32, 32)
-                    .to_rgb8(),
-            );
-        }
         Ok(GeneratedDerivative {
             key,
             relative_path,

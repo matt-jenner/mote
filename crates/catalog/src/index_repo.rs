@@ -84,6 +84,24 @@ impl Catalog {
         Ok(inserted == 1)
     }
 
+    pub fn clear_warning(
+        &mut self,
+        library_id: LibraryId,
+        asset_id: Option<AssetId>,
+        code: &str,
+    ) -> Result<u64, CatalogError> {
+        let removed = self.connection.execute(
+            "DELETE FROM warnings \
+             WHERE library_id = ?1 AND asset_id IS ?2 AND code = ?3",
+            params![
+                library_id.as_uuid().as_bytes(),
+                asset_id.map(|id| id.as_uuid().as_bytes().to_vec()),
+                code,
+            ],
+        )?;
+        u64::try_from(removed).map_err(|_| CatalogError::ValueOutOfRange)
+    }
+
     pub fn apply_index_batch(
         &mut self,
         records: &[CatalogIndexRecord],

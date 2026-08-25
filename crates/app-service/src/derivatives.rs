@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use photo_cache::{
-    DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget, ImageDerivativeGenerator,
+    DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget, ImageDerivativeError,
+    ImageDerivativeGenerator,
 };
 use photo_catalog::{Catalog, NewDerivative, WallOrder};
 use photo_domain::{AssetId, Availability, DerivativeId, FolderGroupId};
@@ -19,6 +20,43 @@ use crate::{
 };
 
 const DECODER_VERSION: &str = "image-0.25-v1";
+const ASSET_DERIVATIVE_WARNING: &str = "derivative_generation_failed";
+const CACHE_DERIVATIVE_WARNING: &str = "derivative_cache_unavailable";
+
+#[derive(Debug)]
+enum DerivativeWorkError {
+    Image(ImageDerivativeError),
+    WorkerUnavailable,
+}
+
+impl From<ImageDerivativeError> for DerivativeWorkError {
+    fn from(error: ImageDerivativeError) -> Self {
+        Self::Image(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DerivativeFailureScope {
+    Asset,
+    CacheWide,
+}
+
+impl DerivativeWorkError {
+    fn scope(&self) -> DerivativeFailureScope {
+        match self {
+            Self::Image(ImageDerivativeError::Io(_))
+            | Self::Image(ImageDerivativeError::Decode(_))
+            | Self::Image(ImageDerivativeError::UnsupportedTarget)
+            | Self::Image(ImageDerivativeError::BudgetAuthorizationRequired)
+            | Self::Image(ImageDerivativeError::InvalidSpecification) => {
+                DerivativeFailureScope::Asset
+            }
+            Self::Image(ImageDerivativeError::Cache(_))
+            | Self::Image(ImageDerivativeError::Catalog(_))
+            | Self::WorkerUnavailable => DerivativeFailureScope::CacheWide,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct PendingDerivative {
@@ -357,9 +395,19 @@ impl AppService {
             let asset_id = pending.id;
             let result = if self.selection_is_active(selection) {
                 match self.generate_derivative(pending).await {
-                    Ok(reference) => Some(reference),
-                    Err(_) => {
-                        self.record_derivative_warning(selection, asset_id);
+                    Ok(reference) => {
+                        self.clear_derivative_warnings(selection, asset_id);
+                        Some(reference)
+                    }
+                    Err(error) => {
+                        match error.scope() {
+                            DerivativeFailureScope::Asset => {
+                                self.record_asset_derivative_warning(selection, asset_id);
+                            }
+                            DerivativeFailureScope::CacheWide => {
+                                self.record_cache_derivative_warning(selection);
+                            }
+                        }
                         None
                     }
                 }
@@ -373,9 +421,8 @@ impl AppService {
     async fn generate_derivative(
         &self,
         pending: PendingDerivative,
-    ) -> Result<DerivativeReference, AppServiceError> {
-        let generator = ImageDerivativeGenerator::new(&self.cache_root)
-            .map_err(|_| AppServiceError::DerivativeFailed)?;
+    ) -> Result<DerivativeReference, DerivativeWorkError> {
+        let generator = ImageDerivativeGenerator::new(&self.cache_root)?;
         let id = pending.id;
         let group = pending.group;
         let class = pending.class;
@@ -386,8 +433,7 @@ impl AppService {
                 let spec = pending.spec;
                 tokio::task::spawn_blocking(move || generator.generate(&source, &spec))
                     .await
-                    .map_err(|_| AppServiceError::DerivativeFailed)?
-                    .map_err(|_| AppServiceError::DerivativeFailed)?
+                    .map_err(|_| DerivativeWorkError::WorkerUnavailable)??
             }
             DerivativeClass::ScreenPreview => {
                 let source = pending.source;
@@ -409,15 +455,16 @@ impl AppService {
                     )
                 })
                 .await
-                .map_err(|_| AppServiceError::DerivativeFailed)?
-                .map_err(|_| AppServiceError::DerivativeFailed)?
+                .map_err(|_| DerivativeWorkError::WorkerUnavailable)??
             }
         };
         if !self.selection_is_active(selection) {
-            return Err(AppServiceError::DerivativeFailed);
+            return Err(DerivativeWorkError::WorkerUnavailable);
         }
         if class == DerivativeClass::WallThumbnail {
-            let mut state = self.state()?;
+            let mut state = self
+                .state()
+                .map_err(|_| DerivativeWorkError::WorkerUnavailable)?;
             state
                 .libraries
                 .catalog_mut()
@@ -431,7 +478,8 @@ impl AppService {
                     size_bytes: generated.size_bytes,
                     durable: true,
                     created_at: 0,
-                })?;
+                })
+                .map_err(ImageDerivativeError::from)?;
         }
         Ok(reference(id, class, generated.key.as_str().into()))
     }
@@ -574,7 +622,7 @@ impl AppService {
         true
     }
 
-    fn record_derivative_warning(&self, selection: SelectionToken, asset_id: AssetId) {
+    fn record_asset_derivative_warning(&self, selection: SelectionToken, asset_id: AssetId) {
         let warning = crate::WallWarningState {
             code: "derivativeUnavailable".to_owned(),
             retryable: true,
@@ -589,7 +637,7 @@ impl AppService {
                 &photo_catalog::CatalogWarningRecord {
                     library_id: selection.library_id,
                     asset_id: Some(asset_id),
-                    code: "derivative_generation_failed".to_owned(),
+                    code: ASSET_DERIVATIVE_WARNING.to_owned(),
                     message: "A cached preview could not be generated. The app can retry it."
                         .to_owned(),
                 },
@@ -601,6 +649,58 @@ impl AppService {
                     warning,
                 });
             }
+            Ok(())
+        });
+    }
+
+    fn record_cache_derivative_warning(&self, selection: SelectionToken) {
+        let warning = crate::WallWarningState {
+            code: "cacheUnavailable".to_owned(),
+            retryable: true,
+        };
+        let _ = self.state().and_then(|mut state| {
+            if state.selection_epoch != selection.epoch
+                || state.protected_group != Some(selection.group_id)
+            {
+                return Ok(());
+            }
+            let inserted = state.libraries.catalog_mut().record_warning_once(
+                &photo_catalog::CatalogWarningRecord {
+                    library_id: selection.library_id,
+                    asset_id: None,
+                    code: CACHE_DERIVATIVE_WARNING.to_owned(),
+                    message: "The preview cache is unavailable. Browsing can continue while the app retries it."
+                        .to_owned(),
+                },
+            )?;
+            if inserted {
+                let _ = self.updates.send(WallUpdate::Warning {
+                    source_id: selection.library_id.as_uuid().hyphenated().to_string(),
+                    asset_id: None,
+                    warning,
+                });
+            }
+            Ok(())
+        });
+    }
+
+    fn clear_derivative_warnings(&self, selection: SelectionToken, asset_id: AssetId) {
+        let _ = self.state().and_then(|mut state| {
+            if state.selection_epoch != selection.epoch
+                || state.protected_group != Some(selection.group_id)
+            {
+                return Ok(());
+            }
+            state.libraries.catalog_mut().clear_warning(
+                selection.library_id,
+                Some(asset_id),
+                ASSET_DERIVATIVE_WARNING,
+            )?;
+            state.libraries.catalog_mut().clear_warning(
+                selection.library_id,
+                None,
+                CACHE_DERIVATIVE_WARNING,
+            )?;
             Ok(())
         });
     }
@@ -678,7 +778,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use photo_cache::{DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget};
+    use image::{ImageBuffer, Rgb};
+    use photo_cache::{
+        CacheBudget, DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget,
+    };
     use photo_catalog::{AssetShapeUpdate, CatalogIndexRecord, NewAsset, ShapeStatus};
     use photo_domain::{
         AssetId, FileSignature, FolderGroupId, LibraryId, MediaKind, RelativePathKey,
@@ -686,7 +789,9 @@ mod tests {
     use photo_indexer::{IndexJob, IndexScheduler, JobPriority, SchedulerConfig};
 
     use crate::service::SelectionToken;
-    use crate::{AppConfig, AppService, DerivativeClass, DerivativeReference};
+    use crate::{
+        AppConfig, AppService, DerivativeClass, DerivativeReference, DerivativeRequest, WallUpdate,
+    };
 
     use super::{DerivativeQueue, PendingDerivative};
 
@@ -880,5 +985,103 @@ mod tests {
         assert!(!super::should_pause(JobPriority::NearViewport, 1));
         assert!(!super::should_pause(JobPriority::Visible, 1));
         assert!(!super::should_pause(JobPriority::IdleLibrary, 4));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cache_wide_failures_are_coalesced_and_a_successful_retry_clears_the_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(&source).unwrap();
+        for index in 0..250 {
+            ImageBuffer::from_pixel(2, 2, Rgb([index as u8, 20, 30]))
+                .save(source.join(format!("photo-{index:03}.jpg")))
+                .unwrap();
+        }
+        let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+        let mut service = AppService::open(config.clone()).unwrap();
+        service.cache_budget = CacheBudget::from_total_space(0);
+        let mut updates = service.subscribe_wall_updates();
+        service.start_scan(&source).await.unwrap();
+        receive_until(&mut updates, |event| {
+            matches!(event, WallUpdate::MetadataSettled { .. })
+        })
+        .await;
+        let ids = service
+            .query_wall(crate::WallQueryRequest {
+                cursor: None,
+                limit: 250,
+                direction: crate::SortDirection::OldestFirst,
+            })
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|asset| asset.id)
+            .collect::<Vec<_>>();
+        service
+            .request_derivatives(DerivativeRequest::visible(ids.clone()))
+            .await
+            .unwrap();
+        let warning = receive_until(&mut updates, |event| {
+            matches!(event, WallUpdate::Warning { .. })
+        })
+        .await;
+        assert!(matches!(
+            warning,
+            WallUpdate::Warning { asset_id: None, .. }
+        ));
+        let warning_json = serde_json::to_string(&warning).unwrap();
+        assert!(warning_json.len() < 512);
+        assert!(!warning_json.contains(&source.to_string_lossy().into_owned()));
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while !service.derivative_queue.is_empty().await {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            photo_catalog::Catalog::open(&config.catalog_path())
+                .unwrap()
+                .warning_count()
+                .unwrap(),
+            1,
+            "250 cache failures must produce one library warning"
+        );
+
+        service.cache_budget = CacheBudget::from_total_space(10_000_000);
+        service
+            .request_derivatives(DerivativeRequest::visible(ids))
+            .await
+            .unwrap();
+        receive_until(&mut updates, |event| {
+            matches!(event, WallUpdate::DerivativesReady { derivatives } if
+                derivatives.len() == 250
+                && derivatives.iter().all(|item| item.kind == DerivativeClass::ScreenPreview))
+        })
+        .await;
+        assert_eq!(
+            photo_catalog::Catalog::open(&config.catalog_path())
+                .unwrap()
+                .warning_count()
+                .unwrap(),
+            0,
+            "a successful cache write must clear the recovered library warning"
+        );
+    }
+
+    async fn receive_until(
+        receiver: &mut tokio::sync::broadcast::Receiver<WallUpdate>,
+        mut predicate: impl FnMut(&WallUpdate) -> bool,
+    ) -> WallUpdate {
+        let mut last = None;
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(15), receiver.recv()).await {
+                Ok(Ok(event)) if predicate(&event) => return event,
+                Ok(Ok(event)) => last = Some(event),
+                Ok(Err(error)) => panic!("update receiver failed after {last:?}: {error}"),
+                Err(_) => panic!("timed out waiting for update, last event: {last:?}"),
+            }
+        }
     }
 }

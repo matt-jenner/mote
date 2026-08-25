@@ -201,3 +201,93 @@ fn decode_wall_record(row: &rusqlite::Row<'_>) -> Result<WallCatalogRecord, rusq
         has_warning: row.get(10)?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::params;
+
+    use super::Catalog;
+
+    fn plan_details(catalog: &Catalog, sql: &str) -> Vec<String> {
+        let mut statement = catalog.connection.prepare(sql).unwrap();
+        statement
+            .query_map(params![vec![0_u8; 16], 10_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn provisional_wall_query_uses_group_order_index() {
+        let catalog = Catalog::open_in_memory().unwrap();
+        let details = plan_details(
+            &catalog,
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM assets
+             WHERE folder_group_id = ?1
+               AND shape_status IN ('ready', 'fallback')
+               AND width IS NOT NULL
+               AND height IS NOT NULL
+             ORDER BY provisional_order, id
+             LIMIT ?2",
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("assets_group_provisional_wall")),
+            "expected provisional wall index in query plan: {details:?}"
+        );
+    }
+
+    #[test]
+    fn captured_wall_query_uses_group_capture_index() {
+        let catalog = Catalog::open_in_memory().unwrap();
+        let details = plan_details(
+            &catalog,
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM assets
+             WHERE folder_group_id = ?1
+               AND shape_status IN ('ready', 'fallback')
+               AND width IS NOT NULL
+               AND height IS NOT NULL
+               AND captured_at_utc IS NOT NULL
+             ORDER BY captured_at_utc ASC, display_path ASC, id ASC
+             LIMIT ?2",
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("assets_group_capture_wall")),
+            "expected captured wall index in query plan: {details:?}"
+        );
+    }
+
+    #[test]
+    fn descending_captured_wall_query_uses_its_mixed_direction_index() {
+        let catalog = Catalog::open_in_memory().unwrap();
+        let details = plan_details(
+            &catalog,
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM assets
+             WHERE folder_group_id = ?1
+               AND shape_status IN ('ready', 'fallback')
+               AND width IS NOT NULL
+               AND height IS NOT NULL
+               AND captured_at_utc IS NOT NULL
+             ORDER BY captured_at_utc DESC, display_path ASC, id ASC
+             LIMIT ?2",
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("assets_group_capture_desc_wall")),
+            "expected descending capture wall index in query plan: {details:?}"
+        );
+        assert!(
+            details.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+            "descending wall order should not need a temporary sort: {details:?}"
+        );
+    }
+}

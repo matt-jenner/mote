@@ -16,6 +16,8 @@ pub(crate) struct ServiceState {
     pub(crate) protected_group: Option<photo_domain::FolderGroupId>,
     pub(crate) recent_derivative_ids: Vec<AssetId>,
     pub(crate) selection_epoch: u64,
+    #[cfg(test)]
+    pub(crate) selection_barrier: Option<Arc<std::sync::Barrier>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,6 +122,8 @@ impl AppService {
                 protected_group: None,
                 recent_derivative_ids: Vec::new(),
                 selection_epoch: u64::from(should_reconcile),
+                #[cfg(test)]
+                selection_barrier: None,
             })),
             scheduler: Arc::new(IndexScheduler::new(Default::default())),
             updates,
@@ -210,6 +214,9 @@ impl AppService {
         Self::bootstrap_locked(&state)
     }
 
+    /// Synchronous host compatibility entry point. It persists the selection everywhere, but it
+    /// can launch reconciliation only when the caller already runs inside a Tokio runtime. Async
+    /// hosts should prefer `start_scan`, which reports scan-start failures to the caller.
     pub fn open_recent(&self, folder: &Path) -> Result<BootstrapState, AppServiceError> {
         let (bootstrap, selection) = self.select_recent(folder)?;
         if tokio::runtime::Handle::try_current().is_ok() {
@@ -225,22 +232,16 @@ impl AppService {
         &self,
         folder: &Path,
     ) -> Result<(BootstrapState, SelectionToken), AppServiceError> {
-        if let Ok(mut state) = self.state.lock() {
-            if let Some(cancel) = state.active_cancel.take() {
-                let _ = cancel.send(true);
-            }
-            state.active_scan = None;
-            state.selection_epoch = state.selection_epoch.wrapping_add(1).max(1);
+        #[cfg(test)]
+        if let Some(barrier) = self
+            .state()
+            .ok()
+            .and_then(|state| state.selection_barrier.clone())
+        {
+            barrier.wait();
         }
         let mut state = self.state()?;
         let selection = state.libraries.open_recent(folder)?;
-        state
-            .libraries
-            .catalog_mut()
-            .set_active_selection(Some(&StoredSourceSelection {
-                library_id: selection.library_id,
-                relative_folder: selection.relative_folder.clone(),
-            }))?;
         let display_path = folder
             .file_name()
             .map(|v| v.to_string_lossy().into_owned())
@@ -251,11 +252,39 @@ impl AppService {
             .upsert_folder_group(&NewFolderGroup {
                 id: photo_domain::FolderGroupId::new(),
                 library_id: selection.library_id,
-                relative_path: selection.relative_folder,
+                relative_path: selection.relative_folder.clone(),
                 display_path,
                 last_viewed_at: Some(unix_timestamp()),
             })?;
-        let previous = state.protected_group.replace(group);
+        let previous = state.protected_group;
+        if previous != Some(group) {
+            self.protected_groups.protect(group)?;
+        }
+        if let Err(error) =
+            state
+                .libraries
+                .catalog_mut()
+                .set_active_selection(Some(&StoredSourceSelection {
+                    library_id: selection.library_id,
+                    relative_folder: selection.relative_folder,
+                }))
+        {
+            if previous != Some(group) {
+                let _ = self.protected_groups.unprotect(group);
+            }
+            return Err(error.into());
+        }
+        if let Some(cancel) = state.active_cancel.take() {
+            let _ = cancel.send(true);
+        }
+        state.active_scan = None;
+        state.selection_epoch = state.selection_epoch.wrapping_add(1).max(1);
+        if previous != Some(group) {
+            if let Some(previous) = previous {
+                self.protected_groups.unprotect(previous)?;
+            }
+            state.protected_group = Some(group);
+        }
         let token = SelectionToken {
             library_id: selection.library_id,
             group_id: group,
@@ -263,12 +292,6 @@ impl AppService {
         };
         let bootstrap = Self::bootstrap_locked(&state)?;
         drop(state);
-        if previous != Some(group) {
-            if let Some(previous) = previous {
-                self.protected_groups.unprotect(previous)?;
-            }
-            self.protected_groups.protect(group)?;
-        }
         if tokio::runtime::Handle::try_current().is_ok() {
             let queue = self.derivative_queue.clone();
             tokio::spawn(async move {
@@ -322,46 +345,13 @@ impl AppService {
             .libraries
             .catalog()
             .wall_page(group, order, cursor, request.limit)?;
-        let asset_ids = page.items.iter().map(|item| item.id).collect::<Vec<_>>();
-        let wall_derivatives = state
-            .libraries
-            .catalog()
-            .derivatives_for_assets(&asset_ids, "wall_thumbnail")?
-            .into_iter()
-            .fold(HashMap::new(), |mut rows, derivative| {
-                rows.entry(derivative.asset_id).or_insert(derivative);
-                rows
-            });
-        let screen_derivatives = state
-            .libraries
-            .catalog()
-            .derivatives_for_assets(&asset_ids, "screen_preview")?
-            .into_iter()
-            .fold(HashMap::new(), |mut rows, derivative| {
-                rows.entry(derivative.asset_id).or_insert(derivative);
-                rows
-            });
         let date_state = if settled {
             crate::OrderState::Settled
         } else {
             crate::OrderState::Provisional
         };
-        let items = page
-            .items
-            .iter()
-            .map(|item| {
-                wall_asset_from_record(
-                    item,
-                    date_state,
-                    wall_derivatives
-                        .get(&item.id)
-                        .map(|row| row.cache_key.as_str()),
-                    screen_derivatives
-                        .get(&item.id)
-                        .map(|row| row.cache_key.as_str()),
-                )
-            })
-            .collect();
+        let items =
+            wall_assets_with_derivatives(state.libraries.catalog(), &page.items, date_state)?;
         let next_cursor = page
             .next
             .as_ref()
@@ -471,6 +461,41 @@ pub(crate) fn wall_asset_from_record(
     }
 }
 
+pub(crate) fn wall_assets_with_derivatives(
+    catalog: &Catalog,
+    records: &[photo_catalog::WallCatalogRecord],
+    date_state: crate::OrderState,
+) -> Result<Vec<crate::WallAsset>, CatalogError> {
+    let asset_ids = records.iter().map(|item| item.id).collect::<Vec<_>>();
+    let latest_by_asset =
+        |kind| -> Result<HashMap<AssetId, photo_catalog::DerivativeRecord>, CatalogError> {
+            Ok(catalog
+                .derivatives_for_assets(&asset_ids, kind)?
+                .into_iter()
+                .fold(HashMap::new(), |mut rows, derivative| {
+                    rows.entry(derivative.asset_id).or_insert(derivative);
+                    rows
+                }))
+        };
+    let wall_derivatives = latest_by_asset("wall_thumbnail")?;
+    let screen_derivatives = latest_by_asset("screen_preview")?;
+    Ok(records
+        .iter()
+        .map(|item| {
+            wall_asset_from_record(
+                item,
+                date_state,
+                wall_derivatives
+                    .get(&item.id)
+                    .map(|row| row.cache_key.as_str()),
+                screen_derivatives
+                    .get(&item.id)
+                    .map(|row| row.cache_key.as_str()),
+            )
+        })
+        .collect())
+}
+
 fn map_media_kind(kind: MediaKind) -> crate::WallMediaKind {
     match kind {
         MediaKind::Jpeg => crate::WallMediaKind::Jpeg,
@@ -487,7 +512,45 @@ fn map_media_kind(kind: MediaKind) -> crate::WallMediaKind {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::path::Path;
+    use std::sync::{Arc, Barrier, Condvar, Mutex};
+
+    use chrono::{FixedOffset, TimeZone};
+    use image::{ImageBuffer, Rgb};
+    use photo_metadata::{MetadataBundle, MetadataCandidate, MetadataReadWarning, MetadataSource};
+
     use super::{AppConfig, AppService};
+
+    #[derive(Clone)]
+    struct BlockingReader(Arc<(Mutex<bool>, Condvar)>);
+
+    impl photo_indexer::MetadataReader for BlockingReader {
+        fn read(
+            &self,
+            _media_path: &Path,
+            _sidecar_path: Option<&Path>,
+        ) -> Result<MetadataBundle, MetadataReadWarning> {
+            let (lock, changed) = &*self.0;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = changed.wait(released).unwrap();
+            }
+            let captured = FixedOffset::east_opt(0)
+                .unwrap()
+                .timestamp_opt(1_700_000_000, 0)
+                .single()
+                .unwrap();
+            Ok(MetadataBundle {
+                capture_dates: vec![MetadataCandidate {
+                    value: captured,
+                    source: MetadataSource::FilesystemModified,
+                    raw_value: captured.to_rfc3339(),
+                }],
+                ..MetadataBundle::default()
+            })
+        }
+    }
 
     #[test]
     fn reopened_service_restores_the_active_protected_group_marker() {
@@ -501,5 +564,105 @@ mod tests {
 
         let reopened = AppService::open(config).unwrap();
         assert!(reopened.state().unwrap().protected_group.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_selections_keep_the_active_scan_and_catalog_on_one_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        ImageBuffer::from_pixel(2, 2, Rgb([10_u8, 20, 30]))
+            .save(first.join("first.jpg"))
+            .unwrap();
+        ImageBuffer::from_pixel(2, 2, Rgb([30_u8, 20, 10]))
+            .save(second.join("second.jpg"))
+            .unwrap();
+        let reader_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let service = AppService::open_with_reader(
+            AppConfig::new(temp.path().join("data"), temp.path().join("cache")),
+            Arc::new(BlockingReader(reader_gate.clone())),
+        )
+        .unwrap();
+        service.state().unwrap().selection_barrier = Some(Arc::new(Barrier::new(2)));
+
+        let first_service = service.clone();
+        let first_path = first.clone();
+        let first_call = std::thread::spawn(move || first_service.select_recent(&first_path));
+        let second_service = service.clone();
+        let second_path = second.clone();
+        let second_call = std::thread::spawn(move || second_service.select_recent(&second_path));
+        let first_token = first_call.join().unwrap().unwrap().1;
+        let second_token = second_call.join().unwrap().unwrap().1;
+
+        assert_eq!(
+            HashSet::from([first_token.epoch, second_token.epoch]).len(),
+            2,
+            "each serialized selection must own a distinct epoch"
+        );
+        let (final_token, stale_token) = {
+            let state = service.state().unwrap();
+            let stored = state
+                .libraries
+                .catalog()
+                .load_app_state()
+                .unwrap()
+                .active_selection
+                .unwrap();
+            let stored_group = state
+                .libraries
+                .catalog()
+                .folder_group_for_path(stored.library_id, &stored.relative_folder)
+                .unwrap()
+                .unwrap();
+            let final_token = [first_token, second_token]
+                .into_iter()
+                .find(|token| token.epoch == state.selection_epoch)
+                .unwrap();
+            let stale_token = [first_token, second_token]
+                .into_iter()
+                .find(|token| *token != final_token)
+                .unwrap();
+            assert_eq!(final_token.library_id, stored.library_id);
+            assert_eq!(final_token.group_id, stored_group);
+            assert_eq!(state.protected_group, Some(stored_group));
+            (final_token, stale_token)
+        };
+
+        let mut updates = service.subscribe_wall_updates();
+        service.start_selected_scan(stale_token).await.unwrap();
+        service.start_selected_scan(final_token).await.unwrap();
+        assert_eq!(
+            service.state().unwrap().active_scan.unwrap().selection,
+            final_token,
+            "the scan owner must match the final persisted selection"
+        );
+        let (lock, changed) = &*reader_gate;
+        *lock.lock().unwrap() = true;
+        changed.notify_all();
+        let mut published = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), updates.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                crate::WallUpdate::CatalogBatch { assets, .. } => {
+                    published.extend(assets.into_iter().map(|asset| asset.id));
+                }
+                crate::WallUpdate::MetadataSettled { .. } => break,
+                _ => {}
+            }
+        }
+        let active = service
+            .query_wall(crate::WallQueryRequest::oldest_first())
+            .await
+            .unwrap();
+        assert_eq!(active.items.len(), 1);
+        assert!(
+            published.iter().all(|id| id == &active.items[0].id),
+            "the stale selection committed or published wall rows"
+        );
     }
 }

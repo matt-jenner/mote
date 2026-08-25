@@ -649,6 +649,7 @@ async fn derivative_failure_records_and_publishes_a_retryable_asset_warning() {
         .items[0]
         .id
         .clone();
+    let original = std::fs::read(fixture.source.join("photo-000.jpg")).unwrap();
     std::fs::write(
         fixture.source.join("photo-000.jpg"),
         b"damaged after indexing",
@@ -692,6 +693,37 @@ async fn derivative_failure_records_and_publishes_a_retryable_asset_warning() {
             .unwrap(),
         1,
         "wall and screen failures for one asset must share one bounded warning"
+    );
+
+    std::fs::write(fixture.source.join("photo-000.jpg"), original).unwrap();
+    service
+        .request_derivatives(photo_app_service::DerivativeRequest::visible(vec![
+            asset_id,
+        ]))
+        .await
+        .unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::DerivativesReady { derivatives } if
+            derivatives.len() == 1
+            && derivatives[0].kind == DerivativeClass::WallThumbnail)
+    })
+    .await;
+    assert_eq!(
+        photo_catalog::Catalog::open(&fixture.config.catalog_path())
+            .unwrap()
+            .warning_count()
+            .unwrap(),
+        0,
+        "a recovered asset must stop presenting its retryable derivative warning"
+    );
+    assert!(
+        service
+            .query_wall(query(SortDirection::OldestFirst))
+            .await
+            .unwrap()
+            .items[0]
+            .warning
+            .is_none()
     );
 }
 
@@ -876,6 +908,76 @@ async fn offline_reopen_keeps_cached_references() {
         page.items
             .iter()
             .all(|asset| asset.wall_thumbnail.is_some())
+    );
+    std::fs::rename(unavailable, &fixture.source).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconciliation_batches_preserve_cached_wall_and_screen_references_online_and_offline() {
+    let fixture = ProgressiveFixture::new(2);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let ids = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|asset| asset.id)
+        .collect::<Vec<_>>();
+    service
+        .request_derivatives(photo_app_service::DerivativeRequest::visible(ids))
+        .await
+        .unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::DerivativesReady { derivatives } if
+            derivatives.len() == 2
+            && derivatives.iter().all(|item| item.kind == DerivativeClass::ScreenPreview))
+    })
+    .await;
+    drop(service);
+
+    let (reader, release) = BlockingReader::new();
+    let online = AppService::open_with_reader(fixture.config.clone(), Arc::new(reader)).unwrap();
+    let mut updates = online.subscribe_wall_updates();
+    let batch = recv_until(
+        &mut updates,
+        |event| matches!(event, WallUpdate::CatalogBatch { assets, .. } if !assets.is_empty()),
+    )
+    .await;
+    assert!(matches!(batch, WallUpdate::CatalogBatch { assets, .. } if
+        assets.len() == 2
+        && assets.iter().all(|asset|
+            asset.wall_thumbnail.is_some() && asset.screen_preview.is_some())));
+    release.release();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    drop(online);
+
+    let unavailable = fixture.temp.path().join("photos-offline-with-derivatives");
+    std::fs::rename(&fixture.source, &unavailable).unwrap();
+    let offline =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
+            .unwrap();
+    let page = offline
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    assert!(
+        page.items
+            .iter()
+            .all(|asset| asset.wall_thumbnail.is_some() && asset.screen_preview.is_some())
     );
     std::fs::rename(unavailable, &fixture.source).unwrap();
 }

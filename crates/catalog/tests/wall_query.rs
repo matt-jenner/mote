@@ -527,6 +527,167 @@ fn opening_a_v4_catalog_adds_group_generation_support() {
 }
 
 #[test]
+fn opening_a_populated_v4_catalog_backfills_settled_groups_offline() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("catalog.sqlite");
+    let connection = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_catalog.sql"),
+        include_str!("../migrations/0002_unavailable_assets.sql"),
+        include_str!("../migrations/0003_app_state.sql"),
+        include_str!("../migrations/0004_wall_projection.sql"),
+    ] {
+        connection.execute_batch(migration).unwrap();
+    }
+
+    let library = [1_u8; 16];
+    let first_group = [2_u8; 16];
+    let second_group = [3_u8; 16];
+    let first_asset = [4_u8; 16];
+    let second_asset = [5_u8; 16];
+    let derivative = [6_u8; 16];
+    let first_older_asset = [7_u8; 16];
+    let second_newer_asset = [8_u8; 16];
+    connection
+        .execute(
+            "INSERT INTO library_roots
+                (id, kind, display_name, canonical_root_key, display_path, availability)
+             VALUES (?1, 'configured', 'Photos', ?1, '/Photos', 'root_offline')",
+            [library.as_slice()],
+        )
+        .unwrap();
+    for (id, path) in [(first_group, "first"), (second_group, "second")] {
+        connection
+            .execute(
+                "INSERT INTO folder_groups
+                    (id, library_id, relative_path_key, display_path)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id.as_slice(), library.as_slice(), path.as_bytes(), path],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO scan_generations
+                (library_id, generation, started_at, completed_at, source_was_online)
+             VALUES (?1, 7, 100, 200, 1)",
+            [library.as_slice()],
+        )
+        .unwrap();
+    for (provisional, id, group, path, captured) in [
+        (
+            1_i64,
+            first_asset,
+            first_group,
+            "first/new.jpg",
+            "2024-01-02T00:00:00Z",
+        ),
+        (
+            2_i64,
+            first_older_asset,
+            first_group,
+            "first/old.jpg",
+            "2024-01-01T00:00:00Z",
+        ),
+        (
+            3_i64,
+            second_asset,
+            second_group,
+            "second/old.jpg",
+            "2024-01-01T00:00:00Z",
+        ),
+        (
+            4_i64,
+            second_newer_asset,
+            second_group,
+            "second/new.jpg",
+            "2024-01-03T00:00:00Z",
+        ),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO assets
+                    (id, library_id, folder_group_id, relative_path_key, display_path,
+                     media_kind, size_bytes, modified_unix_ns, width, height, availability,
+                     captured_at_utc, last_seen_generation, provisional_order, shape_status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'jpeg', 10, '10', 1600, 900,
+                         'root_offline', ?6, 7, ?7, 'ready')",
+                rusqlite::params![
+                    id.as_slice(),
+                    library.as_slice(),
+                    group.as_slice(),
+                    path.as_bytes(),
+                    path,
+                    captured,
+                    provisional,
+                ],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO derivatives
+                (id, asset_id, folder_group_id, kind, cache_key, relative_cache_path,
+                 size_bytes, durable, created_at)
+             VALUES (?1, ?2, ?3, 'wall_thumbnail', 'cached-wall', 'wall/cached.jpg', 12, 1, 200)",
+            rusqlite::params![
+                derivative.as_slice(),
+                first_asset.as_slice(),
+                first_group.as_slice()
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let catalog = Catalog::open(&path).unwrap();
+    assert!(
+        catalog
+            .has_completed_generation_for_group(
+                photo_domain::LibraryId::from_uuid(uuid::Uuid::from_bytes(library)),
+                FolderGroupId::from_uuid(uuid::Uuid::from_bytes(first_group)),
+            )
+            .unwrap()
+    );
+    assert!(
+        catalog
+            .has_completed_generation_for_group(
+                photo_domain::LibraryId::from_uuid(uuid::Uuid::from_bytes(library)),
+                FolderGroupId::from_uuid(uuid::Uuid::from_bytes(second_group)),
+            )
+            .unwrap()
+    );
+
+    let first_page = catalog
+        .wall_page(
+            FolderGroupId::from_uuid(uuid::Uuid::from_bytes(first_group)),
+            WallOrder::CapturedAscending,
+            None,
+            10,
+        )
+        .unwrap();
+    assert_eq!(first_page.items.len(), 2);
+    assert_eq!(first_page.items[0].display_path, "first/old.jpg");
+    assert_eq!(first_page.items[1].display_path, "first/new.jpg");
+    assert_eq!(
+        first_page.items[0].availability,
+        photo_domain::Availability::RootOffline
+    );
+
+    let second_page = catalog
+        .wall_page(
+            FolderGroupId::from_uuid(uuid::Uuid::from_bytes(second_group)),
+            WallOrder::CapturedAscending,
+            None,
+            10,
+        )
+        .unwrap();
+    assert_eq!(second_page.items.len(), 2);
+    assert_eq!(second_page.items[0].display_path, "second/old.jpg");
+    assert_eq!(second_page.items[1].display_path, "second/new.jpg");
+    assert_eq!(catalog.all_derivatives().unwrap().len(), 1);
+}
+
+#[test]
 fn wall_page_excludes_pending_shapes_but_keeps_fallback_shapes() {
     let mut fixture = WallFixture::new();
     let pending = fixture.pending("pending.jpg");

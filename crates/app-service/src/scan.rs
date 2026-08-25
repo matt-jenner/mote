@@ -279,18 +279,13 @@ impl AppService {
                     .catalog()
                     .wall_records_for_assets(owner.selection.group_id, &shaped)
                     .ok()
-                    .map(|records| {
-                        records
-                            .into_iter()
-                            .map(|asset| {
-                                crate::service::wall_asset_from_record(
-                                    &asset,
-                                    crate::OrderState::Provisional,
-                                    None,
-                                    None,
-                                )
-                            })
-                            .collect::<Vec<_>>()
+                    .and_then(|records| {
+                        crate::service::wall_assets_with_derivatives(
+                            state.libraries.catalog(),
+                            &records,
+                            crate::OrderState::Provisional,
+                        )
+                        .ok()
                     })
                     .unwrap_or_default();
                 if !assets.is_empty() {
