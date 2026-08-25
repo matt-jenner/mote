@@ -86,6 +86,7 @@ impl ImageDerivativeGenerator {
             colour_space: "srgb".into(),
             target: DerivativeTarget::LongEdge(4096),
         };
+        validate_spec(&spec)?;
         let _guard = protected.begin_write(folder_group_id)?;
         let (encoded, representative_rgb) = encode_screen(source, &spec)?;
         let estimated = encoded.len() as u64;
