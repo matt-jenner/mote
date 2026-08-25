@@ -1,39 +1,249 @@
-import type { Appearance, BootstrapState, PhotoService } from "./photoService";
+import type {
+	Appearance,
+	BootstrapState,
+	DerivativeClass,
+	DerivativeReference,
+	DerivativeRequest,
+	PhotoService,
+	ScanProgressDto,
+	WallAsset,
+	WallPage,
+	WallQueryRequest,
+	WallUpdate,
+} from "./photoService";
+import { PhotoServiceError } from "./photoService";
 
-interface InMemoryOptions {
+export interface InMemoryWallFixture extends WallAsset {
+	/** URLs are supplied by the memory-mode host rather than invented by the adapter. */
+	derivativeUrls?: Partial<Record<DerivativeClass, string>>;
+	wallThumbnailUrl?: string;
+	screenPreviewUrl?: string;
+}
+
+export interface InMemoryOptions {
 	selectedFolderName?: string;
 	cancelFolderPicker?: boolean;
+	wallAssets?: readonly InMemoryWallFixture[];
+	geometryDelayMs?: number;
+	thumbnailDelayMs?: number;
+	metadataDelayMs?: number;
 }
+
+export interface InMemoryPhotoService extends PhotoService {
+	startFixtureScan(): Promise<void>;
+	finishFixtureScan(): Promise<void>;
+	emitForTest(update: WallUpdate): void;
+}
+
+type WallListener = (update: WallUpdate) => void;
+
+const sourceId = "memory-source";
+const maxWallPageSize = 250;
+
+const clone = <T>(value: T): T => structuredClone(value);
+const delay = (milliseconds: number): Promise<void> =>
+	new Promise((resolve) => setTimeout(resolve, Math.max(0, milliseconds)));
 
 export function createInMemoryPhotoService(
 	options: InMemoryOptions = {},
-): PhotoService {
+): InMemoryPhotoService {
+	const fixtures = clone(options.wallAssets ?? []).map((fixture) => ({
+		...fixture,
+		derivativeUrls: fixture.derivativeUrls
+			? { ...fixture.derivativeUrls }
+			: undefined,
+	}));
+	const listeners = new Set<WallListener>();
+	const derivativeUrls = new Map<string, string>();
+	let settled = false;
+	let scanStarted = false;
 	let state: BootstrapState = {
 		settings: { appearance: "system" },
 		activeSource: null,
 	};
-	const copy = (): BootstrapState => structuredClone(state);
+	let assets: WallAsset[] = fixtures.map(
+		({
+			derivativeUrls: _urls,
+			wallThumbnailUrl: _wallUrl,
+			screenPreviewUrl: _screenUrl,
+			...asset
+		}) => ({
+			...asset,
+			dateState: "provisional" as const,
+			wallThumbnail: null,
+			screenPreview: null,
+		}),
+	);
 
-	return {
+	for (const fixture of fixtures) {
+		for (const kind of ["wallThumbnail", "screenPreview"] as const) {
+			const reference = fixture[kind];
+			const url =
+				fixture.derivativeUrls?.[kind] ??
+				(kind === "wallThumbnail"
+					? fixture.wallThumbnailUrl
+					: fixture.screenPreviewUrl);
+			if (reference && url) derivativeUrls.set(`${kind}:${reference.key}`, url);
+		}
+	}
+
+	const publish = (update: WallUpdate): void => {
+		for (const listener of listeners) listener(clone(update));
+	};
+	const progress = (enriched: number): ScanProgressDto => ({
+		discovered: fixtures.length,
+		shaped: fixtures.length,
+		enriched,
+		total: fixtures.length,
+	});
+	const derivativeReferences = (): DerivativeReference[] =>
+		fixtures.flatMap((fixture) =>
+			[fixture.wallThumbnail, fixture.screenPreview].filter(
+				(reference): reference is DerivativeReference => reference !== null,
+			),
+		);
+
+	const service: InMemoryPhotoService = {
 		capabilities: { chooseFolder: true, locateFolder: false },
 		async getBootstrapState() {
-			return copy();
+			return clone(state);
 		},
 		async chooseFolder() {
 			if (options.cancelFolderPicker) return { kind: "cancelled" };
 			state = {
 				...state,
 				activeSource: {
-					id: "memory-source",
+					id: sourceId,
 					displayName: options.selectedFolderName ?? "Selected Folder",
 					availability: "available",
 				},
 			};
-			return { kind: "selected", state: copy() };
+			return { kind: "selected", state: clone(state) };
 		},
 		async updateAppearance(appearance: Appearance) {
 			state = { ...state, settings: { appearance } };
-			return copy();
+			return clone(state);
+		},
+		async queryWall(request: WallQueryRequest): Promise<WallPage> {
+			if (
+				!Number.isInteger(request.limit) ||
+				request.limit < 1 ||
+				request.limit > maxWallPageSize
+			) {
+				throw new PhotoServiceError(
+					"invalidLimit",
+					"The requested wall page is not valid.",
+				);
+			}
+			const ordered = [...assets]
+				.filter((asset) => !settled || asset.capturedAtUtc !== null)
+				.sort((left, right) => {
+					if (!settled) {
+						return (
+							left.provisionalOrder - right.provisionalOrder ||
+							left.id.localeCompare(right.id)
+						);
+					}
+					const leftDate = left.capturedAtUtc ?? "";
+					const rightDate = right.capturedAtUtc ?? "";
+					const dateOrder = leftDate.localeCompare(rightDate);
+					const order =
+						dateOrder ||
+						left.displayName.localeCompare(right.displayName) ||
+						left.id.localeCompare(right.id);
+					return request.direction === "newestFirst" ? -order : order;
+				});
+			const offset = request.cursor === null ? 0 : Number(request.cursor);
+			const start = Number.isSafeInteger(offset) && offset >= 0 ? offset : 0;
+			const items = ordered.slice(start, start + request.limit).map(clone);
+			const nextCursor =
+				start + items.length < ordered.length
+					? String(start + items.length)
+					: null;
+			return {
+				items,
+				nextCursor,
+				orderState: settled ? "settled" : "provisional",
+			};
+		},
+		async requestDerivatives(_request: DerivativeRequest) {
+			return undefined;
+		},
+		async setWallInteraction(_active: boolean) {
+			return undefined;
+		},
+		watchWallUpdates(listener: WallListener) {
+			listeners.add(listener);
+			return () => listeners.delete(listener);
+		},
+		derivativeUrl(reference: DerivativeReference) {
+			const url = derivativeUrls.get(`${reference.kind}:${reference.key}`);
+			if (!url) {
+				throw new PhotoServiceError(
+					"derivativeUnavailable",
+					"That photo derivative is not available.",
+				);
+			}
+			return url;
+		},
+		async startFixtureScan() {
+			scanStarted = true;
+			settled = false;
+			assets = fixtures.map(
+				({
+					derivativeUrls: _urls,
+					wallThumbnailUrl: _wallUrl,
+					screenPreviewUrl: _screenUrl,
+					...asset
+				}) => ({
+					...asset,
+					dateState: "provisional" as const,
+					wallThumbnail: null,
+					screenPreview: null,
+				}),
+			);
+			await delay(options.geometryDelayMs ?? 0);
+			publish({
+				kind: "catalogBatch",
+				assets: clone(assets),
+				orderState: "provisional",
+				progress: progress(0),
+			});
+			await delay(options.thumbnailDelayMs ?? 0);
+			const derivatives = derivativeReferences();
+			if (derivatives.length > 0) {
+				for (const derivative of derivatives) {
+					const index = assets.findIndex(
+						(asset) => asset.id === derivative.assetId,
+					);
+					const current = assets[index];
+					if (!current) continue;
+					if (derivative.kind === "wallThumbnail") {
+						assets[index] = {
+							...current,
+							wallThumbnail: clone(derivative),
+						};
+					} else {
+						assets[index] = {
+							...current,
+							screenPreview: clone(derivative),
+						};
+					}
+				}
+				publish({ kind: "derivativesReady", derivatives: clone(derivatives) });
+			}
+		},
+		async finishFixtureScan() {
+			if (!scanStarted) await service.startFixtureScan();
+			await delay(options.metadataDelayMs ?? 0);
+			settled = true;
+			assets = assets.map((asset) => ({ ...asset, dateState: "settled" }));
+			publish({ kind: "metadataSettled", sourceId });
+		},
+		emitForTest(update: WallUpdate) {
+			publish(update);
 		},
 	};
+
+	return service;
 }
