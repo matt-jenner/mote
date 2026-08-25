@@ -35,3 +35,30 @@ Passed 3 tests.
 `cargo test -p photo-catalog`
 
 Passed all catalog unit, integration, wall-query, settings, and doc tests.
+
+## Fix round 1
+
+Changes made:
+
+- Fixed provisional cursor pagination to bind the correct `LIMIT` parameter.
+- Fixed `has_completed_generation` to read nullable `completed_at` safely.
+- Added `ShapeStatus::Pending` so asset reads preserve the migration state instead of reporting fallback.
+- Added provisional multi-page coverage, equal-date path tie coverage in both directions, incomplete-generation coverage, and pending asset round-trip coverage.
+
+Covering tests: `crates/catalog/tests/wall_query.rs`.
+
+RED:
+
+`cargo test -p photo-catalog --test wall_query`
+
+Failed to compile because `ShapeStatus::Pending` was missing. After adding that test API, the focused run failed at runtime for incomplete generations with `Sqlite(InvalidColumnType(0, "completed_at", Null))`, confirming the nullable-read defect. The provisional pagination test also exercised the broken cursor branch before its fix.
+
+GREEN:
+
+`cargo test -p photo-catalog --test wall_query`
+
+Passed all 6 focused wall and generation tests.
+
+`cargo test -p photo-catalog`
+
+Passed the full package suite: catalog unit tests, 5 round-trip tests, 2 settings tests, 6 wall-query tests, and doc tests.

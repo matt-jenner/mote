@@ -5,6 +5,7 @@ use crate::{Catalog, CatalogError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShapeStatus {
+    Pending,
     Ready,
     Fallback,
 }
@@ -12,14 +13,16 @@ pub enum ShapeStatus {
 impl ShapeStatus {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
             Self::Ready => "ready",
             Self::Fallback => "fallback",
         }
     }
     pub(crate) fn decode(value: &str, column: usize) -> Result<Self, rusqlite::Error> {
         match value {
+            "pending" => Ok(Self::Pending),
             "ready" => Ok(Self::Ready),
-            "fallback" | "pending" => Ok(Self::Fallback),
+            "fallback" => Ok(Self::Fallback),
             _ => Err(rusqlite::Error::FromSqlConversionFailure(
                 column,
                 rusqlite::types::Type::Text,
@@ -99,10 +102,11 @@ impl Catalog {
             }
         }
         sql.push_str(match order { WallOrder::Provisional => " ORDER BY provisional_order, id", WallOrder::CapturedAscending => " AND captured_at_utc IS NOT NULL ORDER BY captured_at_utc ASC, display_path ASC, id ASC", WallOrder::CapturedDescending => " AND captured_at_utc IS NOT NULL ORDER BY captured_at_utc DESC, display_path ASC, id ASC" });
-        sql.push_str(if cursor.is_some() {
-            " LIMIT ?5"
-        } else {
-            " LIMIT ?2"
+        sql.push_str(match (order, cursor.is_some()) {
+            (WallOrder::Provisional, false) => " LIMIT ?2",
+            (WallOrder::Provisional, true) => " LIMIT ?4",
+            (_, false) => " LIMIT ?2",
+            (_, true) => " LIMIT ?5",
         });
         let mut stmt = self.connection.prepare(&sql)?;
         let group_uuid = group.as_uuid();

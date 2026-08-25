@@ -70,6 +70,30 @@ fn new_assets_keep_append_only_provisional_order_across_upserts() {
     );
 }
 
+#[test]
+fn provisional_pages_paginate_with_stable_order() {
+    let mut fixture = WallFixture::new();
+    let first = fixture.shaped("one.jpg", ShapeStatus::Ready, 1, 1);
+    let second = fixture.shaped("two.jpg", ShapeStatus::Ready, 1, 1);
+    let third = fixture.shaped("three.jpg", ShapeStatus::Ready, 1, 1);
+    let page = fixture
+        .catalog
+        .wall_page(fixture.group, WallOrder::Provisional, None, 2)
+        .unwrap();
+    assert_eq!(
+        page.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+        [first, second]
+    );
+    let tail = fixture
+        .catalog
+        .wall_page(fixture.group, WallOrder::Provisional, page.next, 2)
+        .unwrap();
+    assert_eq!(
+        tail.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+        [third]
+    );
+}
+
 struct WallFixture {
     catalog: Catalog,
     library: photo_domain::LibraryId,
@@ -189,9 +213,74 @@ fn settled_pages_sort_dates_in_both_directions_with_stable_ties() {
 }
 
 #[test]
+fn settled_pages_use_path_ties_in_both_directions() {
+    let mut fixture = WallFixture::new();
+    let first = fixture.ready("a.jpg", "2024-01-01T00:00:00Z");
+    let second = fixture.ready("b.jpg", "2024-01-01T00:00:00Z");
+    let ascending = fixture
+        .catalog
+        .wall_page(fixture.group, WallOrder::CapturedAscending, None, 1)
+        .unwrap();
+    assert_eq!(ascending.items[0].id, first);
+    let ascending_tail = fixture
+        .catalog
+        .wall_page(
+            fixture.group,
+            WallOrder::CapturedAscending,
+            ascending.next,
+            1,
+        )
+        .unwrap();
+    assert_eq!(ascending_tail.items[0].id, second);
+    let descending = fixture
+        .catalog
+        .wall_page(fixture.group, WallOrder::CapturedDescending, None, 2)
+        .unwrap();
+    assert_eq!(
+        descending
+            .items
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        [first, second]
+    );
+}
+
+#[test]
+fn incomplete_generations_report_false() {
+    let mut fixture = WallFixture::new();
+    let generation = fixture.catalog.begin_generation(fixture.library).unwrap();
+    assert!(
+        !fixture
+            .catalog
+            .has_completed_generation(fixture.library, generation)
+            .unwrap()
+    );
+    fixture
+        .catalog
+        .complete_generation(fixture.library, generation)
+        .unwrap();
+    assert!(
+        fixture
+            .catalog
+            .has_completed_generation(fixture.library, generation)
+            .unwrap()
+    );
+}
+
+#[test]
 fn wall_page_excludes_pending_shapes_but_keeps_fallback_shapes() {
     let mut fixture = WallFixture::new();
     let pending = fixture.pending("pending.jpg");
+    assert_eq!(
+        fixture
+            .catalog
+            .find_asset(pending)
+            .unwrap()
+            .unwrap()
+            .shape_status,
+        ShapeStatus::Pending
+    );
     let ready = fixture.shaped("ready.jpg", ShapeStatus::Ready, 16, 9);
     let fallback = fixture.shaped("broken.jpg", ShapeStatus::Fallback, 4, 3);
     let page = fixture

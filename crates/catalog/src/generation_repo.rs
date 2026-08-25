@@ -19,8 +19,8 @@ impl Catalog {
         let completed: Option<i64> = self.connection.query_row(
             "SELECT completed_at FROM scan_generations WHERE library_id = ?1 AND generation = ?2",
             params![library.as_uuid().as_bytes(), generation],
-            |row| row.get(0),
-        ).optional()?;
+            |row| row.get::<_, Option<i64>>(0),
+        ).optional()?.flatten();
         Ok(completed.is_some())
     }
 
