@@ -4,8 +4,11 @@ export interface JustifiedLayoutOptions {
 	containerWidth: number;
 	targetRowHeight: number;
 	gap: number;
-	sourceComplete: boolean;
+	layoutComplete: boolean;
 }
+
+/** Maximum CSS-pixel error accepted when checking fractional row geometry. */
+export const LAYOUT_GEOMETRY_TOLERANCE = 1e-9;
 
 export interface PositionedWallAsset {
 	asset: WallAsset;
@@ -141,7 +144,7 @@ export function layoutJustifiedRows(
 		}
 	}
 
-	if (candidate.length > 0 && options.sourceComplete) {
+	if (candidate.length > 0 && options.layoutComplete) {
 		rows.push(makeRow(candidate, options, false));
 	}
 

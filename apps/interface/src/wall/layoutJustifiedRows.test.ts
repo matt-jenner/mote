@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { WallAsset } from "../services/photoService";
 import {
 	type JustifiedLayoutOptions,
+	LAYOUT_GEOMETRY_TOLERANCE,
 	layoutJustifiedRows,
 } from "./layoutJustifiedRows";
 
@@ -31,7 +32,7 @@ function options(
 		containerWidth: 1000,
 		targetRowHeight: 220,
 		gap: 4,
-		sourceComplete: false,
+		layoutComplete: false,
 		...overrides,
 	};
 }
@@ -42,7 +43,7 @@ describe("layoutJustifiedRows", () => {
 			containerWidth: 1000,
 			targetRowHeight: 220,
 			gap: 4,
-			sourceComplete: false,
+			layoutComplete: false,
 		});
 
 		expect(rows).toHaveLength(1);
@@ -57,10 +58,10 @@ describe("layoutJustifiedRows", () => {
 
 	it("holds an incomplete row until the source completes", () => {
 		expect(
-			layoutJustifiedRows(assets([1]), options({ sourceComplete: false })),
+			layoutJustifiedRows(assets([1]), options({ layoutComplete: false })),
 		).toEqual([]);
 		expect(
-			layoutJustifiedRows(assets([1]), options({ sourceComplete: true }))[0]
+			layoutJustifiedRows(assets([1]), options({ layoutComplete: true }))[0]
 				?.justified,
 		).toBe(false);
 	});
@@ -120,7 +121,7 @@ describe("layoutJustifiedRows", () => {
 	it("leaves a completed final row left-aligned at the target height", () => {
 		const rows = layoutJustifiedRows(
 			assets([1, 2]),
-			options({ sourceComplete: true }),
+			options({ layoutComplete: true }),
 		);
 
 		expect(rows).toHaveLength(1);
@@ -171,5 +172,44 @@ describe("layoutJustifiedRows", () => {
 				options(),
 			),
 		).toThrow("Wall asset dimensions must be positive");
+	});
+
+	it("uses the documented tolerance for fractional container geometry", () => {
+		const fixture = assets([1])[0];
+		if (!fixture) throw new Error("expected a fixture asset");
+		const dimensions: readonly (readonly [number, number])[] = [
+			[3713, 4000],
+			[1396, 1080],
+			[1153, 630],
+			[988, 1741],
+			[766, 1649],
+			[3223, 413],
+		];
+		const source = dimensions.map(([width, height], index) => ({
+			...fixture,
+			id: `fractional-${index}`,
+			width,
+			height,
+		}));
+		const row = layoutJustifiedRows(source, {
+			containerWidth: 1000.1,
+			targetRowHeight: 107.18,
+			gap: 4.1,
+			layoutComplete: true,
+		})[0];
+		if (!row) throw new Error("expected a justified row");
+		const last = row.items.at(-1);
+		if (!last) throw new Error("expected the final tile");
+
+		expect(Math.abs(last.left + last.width - 1000.1)).toBeLessThanOrEqual(
+			LAYOUT_GEOMETRY_TOLERANCE,
+		);
+		for (const item of row.items) {
+			expect(
+				Math.abs(
+					item.width / item.height - item.asset.width / item.asset.height,
+				),
+			).toBeLessThanOrEqual(LAYOUT_GEOMETRY_TOLERANCE);
+		}
 	});
 });

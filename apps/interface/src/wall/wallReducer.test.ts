@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { WallAsset } from "../services/photoService";
-import { initialWallState, type WallAction, wallReducer } from "./wallReducer";
+import {
+	initialWallState,
+	isWallLayoutComplete,
+	type WallAction,
+	wallReducer,
+} from "./wallReducer";
 
 function wallAsset(
 	id: string,
@@ -107,20 +112,30 @@ describe("wallReducer", () => {
 			assets: [wallAsset("a", 1, 1)],
 			orderState: "provisional",
 			nextCursor: "page-2",
-			sourceComplete: false,
 		});
 		expect(firstPage.cursor).toBe("page-2");
-		expect(firstPage.sourceComplete).toBe(false);
+		expect(firstPage.pagesExhausted).toBe(false);
+		expect(firstPage.scanComplete).toBe(false);
+		expect(isWallLayoutComplete(firstPage)).toBe(false);
 
-		const terminalPage = reduce(firstPage, {
+		const settledFirstPage = reduce(firstPage, {
+			type: "metadataSettled",
+			assets: firstPage.items,
+		});
+		expect(settledFirstPage.scanComplete).toBe(true);
+		expect(settledFirstPage.pagesExhausted).toBe(false);
+		expect(isWallLayoutComplete(settledFirstPage)).toBe(false);
+
+		const terminalPage = reduce(settledFirstPage, {
 			type: "pageLoaded",
 			assets: [wallAsset("b", 1, 2)],
 			orderState: "provisional",
 			nextCursor: null,
-			sourceComplete: true,
 		});
 		expect(terminalPage.cursor).toBeNull();
-		expect(terminalPage.sourceComplete).toBe(true);
+		expect(terminalPage.pagesExhausted).toBe(true);
+		expect(terminalPage.scanComplete).toBe(true);
+		expect(isWallLayoutComplete(terminalPage)).toBe(true);
 		expect(terminalPage.items.map((item) => item.id)).toEqual(["a", "b"]);
 	});
 
@@ -135,7 +150,8 @@ describe("wallReducer", () => {
 			orderState: "provisional",
 		});
 		expect(streamed.settled).toBe(true);
-		expect(streamed.sourceComplete).toBe(true);
+		expect(streamed.scanComplete).toBe(true);
+		expect(streamed.pagesExhausted).toBe(false);
 		expect(
 			reduce(streamed, {
 				type: "metadataSettled",
@@ -167,6 +183,102 @@ describe("wallReducer", () => {
 		expect(repeated).toBe(state);
 		expect(repeated.items).toBe(state.items);
 		expect(repeated.items[0]).toBe(state.items[0]);
+	});
+
+	it("keeps settled order irreversible across provisional stream updates", () => {
+		const settled = reduce(initialWallState, {
+			type: "metadataSettled",
+			assets: [wallAsset("b", 1, 1), wallAsset("a", 1, 2)],
+		});
+		expect(settled.items.map((item) => item.id)).toEqual(["b", "a"]);
+
+		const emptyStream = reduce(settled, {
+			type: "catalogBatch",
+			assets: [],
+			orderState: "provisional",
+		});
+		expect(emptyStream).toBe(settled);
+
+		const streamed = reduce(emptyStream, {
+			type: "catalogBatch",
+			assets: [wallAsset("c", 1, 0)],
+			orderState: "provisional",
+		});
+		expect(streamed.orderState).toBe("settled");
+		expect(streamed.items.map((item) => item.id)).toEqual(["b", "a", "c"]);
+
+		const paged = reduce(streamed, {
+			type: "pageLoaded",
+			assets: [wallAsset("d", 1, -1)],
+			orderState: "provisional",
+			nextCursor: null,
+		});
+		expect(paged.orderState).toBe("settled");
+		expect(paged.items.map((item) => item.id)).toEqual(["b", "a", "c", "d"]);
+	});
+
+	it("treats cloned nested warning and derivative records as a semantic no-op", () => {
+		const asset: WallAsset = {
+			...wallAsset("a", 1, 1),
+			warning: { code: "unreadable", retryable: true },
+			wallThumbnail: { assetId: "a", kind: "wallThumbnail", key: "thumb" },
+			screenPreview: { assetId: "a", kind: "screenPreview", key: "screen" },
+		};
+		const state = reduce(initialWallState, {
+			type: "catalogBatch",
+			assets: [asset],
+			orderState: "provisional",
+		});
+		const cloned = reduce(state, {
+			type: "catalogBatch",
+			assets: [
+				{
+					...asset,
+					warning: { code: "unreadable", retryable: true },
+					wallThumbnail: {
+						assetId: "a",
+						kind: "wallThumbnail",
+						key: "thumb",
+					},
+					screenPreview: {
+						assetId: "a",
+						kind: "screenPreview",
+						key: "screen",
+					},
+				},
+			],
+			orderState: "provisional",
+		});
+
+		expect(cloned).toBe(state);
+		expect(cloned.items).toBe(state.items);
+		expect(cloned.items[0]).toBe(state.items[0]);
+	});
+
+	it("resets paging exhaustion but retains scan completion when direction changes", () => {
+		const complete = reduce(
+			reduce(initialWallState, {
+				type: "metadataSettled",
+				assets: [wallAsset("a", 1, 1)],
+			}),
+			{
+				type: "pageLoaded",
+				assets: [],
+				orderState: "settled",
+				nextCursor: null,
+			},
+		);
+		expect(isWallLayoutComplete(complete)).toBe(true);
+		const reset = reduce(complete, {
+			type: "setDirection",
+			direction: "newestFirst",
+		});
+
+		expect(reset.scanComplete).toBe(true);
+		expect(reset.pagesExhausted).toBe(false);
+		expect(reset.cursor).toBeNull();
+		expect(reset.items).toEqual([]);
+		expect(isWallLayoutComplete(reset)).toBe(false);
 	});
 
 	it("replaces only matching derivative reference fields", () => {
