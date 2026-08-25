@@ -58,7 +58,23 @@ The default profile keeps its SQLite catalog and generated cache under the opera
 PHOTO_VIEWER_PROFILE=clean-demo npm run desktop:dev
 ```
 
-A named profile isolates local SQLite and cache state below profile-specific application directories. It does not copy, rename, delete, or otherwise modify photos in a selected source folder.
+A named profile isolates the local SQLite catalog and generated derivatives in
+per-user macOS paths below the `app.photoviewer.desktop` Tauri identifier:
+
+- `~/Library/Application Support/app.photoviewer.desktop/profiles/<profile>/catalog.sqlite`
+- `~/Library/Caches/app.photoviewer.desktop/profiles/<profile>/`
+
+For the progressive wall demonstration, use a fresh profile and choose the
+checked-in `apps/interface/public/demo-photos` folder in the native picker:
+
+```bash
+PHOTO_VIEWER_PROFILE=wall-demo npm run desktop:dev
+```
+
+Use another profile name, such as `wall-demo-2`, for another clean run without
+reusing the first catalog or derivative cache. No command in this workflow
+copies, renames, deletes, or otherwise modifies photos in the selected source
+folder.
 
 To create an unsigned macOS application bundle:
 
