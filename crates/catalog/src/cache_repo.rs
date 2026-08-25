@@ -38,7 +38,10 @@ pub struct CacheEvictionGroup {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DerivativeRecord {
     pub id: DerivativeId,
+    pub asset_id: AssetId,
     pub folder_group_id: FolderGroupId,
+    pub kind: String,
+    pub cache_key: String,
     pub relative_cache_path: PathBuf,
     pub size_bytes: u64,
     pub durable: bool,
@@ -137,7 +140,7 @@ impl Catalog {
     ) -> Result<Vec<DerivativeRecord>, CatalogError> {
         let mut records = Vec::new();
         let mut statement = self.connection.prepare(
-            "SELECT id, folder_group_id, relative_cache_path, size_bytes, durable \
+            "SELECT id, asset_id, folder_group_id, kind, cache_key, relative_cache_path, size_bytes, durable \
              FROM derivatives WHERE folder_group_id = ?1 AND durable = 0 ORDER BY id",
         )?;
         for group in groups {
@@ -149,13 +152,39 @@ impl Catalog {
 
     pub fn all_derivatives(&self) -> Result<Vec<DerivativeRecord>, CatalogError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, folder_group_id, relative_cache_path, size_bytes, durable \
+            "SELECT id, asset_id, folder_group_id, kind, cache_key, relative_cache_path, size_bytes, durable \
              FROM derivatives ORDER BY id",
         )?;
         statement
             .query_map([], decode_derivative)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    pub fn derivatives_for_assets(
+        &self,
+        assets: &[AssetId],
+        kind: &str,
+    ) -> Result<Vec<DerivativeRecord>, CatalogError> {
+        let mut statement = self.connection.prepare("SELECT id, asset_id, folder_group_id, kind, cache_key, relative_cache_path, size_bytes, durable FROM derivatives WHERE asset_id = ?1 AND kind = ?2 ORDER BY created_at DESC, id")?;
+        let mut records = Vec::new();
+        for asset in assets {
+            records.extend(
+                statement
+                    .query_map(params![asset.as_uuid().as_bytes(), kind], decode_derivative)?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        Ok(records)
+    }
+
+    pub fn find_derivative(
+        &self,
+        asset: AssetId,
+        kind: &str,
+        key: &str,
+    ) -> Result<Option<DerivativeRecord>, CatalogError> {
+        self.connection.query_row("SELECT id, asset_id, folder_group_id, kind, cache_key, relative_cache_path, size_bytes, durable FROM derivatives WHERE asset_id = ?1 AND kind = ?2 AND cache_key = ?3", params![asset.as_uuid().as_bytes(), kind, key], decode_derivative).optional().map_err(Into::into)
     }
 
     pub fn delete_derivatives(
@@ -208,19 +237,23 @@ impl Catalog {
 
 fn decode_derivative(row: &rusqlite::Row<'_>) -> Result<DerivativeRecord, rusqlite::Error> {
     let id: Vec<u8> = row.get(0)?;
-    let group: Vec<u8> = row.get(1)?;
-    let size_bytes: i64 = row.get(3)?;
+    let asset: Vec<u8> = row.get(1)?;
+    let group: Vec<u8> = row.get(2)?;
+    let size_bytes: i64 = row.get(6)?;
     Ok(DerivativeRecord {
         id: DerivativeId::from_uuid(decode_uuid(id, 0)?),
-        folder_group_id: FolderGroupId::from_uuid(decode_uuid(group, 1)?),
-        relative_cache_path: PathBuf::from(row.get::<_, String>(2)?),
+        asset_id: AssetId::from_uuid(decode_uuid(asset, 1)?),
+        folder_group_id: FolderGroupId::from_uuid(decode_uuid(group, 2)?),
+        kind: row.get(3)?,
+        cache_key: row.get(4)?,
+        relative_cache_path: PathBuf::from(row.get::<_, String>(5)?),
         size_bytes: u64::try_from(size_bytes).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                3,
+                6,
                 rusqlite::types::Type::Integer,
                 Box::new(error),
             )
         })?,
-        durable: row.get(4)?,
+        durable: row.get(7)?,
     })
 }

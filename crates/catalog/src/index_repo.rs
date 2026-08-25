@@ -1,6 +1,7 @@
 use photo_domain::{AssetId, LibraryId};
 use rusqlite::{Connection, params};
 
+use crate::ShapeStatus;
 use crate::asset_repo::upsert_asset_on;
 use crate::{Catalog, CatalogError, NewAsset};
 
@@ -11,6 +12,7 @@ pub struct AssetShapeUpdate {
     pub height: u32,
     pub orientation: Option<u16>,
     pub representative_rgb: Option<u32>,
+    pub shape_status: ShapeStatus,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,7 +85,7 @@ fn apply_record(connection: &Connection, record: &CatalogIndexRecord) -> Result<
         CatalogIndexRecord::Discovered(asset) => upsert_asset_on(connection, asset),
         CatalogIndexRecord::Shaped(shape) => {
             connection.execute(
-                "UPDATE assets SET width = ?2, height = ?3, orientation = ?4, representative_rgb = ?5 \
+                "UPDATE assets SET width = ?2, height = ?3, orientation = ?4, representative_rgb = ?5, shape_status = ?6 \
                  WHERE id = ?1",
                 params![
                     shape.asset_id.as_uuid().as_bytes(),
@@ -91,6 +93,7 @@ fn apply_record(connection: &Connection, record: &CatalogIndexRecord) -> Result<
                     i64::from(shape.height),
                     shape.orientation.map(i64::from),
                     shape.representative_rgb.map(i64::from),
+                    shape.shape_status.as_str(),
                 ],
             )?;
             Ok(())

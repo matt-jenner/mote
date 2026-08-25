@@ -1,4 +1,6 @@
-use photo_domain::{AssetId, Availability, FileSignature, LibraryId, MediaKind, RelativePathKey};
+use photo_domain::{
+    AssetId, Availability, FileSignature, FolderGroupId, LibraryId, MediaKind, RelativePathKey,
+};
 use rusqlite::params;
 
 use crate::library_repo::decode_uuid;
@@ -12,6 +14,7 @@ pub struct NewAsset {
     pub display_path: String,
     pub media_kind: MediaKind,
     pub signature: FileSignature,
+    pub folder_group_id: Option<FolderGroupId>,
 }
 
 impl NewAsset {
@@ -33,6 +36,7 @@ impl NewAsset {
                 modified_unix_ns: 0,
                 sidecar_modified_unix_ns: None,
             },
+            folder_group_id: None,
         }
     }
 }
@@ -52,6 +56,9 @@ pub struct AssetRecord {
     pub representative_rgb: Option<u32>,
     pub captured_at_utc: Option<String>,
     pub rating: Option<u8>,
+    pub folder_group_id: Option<FolderGroupId>,
+    pub provisional_order: u64,
+    pub shape_status: crate::ShapeStatus,
 }
 
 impl Catalog {
@@ -63,7 +70,7 @@ impl Catalog {
         let mut statement = self.connection.prepare(
             "SELECT id, library_id, relative_path_key, display_path, media_kind, size_bytes, \
                     modified_unix_ns, sidecar_modified_unix_ns, availability, width, height, \
-                    orientation, representative_rgb, captured_at_utc, rating \
+                    orientation, representative_rgb, captured_at_utc, rating, folder_group_id, provisional_order, shape_status \
              FROM assets WHERE id = ?1",
         )?;
         let mut rows = statement.query([id.as_uuid().as_bytes()])?;
@@ -79,7 +86,7 @@ impl Catalog {
         after: Option<(String, AssetId)>,
         limit: u32,
     ) -> Result<Vec<AssetRecord>, CatalogError> {
-        const COLUMNS: &str = "id, library_id, relative_path_key, display_path, media_kind, size_bytes, modified_unix_ns, sidecar_modified_unix_ns, availability, width, height, orientation, representative_rgb, captured_at_utc, rating";
+        const COLUMNS: &str = "id, library_id, relative_path_key, display_path, media_kind, size_bytes, modified_unix_ns, sidecar_modified_unix_ns, availability, width, height, orientation, representative_rgb, captured_at_utc, rating, folder_group_id, provisional_order, shape_status";
         let records = if let Some((display_path, id)) = after {
             let sql = format!(
                 "SELECT {COLUMNS} FROM assets \
@@ -124,14 +131,16 @@ pub(crate) fn upsert_asset_on(
     connection.execute(
         "INSERT INTO assets (\
                 id, library_id, relative_path_key, display_path, media_kind, size_bytes, \
-                modified_unix_ns, sidecar_modified_unix_ns, availability \
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available') \
+                modified_unix_ns, sidecar_modified_unix_ns, availability, folder_group_id, provisional_order \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available', ?9, \
+                COALESCE((SELECT MAX(provisional_order) + 1 FROM assets WHERE library_id = ?2), 1)) \
              ON CONFLICT(id) DO UPDATE SET \
                 display_path = excluded.display_path, \
                 media_kind = excluded.media_kind, \
                 size_bytes = excluded.size_bytes, \
                 modified_unix_ns = excluded.modified_unix_ns, \
                 sidecar_modified_unix_ns = excluded.sidecar_modified_unix_ns, \
+                folder_group_id = COALESCE(excluded.folder_group_id, assets.folder_group_id), \
                 availability = excluded.availability",
         params![
             value.id.as_uuid().as_bytes(),
@@ -145,6 +154,7 @@ pub(crate) fn upsert_asset_on(
                 .signature
                 .sidecar_modified_unix_ns
                 .map(|timestamp| timestamp.to_string()),
+            value.folder_group_id.map(|id| id.as_uuid().as_bytes().to_vec()),
         ],
     )?;
     Ok(())
@@ -159,6 +169,7 @@ fn decode_asset(row: &rusqlite::Row<'_>) -> Result<AssetRecord, rusqlite::Error>
     let modified: String = row.get(6)?;
     let sidecar_modified: Option<String> = row.get(7)?;
     let availability: String = row.get(8)?;
+    let group: Option<Vec<u8>> = row.get(15)?;
 
     Ok(AssetRecord {
         id: AssetId::from_uuid(decode_uuid(id, 0)?),
@@ -180,6 +191,12 @@ fn decode_asset(row: &rusqlite::Row<'_>) -> Result<AssetRecord, rusqlite::Error>
         representative_rgb: optional_u32(row, 12)?,
         captured_at_utc: row.get(13)?,
         rating: optional_u8(row, 14)?,
+        folder_group_id: group
+            .map(|id| decode_uuid(id, 15).map(FolderGroupId::from_uuid))
+            .transpose()?,
+        provisional_order: u64::try_from(row.get::<_, i64>(16)?)
+            .map_err(|error| conversion_error(16, rusqlite::types::Type::Integer, error))?,
+        shape_status: crate::ShapeStatus::decode(row.get::<_, String>(17)?.as_str(), 17)?,
     })
 }
 

@@ -10,6 +10,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_catalog.sql"),
     include_str!("../migrations/0002_unavailable_assets.sql"),
     include_str!("../migrations/0003_app_state.sql"),
+    include_str!("../migrations/0004_wall_projection.sql"),
 ];
 
 pub(crate) fn migrate_with(path: &Path, migrations: &[&str]) -> Result<Connection, CatalogError> {

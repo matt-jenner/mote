@@ -8,6 +8,7 @@ mod library_repo;
 mod migrate;
 mod policy_repo;
 mod settings_repo;
+mod wall_repo;
 
 use std::num::ParseIntError;
 use std::path::Path;
@@ -24,6 +25,7 @@ pub use library_repo::{LibraryRootRecord, NewLibrary};
 use rusqlite::Connection;
 pub use settings_repo::{AppStateRecord, StoredSourceSelection};
 use thiserror::Error;
+pub use wall_repo::{ShapeStatus, WallCatalogPage, WallCatalogRecord, WallCursorKey, WallOrder};
 
 pub struct Catalog {
     pub(crate) connection: Connection,

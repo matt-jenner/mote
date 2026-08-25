@@ -1,5 +1,5 @@
 use photo_domain::LibraryId;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use crate::asset_repo::upsert_asset_on;
 use crate::{AssetRecord, Catalog, CatalogError, NewAsset};
@@ -10,6 +10,20 @@ pub struct GenerationCompletion {
 }
 
 impl Catalog {
+    pub fn has_completed_generation(
+        &self,
+        library: LibraryId,
+        generation: u64,
+    ) -> Result<bool, CatalogError> {
+        let generation = i64::try_from(generation).map_err(|_| CatalogError::ValueOutOfRange)?;
+        let completed: Option<i64> = self.connection.query_row(
+            "SELECT completed_at FROM scan_generations WHERE library_id = ?1 AND generation = ?2",
+            params![library.as_uuid().as_bytes(), generation],
+            |row| row.get(0),
+        ).optional()?;
+        Ok(completed.is_some())
+    }
+
     pub fn begin_generation(&mut self, library: LibraryId) -> Result<u64, CatalogError> {
         let transaction = self.connection.transaction()?;
         let current: i64 = transaction.query_row(
