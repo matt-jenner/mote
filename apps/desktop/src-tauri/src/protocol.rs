@@ -1,11 +1,11 @@
 use photo_app_service::{AppService, DerivativeClass, WallUpdate};
-use tauri::http::{Request, Response, StatusCode};
+use tauri::http::{Request, Response, StatusCode, Uri};
 
 pub(crate) fn handle_derivative_request(
     service: &AppService,
     request: Request<Vec<u8>>,
 ) -> Response<Vec<u8>> {
-    let parsed = parse_derivative_path(request.uri().path());
+    let parsed = parse_derivative_uri(request.uri());
     let (asset_id, class, key) = match parsed {
         Ok(value) => value,
         Err(status) => return empty_response(status),
@@ -24,6 +24,19 @@ pub(crate) fn handle_derivative_request(
         }
         Err(_) => empty_response(StatusCode::NOT_FOUND),
     }
+}
+
+fn parse_derivative_uri(uri: &Uri) -> Result<(String, DerivativeClass, String), StatusCode> {
+    let authority = uri.authority().map(|value| value.as_str());
+    let approved_origin = matches!(
+        (uri.scheme_str(), authority),
+        (Some("photo-derivative"), Some("localhost"))
+            | (Some("http"), Some("photo-derivative.localhost"))
+    );
+    if !approved_origin {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    parse_derivative_path(uri.path())
 }
 
 fn parse_derivative_path(path: &str) -> Result<(String, DerivativeClass, String), StatusCode> {
@@ -55,9 +68,30 @@ fn empty_response(status: StatusCode) -> Response<Vec<u8>> {
 }
 
 pub(crate) async fn forward_wall_updates(
-    mut receiver: tokio::sync::broadcast::Receiver<WallUpdate>,
+    receiver: tokio::sync::broadcast::Receiver<WallUpdate>,
     channel: tauri::ipc::Channel<WallUpdate>,
 ) {
+    forward_wall_updates_inner(receiver, channel, |_| {}).await;
+}
+
+#[cfg(test)]
+async fn forward_wall_updates_with_lag_hook<F>(
+    receiver: tokio::sync::broadcast::Receiver<WallUpdate>,
+    channel: tauri::ipc::Channel<WallUpdate>,
+    on_lag: F,
+) where
+    F: FnMut(usize) + Send,
+{
+    forward_wall_updates_inner(receiver, channel, on_lag).await;
+}
+
+async fn forward_wall_updates_inner<F>(
+    mut receiver: tokio::sync::broadcast::Receiver<WallUpdate>,
+    channel: tauri::ipc::Channel<WallUpdate>,
+    mut on_lag: F,
+) where
+    F: FnMut(usize) + Send,
+{
     loop {
         match receiver.recv().await {
             Ok(update) => {
@@ -67,8 +101,10 @@ pub(crate) async fn forward_wall_updates(
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                let retained_window = receiver.len();
+                on_lag(retained_window);
                 let mut newest_progress = None;
-                loop {
+                for _ in 0..retained_window {
                     match receiver.try_recv() {
                         Ok(update) => match update {
                             WallUpdate::CatalogBatch { progress, .. }
@@ -189,6 +225,20 @@ mod tests {
             )
         }
 
+        fn uri_with_authority(&self, authority: &str) -> String {
+            format!(
+                "photo-derivative://{}/{}/{}/{}",
+                authority, self.asset_id, "wallThumbnail", self.reference.key
+            )
+        }
+
+        fn windows_uri(&self) -> String {
+            format!(
+                "http://photo-derivative.localhost/{}/{}/{}",
+                self.asset_id, "wallThumbnail", self.reference.key
+            )
+        }
+
         fn uri_for_missing_asset(&self) -> String {
             format!(
                 "photo-derivative://localhost/00000000-0000-0000-0000-000000000000/wallThumbnail/{}",
@@ -213,6 +263,7 @@ mod tests {
             (fixture.uri_with_key(&"x".repeat(257)), 400),
             (fixture.uri_for_missing_asset(), 404),
             (fixture.uri_with_key("wrong-key"), 404),
+            (fixture.uri_with_authority("unsupported.example"), 400),
         ];
         for (uri, expected) in cases {
             let response = handle_derivative_request(&fixture.service, request(&uri));
@@ -222,6 +273,27 @@ mod tests {
                     .contains(fixture.source_root.to_string_lossy().as_ref())
             );
         }
+    }
+
+    #[test]
+    fn derivative_protocol_returns_jpeg_with_cache_security_headers() {
+        let fixture = ProtocolFixture::with_ready_wall_thumbnail();
+        let response = handle_derivative_request(
+            &fixture.service,
+            request(&fixture.uri_with_authority("localhost")),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["Content-Type"], "image/jpeg");
+        assert_eq!(
+            response.headers()["Cache-Control"],
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(response.headers()["X-Content-Type-Options"], "nosniff");
+        assert_eq!(&response.body()[..2], b"\xff\xd8");
+
+        let windows_response =
+            handle_derivative_request(&fixture.service, request(&fixture.windows_uri()));
+        assert_eq!(windows_response.status(), StatusCode::OK);
     }
 
     fn sample_catalog_batch() -> WallUpdate {
@@ -270,6 +342,72 @@ mod tests {
         assert!(matches!(
             received.lock().unwrap().as_slice(),
             [WallUpdate::CatalogBatch { .. }]
+        ));
+    }
+
+    fn progress(discovered: u64) -> WallUpdate {
+        WallUpdate::Progress {
+            progress: ScanProgressDto {
+                discovered,
+                shaped: discovered,
+                enriched: discovered,
+                total: Some(20),
+            },
+        }
+    }
+
+    fn later_source_update(source_id: &str) -> WallUpdate {
+        WallUpdate::SourceUnavailable {
+            source_id: source_id.to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn wall_update_forwarder_recovers_from_lag_and_resumes_ordered_live_updates() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(4);
+        sender.send(later_source_update("retained-1")).unwrap();
+        sender.send(progress(2)).unwrap();
+        sender.send(later_source_update("retained-3")).unwrap();
+        sender.send(later_source_update("retained-4")).unwrap();
+        sender.send(later_source_update("retained-5")).unwrap();
+        sender.send(progress(6)).unwrap();
+
+        let received = Arc::new(Mutex::new(Vec::<WallUpdate>::new()));
+        let sink = received.clone();
+        let (snapshot_sent, snapshot_received) = tokio::sync::oneshot::channel();
+        let first = Arc::new(Mutex::new(Some(snapshot_sent)));
+        let first_signal = first.clone();
+        let channel = tauri::ipc::Channel::new(move |body| {
+            let update = body.deserialize::<WallUpdate>().unwrap();
+            if matches!(update, WallUpdate::Progress { .. })
+                && let Some(signal) = first_signal.lock().unwrap().take()
+            {
+                let _ = signal.send(());
+            }
+            sink.lock().unwrap().push(update);
+            Ok(())
+        });
+        let mut later_sender = Some(sender.clone());
+        let task = tokio::spawn(forward_wall_updates_with_lag_hook(
+            receiver,
+            channel,
+            move |_| {
+                let later_sender = later_sender.take().unwrap();
+                later_sender.send(later_source_update("live-7")).unwrap();
+                later_sender.send(later_source_update("live-8")).unwrap();
+            },
+        ));
+        snapshot_received.await.unwrap();
+        drop(sender);
+        task.await.unwrap();
+
+        let received = received.lock().unwrap();
+        assert!(matches!(
+            received.as_slice(),
+            [
+                WallUpdate::Progress { progress: ScanProgressDto { discovered: 6, .. } },
+                WallUpdate::SourceUnavailable { source_id },
+            ] if source_id == "live-8"
         ));
     }
 }
