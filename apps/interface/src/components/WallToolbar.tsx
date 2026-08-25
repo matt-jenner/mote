@@ -6,18 +6,27 @@ interface WallToolbarProps {
 	direction: SortDirection;
 	onDirectionChange: (direction: SortDirection) => void;
 	status: string;
+	onRetry?: () => void;
+	retryable?: boolean;
 }
 
 export function WallToolbar({
 	direction,
 	onDirectionChange,
 	status,
+	onRetry,
+	retryable = false,
 }: WallToolbarProps) {
 	return (
 		<div className={styles.wallToolbar}>
 			<div aria-live="polite" className={styles.progress} role="status">
 				{status}
 			</div>
+			{retryable && onRetry ? (
+				<button className={styles.retryButton} onClick={onRetry} type="button">
+					Retry
+				</button>
+			) : null}
 			<fieldset aria-label="Photo order" className={styles.sortControls}>
 				<button
 					aria-pressed={direction === "oldestFirst"}

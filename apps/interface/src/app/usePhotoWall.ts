@@ -16,10 +16,19 @@ type ScanCapableService = ReturnType<typeof usePhotoService> & {
 	startFixtureScan?: () => Promise<void>;
 };
 
+interface RequestOwner {
+	sourceId: string;
+	generation: number;
+	requestId: WallRequestId;
+	cursor: string | null;
+	epoch: number;
+}
+
 export interface PhotoWallController {
 	state: typeof initialWallState;
 	loading: boolean;
 	status: string;
+	retry: () => void;
 	loadMore: () => void;
 	setDirection: (direction: SortDirection) => void;
 	requestVisibleDerivatives: (assetIds: readonly string[]) => void;
@@ -28,55 +37,87 @@ export interface PhotoWallController {
 	layoutComplete: boolean;
 }
 
-function wallStatus(state: typeof initialWallState, loading: boolean): string {
-	if (state.items.length === 0 && !loading && state.pagesExhausted)
-		return "No photos found · Folder ready";
-	if (!state.scanComplete) return "Indexing photos";
-	if (loading) return `${state.items.length} photos loading`;
+function wallStatus(state: typeof initialWallState): string {
+	if (state.error) return state.error;
+	if (!state.scanComplete)
+		return state.items.length === 0
+			? "Folder ready · Indexing photos"
+			: "Indexing photos";
+	if (state.items.length === 0 && state.pagesExhausted && !state.activeRequest)
+		return "No photos found";
+	if (state.activeRequest) return `${state.items.length} photos loading`;
 	return `${state.items.length} photos ready`;
 }
 
 export function usePhotoWall(sourceId: string | null): PhotoWallController {
 	const service = usePhotoService();
 	const [state, dispatch] = useReducer(wallReducer, initialWallState);
+	const stateRef = useRef(state);
+	stateRef.current = state;
 	const requestNumber = useRef(0);
-	const requestInFlight = useRef(false);
+	const sourceIdRef = useRef(sourceId);
+	const sourceGeneration = useRef(0);
+	const ownerRef = useRef<RequestOwner | null>(null);
 	const settlementPending = useRef(false);
+	const failedCursor = useRef<string | null>(null);
 	const derivativeRequests = useRef(new Map<string, DerivativePriority>());
 	const wallInteractionTimer = useRef<number | null>(null);
 	const wallInteractionActive = useRef(false);
-	const stateRef = useRef(state);
-	stateRef.current = state;
+
+	const isLive = useCallback(
+		(generation: number, expectedSourceId: string) =>
+			sourceGeneration.current === generation &&
+			sourceIdRef.current === expectedSourceId,
+		[],
+	);
 
 	const loadPage = useCallback(
-		(cursor: string | null, settle = false) => {
-			if (!sourceId || requestInFlight.current) return;
-			requestInFlight.current = true;
+		(cursor: string | null, settle = false, generationOverride?: number) => {
+			const expectedSourceId = sourceId;
+			if (!expectedSourceId) return;
+			const generation = generationOverride ?? sourceGeneration.current;
+			if (!isLive(generation, expectedSourceId) || ownerRef.current) return;
 			const requestId: WallRequestId = ++requestNumber.current;
-			const requestEpoch = stateRef.current.scrollEpoch;
-			const requestCursor = cursor;
-			// This action must precede the service call so every response is fenced.
+			const owner: RequestOwner = {
+				sourceId: expectedSourceId,
+				generation,
+				requestId,
+				cursor,
+				epoch:
+					generationOverride === undefined ? stateRef.current.scrollEpoch : 0,
+			};
+			ownerRef.current = owner;
 			dispatch({
 				type: "pageRequestStarted",
 				requestId,
-				requestCursor,
-				requestEpoch,
+				requestCursor: cursor,
+				requestEpoch: owner.epoch,
+				sourceGeneration: generation,
 			});
 			void service
 				.queryWall({
-					cursor: requestCursor,
+					cursor,
 					limit: 100,
-					direction: stateRef.current.direction,
+					direction:
+						generationOverride === undefined
+							? stateRef.current.direction
+							: "oldestFirst",
 				})
 				.then((page) => {
+					if (
+						ownerRef.current !== owner ||
+						!isLive(generation, expectedSourceId)
+					)
+						return;
 					if (settle) {
 						dispatch({
 							type: "metadataSettled",
 							assets: page.items,
 							nextCursor: page.nextCursor,
-							requestEpoch,
-							requestCursor,
+							requestEpoch: owner.epoch,
+							requestCursor: cursor,
 							requestId,
+							sourceGeneration: generation,
 						});
 					} else {
 						dispatch({
@@ -84,29 +125,67 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 							assets: page.items,
 							orderState: page.orderState,
 							nextCursor: page.nextCursor,
-							requestEpoch,
-							requestCursor,
+							requestEpoch: owner.epoch,
+							requestCursor: cursor,
 							requestId,
+							sourceGeneration: generation,
 						});
 					}
 				})
-				.catch(() => {
-					// The service reports recoverable warnings through its update stream.
+				.catch((_error: unknown) => {
+					if (
+						ownerRef.current !== owner ||
+						!isLive(generation, expectedSourceId)
+					)
+						return;
+					failedCursor.current = cursor;
+					dispatch({
+						type: "pageRequestFailed",
+						requestId,
+						requestCursor: cursor,
+						requestEpoch: owner.epoch,
+						sourceGeneration: generation,
+						error: "Unable to load photos. Try again.",
+					});
 				})
 				.finally(() => {
-					requestInFlight.current = false;
+					if (
+						ownerRef.current !== owner ||
+						!isLive(generation, expectedSourceId)
+					)
+						return;
+					ownerRef.current = null;
 					if (settlementPending.current) {
 						settlementPending.current = false;
-						queueMicrotask(() => loadPage(null, true));
+						queueMicrotask(() => loadPage(null, true, generation));
 					}
 				});
 		},
-		[sourceId, service],
+		[isLive, service, sourceId],
 	);
 
 	useEffect(() => {
-		if (!sourceId) return;
+		const expectedSourceId = sourceId;
+		const generation = sourceGeneration.current + 1;
+		sourceGeneration.current = generation;
+		sourceIdRef.current = expectedSourceId;
+		ownerRef.current = null;
+		settlementPending.current = false;
+		failedCursor.current = null;
+		derivativeRequests.current.clear();
+		if (wallInteractionTimer.current !== null) {
+			window.clearTimeout(wallInteractionTimer.current);
+			wallInteractionTimer.current = null;
+		}
+		if (wallInteractionActive.current) {
+			wallInteractionActive.current = false;
+			void service.setWallInteraction(false);
+		}
+		dispatch({ type: "resetSource", sourceGeneration: generation });
+		if (!expectedSourceId) return;
 		const stop = service.watchWallUpdates((update: WallUpdate) => {
+			if (!isLive(generation, expectedSourceId)) return;
+			if ("sourceId" in update && update.sourceId !== expectedSourceId) return;
 			switch (update.kind) {
 				case "catalogBatch":
 					dispatch({ type: "catalogBatch", ...update });
@@ -118,38 +197,67 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 					});
 					break;
 				case "metadataSettled":
-					if (requestInFlight.current) settlementPending.current = true;
-					else loadPage(null, true);
+					if (ownerRef.current) settlementPending.current = true;
+					else loadPage(null, true, generation);
+					break;
+				case "sourceUnavailable":
+					dispatch({
+						type: "wallError",
+						sourceGeneration: generation,
+						error: "Source unavailable. Try again.",
+					});
 					break;
 				default:
 					break;
 			}
 		});
 		void (service as ScanCapableService).startFixtureScan?.();
-		loadPage(null);
-		return stop;
-	}, [loadPage, service, sourceId]);
-
-	const setDirection = useCallback((direction: SortDirection) => {
-		dispatch({ type: "setDirection", direction });
-		requestInFlight.current = false;
-	}, []);
+		queueMicrotask(() => {
+			if (isLive(generation, expectedSourceId))
+				loadPage(null, false, generation);
+		});
+		return () => {
+			stop();
+			if (sourceGeneration.current === generation) {
+				ownerRef.current = null;
+				settlementPending.current = false;
+			}
+		};
+	}, [isLive, loadPage, service, sourceId]);
 
 	useEffect(() => {
-		if (state.scrollEpoch === 0 || !sourceId) return;
+		if (
+			state.scrollEpoch === 0 ||
+			!sourceId ||
+			state.sourceGeneration !== sourceGeneration.current
+		)
+			return;
+		ownerRef.current = null;
 		loadPage(null);
-	}, [loadPage, sourceId, state.scrollEpoch]);
+	}, [loadPage, sourceId, state.scrollEpoch, state.sourceGeneration]);
+
+	const setDirection = useCallback((direction: SortDirection) => {
+		ownerRef.current = null;
+		settlementPending.current = false;
+		dispatch({ type: "setDirection", direction });
+	}, []);
 
 	const loadMore = useCallback(() => {
-		if (state.pagesExhausted || requestInFlight.current) return;
+		if (state.pagesExhausted || ownerRef.current) return;
 		loadPage(state.cursor);
 	}, [loadPage, state.cursor, state.pagesExhausted]);
 
+	const retry = useCallback(() => {
+		if (!state.error) return;
+		ownerRef.current = null;
+		dispatch({ type: "setDirection", direction: state.direction });
+		loadPage(failedCursor.current);
+	}, [loadPage, state.direction, state.error]);
+
 	const requestDerivatives = useCallback(
 		(assetIds: readonly string[], priority: DerivativePriority) => {
-			const unique = [...new Set(assetIds)].filter(Boolean);
 			const next: string[] = [];
-			for (const assetId of unique) {
+			for (const assetId of new Set(assetIds)) {
 				const previous = derivativeRequests.current.get(assetId);
 				if (previous === "visible" || previous === priority) continue;
 				derivativeRequests.current.set(assetId, priority);
@@ -198,7 +306,8 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 		() => ({
 			state,
 			loading: state.activeRequest !== null,
-			status: wallStatus(state, state.activeRequest !== null),
+			status: wallStatus(state),
+			retry,
 			loadMore,
 			setDirection,
 			requestVisibleDerivatives: (ids: readonly string[]) =>
@@ -208,6 +317,13 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 			setWallInteraction,
 			layoutComplete: isWallLayoutComplete(state),
 		}),
-		[loadMore, requestDerivatives, setDirection, setWallInteraction, state],
+		[
+			loadMore,
+			requestDerivatives,
+			retry,
+			setDirection,
+			setWallInteraction,
+			state,
+		],
 	);
 }

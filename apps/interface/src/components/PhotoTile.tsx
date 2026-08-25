@@ -19,7 +19,7 @@ function rgb(value: number | null): string | undefined {
 export function PhotoTile({ positioned, service }: PhotoTileProps) {
 	const { asset } = positioned;
 	const [loaded, setLoaded] = useState(false);
-	const [failed, setFailed] = useState(asset.shapeState === "fallback");
+	const [failed, setFailed] = useState(false);
 	const thumbnail = asset.wallThumbnail;
 	const shapeState = asset.shapeState;
 	const thumbnailKey = thumbnail?.key;
@@ -36,8 +36,10 @@ export function PhotoTile({ positioned, service }: PhotoTileProps) {
 	useEffect(() => {
 		if (previousThumbnailKey.current !== thumbnailKey) setLoaded(false);
 		previousThumbnailKey.current = thumbnailKey;
-		setFailed(shapeState === "fallback");
-	}, [shapeState, thumbnailKey]);
+		setFailed(
+			(shapeState === "fallback" || asset.availability !== "available") && !url,
+		);
+	}, [asset.availability, shapeState, thumbnailKey, url]);
 
 	const style = {
 		width: `${positioned.width}px`,
@@ -71,9 +73,6 @@ export function PhotoTile({ positioned, service }: PhotoTileProps) {
 					) : null}
 				</>
 			)}
-			<figcaption className={styles.visuallyHidden}>
-				{asset.displayName}
-			</figcaption>
 		</figure>
 	);
 }

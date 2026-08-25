@@ -100,6 +100,7 @@ export interface ScanProgressDto {
 export type WallUpdate =
 	| {
 			kind: "catalogBatch";
+			sourceId?: string;
 			assets: WallAsset[];
 			orderState: OrderState;
 			progress: ScanProgressDto;

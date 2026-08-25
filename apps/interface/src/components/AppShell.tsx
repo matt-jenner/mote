@@ -1,10 +1,12 @@
 import { Menu, X } from "lucide-react";
 import { type KeyboardEvent, useEffect, useRef, useState } from "react";
 import { useAppController } from "../app/useAppController";
+import { usePhotoWall } from "../app/usePhotoWall";
 import styles from "../styles/appShell.module.css";
 import { AppearanceMenu } from "./AppearanceMenu";
 import { NavigationRail } from "./NavigationRail";
 import { SourceCanvas } from "./SourceCanvas";
+import { WallToolbar } from "./WallToolbar";
 
 export function AppShell() {
 	const controller = useAppController();
@@ -14,6 +16,7 @@ export function AppShell() {
 	const drawerCloseRef = useRef<HTMLButtonElement>(null);
 	const drawerWasOpen = useRef(false);
 	const source = controller.state?.activeSource ?? null;
+	const wall = usePhotoWall(source?.id ?? null);
 	const appearance = controller.state?.settings.appearance ?? "system";
 	const chooseFolder = () => controller.chooseFolder();
 
@@ -95,6 +98,15 @@ export function AppShell() {
 							{source?.displayName ?? "Library"}
 						</span>
 					</div>
+					{source ? (
+						<WallToolbar
+							direction={wall.state.direction}
+							onDirectionChange={wall.setDirection}
+							onRetry={wall.retry}
+							status={wall.status}
+							retryable={Boolean(wall.state.error)}
+						/>
+					) : null}
 					<AppearanceMenu
 						onChange={controller.updateAppearance}
 						value={appearance}
@@ -114,6 +126,7 @@ export function AppShell() {
 						chooseFolderAvailable={controller.capabilities.chooseFolder}
 						onChooseFolder={chooseFolder}
 						source={source}
+						wall={wall}
 					/>
 				)}
 			</section>

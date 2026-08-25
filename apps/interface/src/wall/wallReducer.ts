@@ -15,6 +15,8 @@ export interface WallState {
 	pagesExhausted: boolean;
 	settled: boolean;
 	activeRequest: PageRequest | null;
+	sourceGeneration: number;
+	error: string | null;
 }
 
 export type WallRequestId = string | number;
@@ -39,13 +41,29 @@ export type WallAction =
 			requestCursor: string | null;
 			requestEpoch: number;
 			requestId: WallRequestId;
+			sourceGeneration?: number;
 	  }
 	| {
 			type: "pageRequestStarted";
 			requestId: WallRequestId;
 			requestCursor: string | null;
 			requestEpoch: number;
+			sourceGeneration?: number;
 	  }
+	| {
+			type: "pageRequestFailed";
+			requestId: WallRequestId;
+			requestCursor: string | null;
+			requestEpoch: number;
+			error: string;
+			sourceGeneration?: number;
+	  }
+	| {
+			type: "wallError";
+			error: string;
+			sourceGeneration?: number;
+	  }
+	| { type: "resetSource"; sourceGeneration: number }
 	| { type: "derivativesReady"; derivatives: readonly DerivativeReference[] }
 	| {
 			type: "metadataSettled";
@@ -54,6 +72,7 @@ export type WallAction =
 			requestEpoch: number;
 			requestCursor: string | null;
 			requestId: WallRequestId;
+			sourceGeneration?: number;
 	  }
 	| { type: "setDirection"; direction: SortDirection };
 
@@ -67,6 +86,8 @@ export const initialWallState: WallState = {
 	pagesExhausted: false,
 	settled: false,
 	activeRequest: null,
+	sourceGeneration: 0,
+	error: null,
 };
 
 export function isWallLayoutComplete(
@@ -88,6 +109,13 @@ function matchesActiveRequest(
 		active.cursor === requestCursor &&
 		active.epoch === requestEpoch &&
 		requestEpoch === state.scrollEpoch
+	);
+}
+
+function matchesSource(state: WallState, sourceGeneration?: number): boolean {
+	return (
+		sourceGeneration === undefined ||
+		sourceGeneration === state.sourceGeneration
 	);
 }
 
@@ -185,6 +213,7 @@ function reuseSequence(previous: WallAsset[], next: WallAsset[]): WallAsset[] {
 export function wallReducer(state: WallState, action: WallAction): WallState {
 	switch (action.type) {
 		case "pageRequestStarted": {
+			if (!matchesSource(state, action.sourceGeneration)) return state;
 			if (action.requestEpoch !== state.scrollEpoch) return state;
 			if (
 				action.requestCursor !== null &&
@@ -222,6 +251,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			};
 		}
 		case "pageLoaded": {
+			if (!matchesSource(state, action.sourceGeneration)) return state;
 			if (
 				!matchesActiveRequest(
 					state,
@@ -262,8 +292,25 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				scanComplete: state.scanComplete || settledPage,
 				settled: state.settled || settledPage,
 				activeRequest: null,
+				error: null,
 			};
 		}
+		case "pageRequestFailed": {
+			if (!matchesSource(state, action.sourceGeneration)) return state;
+			if (
+				!matchesActiveRequest(
+					state,
+					action.requestId,
+					action.requestCursor,
+					action.requestEpoch,
+				)
+			)
+				return state;
+			return { ...state, activeRequest: null, error: action.error };
+		}
+		case "wallError":
+			if (!matchesSource(state, action.sourceGeneration)) return state;
+			return { ...state, activeRequest: null, error: action.error };
 		case "derivativesReady": {
 			if (action.derivatives.length === 0 || state.items.length === 0)
 				return state;
@@ -291,6 +338,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			return changed ? { ...state, items } : state;
 		}
 		case "metadataSettled": {
+			if (!matchesSource(state, action.sourceGeneration)) return state;
 			if (
 				!matchesActiveRequest(
 					state,
@@ -311,8 +359,14 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				pagesExhausted: action.nextCursor === null,
 				settled: true,
 				activeRequest: null,
+				error: null,
 			};
 		}
+		case "resetSource":
+			return {
+				...initialWallState,
+				sourceGeneration: action.sourceGeneration,
+			};
 		case "setDirection": {
 			if (state.direction === action.direction) return state;
 			return {
@@ -321,6 +375,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				cursor: null,
 				pagesExhausted: false,
 				activeRequest: null,
+				error: null,
 				direction: action.direction,
 				scrollEpoch: state.scrollEpoch + 1,
 			};

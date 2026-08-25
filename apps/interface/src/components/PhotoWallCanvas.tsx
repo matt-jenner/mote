@@ -1,27 +1,35 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { usePhotoService } from "../app/PhotoServiceContext";
-import { usePhotoWall } from "../app/usePhotoWall";
+import type { PhotoWallController } from "../app/usePhotoWall";
 import type { SourceSummary } from "../services/photoService";
 import styles from "../styles/photoWall.module.css";
 import { layoutJustifiedRows } from "../wall/layoutJustifiedRows";
 import { JustifiedWall } from "./JustifiedWall";
-import { WallToolbar } from "./WallToolbar";
 
 interface PhotoWallCanvasProps {
 	source: SourceSummary;
+	wall: PhotoWallController;
 }
 
-export function PhotoWallCanvas({ source }: PhotoWallCanvasProps) {
+export function PhotoWallCanvas({
+	source: _source,
+	wall,
+}: PhotoWallCanvasProps) {
 	const service = usePhotoService();
-	const wall = usePhotoWall(source.id);
 	const regionRef = useRef<HTMLElement>(null);
 	const [containerWidth, setContainerWidth] = useState(0);
 
 	useEffect(() => {
 		const region = regionRef.current;
 		if (!region) return;
-		const measure = () =>
-			setContainerWidth(Math.max(0, region.clientWidth - 32));
+		const measure = () => {
+			const padding = Number.parseFloat(
+				getComputedStyle(region).getPropertyValue("--wall-content-padding"),
+			);
+			const inset = Number.isFinite(padding) ? padding : 0;
+			const width = region.clientWidth || window.innerWidth;
+			setContainerWidth(Math.max(0, width - inset * 2));
+		};
 		measure();
 		if (typeof ResizeObserver !== "undefined") {
 			const observer = new ResizeObserver(measure);
@@ -38,6 +46,11 @@ export function PhotoWallCanvas({ source }: PhotoWallCanvasProps) {
 		return () => window.removeEventListener("resize", reportResize);
 	}, [wall.setWallInteraction]);
 
+	const scrollEpoch = wall.state.scrollEpoch;
+	useEffect(() => {
+		if (scrollEpoch >= 0 && regionRef.current) regionRef.current.scrollTop = 0;
+	}, [scrollEpoch]);
+
 	const rows = useMemo(() => {
 		if (containerWidth <= 0 || wall.state.items.length === 0) return [];
 		const layoutAssets = wall.state.items.map((asset) =>
@@ -53,19 +66,8 @@ export function PhotoWallCanvas({ source }: PhotoWallCanvasProps) {
 		});
 	}, [containerWidth, wall.layoutComplete, wall.state.items]);
 
-	const changeDirection = (direction: "oldestFirst" | "newestFirst") => {
-		if (direction === wall.state.direction) return;
-		if (regionRef.current) regionRef.current.scrollTop = 0;
-		wall.setDirection(direction);
-	};
-
 	return (
 		<main className={styles.wallCanvas}>
-			<WallToolbar
-				direction={wall.state.direction}
-				onDirectionChange={changeDirection}
-				status={wall.status}
-			/>
 			<JustifiedWall
 				assets={wall.state.items}
 				loadMore={wall.loadMore}
@@ -75,6 +77,7 @@ export function PhotoWallCanvas({ source }: PhotoWallCanvasProps) {
 				rows={rows}
 				service={service}
 				setWallInteraction={wall.setWallInteraction}
+				showEmpty={wall.layoutComplete && !wall.loading && !wall.state.error}
 			/>
 		</main>
 	);

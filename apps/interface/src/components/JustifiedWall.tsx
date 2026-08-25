@@ -12,6 +12,7 @@ interface JustifiedWallProps {
 	requestVisibleDerivatives: (assetIds: readonly string[]) => void;
 	requestNearViewportDerivatives: (assetIds: readonly string[]) => void;
 	setWallInteraction: (active: boolean) => void;
+	showEmpty: boolean;
 	regionRef?: RefObject<HTMLElement | null>;
 }
 
@@ -23,6 +24,7 @@ export function JustifiedWall({
 	requestVisibleDerivatives,
 	requestNearViewportDerivatives,
 	setWallInteraction,
+	showEmpty,
 	regionRef: forwardedRegionRef,
 }: JustifiedWallProps) {
 	const localRegionRef = useRef<HTMLElement>(null);
@@ -32,12 +34,21 @@ export function JustifiedWall({
 	useEffect(() => {
 		const root = regionRef.current;
 		if (!root) return;
-		const firstRowIds = rows[0]?.items.map((item) => item.asset.id) ?? [];
-		const nearRowIds = rows
-			.slice(0, 2)
-			.flatMap((row) => row.items.map((item) => item.asset.id));
-		if (firstRowIds.length > 0) requestVisibleDerivatives(firstRowIds);
-		if (nearRowIds.length > 0) requestNearViewportDerivatives(nearRowIds);
+		const visibleIds = new Set<string>();
+		const nearIds = new Set<string>();
+		let frame: number | null = null;
+		const flush = () => {
+			frame = null;
+			const visible = [...visibleIds];
+			const near = [...nearIds].filter((id) => !visibleIds.has(id));
+			visibleIds.clear();
+			nearIds.clear();
+			if (visible.length > 0) requestVisibleDerivatives(visible);
+			if (near.length > 0) requestNearViewportDerivatives(near);
+		};
+		const schedule = () => {
+			if (frame === null) frame = window.requestAnimationFrame(flush);
+		};
 		const sentinel = sentinelRef.current;
 		if (!sentinel || typeof IntersectionObserver === "undefined") {
 			return;
@@ -52,21 +63,23 @@ export function JustifiedWall({
 
 		const visibleObserver = new IntersectionObserver(
 			(entries) => {
-				const ids = entries
-					.filter((entry) => entry.isIntersecting)
-					.map((entry) => (entry.target as HTMLElement).dataset.assetId)
-					.filter((id): id is string => Boolean(id));
-				if (ids.length > 0) requestVisibleDerivatives(ids);
+				for (const entry of entries) {
+					if (!entry.isIntersecting) continue;
+					const id = (entry.target as HTMLElement).dataset.assetId;
+					if (id) visibleIds.add(id);
+				}
+				schedule();
 			},
 			{ root, rootMargin: "0px" },
 		);
 		const nearObserver = new IntersectionObserver(
 			(entries) => {
-				const ids = entries
-					.filter((entry) => entry.isIntersecting)
-					.map((entry) => (entry.target as HTMLElement).dataset.assetId)
-					.filter((id): id is string => Boolean(id));
-				if (ids.length > 0) requestNearViewportDerivatives(ids);
+				for (const entry of entries) {
+					if (!entry.isIntersecting) continue;
+					const id = (entry.target as HTMLElement).dataset.assetId;
+					if (id) nearIds.add(id);
+				}
+				schedule();
 			},
 			{ root, rootMargin: "720px 0px" },
 		);
@@ -75,6 +88,7 @@ export function JustifiedWall({
 			nearObserver.observe(tile);
 		}
 		return () => {
+			if (frame !== null) window.cancelAnimationFrame(frame);
 			loadObserver.disconnect();
 			visibleObserver.disconnect();
 			nearObserver.disconnect();
@@ -83,7 +97,6 @@ export function JustifiedWall({
 		loadMore,
 		requestNearViewportDerivatives,
 		requestVisibleDerivatives,
-		rows,
 		regionRef.current,
 	]);
 
@@ -94,15 +107,16 @@ export function JustifiedWall({
 		const events = [
 			"pointerdown",
 			"pointermove",
-			"keydown",
 			"touchstart",
 			"wheel",
 			"scroll",
 		];
 		for (const event of events)
 			root.addEventListener(event, report, { passive: true });
+		window.addEventListener("keydown", report, { passive: true });
 		return () => {
 			for (const event of events) root.removeEventListener(event, report);
+			window.removeEventListener("keydown", report);
 		};
 	}, [setWallInteraction, regionRef.current]);
 
@@ -129,7 +143,7 @@ export function JustifiedWall({
 					className={styles.loadSentinel}
 					ref={sentinelRef}
 				/>
-				{rows.length === 0 && assets.length === 0 ? (
+				{showEmpty && rows.length === 0 && assets.length === 0 ? (
 					<div className={styles.emptyWall}>No photos found</div>
 				) : null}
 			</div>

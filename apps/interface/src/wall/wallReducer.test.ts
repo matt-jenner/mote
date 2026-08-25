@@ -35,6 +35,93 @@ function reduce(state: typeof initialWallState, action: WallAction) {
 }
 
 describe("wallReducer", () => {
+	it("resets a source and ignores stale failures from the prior source", () => {
+		const request = reduce(initialWallState, {
+			type: "pageRequestStarted",
+			requestId: "a-1",
+			requestCursor: null,
+			requestEpoch: 0,
+			sourceGeneration: 1,
+		});
+		const reset = reduce(request, {
+			type: "resetSource",
+			sourceGeneration: 2,
+		});
+		const stale = reduce(reset, {
+			type: "pageRequestFailed",
+			requestId: "a-1",
+			requestCursor: null,
+			requestEpoch: 0,
+			sourceGeneration: 1,
+			error: "old source failed",
+		});
+		expect(stale).toEqual(reset);
+		expect(stale.items).toEqual([]);
+	});
+
+	it("accepts a generation-fenced first page after source reset", () => {
+		const reset = reduce(initialWallState, {
+			type: "resetSource",
+			sourceGeneration: 1,
+		});
+		const started = reduce(reset, {
+			type: "pageRequestStarted",
+			requestId: "first",
+			requestCursor: null,
+			requestEpoch: 0,
+			sourceGeneration: 1,
+		});
+		const loaded = reduce(started, {
+			type: "pageLoaded",
+			assets: [wallAsset("one", 1)],
+			orderState: "provisional",
+			nextCursor: null,
+			requestCursor: null,
+			requestEpoch: 0,
+			requestId: "first",
+			sourceGeneration: 1,
+		});
+		expect(loaded.items.map((item) => item.id)).toEqual(["one"]);
+	});
+
+	it("clears a matching failed request and keeps a retryable error", () => {
+		const source = reduce(initialWallState, {
+			type: "resetSource",
+			sourceGeneration: 4,
+		});
+		const request = reduce(source, {
+			type: "pageRequestStarted",
+			requestId: "request-1",
+			requestCursor: null,
+			requestEpoch: 0,
+			sourceGeneration: 4,
+		});
+		const failed = reduce(request, {
+			type: "pageRequestFailed",
+			requestId: "request-1",
+			requestCursor: null,
+			requestEpoch: 0,
+			sourceGeneration: 4,
+			error: "Try again",
+		});
+		expect(failed.activeRequest).toBeNull();
+		expect(failed.error).toBe("Try again");
+	});
+
+	it("surfaces a source-scoped error even when no request is active", () => {
+		const source = reduce(initialWallState, {
+			type: "resetSource",
+			sourceGeneration: 4,
+		});
+		const errored = reduce(source, {
+			type: "wallError",
+			sourceGeneration: 4,
+			error: "Source unavailable. Try again.",
+		});
+		expect(errored.error).toBe("Source unavailable. Try again.");
+		expect(errored.activeRequest).toBeNull();
+	});
+
 	it("merges idempotently, refines in place, and resets once at settlement", () => {
 		const provisional = reduce(initialWallState, {
 			type: "catalogBatch",

@@ -212,6 +212,7 @@ export function createInMemoryPhotoService(
 				await delay(options.geometryDelayMs ?? 0);
 				publish({
 					kind: "catalogBatch",
+					sourceId,
 					assets: clone(assets),
 					orderState: "provisional",
 					progress: progress(0),

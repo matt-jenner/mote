@@ -1,4 +1,5 @@
 import { FolderOpen } from "lucide-react";
+import type { PhotoWallController } from "../app/usePhotoWall";
 import type { SourceSummary } from "../services/photoService";
 import styles from "../styles/appShell.module.css";
 import { PhotoWallCanvas } from "./PhotoWallCanvas";
@@ -7,14 +8,16 @@ interface SourceCanvasProps {
 	source: SourceSummary | null;
 	chooseFolderAvailable: boolean;
 	onChooseFolder: () => void;
+	wall: PhotoWallController;
 }
 
 export function SourceCanvas({
 	source,
 	chooseFolderAvailable,
 	onChooseFolder,
+	wall,
 }: SourceCanvasProps) {
-	if (source) return <PhotoWallCanvas source={source} />;
+	if (source) return <PhotoWallCanvas source={source} wall={wall} />;
 	return (
 		<main className={styles.canvas}>
 			<div className={styles.emptyState}>
