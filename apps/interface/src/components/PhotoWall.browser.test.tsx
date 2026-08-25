@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import axe from "axe-core";
 import { useState } from "react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { page } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { PhotoServiceProvider } from "../app/PhotoServiceContext";
@@ -460,6 +460,114 @@ describe("progressive photo wall", () => {
 		expect(near?.assetIds).not.toContain("coast");
 	});
 
+	it("re-observes replacement tiles after a responsive row regroup", async () => {
+		await page.viewport(1440, 1024);
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(0, pageOf(realFixtureAssets, "settled"));
+		const wall = screen.getByRole("region", { name: "Photos" });
+		await expect
+			.poll(() => wall.element().querySelector("[data-asset-id='coast']"))
+			.not.toBeNull();
+		const before = new Set([
+			...wall.element().querySelectorAll("[data-asset-id]"),
+		]);
+		await page.viewport(390, 844);
+		await expect
+			.poll(() =>
+				[...wall.element().querySelectorAll("[data-asset-id]")].some(
+					(tile) => !before.has(tile),
+				),
+			)
+			.toBe(true);
+		const replacement = [
+			...wall.element().querySelectorAll<HTMLElement>("[data-asset-id]"),
+		].find((tile) => !before.has(tile));
+		const replacementId = replacement?.dataset.assetId;
+		expect(replacementId).toBeTruthy();
+		if (!replacementId) return;
+		await expect
+			.poll(() =>
+				TestIntersectionObserver.isObserving(
+					"visible",
+					wall.element(),
+					replacementId,
+				),
+			)
+			.toBe(true);
+		TestIntersectionObserver.trigger("visible", wall.element(), [
+			replacementId,
+		]);
+		TestIntersectionObserver.trigger("near", wall.element(), ["coast"]);
+		await expect.poll(() => service.derivativeRequests.length).toBe(2);
+		screen.unmount();
+	});
+
+	it("preserves visible-first dedupe when intersections share one RAF", async () => {
+		const callbacks: FrameRequestCallback[] = [];
+		const originalRequestAnimationFrame = window.requestAnimationFrame;
+		const originalCancelAnimationFrame = window.cancelAnimationFrame;
+		Object.defineProperty(window, "requestAnimationFrame", {
+			configurable: true,
+			value: (callback: FrameRequestCallback) => {
+				callbacks.push(callback);
+				return callbacks.length;
+			},
+		});
+		Object.defineProperty(window, "cancelAnimationFrame", {
+			configurable: true,
+			value: () => undefined,
+		});
+		try {
+			const service = new ControlledWallService();
+			const screen = await renderWall(service);
+			await expect.poll(() => service.queryRequests.length).toBe(1);
+			service.releaseQuery(0, pageOf(realFixtureAssets, "settled"));
+			const wall = screen.getByRole("region", { name: "Photos" });
+			await expect
+				.poll(() =>
+					TestIntersectionObserver.isObserving(
+						"visible",
+						wall.element(),
+						"coast",
+					),
+				)
+				.toBe(true);
+			TestIntersectionObserver.trigger("visible", wall.element(), [
+				"coast",
+				"forest",
+			]);
+			TestIntersectionObserver.trigger("near", wall.element(), [
+				"forest",
+				"city",
+			]);
+			expect(service.derivativeRequests).toEqual([]);
+			callbacks.splice(0).forEach((callback) => {
+				callback(0);
+			});
+			await expect.poll(() => service.derivativeRequests.length).toBe(2);
+			expect(service.derivativeRequests[0]).toMatchObject({
+				priority: "visible",
+				assetIds: ["coast", "forest"],
+			});
+			expect(service.derivativeRequests[1]).toMatchObject({
+				priority: "nearViewport",
+				assetIds: ["city"],
+			});
+			screen.unmount();
+		} finally {
+			Object.defineProperty(window, "requestAnimationFrame", {
+				configurable: true,
+				value: originalRequestAnimationFrame,
+			});
+			Object.defineProperty(window, "cancelAnimationFrame", {
+				configurable: true,
+				value: originalCancelAnimationFrame,
+			});
+		}
+	});
+
 	it("keeps fallback geometry and populated-wall accessibility across required viewports", async () => {
 		document.documentElement.style.setProperty("--fade-duration", "0ms");
 		for (const [width, height] of [
@@ -572,37 +680,75 @@ describe("progressive photo wall", () => {
 		screen.unmount();
 	});
 
-	it("clears an active interaction timer when the wall unmounts", async () => {
-		const service = new ControlledWallService();
-		const screen = await renderWall(service);
-		await expect.poll(() => service.queryRequests.length).toBe(1);
-		const wall = screen.getByRole("region", { name: "Photos" });
-		wall.element().dispatchEvent(new Event("pointerdown"));
-		await expect.poll(() => service.interactionCalls.at(-1)).toBe(true);
-		const callsBeforeUnmount = service.interactionCalls.length;
-		screen.unmount();
-		expect(service.interactionCalls.at(-1)).toBe(false);
-		await expect
-			.poll(() => service.interactionCalls.length)
-			.toBe(callsBeforeUnmount + 1);
+	it("fences an initial callback that is queued before unmount", async () => {
+		const originalQueueMicrotask = window.queueMicrotask;
+		const queued: VoidFunction[] = [];
+		Object.defineProperty(window, "queueMicrotask", {
+			configurable: true,
+			value: (callback: VoidFunction) => queued.push(callback),
+		});
+		try {
+			const service = new ControlledWallService();
+			const screen = await renderWall(service);
+			await screen.unmount();
+			queued.splice(0).forEach((callback) => {
+				callback();
+			});
+			await expect.poll(() => service.queryRequests.length).toBe(0);
+		} finally {
+			Object.defineProperty(window, "queueMicrotask", {
+				configurable: true,
+				value: originalQueueMicrotask,
+			});
+		}
 	});
 
-	it("does not start queued work after immediate or settlement unmount", async () => {
-		const immediateService = new ControlledWallService();
-		const immediate = await renderWall(immediateService);
-		const initialQueryCount = immediateService.queryRequests.length;
-		immediate.unmount();
-		await expect
-			.poll(() => immediateService.queryRequests.length)
-			.toBe(initialQueryCount);
+	it("fences a queued settlement callback before unmount", async () => {
+		const originalQueueMicrotask = window.queueMicrotask;
+		const queued: VoidFunction[] = [];
+		Object.defineProperty(window, "queueMicrotask", {
+			configurable: true,
+			value: (callback: VoidFunction) => queued.push(callback),
+		});
+		try {
+			const service = new ControlledWallService();
+			const screen = await renderWall(service);
+			queued.splice(0).forEach((callback) => {
+				callback();
+			});
+			await expect.poll(() => service.queryRequests.length).toBe(1);
+			service.emit({ kind: "metadataSettled", sourceId: "source-a" });
+			service.releaseQuery(0, pageOf(realFixtureAssets));
+			await expect.poll(() => queued.length).toBeGreaterThan(0);
+			await screen.unmount();
+			queued.splice(0).forEach((callback) => {
+				callback();
+			});
+			await expect.poll(() => service.queryRequests.length).toBe(1);
+		} finally {
+			Object.defineProperty(window, "queueMicrotask", {
+				configurable: true,
+				value: originalQueueMicrotask,
+			});
+		}
+	});
 
-		const settledService = new ControlledWallService();
-		const settled = await renderWall(settledService);
-		await expect.poll(() => settledService.queryRequests.length).toBe(1);
-		settledService.emit({ kind: "metadataSettled", sourceId: "source-a" });
-		settledService.releaseQuery(0, pageOf(realFixtureAssets));
-		settled.unmount();
-		await expect.poll(() => settledService.queryRequests.length).toBe(1);
+	it("does not emit a second false after timer cleanup on unmount", async () => {
+		vi.useFakeTimers();
+		try {
+			const service = new ControlledWallService();
+			const screen = await renderWall(service);
+			await expect.poll(() => service.queryRequests.length).toBe(1);
+			const wall = screen.getByRole("region", { name: "Photos" });
+			wall.element().dispatchEvent(new Event("pointerdown"));
+			await expect.poll(() => service.interactionCalls.at(-1)).toBe(true);
+			screen.unmount();
+			expect(service.interactionCalls).toEqual([true, false]);
+			vi.advanceTimersByTime(201);
+			expect(service.interactionCalls).toEqual([true, false]);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("ignores a pending source A completion after source B takes ownership", async () => {

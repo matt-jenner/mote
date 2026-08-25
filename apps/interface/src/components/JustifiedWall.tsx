@@ -1,4 +1,10 @@
-import { type RefObject, useEffect, useRef } from "react";
+import {
+	type RefObject,
+	useCallback,
+	useEffect,
+	useRef,
+	useState,
+} from "react";
 import type { PhotoService, WallAsset } from "../services/photoService";
 import styles from "../styles/photoWall.module.css";
 import type { JustifiedRow } from "../wall/layoutJustifiedRows";
@@ -28,18 +34,21 @@ export function JustifiedWall({
 	regionRef: forwardedRegionRef,
 }: JustifiedWallProps) {
 	const localRegionRef = useRef<HTMLElement>(null);
-	const regionRef = forwardedRegionRef ?? localRegionRef;
+	const [root, setRoot] = useState<HTMLElement | null>(null);
+	const assignRegion = useCallback(
+		(node: HTMLElement | null) => {
+			localRegionRef.current = node;
+			if (forwardedRegionRef) forwardedRegionRef.current = node;
+			setRoot(node);
+		},
+		[forwardedRegionRef],
+	);
 	const sentinelRef = useRef<HTMLDivElement>(null);
-	const renderedAssetKey = assets.map((asset) => asset.id).join("\u0000");
 
 	useEffect(() => {
-		const root = regionRef.current;
 		if (!root) return;
 		const visibleIds = new Set<string>();
 		const nearIds = new Set<string>();
-		const renderedIds = new Set(
-			renderedAssetKey ? renderedAssetKey.split("\u0000") : [],
-		);
 		let frame: number | null = null;
 		const flush = () => {
 			frame = null;
@@ -87,13 +96,23 @@ export function JustifiedWall({
 			},
 			{ root, rootMargin: "720px 0px" },
 		);
-		for (const tile of root.querySelectorAll<HTMLElement>("[data-asset-id]")) {
-			if (!renderedIds.has(tile.dataset.assetId ?? "")) continue;
-			visibleObserver.observe(tile);
-			nearObserver.observe(tile);
-		}
+		const observeTiles = () => {
+			for (const tile of root.querySelectorAll<HTMLElement>(
+				"[data-asset-id]",
+			)) {
+				visibleObserver.observe(tile);
+				nearObserver.observe(tile);
+			}
+		};
+		observeTiles();
+		const mutationObserver =
+			typeof MutationObserver === "undefined"
+				? null
+				: new MutationObserver(observeTiles);
+		mutationObserver?.observe(root, { childList: true, subtree: true });
 		return () => {
 			if (frame !== null) window.cancelAnimationFrame(frame);
+			mutationObserver?.disconnect();
 			loadObserver.disconnect();
 			visibleObserver.disconnect();
 			nearObserver.disconnect();
@@ -102,12 +121,10 @@ export function JustifiedWall({
 		loadMore,
 		requestNearViewportDerivatives,
 		requestVisibleDerivatives,
-		regionRef.current,
-		renderedAssetKey,
+		root,
 	]);
 
 	useEffect(() => {
-		const root = regionRef.current;
 		if (!root) return;
 		const report = () => setWallInteraction(true);
 		const events = [
@@ -124,10 +141,14 @@ export function JustifiedWall({
 			for (const event of events) root.removeEventListener(event, report);
 			window.removeEventListener("keydown", report);
 		};
-	}, [setWallInteraction, regionRef.current]);
+	}, [root, setWallInteraction]);
 
 	return (
-		<section aria-label="Photos" className={styles.wallRegion} ref={regionRef}>
+		<section
+			aria-label="Photos"
+			className={styles.wallRegion}
+			ref={assignRegion}
+		>
 			<div className={styles.wallContent}>
 				{rows.map((row, rowIndex) => (
 					<div
@@ -137,7 +158,7 @@ export function JustifiedWall({
 					>
 						{row.items.map((item) => (
 							<PhotoTile
-								key={item.asset.id}
+								key={`${row.items[0]?.asset.id ?? "row"}:${item.asset.id}`}
 								positioned={item}
 								service={service}
 							/>
