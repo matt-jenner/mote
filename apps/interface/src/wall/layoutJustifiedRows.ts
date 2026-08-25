@@ -37,12 +37,14 @@ function assertFiniteGeometry(options: JustifiedLayoutOptions): void {
 }
 
 function assertAssetDimensions(asset: WallAsset): void {
+	const aspectRatio = asset.width / asset.height;
 	if (
 		!Number.isFinite(asset.width) ||
 		!Number.isFinite(asset.height) ||
 		asset.width <= 0 ||
 		asset.height <= 0 ||
-		!Number.isFinite(asset.width / asset.height)
+		!Number.isFinite(aspectRatio) ||
+		aspectRatio <= 0
 	) {
 		throw new Error("Wall asset dimensions must be positive");
 	}
@@ -55,6 +57,9 @@ function makeRow(
 ): JustifiedRow {
 	const aspectRatios = assets.map((asset) => asset.width / asset.height);
 	const sumOfAspectRatios = aspectRatios.reduce((sum, ratio) => sum + ratio, 0);
+	if (!Number.isFinite(sumOfAspectRatios) || sumOfAspectRatios <= 0) {
+		throw new Error("Wall asset dimensions must be positive");
+	}
 	const availableWidth =
 		options.containerWidth - options.gap * (assets.length - 1);
 	if (!Number.isFinite(availableWidth) || availableWidth <= 0) {
@@ -64,6 +69,9 @@ function makeRow(
 	const rowHeight = justified
 		? availableWidth / sumOfAspectRatios
 		: options.targetRowHeight;
+	if (!Number.isFinite(rowHeight) || rowHeight <= 0) {
+		throw new Error("Wall tile geometry must be finite and positive");
+	}
 	const widths: number[] = [];
 	for (let index = 0; index < assets.length; index += 1) {
 		const ratio = aspectRatios[index];
@@ -74,15 +82,21 @@ function makeRow(
 			justified && index === assets.length - 1
 				? availableWidth - widths.reduce((sum, value) => sum + value, 0)
 				: ratio * rowHeight;
+		if (!Number.isFinite(width) || width <= 0) {
+			throw new Error("Wall tile geometry must be finite and positive");
+		}
 		widths.push(width);
 	}
 
 	const items: PositionedWallAsset[] = [];
 	let left = 0;
 	for (let index = 0; index < assets.length; index += 1) {
-		const width = widths[index];
+		const width =
+			justified && index === assets.length - 1
+				? options.containerWidth - left
+				: widths[index];
 		const asset = assets[index];
-		if (width === undefined || asset === undefined) {
+		if (width === undefined || asset === undefined || width <= 0) {
 			throw new Error("Wall layout assets changed during positioning");
 		}
 		items.push({ asset, left, width, height: rowHeight });

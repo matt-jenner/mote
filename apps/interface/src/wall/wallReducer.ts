@@ -11,6 +11,8 @@ export interface WallState {
 	orderState: OrderState;
 	direction: SortDirection;
 	scrollEpoch: number;
+	sourceComplete: boolean;
+	settled: boolean;
 }
 
 export type WallAction =
@@ -18,6 +20,13 @@ export type WallAction =
 			type: "catalogBatch";
 			assets: readonly WallAsset[];
 			orderState: OrderState;
+	  }
+	| {
+			type: "pageLoaded";
+			assets: readonly WallAsset[];
+			orderState: OrderState;
+			nextCursor: string | null;
+			sourceComplete: boolean;
 	  }
 	| { type: "derivativesReady"; derivatives: readonly DerivativeReference[] }
 	| { type: "metadataSettled"; assets: readonly WallAsset[] }
@@ -29,19 +38,69 @@ export const initialWallState: WallState = {
 	orderState: "provisional",
 	direction: "oldestFirst",
 	scrollEpoch: 0,
+	sourceComplete: false,
+	settled: false,
 };
+
+interface MergeResult {
+	items: WallAsset[];
+	changed: boolean;
+}
+
+function sameAsset(left: WallAsset, right: WallAsset): boolean {
+	return (
+		left.id === right.id &&
+		left.displayName === right.displayName &&
+		left.mediaKind === right.mediaKind &&
+		left.provisionalOrder === right.provisionalOrder &&
+		left.capturedAtUtc === right.capturedAtUtc &&
+		left.dateState === right.dateState &&
+		left.width === right.width &&
+		left.height === right.height &&
+		left.representativeRgb === right.representativeRgb &&
+		left.shapeState === right.shapeState &&
+		left.availability === right.availability &&
+		left.warning === right.warning &&
+		left.wallThumbnail === right.wallThumbnail &&
+		left.screenPreview === right.screenPreview
+	);
+}
+
+function sameSequence(
+	left: readonly WallAsset[],
+	right: readonly WallAsset[],
+): boolean {
+	return (
+		left.length === right.length &&
+		left.every((asset, index) => asset === right[index])
+	);
+}
 
 function mergeAssets(
 	current: readonly WallAsset[],
 	incoming: readonly WallAsset[],
-): WallAsset[] {
+): MergeResult {
 	const byId = new Map<string, WallAsset>();
 	for (const asset of current) byId.set(asset.id, asset);
+	let changed = false;
 	for (const asset of incoming) {
 		const previous = byId.get(asset.id);
-		byId.set(asset.id, previous ? { ...previous, ...asset } : asset);
+		if (!previous) {
+			byId.set(asset.id, asset);
+			changed = true;
+			continue;
+		}
+		const merged = {
+			...previous,
+			...asset,
+			provisionalOrder: previous.provisionalOrder,
+		};
+		if (!sameAsset(previous, merged)) {
+			byId.set(asset.id, merged);
+			changed = true;
+		}
 	}
-	return [...byId.values()];
+	return { items: [...byId.values()], changed };
 }
 
 function sortProvisional(assets: readonly WallAsset[]): WallAsset[] {
@@ -50,6 +109,10 @@ function sortProvisional(assets: readonly WallAsset[]): WallAsset[] {
 			left.provisionalOrder - right.provisionalOrder ||
 			left.id.localeCompare(right.id),
 	);
+}
+
+function reuseSequence(previous: WallAsset[], next: WallAsset[]): WallAsset[] {
+	return sameSequence(previous, next) ? previous : next;
 }
 
 function sameDerivative(
@@ -67,12 +130,41 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 	switch (action.type) {
 		case "catalogBatch": {
 			const merged = mergeAssets(state.items, action.assets);
-			const items =
-				action.orderState === "provisional" ? sortProvisional(merged) : merged;
+			if (!merged.changed && state.orderState === action.orderState)
+				return state;
+			const sorted =
+				action.orderState === "provisional"
+					? sortProvisional(merged.items)
+					: merged.items;
+			const items = reuseSequence(state.items, sorted);
 			return {
 				...state,
 				items,
 				orderState: action.orderState,
+			};
+		}
+		case "pageLoaded": {
+			const merged = mergeAssets(state.items, action.assets);
+			const sorted =
+				action.orderState === "provisional"
+					? sortProvisional(merged.items)
+					: merged.items;
+			const items = reuseSequence(state.items, sorted);
+			const sourceComplete = state.sourceComplete || action.sourceComplete;
+			if (
+				!merged.changed &&
+				state.orderState === action.orderState &&
+				state.cursor === action.nextCursor &&
+				state.sourceComplete === sourceComplete
+			) {
+				return state;
+			}
+			return {
+				...state,
+				items,
+				cursor: action.nextCursor,
+				orderState: action.orderState,
+				sourceComplete,
 			};
 		}
 		case "derivativesReady": {
@@ -102,11 +194,14 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			return changed ? { ...state, items } : state;
 		}
 		case "metadataSettled": {
-			if (state.orderState === "settled") return state;
+			if (state.settled) return state;
+			const merged = mergeAssets([], action.assets);
 			return {
 				...state,
-				items: mergeAssets([], action.assets),
+				items: merged.items,
 				orderState: "settled",
+				sourceComplete: true,
+				settled: true,
 			};
 		}
 		case "setDirection": {

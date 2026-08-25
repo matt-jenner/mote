@@ -130,4 +130,46 @@ describe("layoutJustifiedRows", () => {
 		expect(rows[0]?.items[1]?.left).toBeGreaterThan(220);
 		expect(rows[0]?.width).toBeCloseTo(220 * 3 + 4, 5);
 	});
+
+	it("keeps the final complete tile exactly on the container edge", () => {
+		const fixture = assets([1])[0];
+		if (!fixture) throw new Error("expected a fixture asset");
+		const dimensions: readonly (readonly [number, number])[] = [
+			[4461, 4210],
+			[1394, 2162],
+			[2855, 1077],
+			[451, 4113],
+			[3049, 780],
+		];
+		const source = dimensions.map(([width, height], index) => ({
+			...fixture,
+			id: `review-${index}`,
+			width,
+			height,
+		}));
+		const row = layoutJustifiedRows(source, options())[0];
+		if (!row) throw new Error("expected a justified row");
+		const last = row.items.at(-1);
+		if (!last) throw new Error("expected the final tile");
+
+		expect(row.justified).toBe(true);
+		expect(last.left + last.width).toBe(1000);
+		for (const item of row.items) {
+			expect(item.width / item.height).toBeCloseTo(
+				item.asset.width / item.asset.height,
+				10,
+			);
+		}
+	});
+
+	it("rejects an aspect ratio that underflows to zero", () => {
+		const source = assets([1])[0];
+		if (!source) throw new Error("expected a fixture asset");
+		expect(() =>
+			layoutJustifiedRows(
+				[{ ...source, width: Number.MIN_VALUE, height: 2 }],
+				options(),
+			),
+		).toThrow("Wall asset dimensions must be positive");
+	});
 });
