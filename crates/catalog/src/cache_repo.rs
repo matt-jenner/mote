@@ -87,6 +87,20 @@ impl Catalog {
         })?;
         let size_bytes =
             i64::try_from(value.size_bytes).map_err(|_| CatalogError::ValueOutOfRange)?;
+        if let Some(existing) = self.find_derivative_by_key(&value.cache_key)? {
+            if existing.asset_id != value.asset_id
+                || existing.folder_group_id != value.folder_group_id
+                || existing.kind != value.kind
+                || existing.relative_cache_path != value.relative_cache_path
+                || existing.size_bytes != value.size_bytes
+                || existing.durable != value.durable
+            {
+                return Err(CatalogError::InvalidData(
+                    "cache key already identifies a different immutable derivative".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
         self.connection.execute(
             "INSERT INTO derivatives (id, asset_id, folder_group_id, kind, cache_key, \
                 relative_cache_path, size_bytes, durable, created_at) \
@@ -104,6 +118,21 @@ impl Catalog {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn upsert_derivative(&mut self, value: &NewDerivative) -> Result<(), CatalogError> {
+        self.insert_derivative(value)
+    }
+
+    fn find_derivative_by_key(&self, key: &str) -> Result<Option<DerivativeRecord>, CatalogError> {
+        self.connection
+            .query_row(
+                "SELECT id, asset_id, folder_group_id, kind, cache_key, relative_cache_path, size_bytes, durable FROM derivatives WHERE cache_key = ?1",
+                [key],
+                decode_derivative,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn cache_eviction_groups(&self) -> Result<Vec<CacheEvictionGroup>, CatalogError> {

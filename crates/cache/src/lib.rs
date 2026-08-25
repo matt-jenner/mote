@@ -1,9 +1,14 @@
+mod budget;
 mod eviction;
+mod image_derivative;
 mod key;
 mod writer;
 
+pub use budget::CacheBudget;
 pub use eviction::{ActiveWriteGuard, EvictionPlan, EvictionPlanner, ProtectedGroups};
+pub use image_derivative::{GeneratedDerivative, ImageDerivativeError, ImageDerivativeGenerator};
 pub use key::{DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget};
+pub use photo_metadata::RepresentativeRgb;
 pub use writer::{CacheReconcileReport, CacheWrite, CacheWriter};
 
 #[derive(Debug, thiserror::Error)]

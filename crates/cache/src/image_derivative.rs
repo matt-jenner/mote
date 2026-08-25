@@ -1,0 +1,152 @@
+use std::path::{Path, PathBuf};
+
+use image::{DynamicImage, ImageReader, codecs::jpeg::JpegEncoder};
+use photo_metadata::RepresentativeRgb;
+
+use crate::{
+    CacheError, CacheWriter, DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget,
+};
+
+pub const DECODER_VERSION: &str = "image-0.25-v1";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedDerivative {
+    pub key: DerivativeKey,
+    pub relative_path: PathBuf,
+    pub size_bytes: u64,
+    pub durable: bool,
+    pub reused: bool,
+    pub representative_rgb: RepresentativeRgb,
+    pub content_type: &'static str,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ImageDerivativeError {
+    #[error("source image could not be read: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("source image could not be decoded: {0}")]
+    Decode(#[from] image::ImageError),
+    #[error("cache operation failed: {0}")]
+    Cache(#[from] CacheError),
+    #[error("derivative target must be a long edge")]
+    UnsupportedTarget,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImageDerivativeGenerator {
+    writer: CacheWriter,
+}
+
+impl ImageDerivativeGenerator {
+    pub fn new(cache_root: &Path) -> Result<Self, ImageDerivativeError> {
+        Ok(Self {
+            writer: CacheWriter::new(cache_root)?,
+        })
+    }
+
+    pub fn generate(
+        &self,
+        source: &Path,
+        spec: &DerivativeSpec,
+    ) -> Result<GeneratedDerivative, ImageDerivativeError> {
+        let _decoder_version = DECODER_VERSION;
+        let edge = match spec.target {
+            DerivativeTarget::LongEdge(edge) if edge > 0 => edge,
+            _ => return Err(ImageDerivativeError::UnsupportedTarget),
+        };
+        let key = DerivativeKey::compute(spec);
+        let relative_path = key.sharded_path("jpg");
+        let mut representative_rgb = RepresentativeRgb {
+            red: 0,
+            green: 0,
+            blue: 0,
+        };
+        let quality = match spec.kind {
+            DerivativeKind::WallThumbnail => 82,
+            DerivativeKind::ScreenPreview => 90,
+            _ => return Err(ImageDerivativeError::UnsupportedTarget),
+        };
+        let durable = spec.kind == DerivativeKind::WallThumbnail;
+        let write = self.writer.write_atomic(relative_path.clone(), |file| {
+            let image = ImageReader::open(source)
+                .map_err(std::io::Error::other)?
+                .with_guessed_format()
+                .map_err(std::io::Error::other)?
+                .decode()
+                .map_err(std::io::Error::other)?;
+            let image = apply_orientation(image, spec.orientation);
+            let sample = image.thumbnail(32, 32).to_rgb8();
+            representative_rgb = average_rgb(&sample);
+            let resized = resize_without_upscale(image, edge).to_rgb8();
+            let mut encoder = JpegEncoder::new_with_quality(file, quality);
+            encoder
+                .encode(
+                    &resized,
+                    resized.width(),
+                    resized.height(),
+                    image::ExtendedColorType::Rgb8,
+                )
+                .map_err(std::io::Error::other)
+        })?;
+        if write.reused {
+            let image = ImageReader::open(source)?.with_guessed_format()?.decode()?;
+            representative_rgb = average_rgb(
+                &apply_orientation(image, spec.orientation)
+                    .thumbnail(32, 32)
+                    .to_rgb8(),
+            );
+        }
+        Ok(GeneratedDerivative {
+            key,
+            relative_path,
+            size_bytes: write.size_bytes,
+            durable,
+            reused: write.reused,
+            representative_rgb,
+            content_type: "image/jpeg",
+        })
+    }
+}
+
+fn resize_without_upscale(image: DynamicImage, edge: u32) -> DynamicImage {
+    if image.width().max(image.height()) <= edge {
+        image
+    } else {
+        image.thumbnail(edge, edge)
+    }
+}
+
+fn apply_orientation(image: DynamicImage, orientation: u16) -> DynamicImage {
+    match orientation {
+        2 => image.fliph(),
+        3 => image.rotate180(),
+        4 => image.flipv(),
+        5 => image.fliph().rotate270(),
+        6 => image.rotate90(),
+        7 => image.fliph().rotate90(),
+        8 => image.rotate270(),
+        _ => image,
+    }
+}
+
+fn average_rgb(image: &image::RgbImage) -> RepresentativeRgb {
+    let count = u64::from(image.width()) * u64::from(image.height());
+    if count == 0 {
+        return RepresentativeRgb {
+            red: 0,
+            green: 0,
+            blue: 0,
+        };
+    }
+    let sums = image.pixels().fold([0_u64; 3], |mut s, p| {
+        s[0] += u64::from(p[0]);
+        s[1] += u64::from(p[1]);
+        s[2] += u64::from(p[2]);
+        s
+    });
+    RepresentativeRgb {
+        red: ((sums[0] + count / 2) / count) as u8,
+        green: ((sums[1] + count / 2) / count) as u8,
+        blue: ((sums[2] + count / 2) / count) as u8,
+    }
+}

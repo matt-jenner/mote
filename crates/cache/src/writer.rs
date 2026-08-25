@@ -147,6 +147,17 @@ impl CacheWriter {
         })
     }
 
+    pub fn read_checked(&self, relative_path: &Path) -> Result<Vec<u8>, CacheError> {
+        let path = self.resolve_checked(relative_path)?;
+        if !is_regular_file(&path)? {
+            return Err(CacheError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cache file does not exist",
+            )));
+        }
+        Ok(std::fs::read(path)?)
+    }
+
     pub(crate) fn resolve_checked(&self, relative_path: &Path) -> Result<PathBuf, CacheError> {
         validate_relative(relative_path)?;
         let final_path = self.root.join(relative_path);

@@ -7,11 +7,14 @@ rust-version.workspace = true
 [dependencies]
 photo-catalog = { path = "../catalog" }
 photo-domain = { path = "../domain" }
+photo-metadata = { path = "../metadata" }
 blake3.workspace = true
+fs2.workspace = true
+image.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-
+image.workspace = true
