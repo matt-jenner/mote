@@ -64,6 +64,7 @@ export type WallAction =
 			sourceGeneration?: number;
 	  }
 	| { type: "resetSource"; sourceGeneration: number }
+	| { type: "retryStarted" }
 	| { type: "derivativesReady"; derivatives: readonly DerivativeReference[] }
 	| {
 			type: "metadataSettled";
@@ -367,6 +368,8 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				...initialWallState,
 				sourceGeneration: action.sourceGeneration,
 			};
+		case "retryStarted":
+			return state.error ? { ...state, error: null } : state;
 		case "setDirection": {
 			if (state.direction === action.direction) return state;
 			return {

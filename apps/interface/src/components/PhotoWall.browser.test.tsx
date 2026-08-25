@@ -40,6 +40,7 @@ function gate<T>(): Gate<T> {
 
 class TestIntersectionObserver {
 	static instances: TestIntersectionObserver[] = [];
+	static fireOnObserve = false;
 	private readonly targets = new Set<Element>();
 	constructor(
 		private readonly callback: IntersectionObserverCallback,
@@ -49,6 +50,7 @@ class TestIntersectionObserver {
 	}
 	observe(target: Element) {
 		this.targets.add(target);
+		if (TestIntersectionObserver.fireOnObserve) this.trigger([target]);
 	}
 	unobserve(target: Element) {
 		this.targets.delete(target);
@@ -300,6 +302,7 @@ beforeEach(() => {
 	});
 });
 afterEach(() => {
+	TestIntersectionObserver.fireOnObserve = false;
 	Object.defineProperty(window, "IntersectionObserver", {
 		configurable: true,
 		value: originalIntersectionObserver,
@@ -325,6 +328,11 @@ describe("progressive photo wall", () => {
 		expect(tile).not.toBeNull();
 		if (!tile) return;
 		const before = tile.getBoundingClientRect().toJSON();
+		const colourLayer = tile.querySelector<HTMLElement>("div:nth-child(2)");
+		expect(colourLayer).not.toBeNull();
+		expect(colourLayer && getComputedStyle(colourLayer).backgroundColor).toBe(
+			"rgb(34, 86, 112)",
+		);
 		TestIntersectionObserver.trigger(
 			"visible",
 			screen.getByRole("region", { name: "Photos" }).element(),
@@ -356,6 +364,29 @@ describe("progressive photo wall", () => {
 			.toHaveAttribute("alt", "Interior");
 	});
 
+	it("settles provisional newest-first data with the current direction and epoch", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		await screen.getByRole("button", { name: "Newest first" }).click();
+		await expect.poll(() => service.queryRequests.length).toBe(2);
+		service.releaseQuery(1, pageOf([...realFixtureAssets].reverse()));
+		await expect
+			.poll(() => screen.getByTestId("photo-row-0").query())
+			.not.toBeNull();
+		service.emit({ kind: "metadataSettled", sourceId: "source-a" });
+		await expect.poll(() => service.queryRequests.length).toBe(3);
+		expect(service.queryRequests[2]).toMatchObject({
+			direction: "newestFirst",
+			cursor: null,
+			limit: 100,
+		});
+		service.releaseQuery(2, pageOf([...settledFixtures].reverse(), "settled"));
+		await expect
+			.element(screen.getByRole("img").first())
+			.toHaveAttribute("alt", "Interior");
+	});
+
 	it("loads a bounded second page and batches visible work before near-viewport work", async () => {
 		await page.viewport(1440, 1024);
 		const service = new ControlledWallService();
@@ -372,6 +403,21 @@ describe("progressive photo wall", () => {
 			limit: 100,
 			cursor: "cursor-2",
 		});
+		service.releaseQuery(
+			1,
+			pageOf(
+				Array.from({ length: 30 }, (_, index) =>
+					asset(`page-2-${index}`, `Page 2 ${index}`, index + 7),
+				),
+				"settled",
+			),
+		);
+		await expect
+			.poll(() => wall.element().querySelectorAll("[data-asset-id]").length)
+			.toBe(36);
+		expect(wall.element().scrollHeight).toBeGreaterThan(
+			wall.element().clientHeight,
+		);
 		await expect
 			.poll(() => wall.element().querySelector("[data-asset-id='coast']"))
 			.not.toBeNull();
@@ -511,6 +557,52 @@ describe("progressive photo wall", () => {
 		await expect.poll(() => service.interactionCalls.at(-1)).toBe(false);
 		screen.unmount();
 		expect(service.interactionCalls.at(-1)).toBe(false);
+	});
+
+	it("does not auto-retry a failed page when the sentinel is observed", async () => {
+		TestIntersectionObserver.fireOnObserve = true;
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.rejectQuery(0);
+		await expect
+			.element(screen.getByRole("button", { name: "Retry" }))
+			.toBeVisible();
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		screen.unmount();
+	});
+
+	it("clears an active interaction timer when the wall unmounts", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		const wall = screen.getByRole("region", { name: "Photos" });
+		wall.element().dispatchEvent(new Event("pointerdown"));
+		await expect.poll(() => service.interactionCalls.at(-1)).toBe(true);
+		const callsBeforeUnmount = service.interactionCalls.length;
+		screen.unmount();
+		expect(service.interactionCalls.at(-1)).toBe(false);
+		await expect
+			.poll(() => service.interactionCalls.length)
+			.toBe(callsBeforeUnmount + 1);
+	});
+
+	it("does not start queued work after immediate or settlement unmount", async () => {
+		const immediateService = new ControlledWallService();
+		const immediate = await renderWall(immediateService);
+		const initialQueryCount = immediateService.queryRequests.length;
+		immediate.unmount();
+		await expect
+			.poll(() => immediateService.queryRequests.length)
+			.toBe(initialQueryCount);
+
+		const settledService = new ControlledWallService();
+		const settled = await renderWall(settledService);
+		await expect.poll(() => settledService.queryRequests.length).toBe(1);
+		settledService.emit({ kind: "metadataSettled", sourceId: "source-a" });
+		settledService.releaseQuery(0, pageOf(realFixtureAssets));
+		settled.unmount();
+		await expect.poll(() => settledService.queryRequests.length).toBe(1);
 	});
 
 	it("ignores a pending source A completion after source B takes ownership", async () => {

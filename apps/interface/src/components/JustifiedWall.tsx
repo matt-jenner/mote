@@ -30,12 +30,16 @@ export function JustifiedWall({
 	const localRegionRef = useRef<HTMLElement>(null);
 	const regionRef = forwardedRegionRef ?? localRegionRef;
 	const sentinelRef = useRef<HTMLDivElement>(null);
+	const renderedAssetKey = assets.map((asset) => asset.id).join("\u0000");
 
 	useEffect(() => {
 		const root = regionRef.current;
 		if (!root) return;
 		const visibleIds = new Set<string>();
 		const nearIds = new Set<string>();
+		const renderedIds = new Set(
+			renderedAssetKey ? renderedAssetKey.split("\u0000") : [],
+		);
 		let frame: number | null = null;
 		const flush = () => {
 			frame = null;
@@ -84,6 +88,7 @@ export function JustifiedWall({
 			{ root, rootMargin: "720px 0px" },
 		);
 		for (const tile of root.querySelectorAll<HTMLElement>("[data-asset-id]")) {
+			if (!renderedIds.has(tile.dataset.assetId ?? "")) continue;
 			visibleObserver.observe(tile);
 			nearObserver.observe(tile);
 		}
@@ -98,6 +103,7 @@ export function JustifiedWall({
 		requestNearViewportDerivatives,
 		requestVisibleDerivatives,
 		regionRef.current,
+		renderedAssetKey,
 	]);
 
 	useEffect(() => {

@@ -72,7 +72,12 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 	);
 
 	const loadPage = useCallback(
-		(cursor: string | null, settle = false, generationOverride?: number) => {
+		(
+			cursor: string | null,
+			settle = false,
+			generationOverride?: number,
+			initialSourceQuery = false,
+		) => {
 			const expectedSourceId = sourceId;
 			if (!expectedSourceId) return;
 			const generation = generationOverride ?? sourceGeneration.current;
@@ -83,8 +88,7 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 				generation,
 				requestId,
 				cursor,
-				epoch:
-					generationOverride === undefined ? stateRef.current.scrollEpoch : 0,
+				epoch: initialSourceQuery ? 0 : stateRef.current.scrollEpoch,
 			};
 			ownerRef.current = owner;
 			dispatch({
@@ -98,10 +102,9 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 				.queryWall({
 					cursor,
 					limit: 100,
-					direction:
-						generationOverride === undefined
-							? stateRef.current.direction
-							: "oldestFirst",
+					direction: initialSourceQuery
+						? "oldestFirst"
+						: stateRef.current.direction,
 				})
 				.then((page) => {
 					if (
@@ -214,11 +217,13 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 		void (service as ScanCapableService).startFixtureScan?.();
 		queueMicrotask(() => {
 			if (isLive(generation, expectedSourceId))
-				loadPage(null, false, generation);
+				loadPage(null, false, generation, true);
 		});
 		return () => {
 			stop();
 			if (sourceGeneration.current === generation) {
+				sourceGeneration.current += 1;
+				sourceIdRef.current = null;
 				ownerRef.current = null;
 				settlementPending.current = false;
 			}
@@ -243,16 +248,16 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 	}, []);
 
 	const loadMore = useCallback(() => {
-		if (state.pagesExhausted || ownerRef.current) return;
+		if (state.pagesExhausted || state.error || ownerRef.current) return;
 		loadPage(state.cursor);
-	}, [loadPage, state.cursor, state.pagesExhausted]);
+	}, [loadPage, state.cursor, state.error, state.pagesExhausted]);
 
 	const retry = useCallback(() => {
 		if (!state.error) return;
 		ownerRef.current = null;
-		dispatch({ type: "setDirection", direction: state.direction });
+		dispatch({ type: "retryStarted" });
 		loadPage(failedCursor.current);
-	}, [loadPage, state.direction, state.error]);
+	}, [loadPage, state.error]);
 
 	const requestDerivatives = useCallback(
 		(assetIds: readonly string[], priority: DerivativePriority) => {
@@ -267,6 +272,14 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 				void service.requestDerivatives({ assetIds: next, priority });
 		},
 		[service],
+	);
+	const requestVisibleDerivatives = useCallback(
+		(ids: readonly string[]) => requestDerivatives(ids, "visible"),
+		[requestDerivatives],
+	);
+	const requestNearViewportDerivatives = useCallback(
+		(ids: readonly string[]) => requestDerivatives(ids, "nearViewport"),
+		[requestDerivatives],
 	);
 
 	const setWallInteraction = useCallback(
@@ -310,16 +323,15 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 			retry,
 			loadMore,
 			setDirection,
-			requestVisibleDerivatives: (ids: readonly string[]) =>
-				requestDerivatives(ids, "visible"),
-			requestNearViewportDerivatives: (ids: readonly string[]) =>
-				requestDerivatives(ids, "nearViewport"),
+			requestVisibleDerivatives,
+			requestNearViewportDerivatives,
 			setWallInteraction,
 			layoutComplete: isWallLayoutComplete(state),
 		}),
 		[
 			loadMore,
-			requestDerivatives,
+			requestNearViewportDerivatives,
+			requestVisibleDerivatives,
 			retry,
 			setDirection,
 			setWallInteraction,
