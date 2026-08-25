@@ -1,0 +1,204 @@
+.wallCanvas {
+	display: flex;
+	flex: 1 1 auto;
+	flex-direction: column;
+	min-width: 0;
+	min-height: 0;
+	background: var(--canvas);
+}
+
+.wallToolbar {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: var(--space-3);
+	min-height: 48px;
+	padding: 4px var(--space-6);
+	background: var(--canvas-elevated);
+	border-bottom: 1px solid var(--separator);
+}
+
+.progress {
+	min-width: 0;
+	overflow: hidden;
+	color: var(--text-secondary);
+	font-size: 12px;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.sortControls {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 2px;
+	padding: 0;
+	margin: 0;
+	border: 0;
+}
+
+.sortButton {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	min-height: 32px;
+	padding: 0 9px;
+	color: var(--text-secondary);
+	font-size: 12px;
+	background: transparent;
+	border: 1px solid transparent;
+	border-radius: var(--radius-small);
+	cursor: pointer;
+}
+
+.sortButton[aria-pressed="true"] {
+	color: var(--text-primary);
+	background: var(--selection);
+	border-color: var(--separator);
+}
+
+.wallRegion {
+	position: relative;
+	display: block;
+	flex: 1 1 auto;
+	min-width: 0;
+	min-height: 0;
+	overflow-y: auto;
+	overflow-x: hidden;
+	overscroll-behavior: contain;
+	background: var(--canvas);
+}
+
+.wallContent {
+	width: 100%;
+	padding: var(--space-4);
+}
+
+.row {
+	display: flex;
+	gap: var(--image-gap);
+	width: max-content;
+	min-width: 100%;
+	margin-bottom: var(--image-gap);
+	animation: row-reveal var(--fade-duration) ease both;
+}
+
+.tile {
+	position: relative;
+	flex: 0 0 auto;
+	min-width: 0;
+	padding: 0;
+	margin: 0;
+	overflow: hidden;
+	background: var(--tile-colour, var(--canvas-elevated));
+	border-radius: 3px;
+}
+
+.neutralLayer,
+.colourLayer,
+.imageLayer {
+	position: absolute;
+	inset: 0;
+	display: block;
+	width: 100%;
+	height: 100%;
+}
+
+.neutralLayer {
+	background: color-mix(in srgb, var(--canvas-elevated) 78%, var(--separator));
+}
+
+.colourLayer {
+	background: var(--tile-colour, var(--canvas-elevated));
+	opacity: 0.82;
+}
+
+.imageLayer {
+	object-fit: cover;
+	opacity: 0;
+	transition: opacity var(--fade-duration) ease;
+}
+
+.imageLoaded {
+	opacity: 1;
+}
+
+.fallback {
+	display: grid;
+	place-content: center;
+	justify-items: center;
+	gap: 6px;
+	height: 100%;
+	padding: 12px;
+	color: var(--unavailable);
+	font-size: 11px;
+	text-align: center;
+	background: color-mix(in srgb, var(--canvas) 82%, var(--unavailable));
+}
+
+.fallbackMark {
+	display: grid;
+	place-items: center;
+	width: 22px;
+	height: 22px;
+	font-size: 16px;
+	font-weight: 600;
+	border: 1px solid currentcolor;
+	border-radius: 50%;
+}
+
+.loadSentinel {
+	width: 100%;
+	height: 2px;
+}
+
+.emptyWall {
+	display: grid;
+	place-items: center;
+	min-height: 220px;
+	color: var(--text-secondary);
+	font-size: 13px;
+}
+
+.visuallyHidden {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	white-space: nowrap;
+	border: 0;
+}
+
+@keyframes row-reveal {
+	from {
+		opacity: 0;
+	}
+	to {
+		opacity: 1;
+	}
+}
+
+@media (max-width: 639px) {
+	.wallToolbar {
+		align-items: flex-start;
+		flex-direction: column;
+		gap: 2px;
+		padding: 6px var(--space-3);
+	}
+
+	.wallContent {
+		padding: var(--space-3);
+	}
+
+	.sortControls {
+		width: 100%;
+	}
+
+	.sortButton {
+		flex: 1 1 0;
+		justify-content: center;
+		min-height: 40px;
+	}
+}

@@ -1,0 +1,43 @@
+import { ArrowDownAZ, ArrowUpAZ } from "lucide-react";
+import type { SortDirection } from "../services/photoService";
+import styles from "../styles/photoWall.module.css";
+
+interface WallToolbarProps {
+	direction: SortDirection;
+	onDirectionChange: (direction: SortDirection) => void;
+	status: string;
+}
+
+export function WallToolbar({
+	direction,
+	onDirectionChange,
+	status,
+}: WallToolbarProps) {
+	return (
+		<div className={styles.wallToolbar}>
+			<div aria-live="polite" className={styles.progress} role="status">
+				{status}
+			</div>
+			<fieldset aria-label="Photo order" className={styles.sortControls}>
+				<button
+					aria-pressed={direction === "oldestFirst"}
+					className={styles.sortButton}
+					onClick={() => onDirectionChange("oldestFirst")}
+					type="button"
+				>
+					<ArrowDownAZ aria-hidden="true" size={16} strokeWidth={1.7} />
+					Oldest first
+				</button>
+				<button
+					aria-pressed={direction === "newestFirst"}
+					className={styles.sortButton}
+					onClick={() => onDirectionChange("newestFirst")}
+					type="button"
+				>
+					<ArrowUpAZ aria-hidden="true" size={16} strokeWidth={1.7} />
+					Newest first
+				</button>
+			</fieldset>
+		</div>
+	);
+}
