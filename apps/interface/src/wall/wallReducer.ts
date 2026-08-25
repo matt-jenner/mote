@@ -29,7 +29,11 @@ export type WallAction =
 			nextCursor: string | null;
 	  }
 	| { type: "derivativesReady"; derivatives: readonly DerivativeReference[] }
-	| { type: "metadataSettled"; assets: readonly WallAsset[] }
+	| {
+			type: "metadataSettled";
+			assets: readonly WallAsset[];
+			nextCursor: string | null;
+	  }
 	| { type: "setDirection"; direction: SortDirection };
 
 export const initialWallState: WallState = {
@@ -158,10 +162,15 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			};
 		}
 		case "pageLoaded": {
-			const merged = mergeAssets(state.items, action.assets);
-			const orderState = state.settled ? "settled" : action.orderState;
+			const settledPage = action.orderState === "settled";
+			const replaceWithSettledPage = settledPage && !state.settled;
+			const merged = replaceWithSettledPage
+				? mergeAssets([], action.assets)
+				: mergeAssets(state.items, action.assets);
+			const orderState =
+				state.settled || settledPage ? "settled" : action.orderState;
 			const sorted =
-				!state.settled && action.orderState === "provisional"
+				!state.settled && !settledPage && action.orderState === "provisional"
 					? sortProvisional(merged.items)
 					: merged.items;
 			const items = reuseSequence(state.items, sorted);
@@ -180,6 +189,8 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				cursor: action.nextCursor,
 				orderState,
 				pagesExhausted,
+				scanComplete: state.scanComplete || settledPage,
+				settled: state.settled || settledPage,
 			};
 		}
 		case "derivativesReady": {
@@ -214,8 +225,10 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			return {
 				...state,
 				items: merged.items,
+				cursor: action.nextCursor,
 				orderState: "settled",
 				scanComplete: true,
+				pagesExhausted: action.nextCursor === null,
 				settled: true,
 			};
 		}

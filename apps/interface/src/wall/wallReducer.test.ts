@@ -60,12 +60,14 @@ describe("wallReducer", () => {
 		const settled = reduce(refined, {
 			type: "metadataSettled",
 			assets: refined.items.slice().reverse(),
+			nextCursor: null,
 		});
 		expect(settled.items.map((item) => item.id)).toEqual(["a", "b"]);
 		expect(
 			reduce(settled, {
 				type: "metadataSettled",
 				assets: settled.items.slice().reverse(),
+				nextCursor: null,
 			}),
 		).toBe(settled);
 
@@ -121,6 +123,7 @@ describe("wallReducer", () => {
 		const settledFirstPage = reduce(firstPage, {
 			type: "metadataSettled",
 			assets: firstPage.items,
+			nextCursor: firstPage.cursor,
 		});
 		expect(settledFirstPage.scanComplete).toBe(true);
 		expect(settledFirstPage.pagesExhausted).toBe(false);
@@ -139,10 +142,71 @@ describe("wallReducer", () => {
 		expect(terminalPage.items.map((item) => item.id)).toEqual(["a", "b"]);
 	});
 
+	it("atomically settles the ordered first page and replaces its provisional cursor", () => {
+		const provisional = reduce(
+			reduce(initialWallState, {
+				type: "pageLoaded",
+				assets: [wallAsset("provisional", 1, 1)],
+				orderState: "provisional",
+				nextCursor: "provisional-next",
+			}),
+			{
+				type: "metadataSettled",
+				assets: [wallAsset("b", 1, 2), wallAsset("a", 1, 1)],
+				nextCursor: "settled-next",
+			},
+		);
+
+		expect(provisional.items.map((item) => item.id)).toEqual(["b", "a"]);
+		expect(provisional.cursor).toBe("settled-next");
+		expect(provisional.pagesExhausted).toBe(false);
+		expect(provisional.scanComplete).toBe(true);
+		expect(provisional.orderState).toBe("settled");
+		expect(provisional.settled).toBe(true);
+	});
+
+	it("starts settled from a cached nonterminal page and preserves server order", () => {
+		const cached = reduce(initialWallState, {
+			type: "pageLoaded",
+			assets: [wallAsset("b", 1, 2), wallAsset("a", 1, 1)],
+			orderState: "settled",
+			nextCursor: "cached-next",
+		});
+		expect(cached.settled).toBe(true);
+		expect(cached.scanComplete).toBe(true);
+		expect(cached.pagesExhausted).toBe(false);
+		expect(cached.cursor).toBe("cached-next");
+		expect(cached.items.map((item) => item.id)).toEqual(["b", "a"]);
+		expect(isWallLayoutComplete(cached)).toBe(false);
+
+		const reconciled = reduce(cached, {
+			type: "catalogBatch",
+			assets: [wallAsset("c", 1, 0)],
+			orderState: "provisional",
+		});
+		expect(reconciled.orderState).toBe("settled");
+		expect(reconciled.items.map((item) => item.id)).toEqual(["b", "a", "c"]);
+	});
+
+	it("marks a cached terminal settled page layout complete", () => {
+		const cached = reduce(initialWallState, {
+			type: "pageLoaded",
+			assets: [wallAsset("b", 1, 2), wallAsset("a", 1, 1)],
+			orderState: "settled",
+			nextCursor: null,
+		});
+
+		expect(cached.settled).toBe(true);
+		expect(cached.scanComplete).toBe(true);
+		expect(cached.pagesExhausted).toBe(true);
+		expect(isWallLayoutComplete(cached)).toBe(true);
+	});
+
 	it("keeps source completion and settlement latched across streamed updates", () => {
 		const settled = reduce(initialWallState, {
 			type: "metadataSettled",
 			assets: [wallAsset("a", 1, 1)],
+			nextCursor: null,
 		});
 		const streamed = reduce(settled, {
 			type: "catalogBatch",
@@ -151,11 +215,12 @@ describe("wallReducer", () => {
 		});
 		expect(streamed.settled).toBe(true);
 		expect(streamed.scanComplete).toBe(true);
-		expect(streamed.pagesExhausted).toBe(false);
+		expect(streamed.pagesExhausted).toBe(true);
 		expect(
 			reduce(streamed, {
 				type: "metadataSettled",
 				assets: [wallAsset("c", 1, 3)],
+				nextCursor: null,
 			}),
 		).toBe(streamed);
 	});
@@ -189,6 +254,7 @@ describe("wallReducer", () => {
 		const settled = reduce(initialWallState, {
 			type: "metadataSettled",
 			assets: [wallAsset("b", 1, 1), wallAsset("a", 1, 2)],
+			nextCursor: null,
 		});
 		expect(settled.items.map((item) => item.id)).toEqual(["b", "a"]);
 
@@ -260,6 +326,7 @@ describe("wallReducer", () => {
 			reduce(initialWallState, {
 				type: "metadataSettled",
 				assets: [wallAsset("a", 1, 1)],
+				nextCursor: null,
 			}),
 			{
 				type: "pageLoaded",
