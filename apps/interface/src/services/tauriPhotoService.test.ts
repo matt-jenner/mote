@@ -144,7 +144,8 @@ describe("Tauri PhotoService", () => {
 
 	it("maps wall operations and ordered channel updates", async () => {
 		const calls: Array<[string, Record<string, unknown> | undefined]> = [];
-		const received: WallUpdate[] = [];
+		const firstReceived: WallUpdate[] = [];
+		const secondReceived: WallUpdate[] = [];
 		const channels: FakeChannel<WallUpdate>[] = [];
 		const channelFactory: ChannelFactory = (listener) => {
 			const channel = new FakeChannel(listener);
@@ -155,7 +156,12 @@ describe("Tauri PhotoService", () => {
 			recordingInvoke(calls),
 			channelFactory,
 		);
-		const stop = service.watchWallUpdates((event) => received.push(event));
+		const stopFirst = service.watchWallUpdates((event) =>
+			firstReceived.push(event),
+		);
+		const stopSecond = service.watchWallUpdates((event) =>
+			secondReceived.push(event),
+		);
 
 		await service.queryWall({
 			cursor: null,
@@ -168,11 +174,26 @@ describe("Tauri PhotoService", () => {
 		});
 		await service.setWallInteraction(true);
 
-		expect(calls.map(([name]) => name)).toEqual([
-			"watch_wall_updates",
-			"query_wall",
-			"request_derivatives",
-			"set_wall_interaction",
+		expect(calls).toEqual([
+			["watch_wall_updates", { onEvent: channels[0] }],
+			["watch_wall_updates", { onEvent: channels[1] }],
+			[
+				"query_wall",
+				{ request: { cursor: null, limit: 100, direction: "oldestFirst" } },
+			],
+			[
+				"request_derivatives",
+				{ request: { assetIds: ["asset-a"], priority: "visible" } },
+			],
+			["set_wall_interaction", { active: true }],
+		]);
+		expect(channels).toHaveLength(2);
+		expect(JSON.stringify(calls[0]?.[1])).toBe(
+			'{"onEvent":"__CHANNEL__:fake"}',
+		);
+		expect(channels.map((channel) => channel.toJSON())).toEqual([
+			"__CHANNEL__:fake",
+			"__CHANNEL__:fake",
 		]);
 		expect(
 			service.derivativeUrl({
@@ -182,9 +203,14 @@ describe("Tauri PhotoService", () => {
 			}),
 		).toBe("photo-derivative://localhost/asset-a/wallThumbnail/abc");
 		channels[0]?.emit(sampleCatalogBatch);
-		expect(received).toEqual([sampleCatalogBatch]);
-		stop();
+		channels[1]?.emit(sampleCatalogBatch);
+		expect(firstReceived).toEqual([sampleCatalogBatch]);
+		expect(secondReceived).toEqual([sampleCatalogBatch]);
+		stopFirst();
 		channels[0]?.emit(sampleProgressUpdate);
-		expect(received).toEqual([sampleCatalogBatch]);
+		channels[1]?.emit(sampleProgressUpdate);
+		expect(firstReceived).toEqual([sampleCatalogBatch]);
+		expect(secondReceived).toEqual([sampleCatalogBatch, sampleProgressUpdate]);
+		stopSecond();
 	});
 });

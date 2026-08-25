@@ -56,7 +56,9 @@ export function createInMemoryPhotoService(
 	const listeners = new Set<WallListener>();
 	const derivativeUrls = new Map<string, string>();
 	let settled = false;
-	let scanStarted = false;
+	let scanPromise: Promise<void> | null = null;
+	let derivativePhasePromise: Promise<void> | null = null;
+	let settlementPromise: Promise<void> | null = null;
 	let state: BootstrapState = {
 		settings: { appearance: "system" },
 		activeSource: null,
@@ -147,11 +149,13 @@ export function createInMemoryPhotoService(
 					const leftDate = left.capturedAtUtc ?? "";
 					const rightDate = right.capturedAtUtc ?? "";
 					const dateOrder = leftDate.localeCompare(rightDate);
-					const order =
-						dateOrder ||
+					if (dateOrder !== 0) {
+						return request.direction === "newestFirst" ? -dateOrder : dateOrder;
+					}
+					return (
 						left.displayName.localeCompare(right.displayName) ||
-						left.id.localeCompare(right.id);
-					return request.direction === "newestFirst" ? -order : order;
+						left.id.localeCompare(right.id)
+					);
 				});
 			const offset = request.cursor === null ? 0 : Number(request.cursor);
 			const start = Number.isSafeInteger(offset) && offset >= 0 ? offset : 0;
@@ -186,9 +190,11 @@ export function createInMemoryPhotoService(
 			}
 			return url;
 		},
-		async startFixtureScan() {
-			scanStarted = true;
+		startFixtureScan() {
+			if (scanPromise && !settled) return scanPromise;
 			settled = false;
+			settlementPromise = null;
+			derivativePhasePromise = null;
 			assets = fixtures.map(
 				({
 					derivativeUrls: _urls,
@@ -202,43 +208,57 @@ export function createInMemoryPhotoService(
 					screenPreview: null,
 				}),
 			);
-			await delay(options.geometryDelayMs ?? 0);
-			publish({
-				kind: "catalogBatch",
-				assets: clone(assets),
-				orderState: "provisional",
-				progress: progress(0),
-			});
-			await delay(options.thumbnailDelayMs ?? 0);
-			const derivatives = derivativeReferences();
-			if (derivatives.length > 0) {
-				for (const derivative of derivatives) {
-					const index = assets.findIndex(
-						(asset) => asset.id === derivative.assetId,
-					);
-					const current = assets[index];
-					if (!current) continue;
-					if (derivative.kind === "wallThumbnail") {
-						assets[index] = {
-							...current,
-							wallThumbnail: clone(derivative),
-						};
-					} else {
-						assets[index] = {
-							...current,
-							screenPreview: clone(derivative),
-						};
+			scanPromise = (async () => {
+				await delay(options.geometryDelayMs ?? 0);
+				publish({
+					kind: "catalogBatch",
+					assets: clone(assets),
+					orderState: "provisional",
+					progress: progress(0),
+				});
+				derivativePhasePromise = (async () => {
+					await delay(options.thumbnailDelayMs ?? 0);
+					const derivatives = derivativeReferences();
+					if (derivatives.length === 0) return;
+					for (const derivative of derivatives) {
+						const index = assets.findIndex(
+							(asset) => asset.id === derivative.assetId,
+						);
+						const current = assets[index];
+						if (!current) continue;
+						if (derivative.kind === "wallThumbnail") {
+							assets[index] = {
+								...current,
+								wallThumbnail: clone(derivative),
+							};
+						} else {
+							assets[index] = {
+								...current,
+								screenPreview: clone(derivative),
+							};
+						}
 					}
-				}
-				publish({ kind: "derivativesReady", derivatives: clone(derivatives) });
-			}
+					publish({
+						kind: "derivativesReady",
+						derivatives: clone(derivatives),
+					});
+				})();
+			})();
+			return scanPromise;
 		},
-		async finishFixtureScan() {
-			if (!scanStarted) await service.startFixtureScan();
-			await delay(options.metadataDelayMs ?? 0);
-			settled = true;
-			assets = assets.map((asset) => ({ ...asset, dateState: "settled" }));
-			publish({ kind: "metadataSettled", sourceId });
+		finishFixtureScan() {
+			if (settlementPromise) return settlementPromise;
+			settlementPromise = (async () => {
+				if (!scanPromise) await service.startFixtureScan();
+				await scanPromise;
+				if (derivativePhasePromise) await derivativePhasePromise;
+				await delay(options.metadataDelayMs ?? 0);
+				if (settled) return;
+				settled = true;
+				assets = assets.map((asset) => ({ ...asset, dateState: "settled" }));
+				publish({ kind: "metadataSettled", sourceId });
+			})();
+			return settlementPromise;
 		},
 		emitForTest(update: WallUpdate) {
 			publish(update);
