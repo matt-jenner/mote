@@ -1096,6 +1096,7 @@ dependencies = [
 name = "photo-indexer"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "image",
  "notify",
  "photo-catalog",

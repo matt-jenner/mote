@@ -9,6 +9,7 @@ photo-domain = { path = "../domain" }
 photo-catalog = { path = "../catalog" }
 photo-core = { path = "../core" }
 photo-metadata = { path = "../metadata" }
+chrono.workspace = true
 notify.workspace = true
 tokio.workspace = true
 tracing.workspace = true

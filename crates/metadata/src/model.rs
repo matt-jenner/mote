@@ -30,6 +30,18 @@ pub struct MetadataBundle {
     pub warnings: Vec<MetadataWarning>,
 }
 
+impl MetadataBundle {
+    pub fn extend(&mut self, other: MetadataBundle) {
+        self.capture_dates.extend(other.capture_dates);
+        self.ratings.extend(other.ratings);
+        self.keywords.extend(other.keywords);
+        if self.orientation.is_none() {
+            self.orientation = other.orientation;
+        }
+        self.warnings.extend(other.warnings);
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeywordCandidate {
     pub value: String,

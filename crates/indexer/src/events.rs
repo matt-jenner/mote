@@ -7,23 +7,51 @@ pub enum IndexEvent {
     Discovered {
         asset: NewAsset,
     },
-    Shaped {
+    ShapeReady {
         asset_id: AssetId,
         width: u32,
         height: u32,
-        orientation: Option<u16>,
-        representative_rgb: Option<RepresentativeRgb>,
+        orientation: u16,
+    },
+    ShapeFallback {
+        asset_id: AssetId,
+        width: u32,
+        height: u32,
+        code: &'static str,
+        message: String,
+    },
+    ColourReady {
+        asset_id: AssetId,
+        representative_rgb: RepresentativeRgb,
     },
     MetadataReady {
         asset_id: AssetId,
         metadata: ResolvedMetadata,
     },
+    Progress(ScanProgress),
     Warning {
         asset_id: Option<AssetId>,
         code: &'static str,
         message: String,
     },
     Completed(ScanSummary),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScanStage {
+    Discovering,
+    Shaping,
+    Enriching,
+    Completed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScanProgress {
+    pub stage: ScanStage,
+    pub discovered: u64,
+    pub shaped: u64,
+    pub enriched: u64,
+    pub total: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

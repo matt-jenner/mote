@@ -1,10 +1,15 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use photo_catalog::{Catalog, NewAsset, NewLibrary};
 use photo_core::FolderPolicyEngine;
 use photo_domain::{MediaKind, RelativePathKey};
-use photo_indexer::{CatalogWriter, IndexEvent, Indexer, MetadataReader, ScanRequest};
+use photo_indexer::{
+    CatalogWriter, DefaultMetadataReader, IndexEvent, IndexScheduler, Indexer, InteractionMode,
+    MetadataReader, ScanRequest, SchedulerConfig,
+};
 use photo_metadata::{
     Keyword, MetadataBundle, MetadataReadWarning, ProvenanceRecord, RepresentativeRgb,
     ResolvedMetadata,
@@ -26,6 +31,22 @@ impl MetadataReader for NoopMetadataReader {
 #[derive(Clone)]
 struct BlockingMetadataReader {
     gate: Arc<(Mutex<bool>, Condvar)>,
+}
+
+#[derive(Clone, Default)]
+struct CountingMetadataReader {
+    reads: Arc<AtomicUsize>,
+}
+
+impl MetadataReader for CountingMetadataReader {
+    fn read(
+        &self,
+        _media_path: &Path,
+        _sidecar_path: Option<&Path>,
+    ) -> Result<MetadataBundle, MetadataReadWarning> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(MetadataBundle::default())
+    }
 }
 
 impl BlockingMetadataReader {
@@ -54,6 +75,104 @@ struct ReleaseMetadata {
     gate: Arc<(Mutex<bool>, Condvar)>,
 }
 
+#[derive(Clone)]
+struct AdmissionReader {
+    starts: Arc<AtomicUsize>,
+    started: std::sync::mpsc::Sender<()>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl AdmissionReader {
+    fn new() -> (Self, std::sync::mpsc::Receiver<()>, ReleaseMetadata) {
+        let (started, notifications) = std::sync::mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        (
+            Self {
+                starts: Arc::new(AtomicUsize::new(0)),
+                started,
+                gate: gate.clone(),
+            },
+            notifications,
+            ReleaseMetadata { gate },
+        )
+    }
+}
+
+impl MetadataReader for AdmissionReader {
+    fn read(
+        &self,
+        _media_path: &Path,
+        _sidecar_path: Option<&Path>,
+    ) -> Result<MetadataBundle, MetadataReadWarning> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        self.started.send(()).unwrap();
+        let (lock, changed) = &*self.gate;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = changed.wait(released).unwrap();
+        }
+        Ok(MetadataBundle::default())
+    }
+}
+
+async fn wait_for_starts(
+    notifications: std::sync::mpsc::Receiver<()>,
+    count: usize,
+) -> std::sync::mpsc::Receiver<()> {
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::task::spawn_blocking(move || {
+            for _ in 0..count {
+                notifications.recv().unwrap();
+            }
+            notifications
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+#[tokio::test]
+async fn enrichment_admission_tracks_shared_scheduler_interaction_mode() {
+    let fixture = tempfile::tempdir().unwrap();
+    write_png(&fixture.path().join("a.png"), [255, 0, 0]);
+    write_png(&fixture.path().join("b.png"), [0, 0, 255]);
+    let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig {
+        idle_workers: 4,
+        active_workers: 1,
+    }));
+    let (reader, notifications, release) = AdmissionReader::new();
+    let indexer = Indexer::with_scheduler(reader.clone(), empty_policy_engine(), scheduler.clone());
+
+    let scan = indexer.start(ScanRequest::new(fixture.path())).unwrap();
+    let _notifications = wait_for_starts(notifications, 2).await;
+    assert_eq!(reader.starts.load(Ordering::SeqCst), 2);
+    release.release();
+    scan.join().await.unwrap();
+
+    scheduler
+        .set_interaction_mode(InteractionMode::Active)
+        .await;
+    let (reader, notifications, release) = AdmissionReader::new();
+    let indexer = Indexer::with_scheduler(reader.clone(), empty_policy_engine(), scheduler.clone());
+    let scan = indexer.start(ScanRequest::new(fixture.path())).unwrap();
+    let notifications = wait_for_starts(notifications, 1).await;
+    assert_eq!(reader.starts.load(Ordering::SeqCst), 1);
+    assert!(notifications.try_recv().is_err());
+    release.release();
+    scan.join().await.unwrap();
+
+    scheduler.set_interaction_mode(InteractionMode::Idle).await;
+    let (reader, notifications, release) = AdmissionReader::new();
+    let indexer = Indexer::with_scheduler(reader.clone(), empty_policy_engine(), scheduler);
+    let scan = indexer.start(ScanRequest::new(fixture.path())).unwrap();
+    let _notifications = wait_for_starts(notifications, 2).await;
+    assert_eq!(reader.starts.load(Ordering::SeqCst), 2);
+    release.release();
+    scan.join().await.unwrap();
+}
+
 impl ReleaseMetadata {
     fn release(self) {
         let (lock, changed) = &*self.gate;
@@ -75,7 +194,7 @@ fn empty_policy_engine() -> FolderPolicyEngine {
 }
 
 #[tokio::test]
-async fn emits_discovery_before_blocked_metadata_reader_finishes() {
+async fn emits_shape_before_blocked_metadata_and_before_scan_completion() {
     let fixture = tempfile::tempdir().unwrap();
     write_png(&fixture.path().join("a.png"), [255, 0, 0]);
     write_png(&fixture.path().join("b.png"), [0, 0, 255]);
@@ -83,9 +202,16 @@ async fn emits_discovery_before_blocked_metadata_reader_finishes() {
     let indexer = Indexer::new(reader, empty_policy_engine());
     let mut scan = indexer.start(ScanRequest::new(fixture.path())).unwrap();
 
-    let first = scan.events.recv().await.unwrap();
-
-    assert!(matches!(first, IndexEvent::Discovered { .. }));
+    let shaped = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(IndexEvent::ShapeReady { width, height, .. }) = scan.events.recv().await {
+                break (width, height);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(shaped, (1, 1));
     release.release();
     let summary = scan.join().await.unwrap();
     assert_eq!(summary.discovered, 2);
@@ -93,32 +219,24 @@ async fn emits_discovery_before_blocked_metadata_reader_finishes() {
 }
 
 #[tokio::test]
-async fn corrupt_media_warns_without_preventing_valid_metadata() {
+async fn corrupt_shape_uses_four_by_three_and_still_reads_metadata() {
     let fixture = tempfile::tempdir().unwrap();
-    write_png(&fixture.path().join("valid.png"), [1, 2, 3]);
     std::fs::write(fixture.path().join("broken.jpg"), b"not a jpeg").unwrap();
-    let indexer = Indexer::new(NoopMetadataReader, empty_policy_engine());
+    let reader = CountingMetadataReader::default();
+    let reads = reader.reads.clone();
+    let indexer = Indexer::new(reader, empty_policy_engine());
     let mut scan = indexer.start(ScanRequest::new(fixture.path())).unwrap();
-    let mut warned = false;
-    let mut metadata_ready = false;
+    let mut fallback = None;
     while let Some(event) = scan.events.recv().await {
         match event {
-            IndexEvent::Warning {
-                code: "shape_read_failed",
-                ..
-            } => warned = true,
-            IndexEvent::MetadataReady { .. } => metadata_ready = true,
+            IndexEvent::ShapeFallback { width, height, .. } => fallback = Some((width, height)),
             IndexEvent::Completed(_) => break,
             _ => {}
         }
     }
-
-    let summary = scan.join().await.unwrap();
-
-    assert!(warned);
-    assert!(metadata_ready);
-    assert_eq!(summary.discovered, 2);
-    assert_eq!(summary.failed, 1);
+    scan.join().await.unwrap();
+    assert_eq!(fallback, Some((4, 3)));
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -168,16 +286,19 @@ fn catalog_writer_commits_discovery_shape_and_metadata_together() {
         IndexEvent::Discovered {
             asset: asset.clone(),
         },
-        IndexEvent::Shaped {
+        IndexEvent::ShapeReady {
             asset_id: asset.id,
             width: 100,
             height: 50,
-            orientation: Some(6),
-            representative_rgb: Some(RepresentativeRgb {
+            orientation: 6,
+        },
+        IndexEvent::ColourReady {
+            asset_id: asset.id,
+            representative_rgb: RepresentativeRgb {
                 red: 1,
                 green: 2,
                 blue: 3,
-            }),
+            },
         },
         IndexEvent::MetadataReady {
             asset_id: asset.id,
@@ -185,7 +306,8 @@ fn catalog_writer_commits_discovery_shape_and_metadata_together() {
         },
     ];
 
-    CatalogWriter::new(&mut catalog, library.id)
+    let generation = catalog.begin_generation(library.id).unwrap();
+    CatalogWriter::new(&mut catalog, library.id, generation)
         .apply_batch(&events)
         .unwrap();
 
@@ -193,6 +315,78 @@ fn catalog_writer_commits_discovery_shape_and_metadata_together() {
     assert_eq!((stored.width, stored.height), (Some(100), Some(50)));
     assert_eq!(stored.rating, Some(4));
     assert_eq!(catalog.asset_keywords(asset.id).unwrap(), vec!["Family"]);
+}
+
+#[test]
+fn catalog_writer_commits_shape_before_later_metadata() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured("Pictures", Path::new("/Pictures")))
+        .unwrap();
+    let generation = catalog.begin_generation(library.id).unwrap();
+    let relative = RelativePathKey::from_relative_path(Path::new("a.jpg")).unwrap();
+    let asset = NewAsset::minimal(library.id, relative, "a.jpg", MediaKind::Jpeg, 10);
+    let discovery_and_shape = vec![
+        IndexEvent::Discovered {
+            asset: asset.clone(),
+        },
+        IndexEvent::ShapeReady {
+            asset_id: asset.id,
+            width: 100,
+            height: 50,
+            orientation: 1,
+        },
+    ];
+    CatalogWriter::new(&mut catalog, library.id, generation)
+        .apply_batch(&discovery_and_shape)
+        .unwrap();
+    let shaped = catalog.find_asset(asset.id).unwrap().unwrap();
+    assert_eq!((shaped.width, shaped.height), (Some(100), Some(50)));
+    assert_eq!(shaped.rating, None);
+
+    let metadata = ResolvedMetadata {
+        rating: Some(4),
+        ..ResolvedMetadata::default()
+    };
+    CatalogWriter::new(&mut catalog, library.id, generation)
+        .apply_batch(&[IndexEvent::MetadataReady {
+            asset_id: asset.id,
+            metadata,
+        }])
+        .unwrap();
+    assert_eq!(
+        catalog.find_asset(asset.id).unwrap().unwrap().rating,
+        Some(4)
+    );
+}
+
+#[test]
+fn catalog_writer_rolls_back_an_invalid_record_in_a_batch() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured("Pictures", Path::new("/Pictures")))
+        .unwrap();
+    let other_library = catalog
+        .add_library(&NewLibrary::configured("Other", Path::new("/Other")))
+        .unwrap();
+    let generation = catalog.begin_generation(library.id).unwrap();
+    let relative = RelativePathKey::from_relative_path(Path::new("a.jpg")).unwrap();
+    let valid = NewAsset::minimal(library.id, relative, "a.jpg", MediaKind::Jpeg, 10);
+    let invalid_relative = RelativePathKey::from_relative_path(Path::new("bad.jpg")).unwrap();
+    let invalid = NewAsset::minimal(
+        other_library.id,
+        invalid_relative,
+        "bad.jpg",
+        MediaKind::Jpeg,
+        10,
+    );
+
+    let result = CatalogWriter::new(&mut catalog, library.id, generation).apply_batch(&[
+        IndexEvent::Discovered { asset: valid },
+        IndexEvent::Discovered { asset: invalid },
+    ]);
+    assert!(result.is_err());
+    assert_eq!(catalog.asset_count(library.id).unwrap(), 0);
 }
 
 #[test]
@@ -206,4 +400,135 @@ fn filename_sidecar_wins_over_stem_sidecar_case_insensitively() {
     let found = photo_indexer::find_sidecar(&media).unwrap();
 
     assert_eq!(found, Some(fixture.path().join("PHOTO.JPG.XMP")));
+}
+
+#[tokio::test]
+async fn oriented_image_emits_display_dimensions_and_orientation() {
+    let fixture = tempfile::tempdir().unwrap();
+    let image_path = fixture.path().join("oriented.jpg");
+    std::fs::write(&image_path, oriented_tiff(2, 3, 6)).unwrap();
+    let mut scan = Indexer::new(NoopMetadataReader, empty_policy_engine())
+        .start(ScanRequest::new(fixture.path()))
+        .unwrap();
+
+    let mut observed = None;
+    while let Some(event) = scan.events.recv().await {
+        if let IndexEvent::ShapeReady {
+            width,
+            height,
+            orientation,
+            ..
+        } = event
+        {
+            observed = Some((width, height, orientation));
+            break;
+        }
+    }
+    scan.join().await.unwrap();
+    assert_eq!(observed, Some((3, 2, 6)));
+}
+
+#[tokio::test]
+async fn selection_walk_uses_library_relative_identity_and_folder_group() {
+    let fixture = tempfile::tempdir().unwrap();
+    let library_root = fixture.path().join("library");
+    let selection_root = library_root.join("child");
+    std::fs::create_dir_all(&selection_root).unwrap();
+    let image_path = selection_root.join("a.png");
+    write_png(&image_path, [1, 2, 3]);
+    let library_id = photo_domain::LibraryId::new();
+    let folder_group_id = photo_domain::FolderGroupId::new();
+    let mut scan = Indexer::new(NoopMetadataReader, empty_policy_engine())
+        .start(
+            ScanRequest::new(&selection_root)
+                .for_library(library_id)
+                .roots(&library_root, &selection_root)
+                .for_folder_group(folder_group_id),
+        )
+        .unwrap();
+
+    let asset = loop {
+        match scan.events.recv().await {
+            Some(IndexEvent::Discovered { asset }) => break asset,
+            Some(_) => {}
+            None => panic!("scan ended without discovery"),
+        }
+    };
+    scan.join().await.unwrap();
+
+    let expected_relative = RelativePathKey::from_relative_path(Path::new("child/a.png")).unwrap();
+    assert_eq!(asset.relative_path, expected_relative);
+    assert_eq!(
+        asset.id,
+        photo_domain::AssetId::for_path(library_id, &expected_relative)
+    );
+    assert_eq!(asset.folder_group_id, Some(folder_group_id));
+}
+
+#[test]
+fn default_reader_merges_embedded_sidecar_and_filesystem_metadata() {
+    let fixture = tempfile::tempdir().unwrap();
+    let media = fixture.path().join("photo.jpg");
+    let sidecar = fixture.path().join("photo.xmp");
+    std::fs::write(&media, oriented_tiff(2, 3, 6)).unwrap();
+    std::fs::write(
+        &sidecar,
+        br#"<rdf:Description xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="4"/>"#,
+    )
+    .unwrap();
+
+    let bundle = DefaultMetadataReader.read(&media, Some(&sidecar)).unwrap();
+    assert_eq!(bundle.orientation, Some(6));
+    assert_eq!(
+        bundle
+            .ratings
+            .iter()
+            .map(|value| value.value)
+            .collect::<Vec<_>>(),
+        vec![4]
+    );
+    assert!(bundle
+        .capture_dates
+        .iter()
+        .any(|candidate| candidate.source == photo_metadata::MetadataSource::FilesystemModified));
+}
+
+#[test]
+fn default_reader_warns_on_malformed_xmp_but_keeps_embedded_and_filesystem_values() {
+    let fixture = tempfile::tempdir().unwrap();
+    let media = fixture.path().join("photo.jpg");
+    let sidecar = fixture.path().join("photo.xmp");
+    std::fs::write(&media, oriented_tiff(2, 3, 6)).unwrap();
+    std::fs::write(&sidecar, b"<rdf:RDF><rdf:Description>").unwrap();
+
+    let bundle = DefaultMetadataReader.read(&media, Some(&sidecar)).unwrap();
+    assert_eq!(bundle.orientation, Some(6));
+    assert!(
+        bundle
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "malformed_xmp")
+    );
+    assert!(bundle
+        .capture_dates
+        .iter()
+        .any(|candidate| candidate.source == photo_metadata::MetadataSource::FilesystemModified));
+}
+
+fn oriented_tiff(width: u16, height: u16, orientation: u16) -> Vec<u8> {
+    let mut bytes = vec![b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00, 0x03, 0x00];
+    let entries = [
+        (0x0100_u16, width),
+        (0x0101_u16, height),
+        (0x0112_u16, orientation),
+    ];
+    for (tag, value) in entries {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&3_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0]);
+    }
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    bytes
 }

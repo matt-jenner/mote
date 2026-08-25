@@ -62,7 +62,22 @@ impl Catalog {
     ) -> Result<(), CatalogError> {
         let transaction = self.connection.transaction()?;
         for record in records {
-            apply_record(&transaction, record)?;
+            apply_record(&transaction, record, None)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn apply_index_batch_for_generation(
+        &mut self,
+        library_id: LibraryId,
+        generation: u64,
+        records: &[CatalogIndexRecord],
+    ) -> Result<(), CatalogError> {
+        let generation = i64::try_from(generation).map_err(|_| CatalogError::ValueOutOfRange)?;
+        let transaction = self.connection.transaction()?;
+        for record in records {
+            apply_record(&transaction, record, Some((library_id, generation)))?;
         }
         transaction.commit()?;
         Ok(())
@@ -80,12 +95,32 @@ impl Catalog {
     }
 }
 
-fn apply_record(connection: &Connection, record: &CatalogIndexRecord) -> Result<(), CatalogError> {
+fn apply_record(
+    connection: &Connection,
+    record: &CatalogIndexRecord,
+    generation: Option<(LibraryId, i64)>,
+) -> Result<(), CatalogError> {
     match record {
-        CatalogIndexRecord::Discovered(asset) => upsert_asset_on(connection, asset),
+        CatalogIndexRecord::Discovered(asset) => {
+            if let Some((library_id, generation)) = generation {
+                if asset.library_id != library_id {
+                    return Err(CatalogError::InvalidData(
+                        "index batch contains an asset from another library".into(),
+                    ));
+                }
+                upsert_asset_on(connection, asset)?;
+                connection.execute(
+                    "UPDATE assets SET last_seen_generation = ?2, availability = 'available' WHERE id = ?1",
+                    params![asset.id.as_uuid().as_bytes(), generation],
+                )?;
+                Ok(())
+            } else {
+                upsert_asset_on(connection, asset)
+            }
+        }
         CatalogIndexRecord::Shaped(shape) => {
             connection.execute(
-                "UPDATE assets SET width = ?2, height = ?3, orientation = ?4, representative_rgb = ?5, shape_status = ?6 \
+                "UPDATE assets SET width = CASE WHEN ?2 > 0 THEN ?2 ELSE width END, height = CASE WHEN ?3 > 0 THEN ?3 ELSE height END, orientation = COALESCE(?4, orientation), representative_rgb = COALESCE(?5, representative_rgb), shape_status = ?6 \
                  WHERE id = ?1",
                 params![
                     shape.asset_id.as_uuid().as_bytes(),

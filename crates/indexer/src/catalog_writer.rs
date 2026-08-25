@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use photo_catalog::{
     AssetMetadataUpdate, AssetShapeUpdate, Catalog, CatalogError, CatalogIndexRecord,
-    CatalogKeyword, CatalogProvenance, CatalogWarningRecord,
+    CatalogKeyword, CatalogProvenance, CatalogWarningRecord, ShapeStatus,
 };
 use photo_domain::LibraryId;
 use tokio::sync::mpsc;
@@ -15,13 +15,15 @@ const MAX_BATCH_WAIT: Duration = Duration::from_millis(50);
 pub struct CatalogWriter<'a> {
     catalog: &'a mut Catalog,
     library_id: LibraryId,
+    generation: u64,
 }
 
 impl<'a> CatalogWriter<'a> {
-    pub fn new(catalog: &'a mut Catalog, library_id: LibraryId) -> Self {
+    pub fn new(catalog: &'a mut Catalog, library_id: LibraryId, generation: u64) -> Self {
         Self {
             catalog,
             library_id,
+            generation,
         }
     }
 
@@ -30,10 +32,8 @@ impl<'a> CatalogWriter<'a> {
             .iter()
             .filter_map(|event| to_catalog_record(event, self.library_id))
             .collect::<Vec<_>>();
-        for batch in records.chunks(MAX_BATCH_EVENTS) {
-            self.catalog.apply_index_batch(batch)?;
-        }
-        Ok(())
+        self.catalog
+            .apply_index_batch_for_generation(self.library_id, self.generation, &records)
     }
 
     pub async fn run(
@@ -62,27 +62,53 @@ impl<'a> CatalogWriter<'a> {
 fn to_catalog_record(event: &IndexEvent, library_id: LibraryId) -> Option<CatalogIndexRecord> {
     match event {
         IndexEvent::Discovered { asset } => Some(CatalogIndexRecord::Discovered(asset.clone())),
-        IndexEvent::Shaped {
+        IndexEvent::ShapeReady {
             asset_id,
             width,
             height,
             orientation,
-            representative_rgb,
         } => Some(CatalogIndexRecord::Shaped(AssetShapeUpdate {
             asset_id: *asset_id,
             width: *width,
             height: *height,
-            orientation: *orientation,
-            representative_rgb: representative_rgb.map(|colour| {
-                (u32::from(colour.red) << 16)
-                    | (u32::from(colour.green) << 8)
-                    | u32::from(colour.blue)
-            }),
+            orientation: Some(*orientation),
+            representative_rgb: None,
+            shape_status: ShapeStatus::Ready,
+        })),
+        IndexEvent::ShapeFallback {
+            asset_id,
+            width,
+            height,
+            ..
+        } => Some(CatalogIndexRecord::Shaped(AssetShapeUpdate {
+            asset_id: *asset_id,
+            width: *width,
+            height: *height,
+            orientation: None,
+            representative_rgb: None,
+            shape_status: ShapeStatus::Fallback,
+        })),
+        IndexEvent::ColourReady {
+            asset_id,
+            representative_rgb,
+        } => Some(CatalogIndexRecord::Shaped(AssetShapeUpdate {
+            asset_id: *asset_id,
+            width: 0,
+            height: 0,
+            orientation: None,
+            representative_rgb: Some(
+                (u32::from(representative_rgb.red) << 16)
+                    | (u32::from(representative_rgb.green) << 8)
+                    | u32::from(representative_rgb.blue),
+            ),
+            shape_status: ShapeStatus::Ready,
         })),
         IndexEvent::MetadataReady { asset_id, metadata } => {
             Some(CatalogIndexRecord::Metadata(AssetMetadataUpdate {
                 asset_id: *asset_id,
-                captured_at_utc: metadata.captured_at.map(|value| value.to_rfc3339()),
+                captured_at_utc: metadata
+                    .captured_at
+                    .map(|value| value.with_timezone(&chrono::Utc).to_rfc3339()),
                 rating: metadata.rating,
                 keywords: metadata
                     .keywords
@@ -116,5 +142,6 @@ fn to_catalog_record(event: &IndexEvent, library_id: LibraryId) -> Option<Catalo
             message: message.clone(),
         })),
         IndexEvent::Completed(_) => None,
+        IndexEvent::Progress(_) => None,
     }
 }

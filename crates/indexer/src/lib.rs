@@ -1,4 +1,5 @@
 mod catalog_writer;
+mod default_reader;
 mod discover;
 mod events;
 mod reconcile;
@@ -9,8 +10,9 @@ mod watch;
 use std::path::PathBuf;
 
 pub use catalog_writer::CatalogWriter;
+pub use default_reader::DefaultMetadataReader;
 pub use discover::find_sidecar;
-pub use events::{IndexEvent, ScanSummary};
+pub use events::{IndexEvent, ScanProgress, ScanStage, ScanSummary};
 pub use reconcile::{
     RealReconcileSource, ReconcileError, ReconcileOutcome, ReconcileSource, Reconciler,
 };
