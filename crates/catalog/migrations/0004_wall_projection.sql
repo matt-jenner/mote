@@ -4,6 +4,13 @@ ALTER TABLE assets ADD COLUMN shape_status TEXT NOT NULL DEFAULT 'pending'
 
 UPDATE assets SET provisional_order = rowid WHERE provisional_order IS NULL;
 
+UPDATE assets
+SET shape_status = 'ready'
+WHERE width IS NOT NULL
+  AND height IS NOT NULL
+  AND width > 0
+  AND height > 0;
+
 CREATE UNIQUE INDEX assets_library_provisional
   ON assets(library_id, provisional_order);
 CREATE INDEX assets_library_capture

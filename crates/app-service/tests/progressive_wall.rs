@@ -10,6 +10,7 @@ use photo_app_service::{
     OrderState, SortDirection, SourceAvailability, WallAsset, WallMediaKind, WallPage,
     WallQueryRequest, WallShapeState, WallUpdate, WallWarningState,
 };
+use photo_catalog::Catalog;
 use photo_metadata::{MetadataBundle, MetadataCandidate, MetadataReadWarning, MetadataSource};
 
 #[derive(Clone)]
@@ -139,9 +140,10 @@ async fn recv_until<F>(
 where
     F: FnMut(&WallUpdate) -> bool,
 {
+    const UPDATE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
     let mut last = None;
     loop {
-        match tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await {
+        match tokio::time::timeout(UPDATE_WAIT_TIMEOUT, receiver.recv()).await {
             Ok(Ok(event)) => {
                 if predicate(&event) {
                     return event;
@@ -497,6 +499,85 @@ async fn unavailable_reopen_retains_cached_wall_and_emits_source_unavailable() {
                 .is_some_and(|warning| warning.retryable)
     }));
     std::fs::rename(unavailable, &fixture.source).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unavailable_selected_child_marks_only_its_group_offline() {
+    let fixture = ProgressiveFixture::new(4);
+    let child = fixture.source.join("child");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::copy(
+        fixture.source.join("photo-000.jpg"),
+        child.join("child.jpg"),
+    )
+    .unwrap();
+    let service =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
+            .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    service.start_scan(&child).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    drop(service);
+
+    let unavailable = fixture.source.join("child-offline");
+    std::fs::rename(&child, &unavailable).unwrap();
+    let reopened =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
+            .unwrap();
+    let mut updates = reopened.subscribe_wall_updates();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::SourceUnavailable { .. })
+    })
+    .await;
+
+    let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    let selection = catalog.load_app_state().unwrap().active_selection.unwrap();
+    let child_group = catalog
+        .folder_group_for_path(selection.library_id, &selection.relative_folder)
+        .unwrap()
+        .unwrap();
+    let root_group = catalog
+        .folder_group_for_path(
+            selection.library_id,
+            &photo_domain::RelativePathKey::from_relative_path(Path::new("")).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    let assets = catalog.assets(selection.library_id).unwrap();
+    assert!(
+        assets
+            .iter()
+            .any(|asset| asset.folder_group_id == Some(child_group))
+    );
+    assert!(
+        assets
+            .iter()
+            .filter(|asset| asset.folder_group_id == Some(child_group))
+            .all(|asset| asset.availability == photo_domain::Availability::RootOffline)
+    );
+    assert!(
+        assets
+            .iter()
+            .filter(|asset| asset.folder_group_id == Some(root_group))
+            .all(|asset| asset.availability == photo_domain::Availability::Available)
+    );
+    assert_eq!(
+        catalog
+            .find_library(selection.library_id)
+            .unwrap()
+            .unwrap()
+            .availability,
+        photo_domain::Availability::Available
+    );
+    std::fs::rename(unavailable, child).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

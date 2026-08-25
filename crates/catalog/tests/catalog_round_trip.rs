@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use photo_catalog::{Catalog, NewAsset, NewFolderGroup, NewLibrary, SqliteVersion};
-use photo_domain::{FolderGroupId, MediaKind, RelativePathKey};
+use photo_domain::{Availability, FolderGroupId, MediaKind, RelativePathKey};
 
 #[test]
 fn opens_with_safe_sqlite_and_round_trips_library_and_asset() {
@@ -105,6 +105,83 @@ fn unavailable_asset_count_tracks_retained_offline_rows() {
     assert_eq!(catalog.unavailable_asset_count(library.id).unwrap(), 0);
     assert_eq!(catalog.mark_root_offline(library.id).unwrap(), 3);
     assert_eq!(catalog.unavailable_asset_count(library.id).unwrap(), 3);
+}
+
+#[test]
+fn marking_a_folder_group_offline_does_not_mark_sibling_groups_or_root_offline() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured(
+            "Pictures",
+            Path::new("/mounted/Pictures"),
+        ))
+        .unwrap();
+    let selected = catalog
+        .upsert_folder_group(&NewFolderGroup {
+            id: FolderGroupId::new(),
+            library_id: library.id,
+            relative_path: RelativePathKey::from_relative_path(Path::new("selected")).unwrap(),
+            display_path: "selected".to_owned(),
+            last_viewed_at: None,
+        })
+        .unwrap();
+    let sibling = catalog
+        .upsert_folder_group(&NewFolderGroup {
+            id: FolderGroupId::new(),
+            library_id: library.id,
+            relative_path: RelativePathKey::from_relative_path(Path::new("sibling")).unwrap(),
+            display_path: "sibling".to_owned(),
+            last_viewed_at: None,
+        })
+        .unwrap();
+    let selected_asset = NewAsset {
+        folder_group_id: Some(selected),
+        ..NewAsset::minimal(
+            library.id,
+            RelativePathKey::from_relative_path(Path::new("selected/photo.jpg")).unwrap(),
+            "selected/photo.jpg",
+            MediaKind::Jpeg,
+            1,
+        )
+    };
+    let sibling_asset = NewAsset {
+        folder_group_id: Some(sibling),
+        ..NewAsset::minimal(
+            library.id,
+            RelativePathKey::from_relative_path(Path::new("sibling/photo.jpg")).unwrap(),
+            "sibling/photo.jpg",
+            MediaKind::Jpeg,
+            1,
+        )
+    };
+    catalog.upsert_asset(&selected_asset).unwrap();
+    catalog.upsert_asset(&sibling_asset).unwrap();
+
+    assert_eq!(catalog.mark_group_offline(library.id, selected).unwrap(), 1);
+    assert_eq!(
+        catalog
+            .find_library(library.id)
+            .unwrap()
+            .unwrap()
+            .availability,
+        Availability::Available
+    );
+    assert_eq!(
+        catalog
+            .find_asset(selected_asset.id)
+            .unwrap()
+            .unwrap()
+            .availability,
+        Availability::RootOffline
+    );
+    assert_eq!(
+        catalog
+            .find_asset(sibling_asset.id)
+            .unwrap()
+            .unwrap()
+            .availability,
+        Availability::Available
+    );
 }
 
 #[test]

@@ -109,6 +109,18 @@ impl Catalog {
         cursor: Option<WallCursorKey>,
         limit: u32,
     ) -> Result<WallCatalogPage, CatalogError> {
+        if cursor.as_ref().is_some_and(|cursor| {
+            !matches!(
+                (order, cursor),
+                (WallOrder::Provisional, WallCursorKey::Provisional { .. })
+                    | (
+                        WallOrder::CapturedAscending | WallOrder::CapturedDescending,
+                        WallCursorKey::Captured { .. }
+                    )
+            )
+        }) {
+            return Err(CatalogError::WallCursorOrderMismatch);
+        }
         let mut sql = String::from(
             "SELECT id, display_path, media_kind, provisional_order, captured_at_utc, width, height, representative_rgb, availability, shape_status, \
                     EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id) \

@@ -302,6 +302,25 @@ impl Catalog {
         Ok(retained as u64)
     }
 
+    pub fn mark_group_offline(
+        &mut self,
+        library: LibraryId,
+        folder_group: FolderGroupId,
+    ) -> Result<u64, CatalogError> {
+        let transaction = self.connection.transaction()?;
+        ensure_group_belongs_to_library(&transaction, library, folder_group)?;
+        let retained = transaction.execute(
+            "UPDATE assets SET availability = 'root_offline' \
+             WHERE library_id = ?1 AND folder_group_id = ?2",
+            params![
+                library.as_uuid().as_bytes(),
+                folder_group.as_uuid().as_bytes()
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(retained as u64)
+    }
+
     pub fn asset_count(&self, library: LibraryId) -> Result<u64, CatalogError> {
         let count: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM assets WHERE library_id = ?1",

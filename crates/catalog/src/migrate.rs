@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, FixedOffset, Utc};
 use rusqlite::Connection;
 
 use crate::CatalogError;
@@ -57,10 +58,41 @@ pub(crate) fn apply_migrations(
         )));
     }
 
-    for migration in migrations.iter().skip(current) {
+    for (offset, migration) in migrations.iter().skip(current).enumerate() {
+        let version = current + offset + 1;
         let transaction = connection.transaction()?;
         transaction.execute_batch(migration)?;
+        if version == 4 {
+            normalize_legacy_capture_dates(&transaction)?;
+        }
         transaction.commit()?;
+    }
+    Ok(())
+}
+
+fn normalize_legacy_capture_dates(
+    connection: &rusqlite::Transaction<'_>,
+) -> Result<(), CatalogError> {
+    let mut statement = connection
+        .prepare("SELECT id, captured_at_utc FROM assets WHERE captured_at_utc IS NOT NULL")?;
+    let values = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    for (id, value) in values {
+        let Ok(parsed) = DateTime::<FixedOffset>::parse_from_rfc3339(&value) else {
+            continue;
+        };
+        let normalized = parsed.with_timezone(&Utc).to_rfc3339();
+        if normalized != value {
+            connection.execute(
+                "UPDATE assets SET captured_at_utc = ?2 WHERE id = ?1",
+                rusqlite::params![id, normalized],
+            )?;
+        }
     }
     Ok(())
 }

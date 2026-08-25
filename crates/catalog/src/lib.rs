@@ -69,6 +69,8 @@ pub enum CatalogError {
     InvalidData(String),
     #[error("numeric value cannot be stored in SQLite")]
     ValueOutOfRange,
+    #[error("wall cursor variant does not match the requested order")]
+    WallCursorOrderMismatch,
 }
 
 impl Catalog {

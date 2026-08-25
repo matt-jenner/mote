@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use photo_catalog::{
-    AssetMetadataUpdate, AssetShapeUpdate, Catalog, CatalogIndexRecord, NewAsset, NewFolderGroup,
-    NewLibrary, ShapeStatus, WallOrder,
+    AssetMetadataUpdate, AssetShapeUpdate, Catalog, CatalogError, CatalogIndexRecord, NewAsset,
+    NewFolderGroup, NewLibrary, ShapeStatus, WallCursorKey, WallOrder,
 };
 use photo_domain::{FolderGroupId, MediaKind, RelativePathKey};
 use rusqlite::Connection;
@@ -718,5 +718,132 @@ fn wall_page_excludes_pending_shapes_but_keeps_fallback_shapes() {
             page.items[1].shape_status
         ),
         (4, 3, ShapeStatus::Fallback)
+    );
+}
+
+#[test]
+fn wall_page_rejects_a_cursor_variant_that_does_not_match_the_order() {
+    let mut fixture = WallFixture::new();
+    fixture.shaped("photo.jpg", ShapeStatus::Ready, 16, 9);
+
+    let error = fixture
+        .catalog
+        .wall_page(
+            fixture.group,
+            WallOrder::Provisional,
+            Some(WallCursorKey::Captured {
+                captured_at_utc: "2024-01-01T00:00:00Z".to_owned(),
+                display_path: "photo.jpg".to_owned(),
+                id: photo_domain::AssetId::from_uuid(uuid::Uuid::from_bytes([99_u8; 16])),
+            }),
+            1,
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, CatalogError::WallCursorOrderMismatch));
+}
+
+#[test]
+fn opening_a_populated_v3_catalog_upgrades_shapes_and_normalizes_legacy_dates_offline() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("catalog.sqlite");
+    let connection = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_catalog.sql"),
+        include_str!("../migrations/0002_unavailable_assets.sql"),
+        include_str!("../migrations/0003_app_state.sql"),
+    ] {
+        connection.execute_batch(migration).unwrap();
+    }
+
+    let library = [11_u8; 16];
+    let group = [12_u8; 16];
+    let older = [13_u8; 16];
+    let newer = [14_u8; 16];
+    let invalid = [15_u8; 16];
+    connection
+        .execute(
+            "INSERT INTO library_roots
+                (id, kind, display_name, canonical_root_key, display_path, availability)
+             VALUES (?1, 'configured', 'Pictures', ?1, '/Pictures', 'root_offline')",
+            [library.as_slice()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO folder_groups
+                (id, library_id, relative_path_key, display_path)
+             VALUES (?1, ?2, ?3, 'selected')",
+            rusqlite::params![
+                group.as_slice(),
+                library.as_slice(),
+                b"Uselected".as_slice()
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO assets
+                (id, library_id, folder_group_id, relative_path_key, display_path,
+                 media_kind, size_bytes, modified_unix_ns, width, height, availability,
+                 captured_at_utc)
+             VALUES (?1, ?2, ?3, ?4, 'selected/newer.jpg', 'jpeg', 10, '10', 1600, 900,
+                     'root_offline', '2024-01-01T00:30:00+02:00'),
+                    (?5, ?2, ?3, ?6, 'selected/older.jpg', 'jpeg', 10, '10', 800, 600,
+                    'root_offline', '2023-12-31T22:30:00+01:00'),
+                    (?7, ?2, ?3, ?8, 'selected/invalid.jpg', 'jpeg', 10, '10', 640, 480,
+                     'root_offline', 'not-a-timestamp')",
+            rusqlite::params![
+                newer.as_slice(),
+                library.as_slice(),
+                group.as_slice(),
+                b"Uselected/newer.jpg".as_slice(),
+                older.as_slice(),
+                b"Uselected/older.jpg".as_slice(),
+                invalid.as_slice(),
+                b"Uselected/invalid.jpg".as_slice(),
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let catalog = Catalog::open(&path).unwrap();
+    let group_id = FolderGroupId::from_uuid(uuid::Uuid::from_bytes(group));
+    let page = catalog
+        .wall_page(group_id, WallOrder::CapturedAscending, None, 10)
+        .unwrap();
+
+    assert_eq!(page.items.len(), 3);
+    assert_eq!(page.items[0].display_path, "selected/older.jpg");
+    assert_eq!(page.items[1].display_path, "selected/newer.jpg");
+    assert_eq!(page.items[2].display_path, "selected/invalid.jpg");
+    assert!(
+        page.items
+            .iter()
+            .all(|item| item.shape_status == ShapeStatus::Ready)
+    );
+    assert_eq!(
+        page.items[0].captured_at_utc.as_deref(),
+        Some("2023-12-31T21:30:00+00:00")
+    );
+    assert_eq!(
+        page.items[1].captured_at_utc.as_deref(),
+        Some("2023-12-31T22:30:00+00:00")
+    );
+    assert_eq!(
+        catalog
+            .find_asset(photo_domain::AssetId::from_uuid(uuid::Uuid::from_bytes(
+                invalid
+            )))
+            .unwrap()
+            .unwrap()
+            .captured_at_utc
+            .as_deref(),
+        Some("not-a-timestamp")
+    );
+    assert!(
+        page.items
+            .iter()
+            .all(|item| { item.availability == photo_domain::Availability::RootOffline })
     );
 }

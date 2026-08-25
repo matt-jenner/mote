@@ -7,7 +7,7 @@ use photo_catalog::CatalogError;
 use photo_core::FolderPolicyEngine;
 use photo_indexer::{IndexEvent, Indexer, ScanRequest};
 
-use crate::service::{ScanOwner, SelectionToken};
+use crate::service::{ScanOwner, SelectionToken, ServiceState};
 use crate::{AppService, AppServiceError, BootstrapState, WallUpdate};
 
 impl AppService {
@@ -85,10 +85,7 @@ impl AppService {
                 if state.active_scan != Some(owner) {
                     return Ok(());
                 }
-                state
-                    .libraries
-                    .catalog_mut()
-                    .mark_root_offline(owner.selection.library_id)?;
+                mark_unavailable_selection(&mut state, owner)?;
                 state.active_scan = None;
                 let _ = self.updates.send(WallUpdate::SourceUnavailable {
                     source_id: owner
@@ -195,10 +192,7 @@ impl AppService {
                     if state.active_scan != Some(owner) {
                         return;
                     }
-                    let _ = state
-                        .libraries
-                        .catalog_mut()
-                        .mark_root_offline(owner.selection.library_id);
+                    let _ = mark_unavailable_selection(&mut state, owner);
                     state.active_scan = None;
                     let _ = self.updates.send(WallUpdate::SourceUnavailable {
                         source_id: owner
@@ -349,6 +343,29 @@ impl AppService {
             self.prefetch_screen_previews(recent).await;
         }
     }
+}
+
+fn mark_unavailable_selection(
+    state: &mut ServiceState,
+    owner: ScanOwner,
+) -> Result<(), AppServiceError> {
+    let selection = state.libraries.catalog().load_app_state()?.active_selection;
+    let is_canonical_root = selection
+        .as_ref()
+        .and_then(|selection| selection.relative_folder.to_path_buf().ok())
+        .is_some_and(|path| path.as_os_str().is_empty());
+    if is_canonical_root {
+        state
+            .libraries
+            .catalog_mut()
+            .mark_root_offline(owner.selection.library_id)?;
+    } else {
+        state
+            .libraries
+            .catalog_mut()
+            .mark_group_offline(owner.selection.library_id, owner.selection.group_id)?;
+    }
+    Ok(())
 }
 
 fn progress_dto(progress: photo_indexer::ScanProgress) -> crate::ScanProgressDto {
