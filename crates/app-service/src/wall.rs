@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize)]
 struct Cursor {
     direction: crate::SortDirection,
+    group_id: String,
     key: Key,
 }
 #[derive(Serialize, Deserialize)]
@@ -22,6 +23,7 @@ enum Key {
 
 pub fn encode_cursor(
     direction: crate::SortDirection,
+    group: photo_domain::FolderGroupId,
     key: &WallCursorKey,
 ) -> Result<String, crate::AppServiceError> {
     let key = match key {
@@ -39,13 +41,18 @@ pub fn encode_cursor(
             id: id.as_uuid().hyphenated().to_string(),
         },
     };
-    let bytes = serde_json::to_vec(&Cursor { direction, key })?;
+    let bytes = serde_json::to_vec(&Cursor {
+        direction,
+        group_id: group.as_uuid().hyphenated().to_string(),
+        key,
+    })?;
     Ok(encode(&bytes))
 }
 
 pub fn decode_cursor(
     value: &str,
     direction: crate::SortDirection,
+    group: photo_domain::FolderGroupId,
     order: WallOrder,
 ) -> Result<WallCursorKey, crate::AppServiceError> {
     if value.is_empty() || value.len() > 2048 || value.len() % 4 == 1 {
@@ -57,7 +64,8 @@ pub fn decode_cursor(
     }
     let cursor: Cursor =
         serde_json::from_slice(&bytes).map_err(|_| crate::AppServiceError::InvalidCursor)?;
-    if cursor.direction != direction {
+    if cursor.direction != direction || cursor.group_id != group.as_uuid().hyphenated().to_string()
+    {
         return Err(crate::AppServiceError::InvalidCursor);
     }
     match (order, cursor.key) {

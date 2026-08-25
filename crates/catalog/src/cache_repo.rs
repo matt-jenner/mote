@@ -56,7 +56,8 @@ impl Catalog {
             "INSERT INTO folder_groups (id, library_id, relative_path_key, display_path, last_viewed_at) \
              VALUES (?1, ?2, ?3, ?4, ?5) \
              ON CONFLICT(library_id, relative_path_key) DO UPDATE SET \
-                display_path = excluded.display_path, last_viewed_at = excluded.last_viewed_at \
+                display_path = excluded.display_path, \
+                last_viewed_at = COALESCE(excluded.last_viewed_at, folder_groups.last_viewed_at) \
              RETURNING id",
             params![
                 value.id.as_uuid().as_bytes(),
@@ -68,6 +69,39 @@ impl Catalog {
             |row| row.get::<_, Vec<u8>>(0),
         )?;
         Ok(FolderGroupId::from_uuid(decode_uuid(id, 0)?))
+    }
+
+    pub fn touch_folder_group(
+        &mut self,
+        group: FolderGroupId,
+        viewed_at: i64,
+    ) -> Result<(), CatalogError> {
+        let changed = self.connection.execute(
+            "UPDATE folder_groups SET last_viewed_at = ?2 WHERE id = ?1",
+            params![group.as_uuid().as_bytes(), viewed_at],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(CatalogError::InvalidData(
+                "folder group does not exist".to_owned(),
+            ))
+        }
+    }
+
+    pub fn folder_group_last_viewed_at(
+        &self,
+        group: FolderGroupId,
+    ) -> Result<Option<i64>, CatalogError> {
+        self.connection
+            .query_row(
+                "SELECT last_viewed_at FROM folder_groups WHERE id = ?1",
+                [group.as_uuid().as_bytes()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|value| value.flatten())
+            .map_err(Into::into)
     }
 
     pub fn insert_derivative(&mut self, value: &NewDerivative) -> Result<(), CatalogError> {

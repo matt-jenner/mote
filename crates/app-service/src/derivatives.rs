@@ -12,6 +12,7 @@ use photo_domain::{AssetId, Availability, DerivativeId, FolderGroupId};
 use photo_indexer::{IndexJob, InteractionMode, JobPriority};
 use tokio::sync::{Mutex, oneshot};
 
+use crate::service::SelectionToken;
 use crate::{
     AppService, AppServiceError, DerivativeClass, DerivativePriority, DerivativeReference,
     DerivativeRequest, WallUpdate,
@@ -19,38 +20,98 @@ use crate::{
 
 const DECODER_VERSION: &str = "image-0.25-v1";
 
+#[derive(Clone)]
 pub(crate) struct PendingDerivative {
     id: AssetId,
     source: PathBuf,
     spec: DerivativeSpec,
     group: FolderGroupId,
     class: DerivativeClass,
+    selection: SelectionToken,
 }
 
-struct QueuedDerivative {
+struct SharedDerivative {
     pending: PendingDerivative,
-    result: oneshot::Sender<Option<DerivativeReference>>,
+    job_name: String,
+    waiters: Vec<oneshot::Sender<Option<DerivativeReference>>>,
+}
+
+#[derive(Default)]
+struct QueueState {
+    by_key: HashMap<String, SharedDerivative>,
+    job_to_key: HashMap<String, String>,
 }
 
 #[derive(Default)]
 pub(crate) struct DerivativeQueue {
-    jobs: Mutex<HashMap<String, QueuedDerivative>>,
+    state: Mutex<QueueState>,
     driver: Mutex<()>,
     sequence: AtomicU64,
 }
 
 impl DerivativeQueue {
+    async fn enqueue(
+        &self,
+        scheduler: &photo_indexer::IndexScheduler,
+        pending: PendingDerivative,
+        priority: JobPriority,
+    ) -> oneshot::Receiver<Option<DerivativeReference>> {
+        let immutable_key = DerivativeKey::compute(&pending.spec).as_str().to_owned();
+        let (send, receive) = oneshot::channel();
+        let mut state = self.state.lock().await;
+        if let Some(existing) = state.by_key.get_mut(&immutable_key)
+            && existing.pending.selection == pending.selection
+        {
+            existing.waiters.push(send);
+            let job_name = existing.job_name.clone();
+            drop(state);
+            scheduler.enqueue(IndexJob::new(job_name, priority)).await;
+            return receive;
+        }
+        if let Some(replaced) = state.by_key.remove(&immutable_key) {
+            state.job_to_key.remove(&replaced.job_name);
+        }
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let job_name = format!("photo-derivative:{sequence}");
+        state
+            .job_to_key
+            .insert(job_name.clone(), immutable_key.clone());
+        state.by_key.insert(
+            immutable_key,
+            SharedDerivative {
+                pending,
+                job_name: job_name.clone(),
+                waiters: vec![send],
+            },
+        );
+        drop(state);
+        scheduler.enqueue(IndexJob::new(job_name, priority)).await;
+        receive
+    }
+
     async fn next_owned(
         &self,
         scheduler: &photo_indexer::IndexScheduler,
-    ) -> Option<(IndexJob, QueuedDerivative)> {
+    ) -> Option<(IndexJob, String, PendingDerivative)> {
         let mut foreign = Vec::new();
         while let Some(job) = scheduler.next().await {
-            if let Some(queued) = self.jobs.lock().await.remove(job.name()) {
+            let owned = {
+                let mut state = self.state.lock().await;
+                state.job_to_key.remove(job.name()).and_then(|key| {
+                    state
+                        .by_key
+                        .get(&key)
+                        .map(|work| (key, work.pending.clone()))
+                })
+            };
+            if let Some((key, pending)) = owned {
                 for job in foreign {
                     scheduler.enqueue(job).await;
                 }
-                return Some((job, queued));
+                return Some((job, key, pending));
+            }
+            if job.name().starts_with("photo-derivative:") {
+                continue;
             }
             foreign.push(job);
         }
@@ -58,6 +119,54 @@ impl DerivativeQueue {
             scheduler.enqueue(job).await;
         }
         None
+    }
+
+    async fn requeue(&self, job: &IndexJob, key: &str) {
+        let mut state = self.state.lock().await;
+        if state.by_key.contains_key(key) {
+            state
+                .job_to_key
+                .insert(job.name().to_owned(), key.to_owned());
+        }
+    }
+
+    async fn finish(&self, key: &str, job_name: &str, result: Option<DerivativeReference>) {
+        let work = {
+            let mut state = self.state.lock().await;
+            if state
+                .by_key
+                .get(key)
+                .is_some_and(|work| work.job_name == job_name)
+            {
+                state.by_key.remove(key)
+            } else {
+                None
+            }
+        };
+        if let Some(work) = work {
+            for waiter in work.waiters {
+                let _ = waiter.send(result.clone());
+            }
+        }
+    }
+
+    pub(crate) async fn invalidate_except(&self, selection: SelectionToken) {
+        let mut state = self.state.lock().await;
+        let stale = state
+            .by_key
+            .iter()
+            .filter(|(_, work)| work.pending.selection != selection)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in stale {
+            if let Some(work) = state.by_key.remove(&key) {
+                state.job_to_key.remove(&work.job_name);
+            }
+        }
+    }
+
+    async fn is_empty(&self) -> bool {
+        self.state.lock().await.by_key.is_empty()
     }
 }
 
@@ -72,7 +181,7 @@ impl AppService {
         if state == crate::InteractionState::Idle {
             let service = self.clone();
             tokio::spawn(async move {
-                let has_paused_jobs = !service.derivative_queue.jobs.lock().await.is_empty();
+                let has_paused_jobs = !service.derivative_queue.is_empty().await;
                 if has_paused_jobs {
                     service.drive_derivative_queue().await;
                 } else {
@@ -97,18 +206,20 @@ impl AppService {
             return Ok(());
         }
 
-        let (ready, pending) = self.resolve_derivatives(&ids, DerivativeClass::WallThumbnail)?;
+        let (selection, ready, pending) =
+            self.resolve_derivatives(&ids, DerivativeClass::WallThumbnail)?;
         let priority = match request.priority {
             DerivativePriority::Visible => JobPriority::Visible,
             DerivativePriority::NearViewport => JobPriority::NearViewport,
         };
         let generated = self.run_derivative_jobs(pending, priority).await;
         let derivatives = merge_in_request_order(&ids, ready, generated);
-        let _ = self
-            .updates
-            .send(WallUpdate::DerivativesReady { derivatives });
+        self.publish_derivatives_if_active(selection, derivatives);
 
-        if let Ok(mut state) = self.state.lock() {
+        if let Ok(mut state) = self.state.lock()
+            && state.selection_epoch == selection.epoch
+            && state.protected_group == Some(selection.group_id)
+        {
             state.recent_derivative_ids = ids.clone();
         }
 
@@ -123,8 +234,15 @@ impl AppService {
         &self,
         ids: &[AssetId],
         class: DerivativeClass,
-    ) -> Result<(Vec<DerivativeReference>, Vec<PendingDerivative>), AppServiceError> {
-        let state = self.state()?;
+    ) -> Result<
+        (
+            SelectionToken,
+            Vec<DerivativeReference>,
+            Vec<PendingDerivative>,
+        ),
+        AppServiceError,
+    > {
+        let mut state = self.state()?;
         let stored = state.libraries.catalog().load_app_state()?;
         let selection = stored
             .active_selection
@@ -134,6 +252,15 @@ impl AppService {
             .catalog()
             .folder_group_for_path(selection.library_id, &selection.relative_folder)?
             .ok_or(AppServiceError::UnknownAsset)?;
+        state
+            .libraries
+            .catalog_mut()
+            .touch_folder_group(group, crate::service::unix_timestamp())?;
+        let selection_token = SelectionToken {
+            library_id: selection.library_id,
+            group_id: group,
+            epoch: state.selection_epoch,
+        };
         let library = state
             .libraries
             .catalog()
@@ -176,10 +303,11 @@ impl AppService {
                     spec,
                     group,
                     class,
+                    selection: selection_token,
                 });
             }
         }
-        Ok((ready, pending))
+        Ok((selection_token, ready, pending))
     }
 
     async fn run_derivative_jobs(
@@ -189,24 +317,11 @@ impl AppService {
     ) -> Vec<DerivativeReference> {
         let mut receivers = Vec::with_capacity(pending.len());
         for pending in pending {
-            let sequence = self
-                .derivative_queue
-                .sequence
-                .fetch_add(1, Ordering::Relaxed);
-            let name = format!(
-                "derivative:{sequence}:{}",
-                pending.id.as_uuid().hyphenated()
+            receivers.push(
+                self.derivative_queue
+                    .enqueue(&self.scheduler, pending, priority)
+                    .await,
             );
-            let (send, receive) = oneshot::channel();
-            self.derivative_queue.jobs.lock().await.insert(
-                name.clone(),
-                QueuedDerivative {
-                    pending,
-                    result: send,
-                },
-            );
-            self.scheduler.enqueue(IndexJob::new(name, priority)).await;
-            receivers.push(receive);
         }
         if !receivers.is_empty() {
             let service = self.clone();
@@ -226,7 +341,7 @@ impl AppService {
     async fn drive_derivative_queue(&self) {
         let _driver = self.derivative_queue.driver.lock().await;
         loop {
-            let Some((job, queued)) = self.derivative_queue.next_owned(&self.scheduler).await
+            let Some((job, key, pending)) = self.derivative_queue.next_owned(&self.scheduler).await
             else {
                 break;
             };
@@ -234,16 +349,24 @@ impl AppService {
                 job.priority(),
                 self.scheduler.available_background_permits(),
             ) {
-                self.derivative_queue
-                    .jobs
-                    .lock()
-                    .await
-                    .insert(job.name().to_owned(), queued);
+                self.derivative_queue.requeue(&job, &key).await;
                 self.scheduler.enqueue(job).await;
                 break;
             }
-            let result = self.generate_derivative(queued.pending).await.ok();
-            let _ = queued.result.send(result);
+            let selection = pending.selection;
+            let asset_id = pending.id;
+            let result = if self.selection_is_active(selection) {
+                match self.generate_derivative(pending).await {
+                    Ok(reference) => Some(reference),
+                    Err(_) => {
+                        self.record_derivative_warning(selection, asset_id);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            self.derivative_queue.finish(&key, job.name(), result).await;
         }
     }
 
@@ -256,6 +379,7 @@ impl AppService {
         let id = pending.id;
         let group = pending.group;
         let class = pending.class;
+        let selection = pending.selection;
         let generated = match class {
             DerivativeClass::WallThumbnail => {
                 let source = pending.source;
@@ -289,6 +413,9 @@ impl AppService {
                 .map_err(|_| AppServiceError::DerivativeFailed)?
             }
         };
+        if !self.selection_is_active(selection) {
+            return Err(AppServiceError::DerivativeFailed);
+        }
         if class == DerivativeClass::WallThumbnail {
             let mut state = self.state()?;
             state
@@ -317,7 +444,7 @@ impl AppService {
         {
             return;
         }
-        let Ok((cached, pending)) =
+        let Ok((selection, cached, pending)) =
             self.resolve_derivatives(&recent, DerivativeClass::ScreenPreview)
         else {
             return;
@@ -327,35 +454,60 @@ impl AppService {
             .await;
         let derivatives = merge_in_request_order(&recent, cached, generated);
         if !derivatives.is_empty() {
-            let _ = self
-                .updates
-                .send(WallUpdate::DerivativesReady { derivatives });
+            self.publish_derivatives_if_active(selection, derivatives);
         }
 
-        if self.scheduler.available_background_permits() <= 1 {
-            return;
-        }
-        let remaining = self.remaining_group_ids(&recent).unwrap_or_default();
-        if remaining.is_empty() {
-            return;
-        }
-        let Ok((_cached, pending)) =
-            self.resolve_derivatives(&remaining, DerivativeClass::ScreenPreview)
-        else {
-            return;
-        };
-        let derivatives = self
-            .run_derivative_jobs(pending, JobPriority::IdleLibrary)
-            .await;
-        if !derivatives.is_empty() {
-            let _ = self
-                .updates
-                .send(WallUpdate::DerivativesReady { derivatives });
+        let recent = recent.into_iter().collect::<HashSet<_>>();
+        let mut cursor = None;
+        loop {
+            if self.scheduler.available_background_permits() <= 1
+                || !self.selection_is_active(selection)
+            {
+                return;
+            }
+            let Ok((page_selection, remaining, next)) =
+                self.remaining_group_ids_page(&recent, cursor)
+            else {
+                return;
+            };
+            if page_selection != selection {
+                return;
+            }
+            if !remaining.is_empty() {
+                let Ok((resolved_selection, _cached, pending)) =
+                    self.resolve_derivatives(&remaining, DerivativeClass::ScreenPreview)
+                else {
+                    return;
+                };
+                if resolved_selection != selection {
+                    return;
+                }
+                let derivatives = self
+                    .run_derivative_jobs(pending, JobPriority::IdleLibrary)
+                    .await;
+                if !derivatives.is_empty() {
+                    self.publish_derivatives_if_active(selection, derivatives);
+                }
+            }
+            let Some(next) = next else {
+                break;
+            };
+            cursor = Some(next);
         }
     }
 
-    fn remaining_group_ids(&self, recent: &[AssetId]) -> Result<Vec<AssetId>, AppServiceError> {
-        let recent = recent.iter().copied().collect::<HashSet<_>>();
+    fn remaining_group_ids_page(
+        &self,
+        recent: &HashSet<AssetId>,
+        cursor: Option<photo_catalog::WallCursorKey>,
+    ) -> Result<
+        (
+            SelectionToken,
+            Vec<AssetId>,
+            Option<photo_catalog::WallCursorKey>,
+        ),
+        AppServiceError,
+    > {
         let state = self.state()?;
         let stored = state.libraries.catalog().load_app_state()?;
         let selection = stored
@@ -369,21 +521,88 @@ impl AppService {
         let settled = state
             .libraries
             .catalog()
-            .has_completed_generation_for_library(selection.library_id)?;
+            .has_completed_generation_for_group(selection.library_id, group)?;
         let order = if settled {
             WallOrder::CapturedAscending
         } else {
             WallOrder::Provisional
         };
-        Ok(state
+        let page = state
             .libraries
             .catalog()
-            .wall_page(group, order, None, 250)?
-            .items
-            .into_iter()
-            .map(|asset| asset.id)
-            .filter(|id| !recent.contains(id))
-            .collect())
+            .wall_page(group, order, cursor, 250)?;
+        Ok((
+            SelectionToken {
+                library_id: selection.library_id,
+                group_id: group,
+                epoch: state.selection_epoch,
+            },
+            page.items
+                .into_iter()
+                .map(|asset| asset.id)
+                .filter(|id| !recent.contains(id))
+                .collect(),
+            page.next,
+        ))
+    }
+
+    fn selection_is_active(&self, selection: SelectionToken) -> bool {
+        self.state()
+            .map(|state| {
+                state.selection_epoch == selection.epoch
+                    && state.protected_group == Some(selection.group_id)
+            })
+            .unwrap_or(false)
+    }
+
+    fn publish_derivatives_if_active(
+        &self,
+        selection: SelectionToken,
+        derivatives: Vec<DerivativeReference>,
+    ) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        if state.selection_epoch != selection.epoch
+            || state.protected_group != Some(selection.group_id)
+        {
+            return false;
+        }
+        let _ = self
+            .updates
+            .send(WallUpdate::DerivativesReady { derivatives });
+        true
+    }
+
+    fn record_derivative_warning(&self, selection: SelectionToken, asset_id: AssetId) {
+        let warning = crate::WallWarningState {
+            code: "derivativeUnavailable".to_owned(),
+            retryable: true,
+        };
+        let _ = self.state().and_then(|mut state| {
+            if state.selection_epoch != selection.epoch
+                || state.protected_group != Some(selection.group_id)
+            {
+                return Ok(());
+            }
+            let inserted = state.libraries.catalog_mut().record_warning_once(
+                &photo_catalog::CatalogWarningRecord {
+                    library_id: selection.library_id,
+                    asset_id: Some(asset_id),
+                    code: "derivative_generation_failed".to_owned(),
+                    message: "A cached preview could not be generated. The app can retry it."
+                        .to_owned(),
+                },
+            )?;
+            if inserted {
+                let _ = self.updates.send(WallUpdate::Warning {
+                    source_id: selection.library_id.as_uuid().hyphenated().to_string(),
+                    asset_id: Some(asset_id.as_uuid().hyphenated().to_string()),
+                    warning,
+                });
+            }
+            Ok(())
+        });
     }
 }
 
@@ -456,11 +675,20 @@ fn merge_in_request_order(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
 
+    use photo_cache::{DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget};
+    use photo_catalog::{AssetShapeUpdate, CatalogIndexRecord, NewAsset, ShapeStatus};
+    use photo_domain::{
+        AssetId, FileSignature, FolderGroupId, LibraryId, MediaKind, RelativePathKey,
+    };
     use photo_indexer::{IndexJob, IndexScheduler, JobPriority, SchedulerConfig};
 
-    use super::DerivativeQueue;
+    use crate::service::SelectionToken;
+    use crate::{AppConfig, AppService, DerivativeClass, DerivativeReference};
+
+    use super::{DerivativeQueue, PendingDerivative};
 
     #[tokio::test]
     async fn derivative_driver_leaves_foreign_scheduler_jobs_available() {
@@ -472,6 +700,178 @@ mod tests {
 
         assert!(queue.next_owned(&scheduler).await.is_none());
         assert_eq!(scheduler.next().await.unwrap().name(), "foreign");
+    }
+
+    #[tokio::test]
+    async fn concurrent_producers_share_one_immutable_derivative_job() {
+        let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig::default()));
+        let queue = DerivativeQueue::default();
+        let asset_id = AssetId::from_uuid(uuid::Uuid::new_v4());
+        let group_id = FolderGroupId::new();
+        let selection = SelectionToken {
+            library_id: LibraryId::new(),
+            group_id,
+            epoch: 4,
+        };
+        let spec = DerivativeSpec {
+            asset_id,
+            signature: FileSignature {
+                size_bytes: 10,
+                modified_unix_ns: 20,
+                sidecar_modified_unix_ns: None,
+            },
+            orientation: 1,
+            kind: DerivativeKind::ScreenPreview,
+            decoder_version: "decoder".to_owned(),
+            colour_space: "srgb".to_owned(),
+            target: DerivativeTarget::LongEdge(4096),
+        };
+        let pending = PendingDerivative {
+            id: asset_id,
+            source: PathBuf::from("source.jpg"),
+            spec: spec.clone(),
+            group: group_id,
+            class: DerivativeClass::ScreenPreview,
+            selection,
+        };
+
+        let first = queue
+            .enqueue(&scheduler, pending.clone(), JobPriority::NearViewport)
+            .await;
+        let second = queue
+            .enqueue(&scheduler, pending, JobPriority::IdleLibrary)
+            .await;
+        let (_job, key, queued) = queue.next_owned(&scheduler).await.unwrap();
+
+        assert_eq!(queued.id, asset_id);
+        assert!(scheduler.next().await.is_none());
+        assert_eq!(key, DerivativeKey::compute(&spec).as_str());
+        let reference = DerivativeReference {
+            asset_id: asset_id.as_uuid().hyphenated().to_string(),
+            kind: DerivativeClass::ScreenPreview,
+            key: key.clone(),
+        };
+        queue
+            .finish(&key, _job.name(), Some(reference.clone()))
+            .await;
+        assert_eq!(first.await.unwrap(), Some(reference.clone()));
+        assert_eq!(second.await.unwrap(), Some(reference));
+    }
+
+    #[tokio::test]
+    async fn stale_in_flight_completion_cannot_consume_replacement_selection_work() {
+        let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig::default()));
+        let queue = DerivativeQueue::default();
+        let asset_id = AssetId::from_uuid(uuid::Uuid::new_v4());
+        let group_id = FolderGroupId::new();
+        let library_id = LibraryId::new();
+        let spec = DerivativeSpec {
+            asset_id,
+            signature: FileSignature {
+                size_bytes: 10,
+                modified_unix_ns: 20,
+                sidecar_modified_unix_ns: None,
+            },
+            orientation: 1,
+            kind: DerivativeKind::ScreenPreview,
+            decoder_version: "decoder".to_owned(),
+            colour_space: "srgb".to_owned(),
+            target: DerivativeTarget::LongEdge(4096),
+        };
+        let pending = |epoch| PendingDerivative {
+            id: asset_id,
+            source: PathBuf::from("source.jpg"),
+            spec: spec.clone(),
+            group: group_id,
+            class: DerivativeClass::ScreenPreview,
+            selection: SelectionToken {
+                library_id,
+                group_id,
+                epoch,
+            },
+        };
+        let stale_receiver = queue
+            .enqueue(&scheduler, pending(1), JobPriority::IdleLibrary)
+            .await;
+        let (stale_job, key, _) = queue.next_owned(&scheduler).await.unwrap();
+        let current_receiver = queue
+            .enqueue(&scheduler, pending(2), JobPriority::Visible)
+            .await;
+
+        queue.finish(&key, stale_job.name(), None).await;
+        assert!(stale_receiver.await.is_err());
+        let (current_job, current_key, _) = queue.next_owned(&scheduler).await.unwrap();
+        let reference = DerivativeReference {
+            asset_id: asset_id.as_uuid().hyphenated().to_string(),
+            kind: DerivativeClass::ScreenPreview,
+            key: current_key.clone(),
+        };
+        queue
+            .finish(&current_key, current_job.name(), Some(reference.clone()))
+            .await;
+        assert_eq!(current_receiver.await.unwrap(), Some(reference));
+    }
+
+    #[test]
+    fn remaining_idle_group_enumeration_paginates_past_two_hundred_and_fifty_assets() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(&source).unwrap();
+        let service = AppService::open(AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let (_bootstrap, selection) = service.select_recent(&source).unwrap();
+        {
+            let mut state = service.state().unwrap();
+            let mut shapes = Vec::new();
+            for index in 0..251 {
+                let relative = RelativePathKey::from_relative_path(std::path::Path::new(&format!(
+                    "photo-{index:03}.jpg"
+                )))
+                .unwrap();
+                let mut asset = NewAsset::minimal(
+                    selection.library_id,
+                    relative,
+                    format!("photo-{index:03}.jpg"),
+                    MediaKind::Jpeg,
+                    1,
+                );
+                asset.folder_group_id = Some(selection.group_id);
+                state.libraries.catalog_mut().upsert_asset(&asset).unwrap();
+                shapes.push(CatalogIndexRecord::Shaped(AssetShapeUpdate {
+                    asset_id: asset.id,
+                    width: 16,
+                    height: 9,
+                    orientation: Some(1),
+                    representative_rgb: None,
+                    shape_status: ShapeStatus::Ready,
+                }));
+            }
+            state
+                .libraries
+                .catalog_mut()
+                .apply_index_batch(&shapes)
+                .unwrap();
+        }
+        let recent = std::collections::HashSet::new();
+
+        let (first_selection, first, first_cursor) =
+            service.remaining_group_ids_page(&recent, None).unwrap();
+        let (second_selection, second, second_cursor) = service
+            .remaining_group_ids_page(&recent, first_cursor)
+            .unwrap();
+        let (_, tail, tail_cursor) = service
+            .remaining_group_ids_page(&recent, second_cursor)
+            .unwrap();
+
+        assert_eq!(first_selection, selection);
+        assert_eq!(second_selection, selection);
+        assert_eq!(first.len(), 250);
+        assert_eq!(second.len(), 1);
+        assert!(tail.is_empty());
+        assert!(tail_cursor.is_none());
     }
 
     #[test]

@@ -59,10 +59,47 @@ pub struct DerivativeReference {
 #[serde(rename_all = "camelCase")]
 pub struct WallAsset {
     pub id: String,
+    pub display_name: String,
+    pub media_kind: WallMediaKind,
+    pub provisional_order: u64,
     pub captured_at_utc: Option<String>,
+    pub date_state: OrderState,
     pub width: u32,
     pub height: u32,
+    pub representative_rgb: Option<u32>,
+    pub shape_state: WallShapeState,
+    pub availability: SourceAvailability,
+    pub warning: Option<WallWarningState>,
     pub wall_thumbnail: Option<DerivativeReference>,
+    pub screen_preview: Option<DerivativeReference>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WallMediaKind {
+    Jpeg,
+    Png,
+    Tiff,
+    Heif,
+    Webp,
+    Avif,
+    Raw,
+    Video,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WallShapeState {
+    Ready,
+    Fallback,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WallWarningState {
+    pub code: String,
+    pub retryable: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -122,6 +159,11 @@ pub enum WallUpdate {
     },
     SourceUnavailable {
         source_id: String,
+    },
+    Warning {
+        source_id: String,
+        asset_id: Option<String>,
+        warning: WallWarningState,
     },
 }
 

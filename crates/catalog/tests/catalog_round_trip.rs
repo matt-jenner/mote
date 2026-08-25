@@ -139,3 +139,43 @@ fn repeated_folder_group_upsert_returns_the_stored_id() {
 
     assert_eq!(second, first);
 }
+
+#[test]
+fn reopening_and_touching_a_folder_group_preserves_and_refreshes_recency() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured(
+            "Pictures",
+            Path::new("/mounted/Pictures"),
+        ))
+        .unwrap();
+    let path = RelativePathKey::from_relative_path(Path::new("2026/Trip")).unwrap();
+    let group = catalog
+        .upsert_folder_group(&NewFolderGroup {
+            id: FolderGroupId::new(),
+            library_id: library.id,
+            relative_path: path.clone(),
+            display_path: "Trip".to_owned(),
+            last_viewed_at: Some(10),
+        })
+        .unwrap();
+    catalog
+        .upsert_folder_group(&NewFolderGroup {
+            id: FolderGroupId::new(),
+            library_id: library.id,
+            relative_path: path,
+            display_path: "Trip".to_owned(),
+            last_viewed_at: None,
+        })
+        .unwrap();
+
+    assert_eq!(
+        catalog.folder_group_last_viewed_at(group).unwrap(),
+        Some(10)
+    );
+    catalog.touch_folder_group(group, 20).unwrap();
+    assert_eq!(
+        catalog.folder_group_last_viewed_at(group).unwrap(),
+        Some(20)
+    );
+}

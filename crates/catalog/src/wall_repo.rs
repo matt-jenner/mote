@@ -1,5 +1,5 @@
-use photo_domain::{AssetId, FolderGroupId};
-use rusqlite::params;
+use photo_domain::{AssetId, Availability, FolderGroupId, MediaKind};
+use rusqlite::{OptionalExtension, params};
 
 use crate::{Catalog, CatalogError};
 
@@ -58,10 +58,14 @@ pub enum WallCursorKey {
 pub struct WallCatalogRecord {
     pub id: AssetId,
     pub display_path: String,
+    pub media_kind: MediaKind,
     pub provisional_order: u64,
     pub captured_at_utc: Option<String>,
     pub width: u32,
     pub height: u32,
+    pub representative_rgb: Option<u32>,
+    pub availability: Availability,
+    pub has_warning: bool,
     pub shape_status: ShapeStatus,
 }
 
@@ -72,6 +76,32 @@ pub struct WallCatalogPage {
 }
 
 impl Catalog {
+    pub fn wall_records_for_assets(
+        &self,
+        group: FolderGroupId,
+        assets: &[AssetId],
+    ) -> Result<Vec<WallCatalogRecord>, CatalogError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, display_path, media_kind, provisional_order, captured_at_utc, width, height, representative_rgb, availability, shape_status, \
+                    EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id) \
+             FROM assets WHERE folder_group_id = ?1 AND id = ?2 \
+               AND shape_status IN ('ready','fallback') AND width IS NOT NULL AND height IS NOT NULL",
+        )?;
+        let mut records = Vec::with_capacity(assets.len());
+        for asset in assets {
+            let record = statement
+                .query_row(
+                    params![group.as_uuid().as_bytes(), asset.as_uuid().as_bytes()],
+                    decode_wall_record,
+                )
+                .optional()?;
+            if let Some(record) = record {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
     pub fn wall_page(
         &self,
         group: FolderGroupId,
@@ -80,7 +110,9 @@ impl Catalog {
         limit: u32,
     ) -> Result<WallCatalogPage, CatalogError> {
         let mut sql = String::from(
-            "SELECT id, display_path, provisional_order, captured_at_utc, width, height, shape_status FROM assets WHERE folder_group_id = ?1 AND shape_status IN ('ready','fallback') AND width IS NOT NULL AND height IS NOT NULL",
+            "SELECT id, display_path, media_kind, provisional_order, captured_at_utc, width, height, representative_rgb, availability, shape_status, \
+                    EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id) \
+             FROM assets WHERE folder_group_id = ?1 AND shape_status IN ('ready','fallback') AND width IS NOT NULL AND height IS NOT NULL",
         );
         match order {
             WallOrder::Provisional => {
@@ -136,16 +168,7 @@ impl Catalog {
         };
         let mut items = Vec::new();
         while let Some(row) = rows.next()? {
-            let id: Vec<u8> = row.get(0)?;
-            items.push(WallCatalogRecord {
-                id: AssetId::from_uuid(crate::library_repo::decode_uuid(id, 0)?),
-                display_path: row.get(1)?,
-                provisional_order: row.get::<_, i64>(2)? as u64,
-                captured_at_utc: row.get(3)?,
-                width: row.get::<_, i64>(4)? as u32,
-                height: row.get::<_, i64>(5)? as u32,
-                shape_status: ShapeStatus::decode(row.get::<_, String>(6)?.as_str(), 6)?,
-            });
+            items.push(decode_wall_record(row)?);
         }
         let next = items.last().map(|item| match order {
             WallOrder::Provisional => WallCursorKey::Provisional {
@@ -160,4 +183,21 @@ impl Catalog {
         });
         Ok(WallCatalogPage { items, next })
     }
+}
+
+fn decode_wall_record(row: &rusqlite::Row<'_>) -> Result<WallCatalogRecord, rusqlite::Error> {
+    let id: Vec<u8> = row.get(0)?;
+    Ok(WallCatalogRecord {
+        id: AssetId::from_uuid(crate::library_repo::decode_uuid(id, 0)?),
+        display_path: row.get(1)?,
+        media_kind: crate::asset_repo::decode_media_kind(row.get::<_, String>(2)?.as_str(), 2)?,
+        provisional_order: row.get::<_, i64>(3)? as u64,
+        captured_at_utc: row.get(4)?,
+        width: row.get::<_, i64>(5)? as u32,
+        height: row.get::<_, i64>(6)? as u32,
+        representative_rgb: row.get::<_, Option<i64>>(7)?.map(|value| value as u32),
+        availability: crate::asset_repo::decode_availability(row.get::<_, String>(8)?.as_str(), 8)?,
+        shape_status: ShapeStatus::decode(row.get::<_, String>(9)?.as_str(), 9)?,
+        has_warning: row.get(10)?,
+    })
 }

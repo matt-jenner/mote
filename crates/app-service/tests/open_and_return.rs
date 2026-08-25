@@ -97,3 +97,28 @@ fn cloned_services_share_selection_and_appearance() {
     assert_eq!(state.settings.appearance, Appearance::Dark);
     assert_eq!(state.active_source.unwrap().display_name, "Shared Folder");
 }
+
+#[test]
+fn reopening_the_active_folder_refreshes_group_recency() {
+    let temp = tempfile::tempdir().unwrap();
+    let photos = temp.path().join("Viewed Folder");
+    std::fs::create_dir(&photos).unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let first = AppService::open(config.clone()).unwrap();
+    first.open_recent(&photos).unwrap();
+    drop(first);
+
+    let mut catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    let selection = catalog.load_app_state().unwrap().active_selection.unwrap();
+    let group = catalog
+        .folder_group_for_path(selection.library_id, &selection.relative_folder)
+        .unwrap()
+        .unwrap();
+    catalog.touch_folder_group(group, 1).unwrap();
+    drop(catalog);
+
+    let reopened = AppService::open(config.clone()).unwrap();
+    drop(reopened);
+    let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    assert!(catalog.folder_group_last_viewed_at(group).unwrap().unwrap() > 1);
+}

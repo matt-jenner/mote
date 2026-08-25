@@ -63,6 +63,27 @@ pub enum CatalogIndexRecord {
 }
 
 impl Catalog {
+    pub fn record_warning_once(
+        &mut self,
+        warning: &CatalogWarningRecord,
+    ) -> Result<bool, CatalogError> {
+        let inserted = self.connection.execute(
+            "INSERT INTO warnings (library_id, asset_id, code, message, occurred_at) \
+             SELECT ?1, ?2, ?3, ?4, unixepoch() \
+             WHERE NOT EXISTS ( \
+               SELECT 1 FROM warnings \
+               WHERE library_id = ?1 AND asset_id IS ?2 AND code = ?3 \
+             )",
+            params![
+                warning.library_id.as_uuid().as_bytes(),
+                warning.asset_id.map(|id| id.as_uuid().as_bytes().to_vec()),
+                warning.code,
+                warning.message,
+            ],
+        )?;
+        Ok(inserted == 1)
+    }
+
     pub fn apply_index_batch(
         &mut self,
         records: &[CatalogIndexRecord],

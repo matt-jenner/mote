@@ -7,19 +7,33 @@ use photo_catalog::CatalogError;
 use photo_core::FolderPolicyEngine;
 use photo_indexer::{IndexEvent, Indexer, ScanRequest};
 
+use crate::service::{ScanOwner, SelectionToken};
 use crate::{AppService, AppServiceError, BootstrapState, WallUpdate};
 
 impl AppService {
     /// Starts a cancellable scan after persisting the active selection. The catalog lock is
     /// released before any source read or event wait.
     pub async fn start_scan(&self, folder: &Path) -> Result<BootstrapState, AppServiceError> {
-        let bootstrap = self.open_recent(folder)?;
-        let (library_id, selection_root, library_root, group_id, generation) = {
+        let (bootstrap, selection) = self.select_recent(folder)?;
+        self.start_selected_scan(selection).await?;
+        Ok(bootstrap)
+    }
+
+    pub(crate) async fn start_selected_scan(
+        &self,
+        selection_token: SelectionToken,
+    ) -> Result<(), AppServiceError> {
+        let (selection_root, library_root, owner) = {
             let mut state = self.state()?;
             let stored = state.libraries.catalog().load_app_state()?;
             let selection = stored
                 .active_selection
                 .ok_or(AppServiceError::StatePoisoned)?;
+            if state.selection_epoch != selection_token.epoch
+                || selection.library_id != selection_token.library_id
+            {
+                return Ok(());
+            }
             let library = state
                 .libraries
                 .catalog()
@@ -33,22 +47,24 @@ impl AppService {
                 .relative_folder
                 .to_path_buf()
                 .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
-            let group = state
+            let group_id = state
                 .libraries
                 .catalog()
                 .folder_group_for_path(selection.library_id, &selection.relative_folder)?
                 .ok_or(AppServiceError::StatePoisoned)?;
+            if group_id != selection_token.group_id || state.active_scan.is_some() {
+                return Ok(());
+            }
             let generation = state
                 .libraries
                 .catalog_mut()
-                .begin_generation(selection.library_id)?;
-            (
-                selection.library_id,
-                root.clone().join(&selected),
-                root,
-                group,
+                .begin_generation_for_group(selection.library_id, group_id)?;
+            let owner = ScanOwner {
+                selection: selection_token,
                 generation,
-            )
+            };
+            state.active_scan = Some(owner);
+            (root.clone().join(&selected), root, owner)
         };
         let indexer = Indexer::with_scheduler(
             self.metadata_reader.clone(),
@@ -59,23 +75,37 @@ impl AppService {
         );
         let handle = match indexer.start(
             ScanRequest::new(selection_root.clone())
-                .for_library(library_id)
+                .for_library(owner.selection.library_id)
                 .roots(library_root, selection_root)
-                .for_folder_group(group_id),
+                .for_folder_group(owner.selection.group_id),
         ) {
             Ok(handle) => handle,
             Err(photo_indexer::IndexError::RootUnavailable(_)) => {
                 let mut state = self.state()?;
+                if state.active_scan != Some(owner) {
+                    return Ok(());
+                }
                 state
                     .libraries
                     .catalog_mut()
-                    .mark_root_offline(library_id)?;
+                    .mark_root_offline(owner.selection.library_id)?;
+                state.active_scan = None;
                 let _ = self.updates.send(WallUpdate::SourceUnavailable {
-                    source_id: library_id.as_uuid().hyphenated().to_string(),
+                    source_id: owner
+                        .selection
+                        .library_id
+                        .as_uuid()
+                        .hyphenated()
+                        .to_string(),
                 });
-                return Ok(bootstrap);
+                return Ok(());
             }
             Err(error) => {
+                if let Ok(mut state) = self.state.lock()
+                    && state.active_scan == Some(owner)
+                {
+                    state.active_scan = None;
+                }
                 return Err(AppServiceError::LibrarySetup(std::io::Error::other(
                     error.to_string(),
                 )));
@@ -83,21 +113,25 @@ impl AppService {
         };
         let cancel = handle.cancellation_sender();
         if let Ok(mut state) = self.state.lock() {
+            if state.active_scan != Some(owner) {
+                let _ = cancel.send(true);
+                return Ok(());
+            }
             state.active_cancel = Some(cancel);
-            state.active_scan = Some((library_id, generation));
         }
         let service = self.clone();
         tokio::spawn(async move {
-            service
-                .drain_scan(handle, library_id, generation, group_id)
-                .await;
+            service.drain_scan(handle, owner).await;
         });
-        Ok(bootstrap)
+        Ok(())
     }
 
     pub(crate) async fn reconcile_existing(&self) {
         let details = (|| -> Result<_, AppServiceError> {
-            let state = self.state()?;
+            let mut state = self.state()?;
+            if state.active_scan.is_some() {
+                return Err(AppServiceError::StatePoisoned);
+            }
             let selection = state
                 .libraries
                 .catalog()
@@ -122,21 +156,23 @@ impl AppService {
                 .catalog()
                 .folder_group_for_path(selection.library_id, &selection.relative_folder)?
                 .ok_or(AppServiceError::StatePoisoned)?;
-            Ok((
-                selection.library_id,
-                root.clone().join(selected),
-                root,
-                group,
-            ))
+            let token = SelectionToken {
+                library_id: selection.library_id,
+                group_id: group,
+                epoch: state.selection_epoch,
+            };
+            let generation = state
+                .libraries
+                .catalog_mut()
+                .begin_generation_for_group(selection.library_id, group)?;
+            let owner = ScanOwner {
+                selection: token,
+                generation,
+            };
+            state.active_scan = Some(owner);
+            Ok((root.clone().join(selected), root, owner))
         })();
-        let Ok((library_id, selection_root, library_root, group_id)) = details else {
-            return;
-        };
-        let generation = match self.state.lock() {
-            Ok(mut state) => state.libraries.catalog_mut().begin_generation(library_id),
-            Err(_) => return,
-        };
-        let Ok(generation) = generation else {
+        let Ok((selection_root, library_root, owner)) = details else {
             return;
         };
         let indexer = match FolderPolicyEngine::new(Vec::new()) {
@@ -149,37 +185,45 @@ impl AppService {
         };
         let handle = match indexer.start(
             ScanRequest::new(selection_root.clone())
-                .for_library(library_id)
+                .for_library(owner.selection.library_id)
                 .roots(library_root, selection_root)
-                .for_folder_group(group_id),
+                .for_folder_group(owner.selection.group_id),
         ) {
             Ok(handle) => handle,
             Err(photo_indexer::IndexError::RootUnavailable(_)) => {
                 if let Ok(mut state) = self.state.lock() {
-                    let _ = state.libraries.catalog_mut().mark_root_offline(library_id);
+                    if state.active_scan != Some(owner) {
+                        return;
+                    }
+                    let _ = state
+                        .libraries
+                        .catalog_mut()
+                        .mark_root_offline(owner.selection.library_id);
+                    state.active_scan = None;
+                    let _ = self.updates.send(WallUpdate::SourceUnavailable {
+                        source_id: owner
+                            .selection
+                            .library_id
+                            .as_uuid()
+                            .hyphenated()
+                            .to_string(),
+                    });
                 }
-                let _ = self.updates.send(WallUpdate::SourceUnavailable {
-                    source_id: library_id.as_uuid().hyphenated().to_string(),
-                });
                 return;
             }
             Err(_) => return,
         };
         if let Ok(mut state) = self.state.lock() {
+            if state.active_scan != Some(owner) {
+                let _ = handle.cancellation_sender().send(true);
+                return;
+            }
             state.active_cancel = Some(handle.cancellation_sender());
-            state.active_scan = Some((library_id, generation));
         }
-        self.drain_scan(handle, library_id, generation, group_id)
-            .await;
+        self.drain_scan(handle, owner).await;
     }
 
-    async fn drain_scan(
-        &self,
-        mut handle: photo_indexer::ScanHandle,
-        library_id: photo_domain::LibraryId,
-        generation: u64,
-        group_id: photo_domain::FolderGroupId,
-    ) {
+    async fn drain_scan(&self, mut handle: photo_indexer::ScanHandle, owner: ScanOwner) {
         let mut writer_events = Vec::new();
         let mut last = photo_indexer::ScanProgress {
             stage: photo_indexer::ScanStage::Discovering,
@@ -214,43 +258,41 @@ impl AppService {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            let result = if let Ok(mut state) = self.state.lock() {
-                let mut writer = photo_indexer::CatalogWriter::new(
-                    state.libraries.catalog_mut(),
-                    library_id,
-                    generation,
-                );
-                writer.apply_batch(&writer_events)
-            } else {
-                return;
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(_) => return,
             };
-            if result.is_err() {
+            if state.active_scan != Some(owner) {
+                return;
+            }
+            let mut writer = photo_indexer::CatalogWriter::new(
+                state.libraries.catalog_mut(),
+                owner.selection.library_id,
+                owner.generation,
+            );
+            if writer.apply_batch(&writer_events).is_err() {
                 return;
             }
             if !shaped.is_empty() {
-                let assets = if let Ok(state) = self.state.lock() {
-                    state
-                        .libraries
-                        .catalog()
-                        .wall_page(group_id, photo_catalog::WallOrder::Provisional, None, 250)
-                        .ok()
-                        .map(|page| {
-                            page.items
-                                .into_iter()
-                                .filter(|asset| shaped.contains(&asset.id))
-                                .map(|asset| crate::WallAsset {
-                                    id: asset.id.as_uuid().hyphenated().to_string(),
-                                    captured_at_utc: asset.captured_at_utc,
-                                    width: asset.width,
-                                    height: asset.height,
-                                    wall_thumbnail: None,
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
+                let assets = state
+                    .libraries
+                    .catalog()
+                    .wall_records_for_assets(owner.selection.group_id, &shaped)
+                    .ok()
+                    .map(|records| {
+                        records
+                            .into_iter()
+                            .map(|asset| {
+                                crate::service::wall_asset_from_record(
+                                    &asset,
+                                    crate::OrderState::Provisional,
+                                    None,
+                                    None,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 if !assets.is_empty() {
                     let _ = self.updates.send(WallUpdate::CatalogBatch {
                         assets,
@@ -264,6 +306,7 @@ impl AppService {
                     progress: progress_dto(last),
                 });
             }
+            drop(state);
             writer_events.clear();
         }
         let successful = handle
@@ -272,7 +315,7 @@ impl AppService {
             .map(|summary| !summary.cancelled)
             .unwrap_or(false);
         let recent = if let Ok(mut state) = self.state.lock() {
-            if state.active_scan != Some((library_id, generation)) {
+            if state.active_scan != Some(owner) {
                 return;
             }
             state.active_scan = None;
@@ -281,11 +324,23 @@ impl AppService {
                 if state
                     .libraries
                     .catalog_mut()
-                    .complete_generation(library_id, generation)
+                    .complete_generation_for_group(
+                        owner.selection.library_id,
+                        owner.selection.group_id,
+                        owner.generation,
+                    )
                     .is_err()
                 {
                     return;
                 }
+                let _ = self.updates.send(WallUpdate::MetadataSettled {
+                    source_id: owner
+                        .selection
+                        .library_id
+                        .as_uuid()
+                        .hyphenated()
+                        .to_string(),
+                });
                 Some(state.recent_derivative_ids.clone())
             } else {
                 None
@@ -293,13 +348,10 @@ impl AppService {
         } else {
             return;
         };
-        if let Some(recent) = recent {
-            let _ = self.updates.send(WallUpdate::MetadataSettled {
-                source_id: library_id.as_uuid().hyphenated().to_string(),
-            });
-            if !recent.is_empty() {
-                self.prefetch_screen_previews(recent).await;
-            }
+        if let Some(recent) = recent
+            && !recent.is_empty()
+        {
+            self.prefetch_screen_previews(recent).await;
         }
     }
 }

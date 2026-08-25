@@ -5,18 +5,27 @@ use photo_catalog::{
     NewLibrary, ShapeStatus, WallOrder,
 };
 use photo_domain::{FolderGroupId, MediaKind, RelativePathKey};
+use rusqlite::Connection;
 
 fn id_key(id: photo_domain::AssetId) -> [u8; 16] {
     *id.as_uuid().as_bytes()
 }
 
 fn ready_group(catalog: &mut Catalog, library: photo_domain::LibraryId) -> FolderGroupId {
+    ready_group_at(catalog, library, "group")
+}
+
+fn ready_group_at(
+    catalog: &mut Catalog,
+    library: photo_domain::LibraryId,
+    path: &str,
+) -> FolderGroupId {
     catalog
         .upsert_folder_group(&NewFolderGroup {
             id: FolderGroupId::new(),
             library_id: library,
-            relative_path: RelativePathKey::from_relative_path(Path::new("group")).unwrap(),
-            display_path: "group".into(),
+            relative_path: RelativePathKey::from_relative_path(Path::new(path)).unwrap(),
+            display_path: path.into(),
             last_viewed_at: None,
         })
         .unwrap()
@@ -202,6 +211,20 @@ impl WallFixture {
     fn pending(&mut self, path: &str) -> photo_domain::AssetId {
         self.add(path, None, None, 0, 0)
     }
+
+    fn new_asset(&self, path: &str, group: FolderGroupId) -> NewAsset {
+        let key = RelativePathKey::from_relative_path(Path::new(path)).unwrap();
+        let mut asset = NewAsset::minimal(self.library, key, path, MediaKind::Jpeg, 1);
+        asset.folder_group_id = Some(group);
+        asset
+    }
+
+    fn asset_in_group(&mut self, path: &str, group: FolderGroupId) -> photo_domain::AssetId {
+        let asset = self.new_asset(path, group);
+        let id = asset.id;
+        self.catalog.upsert_asset(&asset).unwrap();
+        id
+    }
 }
 
 #[test]
@@ -386,6 +409,119 @@ fn incomplete_generations_report_false() {
         fixture
             .catalog
             .has_completed_generation(fixture.library, generation)
+            .unwrap()
+    );
+}
+
+#[test]
+fn completing_a_group_generation_only_marks_missing_assets_in_that_group() {
+    let mut fixture = WallFixture::new();
+    let sibling = ready_group_at(&mut fixture.catalog, fixture.library, "sibling");
+    let retained = fixture.asset_in_group("retained.jpg", fixture.group);
+    let missing = fixture.asset_in_group("missing.jpg", fixture.group);
+    let sibling_asset = fixture.asset_in_group("sibling.jpg", sibling);
+
+    let generation = fixture
+        .catalog
+        .begin_generation_for_group(fixture.library, fixture.group)
+        .unwrap();
+    fixture
+        .catalog
+        .record_generation_assets_for_group(
+            fixture.library,
+            fixture.group,
+            generation,
+            &[fixture.new_asset("retained.jpg", fixture.group)],
+        )
+        .unwrap();
+    let completion = fixture
+        .catalog
+        .complete_generation_for_group(fixture.library, fixture.group, generation)
+        .unwrap();
+
+    assert_eq!(completion.marked_missing, 1);
+    assert_eq!(
+        fixture
+            .catalog
+            .find_asset(retained)
+            .unwrap()
+            .unwrap()
+            .availability,
+        photo_domain::Availability::Available
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .find_asset(missing)
+            .unwrap()
+            .unwrap()
+            .availability,
+        photo_domain::Availability::Missing
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .find_asset(sibling_asset)
+            .unwrap()
+            .unwrap()
+            .availability,
+        photo_domain::Availability::Available
+    );
+}
+
+#[test]
+fn completed_generation_is_scoped_to_its_folder_group() {
+    let mut fixture = WallFixture::new();
+    let sibling = ready_group_at(&mut fixture.catalog, fixture.library, "sibling");
+    let generation = fixture
+        .catalog
+        .begin_generation_for_group(fixture.library, fixture.group)
+        .unwrap();
+    fixture
+        .catalog
+        .complete_generation_for_group(fixture.library, fixture.group, generation)
+        .unwrap();
+
+    assert!(
+        fixture
+            .catalog
+            .has_completed_group_generation(fixture.library, fixture.group, generation)
+            .unwrap()
+    );
+    assert!(
+        !fixture
+            .catalog
+            .has_completed_generation_for_group(fixture.library, sibling)
+            .unwrap()
+    );
+}
+
+#[test]
+fn opening_a_v4_catalog_adds_group_generation_support() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("catalog.sqlite");
+    let connection = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_catalog.sql"),
+        include_str!("../migrations/0002_unavailable_assets.sql"),
+        include_str!("../migrations/0003_app_state.sql"),
+        include_str!("../migrations/0004_wall_projection.sql"),
+    ] {
+        connection.execute_batch(migration).unwrap();
+    }
+    drop(connection);
+
+    let mut catalog = Catalog::open(&path).unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured("Photos", Path::new("/Photos")))
+        .unwrap();
+    let group = ready_group(&mut catalog, library.id);
+    let generation = catalog
+        .begin_generation_for_group(library.id, group)
+        .unwrap();
+    assert!(
+        !catalog
+            .has_completed_group_generation(library.id, group, generation)
             .unwrap()
     );
 }

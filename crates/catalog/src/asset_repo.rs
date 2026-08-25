@@ -249,7 +249,7 @@ fn encode_media_kind(kind: MediaKind) -> &'static str {
     }
 }
 
-fn decode_media_kind(value: &str, column: usize) -> Result<MediaKind, rusqlite::Error> {
+pub(crate) fn decode_media_kind(value: &str, column: usize) -> Result<MediaKind, rusqlite::Error> {
     match value {
         "jpeg" => Ok(MediaKind::Jpeg),
         "png" => Ok(MediaKind::Png),
@@ -268,7 +268,10 @@ fn decode_media_kind(value: &str, column: usize) -> Result<MediaKind, rusqlite::
     }
 }
 
-fn decode_availability(value: &str, column: usize) -> Result<Availability, rusqlite::Error> {
+pub(crate) fn decode_availability(
+    value: &str,
+    column: usize,
+) -> Result<Availability, rusqlite::Error> {
     match value {
         "available" => Ok(Availability::Available),
         "root_offline" => Ok(Availability::RootOffline),

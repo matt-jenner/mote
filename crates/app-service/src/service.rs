@@ -2,18 +2,33 @@ use crate::{AppConfig, BootstrapState, SettingsState, SourceAvailability, Source
 use photo_cache::{CacheBudget, CacheError, CacheWriter, ProtectedGroups};
 use photo_catalog::{Catalog, CatalogError, NewFolderGroup, StoredSourceSelection, WallOrder};
 use photo_core::{AddLibraryError, LibraryService, LocalStateError, RealSourceFs};
-use photo_domain::{Appearance, AssetId, Availability};
+use photo_domain::{Appearance, AssetId, Availability, MediaKind};
 use photo_indexer::{DefaultMetadataReader, IndexScheduler, MetadataReader};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
 pub(crate) struct ServiceState {
     pub(crate) libraries: LibraryService<RealSourceFs>,
-    pub(crate) active_scan: Option<(photo_domain::LibraryId, u64)>,
+    pub(crate) active_scan: Option<ScanOwner>,
     pub(crate) active_cancel: Option<watch::Sender<bool>>,
     pub(crate) protected_group: Option<photo_domain::FolderGroupId>,
     pub(crate) recent_derivative_ids: Vec<AssetId>,
+    pub(crate) selection_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SelectionToken {
+    pub(crate) library_id: photo_domain::LibraryId,
+    pub(crate) group_id: photo_domain::FolderGroupId,
+    pub(crate) epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ScanOwner {
+    pub(crate) selection: SelectionToken,
+    pub(crate) generation: u64,
 }
 
 #[derive(Clone)]
@@ -74,11 +89,6 @@ pub enum AppServiceError {
 
 impl AppService {
     pub fn open(config: AppConfig) -> Result<Self, AppServiceError> {
-        let cataloged_roots = Catalog::read_library_root_paths(&config.catalog_path())?;
-        config.validate_source_roots(&cataloged_roots)?;
-        config.prepare(&cataloged_roots)?;
-        let mut catalog = Catalog::open(&config.catalog_path())?;
-        CacheWriter::new(config.cache_dir())?.reconcile_catalog(&mut catalog)?;
         Self::open_with_reader(config, Arc::new(DefaultMetadataReader))
     }
 
@@ -109,6 +119,7 @@ impl AppService {
                 active_cancel: None,
                 protected_group: None,
                 recent_derivative_ids: Vec::new(),
+                selection_epoch: u64::from(should_reconcile),
             })),
             scheduler: Arc::new(IndexScheduler::new(Default::default())),
             updates,
@@ -135,12 +146,18 @@ impl AppService {
             };
             if let Some(group) = active_group {
                 service.protected_groups.protect(group)?;
-                service.state()?.protected_group = Some(group);
+                let mut state = service.state()?;
+                state
+                    .libraries
+                    .catalog_mut()
+                    .touch_folder_group(group, unix_timestamp())?;
+                state.protected_group = Some(group);
             }
         }
         if should_reconcile && tokio::runtime::Handle::try_current().is_ok() {
             let startup = service.clone();
             tokio::spawn(async move {
+                tokio::task::yield_now().await;
                 startup.reconcile_existing().await;
             });
         }
@@ -193,13 +210,27 @@ impl AppService {
         Self::bootstrap_locked(&state)
     }
 
-    /// Synchronous compatibility entry point. Task 5 will move scan launch out of this call.
     pub fn open_recent(&self, folder: &Path) -> Result<BootstrapState, AppServiceError> {
+        let (bootstrap, selection) = self.select_recent(folder)?;
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let service = self.clone();
+            tokio::spawn(async move {
+                let _ = service.start_selected_scan(selection).await;
+            });
+        }
+        Ok(bootstrap)
+    }
+
+    pub(crate) fn select_recent(
+        &self,
+        folder: &Path,
+    ) -> Result<(BootstrapState, SelectionToken), AppServiceError> {
         if let Ok(mut state) = self.state.lock() {
             if let Some(cancel) = state.active_cancel.take() {
                 let _ = cancel.send(true);
             }
             state.active_scan = None;
+            state.selection_epoch = state.selection_epoch.wrapping_add(1).max(1);
         }
         let mut state = self.state()?;
         let selection = state.libraries.open_recent(folder)?;
@@ -222,9 +253,14 @@ impl AppService {
                 library_id: selection.library_id,
                 relative_path: selection.relative_folder,
                 display_path,
-                last_viewed_at: None,
+                last_viewed_at: Some(unix_timestamp()),
             })?;
         let previous = state.protected_group.replace(group);
+        let token = SelectionToken {
+            library_id: selection.library_id,
+            group_id: group,
+            epoch: state.selection_epoch,
+        };
         let bootstrap = Self::bootstrap_locked(&state)?;
         drop(state);
         if previous != Some(group) {
@@ -233,7 +269,13 @@ impl AppService {
             }
             self.protected_groups.protect(group)?;
         }
-        Ok(bootstrap)
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let queue = self.derivative_queue.clone();
+            tokio::spawn(async move {
+                queue.invalidate_except(token).await;
+            });
+        }
+        Ok((bootstrap, token))
     }
 
     pub fn subscribe_wall_updates(&self) -> tokio::sync::broadcast::Receiver<crate::WallUpdate> {
@@ -262,7 +304,7 @@ impl AppService {
         let settled = state
             .libraries
             .catalog()
-            .has_completed_generation_for_library(selection.library_id)?;
+            .has_completed_generation_for_group(selection.library_id, group)?;
         let order = if settled {
             match request.direction {
                 crate::SortDirection::OldestFirst => WallOrder::CapturedAscending,
@@ -274,40 +316,56 @@ impl AppService {
         let cursor = request
             .cursor
             .as_deref()
-            .map(|v| crate::wall::decode_cursor(v, request.direction, order))
+            .map(|v| crate::wall::decode_cursor(v, request.direction, group, order))
             .transpose()?;
         let page = state
             .libraries
             .catalog()
             .wall_page(group, order, cursor, request.limit)?;
-        let derivatives = state
+        let asset_ids = page.items.iter().map(|item| item.id).collect::<Vec<_>>();
+        let wall_derivatives = state
             .libraries
             .catalog()
-            .all_derivatives()?
+            .derivatives_for_assets(&asset_ids, "wall_thumbnail")?
             .into_iter()
-            .filter(|d| d.folder_group_id == group && d.kind == "wall_thumbnail")
-            .collect::<Vec<_>>();
+            .fold(HashMap::new(), |mut rows, derivative| {
+                rows.entry(derivative.asset_id).or_insert(derivative);
+                rows
+            });
+        let screen_derivatives = state
+            .libraries
+            .catalog()
+            .derivatives_for_assets(&asset_ids, "screen_preview")?
+            .into_iter()
+            .fold(HashMap::new(), |mut rows, derivative| {
+                rows.entry(derivative.asset_id).or_insert(derivative);
+                rows
+            });
+        let date_state = if settled {
+            crate::OrderState::Settled
+        } else {
+            crate::OrderState::Provisional
+        };
         let items = page
             .items
             .iter()
-            .map(|item| crate::WallAsset {
-                id: item.id.as_uuid().hyphenated().to_string(),
-                captured_at_utc: item.captured_at_utc.clone(),
-                width: item.width,
-                height: item.height,
-                wall_thumbnail: derivatives.iter().find(|d| d.asset_id == item.id).map(|d| {
-                    crate::DerivativeReference {
-                        asset_id: item.id.as_uuid().hyphenated().to_string(),
-                        kind: crate::DerivativeClass::WallThumbnail,
-                        key: d.cache_key.clone(),
-                    }
-                }),
+            .map(|item| {
+                wall_asset_from_record(
+                    item,
+                    date_state,
+                    wall_derivatives
+                        .get(&item.id)
+                        .map(|row| row.cache_key.as_str()),
+                    screen_derivatives
+                        .get(&item.id)
+                        .map(|row| row.cache_key.as_str()),
+                )
             })
             .collect();
         let next_cursor = page
             .next
             .as_ref()
-            .map(|k| crate::wall::encode_cursor(request.direction, k))
+            .map(|k| crate::wall::encode_cursor(request.direction, group, k))
             .transpose()?;
         Ok(crate::WallPage {
             items,
@@ -330,6 +388,13 @@ impl AppService {
     }
 }
 
+pub(crate) fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
+}
+
 fn empty_page() -> crate::WallPage {
     crate::WallPage {
         items: Vec::new(),
@@ -344,6 +409,79 @@ fn map_availability(availability: Availability) -> SourceAvailability {
         Availability::RootOffline => SourceAvailability::RootOffline,
         Availability::Missing => SourceAvailability::Missing,
         Availability::Unreadable => SourceAvailability::Unreadable,
+    }
+}
+
+pub(crate) fn wall_asset_from_record(
+    item: &photo_catalog::WallCatalogRecord,
+    date_state: crate::OrderState,
+    wall_key: Option<&str>,
+    screen_key: Option<&str>,
+) -> crate::WallAsset {
+    let id = item.id.as_uuid().hyphenated().to_string();
+    let display_name = std::path::Path::new(&item.display_path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Photo".to_owned());
+    let warning = if item.shape_status == photo_catalog::ShapeStatus::Fallback {
+        Some(crate::WallWarningState {
+            code: "shapeFallback".to_owned(),
+            retryable: true,
+        })
+    } else if item.availability != Availability::Available {
+        Some(crate::WallWarningState {
+            code: "sourceUnavailable".to_owned(),
+            retryable: true,
+        })
+    } else if item.has_warning {
+        Some(crate::WallWarningState {
+            code: "assetWarning".to_owned(),
+            retryable: true,
+        })
+    } else {
+        None
+    };
+    crate::WallAsset {
+        id: id.clone(),
+        display_name,
+        media_kind: map_media_kind(item.media_kind),
+        provisional_order: item.provisional_order,
+        captured_at_utc: item.captured_at_utc.clone(),
+        date_state,
+        width: item.width,
+        height: item.height,
+        representative_rgb: item.representative_rgb,
+        shape_state: match item.shape_status {
+            photo_catalog::ShapeStatus::Ready => crate::WallShapeState::Ready,
+            photo_catalog::ShapeStatus::Fallback => crate::WallShapeState::Fallback,
+            photo_catalog::ShapeStatus::Pending => crate::WallShapeState::Fallback,
+        },
+        availability: map_availability(item.availability),
+        warning,
+        wall_thumbnail: wall_key.map(|key| crate::DerivativeReference {
+            asset_id: id.clone(),
+            kind: crate::DerivativeClass::WallThumbnail,
+            key: key.to_owned(),
+        }),
+        screen_preview: screen_key.map(|key| crate::DerivativeReference {
+            asset_id: id,
+            kind: crate::DerivativeClass::ScreenPreview,
+            key: key.to_owned(),
+        }),
+    }
+}
+
+fn map_media_kind(kind: MediaKind) -> crate::WallMediaKind {
+    match kind {
+        MediaKind::Jpeg => crate::WallMediaKind::Jpeg,
+        MediaKind::Png => crate::WallMediaKind::Png,
+        MediaKind::Tiff => crate::WallMediaKind::Tiff,
+        MediaKind::Heif => crate::WallMediaKind::Heif,
+        MediaKind::Webp => crate::WallMediaKind::Webp,
+        MediaKind::Avif => crate::WallMediaKind::Avif,
+        MediaKind::Raw => crate::WallMediaKind::Raw,
+        MediaKind::Video => crate::WallMediaKind::Video,
+        MediaKind::Unknown => crate::WallMediaKind::Unknown,
     }
 }
 

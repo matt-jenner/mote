@@ -7,7 +7,8 @@ use chrono::{FixedOffset, TimeZone};
 use image::{ImageBuffer, Rgb};
 use photo_app_service::{
     AppConfig, AppService, DerivativeClass, DerivativeReference, MetadataReader, OrderState,
-    SortDirection, WallAsset, WallPage, WallQueryRequest, WallUpdate,
+    SortDirection, SourceAvailability, WallAsset, WallMediaKind, WallPage, WallQueryRequest,
+    WallShapeState, WallUpdate, WallWarningState,
 };
 use photo_metadata::{MetadataBundle, MetadataCandidate, MetadataReadWarning, MetadataSource};
 
@@ -212,6 +213,19 @@ async fn uncached_folder_emits_geometry_before_metadata_settles_and_reopens_from
             .order_state,
         OrderState::Settled
     );
+    let settled_page = service
+        .query_wall(query(SortDirection::NewestFirst))
+        .await
+        .unwrap();
+    assert!(settled_page.items.iter().all(|asset| {
+        asset.display_name.ends_with(".jpg")
+            && asset.media_kind == WallMediaKind::Jpeg
+            && asset.provisional_order > 0
+            && asset.date_state == OrderState::Settled
+            && asset.representative_rgb.is_some()
+            && asset.shape_state == WallShapeState::Ready
+            && asset.availability == SourceAvailability::Available
+    }));
     drop(service);
 
     let reopened =
@@ -223,6 +237,84 @@ async fn uncached_folder_emits_geometry_before_metadata_settles_and_reopens_from
         .unwrap();
     assert_eq!(page.items.len(), 12);
     assert_eq!(page.order_state, OrderState::Settled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_recent_starts_the_selected_folder_scan() {
+    let fixture = ProgressiveFixture::new(4);
+    let service =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
+            .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+
+    service.open_recent(&fixture.source).unwrap();
+
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    assert_eq!(
+        service
+            .query_wall(query(SortDirection::OldestFirst))
+            .await
+            .unwrap()
+            .items
+            .len(),
+        4
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completed_sibling_group_does_not_settle_a_new_child_selection() {
+    let fixture = ProgressiveFixture::new(2);
+    let child = fixture.source.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    for index in 0..2 {
+        ImageBuffer::from_pixel(14, 9, Rgb([12_u8, index as u8, 30]))
+            .save(child.join(format!("child-{index}.jpg")))
+            .unwrap();
+    }
+    let first =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
+            .unwrap();
+    let mut updates = first.subscribe_wall_updates();
+    first.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    drop(first);
+
+    let (reader, release) = BlockingReader::new();
+    let service = AppService::open_with_reader(fixture.config.clone(), Arc::new(reader)).unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&child).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::CatalogBatch { .. })
+    })
+    .await;
+
+    assert_eq!(
+        service
+            .query_wall(query(SortDirection::OldestFirst))
+            .await
+            .unwrap()
+            .order_state,
+        OrderState::Provisional
+    );
+    release.release();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    assert_eq!(
+        service
+            .query_wall(query(SortDirection::OldestFirst))
+            .await
+            .unwrap()
+            .order_state,
+        OrderState::Settled
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -271,6 +363,17 @@ async fn stale_cancelled_scan_cannot_settle_the_replacement_source() {
         .await
         .unwrap();
     assert_eq!(page.items.len(), 4);
+    let active_ids = page
+        .items
+        .iter()
+        .map(|asset| asset.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        batches
+            .iter()
+            .all(|asset| active_ids.contains(asset.id.as_str())),
+        "a replaced scan published a catalog batch for the old selection"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -297,6 +400,55 @@ async fn changing_direction_queries_sqlite_without_starting_another_scan() {
             .all(|pair| pair[0].captured_at_utc >= pair[1].captured_at_utc)
     );
     assert_eq!(reader.count(), scans_before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wall_cursor_is_rejected_after_switching_folder_groups() {
+    let fixture = ProgressiveFixture::new(4);
+    let other = fixture.temp.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    for index in 0..2 {
+        ImageBuffer::from_pixel(12, 8, Rgb([40_u8, index as u8, 5]))
+            .save(other.join(format!("other-{index}.jpg")))
+            .unwrap();
+    }
+    let service =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
+            .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let first = service
+        .query_wall(WallQueryRequest {
+            cursor: None,
+            limit: 1,
+            direction: SortDirection::OldestFirst,
+        })
+        .await
+        .unwrap();
+    let stale_cursor = first.next_cursor.unwrap();
+
+    service.start_scan(&other).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let error = service
+        .query_wall(WallQueryRequest {
+            cursor: Some(stale_cursor),
+            limit: 1,
+            direction: SortDirection::OldestFirst,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        photo_app_service::AppServiceError::InvalidCursor
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -332,15 +484,18 @@ async fn unavailable_reopen_retains_cached_wall_and_emits_source_unavailable() {
         matches!(event, WallUpdate::SourceUnavailable { .. })
     })
     .await;
-    assert_eq!(
-        reopened
-            .query_wall(query(SortDirection::NewestFirst))
-            .await
-            .unwrap()
-            .items
-            .len(),
-        12
-    );
+    let unavailable_page = reopened
+        .query_wall(query(SortDirection::NewestFirst))
+        .await
+        .unwrap();
+    assert_eq!(unavailable_page.items.len(), 12);
+    assert!(unavailable_page.items.iter().all(|asset| {
+        asset.availability == SourceAvailability::RootOffline
+            && asset
+                .warning
+                .as_ref()
+                .is_some_and(|warning| warning.retryable)
+    }));
     std::fs::rename(unavailable, &fixture.source).unwrap();
 }
 
@@ -365,6 +520,32 @@ async fn scan_commits_at_most_two_hundred_events_per_transaction() {
         }
     }
     assert!(largest <= 200, "catalog batch contained {largest} assets");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scan_publishes_geometry_batches_beyond_the_first_wall_page() {
+    let fixture = ProgressiveFixture::new(260);
+    let service =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
+            .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    let mut published = std::collections::HashSet::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), updates.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            WallUpdate::CatalogBatch { assets, .. } => {
+                published.extend(assets.into_iter().map(|asset| asset.id));
+            }
+            WallUpdate::MetadataSettled { .. } => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(published.len(), 260);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -447,6 +628,99 @@ async fn one_visible_request_produces_one_ready_batch() {
     assert!(
         matches!(second, WallUpdate::DerivativesReady { ref derivatives } if derivatives.len() == 8)
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn derivative_failure_records_and_publishes_a_retryable_asset_warning() {
+    let fixture = ProgressiveFixture::new(1);
+    let service =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
+            .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let asset_id = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items[0]
+        .id
+        .clone();
+    std::fs::write(
+        fixture.source.join("photo-000.jpg"),
+        b"damaged after indexing",
+    )
+    .unwrap();
+
+    service
+        .request_derivatives(photo_app_service::DerivativeRequest::visible(vec![
+            asset_id.clone(),
+        ]))
+        .await
+        .unwrap();
+
+    let warning = recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::Warning { .. })
+    })
+    .await;
+    assert!(matches!(
+        warning,
+        WallUpdate::Warning {
+            asset_id: Some(id),
+            warning: WallWarningState { retryable: true, .. },
+            ..
+        } if id == asset_id
+    ));
+    let page = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    assert!(
+        page.items[0]
+            .warning
+            .as_ref()
+            .is_some_and(|warning| warning.retryable)
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        photo_catalog::Catalog::open(&fixture.config.catalog_path())
+            .unwrap()
+            .warning_count()
+            .unwrap(),
+        1,
+        "wall and screen failures for one asset must share one bounded warning"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unreadable_geometry_maps_to_the_stable_fallback_question_mark_state() {
+    let fixture = ProgressiveFixture::new(1);
+    std::fs::write(fixture.source.join("photo-000.jpg"), b"not an image").unwrap();
+    let service =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
+            .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+
+    let asset = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!((asset.width, asset.height), (4, 3));
+    assert_eq!(asset.shape_state, WallShapeState::Fallback);
+    assert_eq!(asset.warning.unwrap().code, "shapeFallback");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -736,14 +1010,26 @@ fn wall_dtos_never_serialize_native_paths() {
     let page = WallPage {
         items: vec![WallAsset {
             id: "asset-id".to_owned(),
+            display_name: "photo.jpg".to_owned(),
+            media_kind: WallMediaKind::Jpeg,
+            provisional_order: 7,
             captured_at_utc: Some("2025-01-02T03:04:05Z".to_owned()),
+            date_state: OrderState::Settled,
             width: 4_032,
             height: 3_024,
+            representative_rgb: Some(0x123456),
+            shape_state: WallShapeState::Ready,
+            availability: SourceAvailability::Available,
+            warning: Some(WallWarningState {
+                code: "derivativeUnavailable".to_owned(),
+                retryable: true,
+            }),
             wall_thumbnail: Some(DerivativeReference {
                 asset_id: "asset-id".to_owned(),
                 kind: DerivativeClass::WallThumbnail,
                 key: "opaque-cache-key".to_owned(),
             }),
+            screen_preview: None,
         }],
         next_cursor: Some("opaque-cursor".to_owned()),
         order_state: OrderState::Settled,
@@ -752,4 +1038,7 @@ fn wall_dtos_never_serialize_native_paths() {
     assert!(!json.contains("/Users/"));
     assert!(!json.contains("\\\\server\\share"));
     assert!(!json.contains("relativeCachePath"));
+    assert!(json.contains("\"displayName\":\"photo.jpg\""));
+    assert!(json.contains("\"representativeRgb\":1193046"));
+    assert!(json.contains("\"screenPreview\":null"));
 }
