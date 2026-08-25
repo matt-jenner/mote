@@ -20,7 +20,8 @@ pub(crate) struct ServiceState {
     pub(crate) protected_group: Option<photo_domain::FolderGroupId>,
     pub(crate) recent_derivative_ids: Vec<AssetId>,
     pub(crate) selection_epoch: u64,
-    pub(crate) published_cache_warning: Option<SelectionToken>,
+    pub(crate) published_wall_cache_warning: Option<SelectionToken>,
+    pub(crate) published_screen_cache_warning: Option<SelectionToken>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,7 +143,8 @@ impl AppService {
                 protected_group: None,
                 recent_derivative_ids: Vec::new(),
                 selection_epoch: u64::from(should_reconcile),
-                published_cache_warning: None,
+                published_wall_cache_warning: None,
+                published_screen_cache_warning: None,
             })),
             scheduler: Arc::new(IndexScheduler::new(Default::default())),
             updates,
@@ -260,13 +262,14 @@ impl AppService {
             .wrapping_add(1)
             .max(1);
         let validated = self.source_validator.validate_recent(folder)?;
+        let mut state = self.state()?;
+        let prepared = state.libraries.prepare_validated_recent(validated)?;
         self.latest_validated_selection
             .fetch_max(request_id, Ordering::SeqCst);
-        let mut state = self.state()?;
         if self.latest_validated_selection.load(Ordering::SeqCst) != request_id {
             return Err(AppServiceError::SelectionSuperseded);
         }
-        let selection = state.libraries.open_validated_recent(validated)?;
+        let selection = prepared.open()?;
         let display_path = folder
             .file_name()
             .map(|v| v.to_string_lossy().into_owned())
@@ -303,7 +306,8 @@ impl AppService {
             let _ = cancel.send(true);
         }
         state.active_scan = None;
-        state.published_cache_warning = None;
+        state.published_wall_cache_warning = None;
+        state.published_screen_cache_warning = None;
         state.selection_epoch = state.selection_epoch.wrapping_add(1).max(1);
         if previous != Some(group) {
             if let Some(previous) = previous {
@@ -786,6 +790,58 @@ mod tests {
             published.iter().all(|id| id == &active.items[0].id),
             "only the latest valid selection may publish wall rows"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn newer_catalog_invalid_selection_does_not_supersede_an_older_valid_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let existing_parent = temp.path().join("existing-parent");
+        let existing = existing_parent.join("existing-root");
+        let older_valid = temp.path().join("older-valid");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::create_dir_all(&older_valid).unwrap();
+        let mut service = AppService::open(AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        service.select_recent(&existing).unwrap();
+        let (entered_send, entered_receive) = mpsc::channel();
+        let (release_send, release_receive) = mpsc::channel();
+        BlockingSourceValidator::install(
+            &mut service,
+            older_valid.clone(),
+            entered_send,
+            release_receive,
+        );
+
+        let older_service = service.clone();
+        let older_path = older_valid.clone();
+        let older_call = std::thread::spawn(move || older_service.select_recent(&older_path));
+        entered_receive
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        assert!(matches!(
+            service.select_recent(&existing_parent),
+            Err(AppServiceError::OpenRecent(
+                photo_core::AddLibraryError::Overlaps { .. }
+            ))
+        ));
+        release_send.send(()).unwrap();
+        let older_token = older_call.join().unwrap().unwrap().1;
+
+        let state = service.state().unwrap();
+        let stored = state
+            .libraries
+            .catalog()
+            .load_app_state()
+            .unwrap()
+            .active_selection
+            .unwrap();
+        assert_eq!(stored.library_id, older_token.library_id);
+        assert_eq!(state.selection_epoch, older_token.epoch);
+        assert_eq!(state.protected_group, Some(older_token.group_id));
     }
 
     fn seed_wall_asset(service: &AppService, selection: super::SelectionToken, name: &str) {

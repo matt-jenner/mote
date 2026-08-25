@@ -361,5 +361,47 @@ mod tests {
                 .all(|detail| !detail.contains("TEMP B-TREE")),
             "capture keyset query should not need a temporary sort: {captured_details:?}"
         );
+
+        let mut descending = catalog
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id FROM assets
+                 WHERE folder_group_id = ?1
+                   AND shape_status IN ('ready', 'fallback')
+                   AND width IS NOT NULL
+                   AND height IS NOT NULL
+                   AND (captured_at_utc < ?2 OR (captured_at_utc = ?2 AND (display_path > ?3 OR (display_path = ?3 AND id > ?4))))
+                   AND captured_at_utc IS NOT NULL
+                 ORDER BY captured_at_utc DESC, display_path ASC, id ASC
+                 LIMIT ?5",
+            )
+            .unwrap();
+        let descending_details = descending
+            .query_map(
+                params![
+                    vec![0_u8; 16],
+                    "2026-01-01T00:00:00Z",
+                    "photo.jpg",
+                    vec![1_u8; 16],
+                    10_i64
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            descending_details
+                .iter()
+                .any(|detail| detail.contains("assets_group_capture_desc_wall")),
+            "expected descending capture keyset index in query plan: {descending_details:?}"
+        );
+        assert!(
+            descending_details
+                .iter()
+                .all(|detail| !detail.contains("TEMP B-TREE")),
+            "descending capture keyset query should not need a temporary sort: {descending_details:?}"
+        );
     }
 }

@@ -24,6 +24,21 @@ pub struct ValidatedSourceFolder {
     display_path: PathBuf,
 }
 
+pub struct PreparedSourceSelection<'a, F> {
+    libraries: &'a mut LibraryService<F>,
+    resolution: PreparedSelectionResolution,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PreparedSelectionResolution {
+    Existing(SourceSelection),
+    RecentRoot {
+        canonical: PathBuf,
+        display_path: PathBuf,
+        display_name: String,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceSelection {
     pub library_id: LibraryId,
@@ -137,13 +152,13 @@ impl<F: SourceFs> LibraryService<F> {
         F: Clone,
     {
         let validated = self.source_validator().validate_recent(folder)?;
-        self.open_validated_recent(validated)
+        self.prepare_validated_recent(validated)?.open()
     }
 
-    pub fn open_validated_recent(
+    pub fn prepare_validated_recent(
         &mut self,
         validated: ValidatedSourceFolder,
-    ) -> Result<SourceSelection, AddLibraryError> {
+    ) -> Result<PreparedSourceSelection<'_, F>, AddLibraryError> {
         let canonical = validated.canonical;
         let libraries = self.catalog.list_libraries()?;
         for existing in libraries {
@@ -155,11 +170,14 @@ impl<F: SourceFs> LibraryService<F> {
                 let relative = canonical
                     .strip_prefix(&existing_path)
                     .map_err(|_| AddLibraryError::InvalidSelection)?;
-                return Ok(SourceSelection {
-                    library_id: existing.id,
-                    relative_folder: RelativePathKey::from_relative_path(relative)
-                        .map_err(|_| AddLibraryError::InvalidSelection)?,
-                    created_recent_root: false,
+                return Ok(PreparedSourceSelection {
+                    libraries: self,
+                    resolution: PreparedSelectionResolution::Existing(SourceSelection {
+                        library_id: existing.id,
+                        relative_folder: RelativePathKey::from_relative_path(relative)
+                            .map_err(|_| AddLibraryError::InvalidSelection)?,
+                        created_recent_root: false,
+                    }),
                 });
             }
             if existing_path.starts_with(&canonical) {
@@ -173,14 +191,13 @@ impl<F: SourceFs> LibraryService<F> {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Selected folder".to_owned());
-        let mut recent = NewLibrary::recent(display_name, &canonical);
-        recent.display_path = validated.display_path.to_string_lossy().into_owned();
-        let library = self.catalog.add_library(&recent)?;
-        Ok(SourceSelection {
-            library_id: library.id,
-            relative_folder: RelativePathKey::from_relative_path(Path::new(""))
-                .map_err(|_| AddLibraryError::InvalidSelection)?,
-            created_recent_root: true,
+        Ok(PreparedSourceSelection {
+            libraries: self,
+            resolution: PreparedSelectionResolution::RecentRoot {
+                canonical,
+                display_path: validated.display_path,
+                display_name,
+            },
         })
     }
 
@@ -262,6 +279,28 @@ impl<F: SourceFs> LibraryService<F> {
         self.local_state_roots
             .iter()
             .any(|state| paths_overlap(source, state))
+    }
+}
+
+impl<F: SourceFs> PreparedSourceSelection<'_, F> {
+    pub fn open(self) -> Result<SourceSelection, AddLibraryError> {
+        let (canonical, display_path, display_name) = match self.resolution {
+            PreparedSelectionResolution::Existing(selection) => return Ok(selection),
+            PreparedSelectionResolution::RecentRoot {
+                canonical,
+                display_path,
+                display_name,
+            } => (canonical, display_path, display_name),
+        };
+        let mut recent = NewLibrary::recent(display_name, &canonical);
+        recent.display_path = display_path.to_string_lossy().into_owned();
+        let library = self.libraries.catalog.add_library(&recent)?;
+        Ok(SourceSelection {
+            library_id: library.id,
+            relative_folder: RelativePathKey::from_relative_path(Path::new(""))
+                .map_err(|_| AddLibraryError::InvalidSelection)?,
+            created_recent_root: true,
+        })
     }
 }
 

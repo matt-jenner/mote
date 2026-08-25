@@ -21,7 +21,8 @@ use crate::{
 
 const DECODER_VERSION: &str = "image-0.25-v1";
 const ASSET_DERIVATIVE_WARNING: &str = "derivative_generation_failed";
-const CACHE_DERIVATIVE_WARNING: &str = "derivative_cache_unavailable";
+const WALL_CACHE_DERIVATIVE_WARNING: &str = "wall_thumbnail_cache_unavailable";
+const SCREEN_CACHE_DERIVATIVE_WARNING: &str = "screen_preview_cache_unavailable";
 
 #[derive(Debug)]
 enum DerivativeWorkError {
@@ -393,10 +394,11 @@ impl AppService {
             }
             let selection = pending.selection;
             let asset_id = pending.id;
+            let class = pending.class;
             let result = if self.selection_is_active(selection) {
                 match self.generate_derivative(pending).await {
                     Ok(reference) => {
-                        self.clear_derivative_warnings(selection, asset_id);
+                        self.clear_derivative_warnings(selection, asset_id, class);
                         Some(reference)
                     }
                     Err(error) => {
@@ -405,7 +407,7 @@ impl AppService {
                                 self.record_asset_derivative_warning(selection, asset_id);
                             }
                             DerivativeFailureScope::CacheWide => {
-                                self.record_cache_derivative_warning(selection);
+                                self.record_cache_derivative_warning(selection, class);
                             }
                         }
                         None
@@ -653,9 +655,10 @@ impl AppService {
         });
     }
 
-    fn record_cache_derivative_warning(&self, selection: SelectionToken) {
+    fn record_cache_derivative_warning(&self, selection: SelectionToken, class: DerivativeClass) {
+        let (catalog_code, public_code, message) = cache_warning_identity(class);
         let warning = crate::WallWarningState {
-            code: "cacheUnavailable".to_owned(),
+            code: public_code.to_owned(),
             retryable: true,
         };
         let _ = self.state().and_then(|mut state| {
@@ -668,12 +671,15 @@ impl AppService {
                 &photo_catalog::CatalogWarningRecord {
                     library_id: selection.library_id,
                     asset_id: None,
-                    code: CACHE_DERIVATIVE_WARNING.to_owned(),
-                    message: "The preview cache is unavailable. Browsing can continue while the app retries it."
-                        .to_owned(),
+                    code: catalog_code.to_owned(),
+                    message: message.to_owned(),
                 },
             )?;
-            if state.published_cache_warning != Some(selection)
+            let published = match class {
+                DerivativeClass::WallThumbnail => &mut state.published_wall_cache_warning,
+                DerivativeClass::ScreenPreview => &mut state.published_screen_cache_warning,
+            };
+            if *published != Some(selection)
                 && self
                     .updates
                     .send(WallUpdate::Warning {
@@ -683,13 +689,19 @@ impl AppService {
                     })
                     .is_ok()
             {
-                state.published_cache_warning = Some(selection);
+                *published = Some(selection);
             }
             Ok(())
         });
     }
 
-    fn clear_derivative_warnings(&self, selection: SelectionToken, asset_id: AssetId) {
+    fn clear_derivative_warnings(
+        &self,
+        selection: SelectionToken,
+        asset_id: AssetId,
+        class: DerivativeClass,
+    ) {
+        let (catalog_code, public_code, _) = cache_warning_identity(class);
         let _ = self.state().and_then(|mut state| {
             if state.selection_epoch != selection.epoch
                 || state.protected_group != Some(selection.group_id)
@@ -704,7 +716,7 @@ impl AppService {
             let cache_warning_removed = state.libraries.catalog_mut().clear_warning(
                 selection.library_id,
                 None,
-                CACHE_DERIVATIVE_WARNING,
+                catalog_code,
             )?;
             let source_id = selection.library_id.as_uuid().hyphenated().to_string();
             if asset_warning_removed > 0 {
@@ -715,15 +727,37 @@ impl AppService {
                 });
             }
             if cache_warning_removed > 0 {
-                state.published_cache_warning = None;
+                match class {
+                    DerivativeClass::WallThumbnail => {
+                        state.published_wall_cache_warning = None;
+                    }
+                    DerivativeClass::ScreenPreview => {
+                        state.published_screen_cache_warning = None;
+                    }
+                }
                 let _ = self.updates.send(WallUpdate::WarningCleared {
                     source_id,
                     asset_id: None,
-                    code: "cacheUnavailable".to_owned(),
+                    code: public_code.to_owned(),
                 });
             }
             Ok(())
         });
+    }
+}
+
+fn cache_warning_identity(class: DerivativeClass) -> (&'static str, &'static str, &'static str) {
+    match class {
+        DerivativeClass::WallThumbnail => (
+            WALL_CACHE_DERIVATIVE_WARNING,
+            "wallThumbnailCacheUnavailable",
+            "The thumbnail cache is unavailable. Browsing can continue while the app retries it.",
+        ),
+        DerivativeClass::ScreenPreview => (
+            SCREEN_CACHE_DERIVATIVE_WARNING,
+            "screenPreviewCacheUnavailable",
+            "The preview cache is unavailable. Browsing can continue while the app retries it.",
+        ),
     }
 }
 
@@ -1063,7 +1097,7 @@ mod tests {
                     asset_id: None,
                     warning: crate::WallWarningState { ref code, .. },
                     ..
-                } if code == "cacheUnavailable"
+                } if code == "screenPreviewCacheUnavailable"
             ) {
                 cache_warning_updates += 1;
             }
@@ -1116,8 +1150,37 @@ mod tests {
                 asset_id: None,
                 warning: crate::WallWarningState { ref code, .. },
                 ..
-            } if code == "cacheUnavailable"
+            } if code == "screenPreviewCacheUnavailable"
         ));
+
+        let (_, cached_wall, pending_wall) = service
+            .resolve_derivatives(
+                &ids.iter()
+                    .map(|id| AssetId::from_uuid(uuid::Uuid::parse_str(id).unwrap()))
+                    .collect::<Vec<_>>(),
+                DerivativeClass::WallThumbnail,
+            )
+            .unwrap();
+        assert!(cached_wall.is_empty());
+        assert_eq!(
+            service
+                .run_derivative_jobs(pending_wall, JobPriority::Visible)
+                .await
+                .len(),
+            250
+        );
+        assert_eq!(
+            photo_catalog::Catalog::open(&config.catalog_path())
+                .unwrap()
+                .warning_count()
+                .unwrap(),
+            1,
+            "wall success must not clear an active screen-cache warning"
+        );
+        assert!(
+            updates.try_recv().is_err(),
+            "wall success must not publish a clear for a screen-cache warning"
+        );
 
         service.cache_budget = CacheBudget::from_total_space(10_000_000);
         let (_, cached_after_recovery, pending_after_recovery) = service
@@ -1140,13 +1203,27 @@ mod tests {
                     asset_id: None,
                     code,
                     ..
-                } if code == "cacheUnavailable"
+                } if code == "screenPreviewCacheUnavailable"
             )
         })
         .await;
         let cleared_json = serde_json::to_string(&cleared).unwrap();
         assert!(cleared_json.len() < 256);
         assert!(!cleared_json.contains(&source.to_string_lossy().into_owned()));
+        let mut screen_clear_updates = 1;
+        while let Ok(update) = updates.try_recv() {
+            if matches!(
+                update,
+                WallUpdate::WarningCleared {
+                    asset_id: None,
+                    ref code,
+                    ..
+                } if code == "screenPreviewCacheUnavailable"
+            ) {
+                screen_clear_updates += 1;
+            }
+        }
+        assert_eq!(screen_clear_updates, 1);
         assert_eq!(
             photo_catalog::Catalog::open(&config.catalog_path())
                 .unwrap()
