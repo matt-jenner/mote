@@ -316,6 +316,40 @@ async fn cancellation_completes_when_enrichment_queue_is_backpressured() {
 }
 
 #[tokio::test]
+async fn cancellation_joins_before_blocked_metadata_gate_is_released() {
+    let fixture = tempfile::tempdir().unwrap();
+    for index in 0..160 {
+        write_png(&fixture.path().join(format!("{index:04}.png")), [1, 2, 3]);
+    }
+    let (reader, notifications, release) = AdmissionReader::new();
+    let mut scan = Indexer::new(reader.clone(), empty_policy_engine())
+        .start(ScanRequest::new(fixture.path()))
+        .unwrap();
+    let _notifications = wait_for_starts(notifications, 2).await;
+
+    let mut discovered = 0;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while discovered < 70 {
+            if let Some(IndexEvent::Discovered { .. }) = scan.events.recv().await {
+                discovered += 1;
+            }
+        }
+    })
+    .await
+    .expect("shape stage should fill the bounded enrichment path");
+    assert_eq!(reader.starts.load(Ordering::SeqCst), 2);
+
+    scan.cancel().unwrap();
+    let summary = tokio::time::timeout(Duration::from_secs(1), scan.join())
+        .await
+        .expect("join must return while metadata reads remain blocked")
+        .unwrap();
+    assert!(summary.cancelled);
+    assert!(summary.discovered < 160);
+    release.release();
+}
+
+#[tokio::test]
 async fn malformed_sidecar_is_warning_event_and_metadata_still_arrives() {
     let fixture = tempfile::tempdir().unwrap();
     let media = fixture.path().join("photo.png");

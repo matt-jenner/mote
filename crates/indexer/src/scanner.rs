@@ -297,8 +297,15 @@ impl<R: MetadataReader> Indexer<R> {
                             break;
                         }
                         let reader = reader.clone();
-                        match tokio::task::spawn_blocking(move || process_asset(reader, item)).await
-                        {
+                        let process =
+                            tokio::task::spawn_blocking(move || process_asset(reader, item));
+                        tokio::pin!(process);
+                        let result = tokio::select! {
+                            result = &mut process => Some(result),
+                            _ = cancel.changed() => None,
+                        };
+                        let Some(result) = result else { break };
+                        match result {
                             Ok(Ok(p)) => {
                                 for warning in &p.metadata.warnings {
                                     let _ = events
@@ -470,8 +477,19 @@ fn discover_all(
         policy_engine
             .classify(relative, &structure)
             .map_err(|error| IndexError::Policy(error.to_string()))?;
-        if sender.blocking_send(asset).is_err() {
-            break;
+        let mut pending = asset;
+        loop {
+            if *cancel.borrow() {
+                return Ok(());
+            }
+            match sender.try_send(pending) {
+                Ok(()) => break,
+                Err(mpsc::error::TrySendError::Full(asset)) => {
+                    pending = asset;
+                    std::thread::park_timeout(std::time::Duration::from_millis(2));
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+            }
         }
     }
     Ok(())
