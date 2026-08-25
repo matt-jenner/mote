@@ -104,16 +104,25 @@ async fn forward_wall_updates_inner<F>(
                 let retained_window = receiver.len();
                 on_lag(retained_window);
                 let mut newest_progress = None;
-                for _ in 0..retained_window {
+                let mut remaining = retained_window;
+                while remaining > 0 {
                     match receiver.try_recv() {
-                        Ok(update) => match update {
-                            WallUpdate::CatalogBatch { progress, .. }
-                            | WallUpdate::Progress { progress } => newest_progress = Some(progress),
-                            _ => {}
-                        },
+                        Ok(update) => {
+                            remaining = remaining.saturating_sub(1);
+                            match update {
+                                WallUpdate::CatalogBatch { progress, .. }
+                                | WallUpdate::Progress { progress } => {
+                                    newest_progress = Some(progress)
+                                }
+                                _ => {}
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::TryRecvError::Empty)
                         | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
-                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                            let skipped = usize::try_from(skipped).unwrap_or(usize::MAX);
+                            remaining = remaining.saturating_sub(skipped);
+                        }
                     }
                 }
                 if let Some(progress) = newest_progress
@@ -407,7 +416,8 @@ mod tests {
             [
                 WallUpdate::Progress { progress: ScanProgressDto { discovered: 6, .. } },
                 WallUpdate::SourceUnavailable { source_id },
-            ] if source_id == "live-8"
+                WallUpdate::SourceUnavailable { source_id: second },
+            ] if source_id == "live-7" && second == "live-8"
         ));
     }
 }
