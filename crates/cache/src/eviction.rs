@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -10,7 +10,7 @@ use crate::writer::CacheWriter;
 
 #[derive(Debug, Default)]
 struct ProtectionState {
-    protected: HashSet<FolderGroupId>,
+    protected: HashMap<FolderGroupId, usize>,
     active_writes: HashMap<FolderGroupId, usize>,
 }
 
@@ -21,12 +21,18 @@ pub struct ProtectedGroups {
 
 impl ProtectedGroups {
     pub fn protect(&self, group: FolderGroupId) -> Result<(), CacheError> {
-        self.lock()?.protected.insert(group);
+        *self.lock()?.protected.entry(group).or_default() += 1;
         Ok(())
     }
 
     pub fn unprotect(&self, group: FolderGroupId) -> Result<(), CacheError> {
-        self.lock()?.protected.remove(&group);
+        let mut state = self.lock()?;
+        if let Some(count) = state.protected.get_mut(&group) {
+            *count -= 1;
+            if *count == 0 {
+                state.protected.remove(&group);
+            }
+        }
         Ok(())
     }
 
@@ -86,7 +92,7 @@ impl EvictionPlanner {
         let protection = protected.lock()?;
         let mut plan = EvictionPlan::default();
         for group in catalog.cache_eviction_groups()? {
-            if protection.protected.contains(&group.id)
+            if protection.protected.contains_key(&group.id)
                 || protection.active_writes.contains_key(&group.id)
             {
                 continue;
@@ -111,7 +117,7 @@ impl EvictionPlanner {
     ) -> Result<u64, CacheError> {
         let protection = protected.lock()?;
         if plan.groups.iter().any(|group| {
-            protection.protected.contains(group) || protection.active_writes.contains_key(group)
+            protection.protected.contains_key(group) || protection.active_writes.contains_key(group)
         }) {
             return Err(CacheError::GroupBecameProtected);
         }

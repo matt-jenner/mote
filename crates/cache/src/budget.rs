@@ -64,8 +64,14 @@ impl CacheBudget {
         protected.protect(active_group)?;
         let result = (|| {
             let plan = EvictionPlanner::plan(catalog, needed, protected)?;
+            if plan.reclaimable_bytes < needed {
+                return Err(CacheError::BudgetExceeded);
+            }
             let groups = plan.groups.clone();
             let reclaimed = EvictionPlanner::execute(catalog, cache_root, &plan, protected)?;
+            if reclaimed < needed {
+                return Err(CacheError::BudgetExceeded);
+            }
             Ok::<_, CacheError>((groups, reclaimed))
         })();
         protected.unprotect(active_group)?;

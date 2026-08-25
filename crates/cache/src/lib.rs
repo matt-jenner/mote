@@ -27,4 +27,6 @@ pub enum CacheError {
     ProtectionUnavailable,
     #[error("an eviction group became protected before deletion")]
     GroupBecameProtected,
+    #[error("cache preview budget cannot be satisfied")]
+    BudgetExceeded,
 }

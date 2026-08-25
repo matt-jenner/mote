@@ -25,6 +25,9 @@ pub struct CacheWriter {
 }
 
 impl CacheWriter {
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
     pub fn new(root: &Path) -> Result<Self, CacheError> {
         std::fs::create_dir_all(root)?;
         Ok(Self {
