@@ -1,20 +1,19 @@
-use photo_app_service::{AppServiceError, BootstrapState};
+use photo_app_service::{
+    AppServiceError, BootstrapState, DerivativeRequest, InteractionState, WallQueryRequest,
+    WallUpdate,
+};
 use photo_core::AddLibraryError;
 use photo_domain::Appearance;
 use tauri::{AppHandle, State, Theme, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::dto::{ChooseFolderResult, CommandError};
+use crate::protocol::forward_wall_updates;
 use crate::state::DesktopState;
 
 #[tauri::command]
 pub fn get_bootstrap_state(state: State<'_, DesktopState>) -> Result<BootstrapState, CommandError> {
-    state
-        .service
-        .lock()
-        .map_err(|_| CommandError::internal())?
-        .bootstrap()
-        .map_err(map_service_error)
+    state.service.bootstrap().map_err(map_service_error)
 }
 
 #[tauri::command]
@@ -32,8 +31,6 @@ pub async fn choose_folder(
     })?;
     let state = state
         .service
-        .lock()
-        .map_err(|_| CommandError::internal())?
         .open_recent(&path)
         .map_err(map_service_error)?;
     Ok(ChooseFolderResult::Selected { state })
@@ -47,8 +44,6 @@ pub fn update_appearance(
 ) -> Result<BootstrapState, CommandError> {
     let bootstrap = state
         .service
-        .lock()
-        .map_err(|_| CommandError::internal())?
         .update_appearance(appearance)
         .map_err(map_service_error)?;
     let theme = match appearance {
@@ -61,6 +56,55 @@ pub fn update_appearance(
         CommandError::internal()
     })?;
     Ok(bootstrap)
+}
+
+#[tauri::command]
+pub async fn query_wall(
+    request: WallQueryRequest,
+    state: State<'_, DesktopState>,
+) -> Result<photo_app_service::WallPage, CommandError> {
+    state
+        .service
+        .query_wall(request)
+        .await
+        .map_err(map_service_error)
+}
+
+#[tauri::command]
+pub async fn request_derivatives(
+    request: DerivativeRequest,
+    state: State<'_, DesktopState>,
+) -> Result<(), CommandError> {
+    state
+        .service
+        .request_derivatives(request)
+        .await
+        .map_err(map_service_error)
+}
+
+#[tauri::command]
+pub async fn set_wall_interaction(
+    active: bool,
+    state: State<'_, DesktopState>,
+) -> Result<(), CommandError> {
+    state
+        .service
+        .set_interaction(if active {
+            InteractionState::Active
+        } else {
+            InteractionState::Idle
+        })
+        .await;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn watch_wall_updates(
+    on_event: tauri::ipc::Channel<WallUpdate>,
+    state: State<'_, DesktopState>,
+) {
+    let receiver = state.service.subscribe_wall_updates();
+    tauri::async_runtime::spawn(forward_wall_updates(receiver, on_event));
 }
 
 fn map_service_error(error: AppServiceError) -> CommandError {
@@ -80,6 +124,14 @@ fn map_service_error(error: AppServiceError) -> CommandError {
             "folderOverlapsLocalState",
             "That folder overlaps Photo Viewer's local data.",
         ),
+        AppServiceError::InvalidLimit => {
+            CommandError::new("invalidLimit", "The requested wall page is not valid.")
+        }
+        AppServiceError::InvalidAssetId
+        | AppServiceError::ForeignAsset
+        | AppServiceError::UnknownAsset => {
+            CommandError::new("assetNotFound", "That photo is no longer available.")
+        }
         AppServiceError::LocalState(_) => CommandError::new(
             "localStateUnavailable",
             "Photo Viewer cannot open its local data.",

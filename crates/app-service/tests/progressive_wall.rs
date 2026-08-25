@@ -6,9 +6,9 @@ use std::time::Duration;
 use chrono::{FixedOffset, TimeZone};
 use image::{ImageBuffer, Rgb};
 use photo_app_service::{
-    AppConfig, AppService, DerivativeClass, DerivativeReference, MetadataReader, OrderState,
-    SortDirection, SourceAvailability, WallAsset, WallMediaKind, WallPage, WallQueryRequest,
-    WallShapeState, WallUpdate, WallWarningState,
+    AppConfig, AppService, DerivativeClass, DerivativeReference, DerivativeRequest, MetadataReader,
+    OrderState, SortDirection, SourceAvailability, WallAsset, WallMediaKind, WallPage,
+    WallQueryRequest, WallShapeState, WallUpdate, WallWarningState,
 };
 use photo_metadata::{MetadataBundle, MetadataCandidate, MetadataReadWarning, MetadataSource};
 
@@ -628,6 +628,98 @@ async fn one_visible_request_produces_one_ready_batch() {
     assert!(
         matches!(second, WallUpdate::DerivativesReady { ref derivatives } if derivatives.len() == 8)
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_derivative_returns_bytes_for_the_active_ready_asset() {
+    let fixture = ProgressiveFixture::new(1);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let asset_id = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items[0]
+        .id
+        .clone();
+    service
+        .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
+        .await
+        .unwrap();
+    let reference = match recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::DerivativesReady { .. })
+    })
+    .await
+    {
+        WallUpdate::DerivativesReady { derivatives } => derivatives[0].clone(),
+        _ => unreachable!(),
+    };
+
+    let bytes = service
+        .read_derivative(&reference.asset_id, reference.kind, &reference.key)
+        .unwrap();
+    assert_eq!(&bytes[..2], b"\xff\xd8");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_derivative_fails_closed_after_switching_active_source() {
+    let fixture = ProgressiveFixture::new(1);
+    let source_b = fixture.temp.path().join("replacement");
+    std::fs::create_dir_all(&source_b).unwrap();
+    ImageBuffer::from_pixel(16, 12, Rgb([31_u8, 11, 22]))
+        .save(source_b.join("replacement.jpg"))
+        .unwrap();
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let asset_id = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items[0]
+        .id
+        .clone();
+    service
+        .request_derivatives(DerivativeRequest::visible(vec![asset_id]))
+        .await
+        .unwrap();
+    let reference = match recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::DerivativesReady { .. })
+    })
+    .await
+    {
+        WallUpdate::DerivativesReady { derivatives } => derivatives[0].clone(),
+        _ => unreachable!(),
+    };
+
+    service.start_scan(&source_b).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+
+    assert!(matches!(
+        service.read_derivative(&reference.asset_id, reference.kind, &reference.key),
+        Err(photo_app_service::AppServiceError::ForeignAsset)
+            | Err(photo_app_service::AppServiceError::UnknownAsset)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

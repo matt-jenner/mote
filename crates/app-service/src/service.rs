@@ -1,4 +1,6 @@
-use crate::{AppConfig, BootstrapState, SettingsState, SourceAvailability, SourceSummary};
+use crate::{
+    AppConfig, BootstrapState, DerivativeClass, SettingsState, SourceAvailability, SourceSummary,
+};
 use photo_cache::{CacheBudget, CacheError, CacheWriter, ProtectedGroups};
 use photo_catalog::{Catalog, CatalogError, NewFolderGroup, StoredSourceSelection, WallOrder};
 use photo_core::{
@@ -102,6 +104,8 @@ pub enum AppServiceError {
     ForeignAsset,
     #[error("asset was not found")]
     UnknownAsset,
+    #[error("invalid derivative key")]
+    InvalidDerivativeKey,
     #[error("derivative generation failed")]
     DerivativeFailed,
     #[error("folder selection was superseded by a newer valid selection")]
@@ -333,6 +337,59 @@ impl AppService {
 
     pub fn subscribe_wall_updates(&self) -> tokio::sync::broadcast::Receiver<crate::WallUpdate> {
         self.updates.subscribe()
+    }
+
+    /// Read a generated derivative from the managed cache after revalidating its active wall
+    /// identity. This method deliberately returns bytes, never a native cache path.
+    pub fn read_derivative(
+        &self,
+        asset_id: &str,
+        class: DerivativeClass,
+        key: &str,
+    ) -> Result<Vec<u8>, AppServiceError> {
+        if key.is_empty() || key.len() > 256 || !key.is_ascii() {
+            return Err(AppServiceError::InvalidDerivativeKey);
+        }
+        let asset_id = uuid::Uuid::parse_str(asset_id)
+            .map(photo_domain::AssetId::from_uuid)
+            .map_err(|_| AppServiceError::InvalidAssetId)?;
+        let kind = match class {
+            DerivativeClass::WallThumbnail => "wall_thumbnail",
+            DerivativeClass::ScreenPreview => "screen_preview",
+        };
+        let state = self.state()?;
+        let selection = state
+            .libraries
+            .catalog()
+            .load_app_state()?
+            .active_selection
+            .ok_or(AppServiceError::UnknownAsset)?;
+        let group = state
+            .libraries
+            .catalog()
+            .folder_group_for_path(selection.library_id, &selection.relative_folder)?
+            .ok_or(AppServiceError::UnknownAsset)?;
+        let asset = state
+            .libraries
+            .catalog()
+            .find_asset(asset_id)?
+            .ok_or(AppServiceError::UnknownAsset)?;
+        if asset.library_id != selection.library_id || asset.folder_group_id != Some(group) {
+            return Err(AppServiceError::ForeignAsset);
+        }
+        let record = state
+            .libraries
+            .catalog()
+            .find_derivative(asset_id, kind, key)?
+            .ok_or(AppServiceError::UnknownAsset)?;
+        if record.folder_group_id != group {
+            return Err(AppServiceError::ForeignAsset);
+        }
+        let relative_path = record.relative_cache_path.clone();
+        drop(state);
+        CacheWriter::new(&self.cache_root)?
+            .read_checked(&relative_path)
+            .map_err(AppServiceError::from)
     }
 
     pub async fn query_wall(

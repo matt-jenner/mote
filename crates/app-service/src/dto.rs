@@ -47,7 +47,7 @@ pub enum DerivativeClass {
     ScreenPreview,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DerivativeReference {
     pub asset_id: String,
@@ -55,7 +55,7 @@ pub struct DerivativeReference {
     pub key: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WallAsset {
     pub id: String,
@@ -102,7 +102,7 @@ pub struct WallWarningState {
     pub retryable: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WallPage {
     pub items: Vec<WallAsset>,
@@ -140,7 +140,7 @@ pub enum InteractionState {
     Active,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum WallUpdate {
     CatalogBatch {
@@ -172,7 +172,7 @@ pub enum WallUpdate {
     },
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanProgressDto {
     pub discovered: u64,

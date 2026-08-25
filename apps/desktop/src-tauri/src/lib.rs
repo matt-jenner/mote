@@ -1,14 +1,16 @@
-use std::{env::VarError, sync::Mutex};
+use std::env::VarError;
 
 use photo_app_service::{AppConfig, AppService, AppServiceError};
 use photo_domain::Appearance;
 use profile::{ProfileError, ProfileRoots};
+use protocol::handle_derivative_request;
 use state::DesktopState;
 use tauri::{Manager, Theme};
 
 mod commands;
 mod dto;
 mod profile;
+mod protocol;
 mod state;
 
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +32,10 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .register_uri_scheme_protocol("photo-derivative", |context, request| {
+            let state = context.app_handle().state::<DesktopState>();
+            handle_derivative_request(&state.service, request)
+        })
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let cache_dir = app.path().app_cache_dir()?;
@@ -52,15 +58,17 @@ pub fn run() {
                 Appearance::Dark => Some(Theme::Dark),
             };
             window.set_theme(theme).map_err(StartupError::NativeTheme)?;
-            app.manage(DesktopState {
-                service: Mutex::new(service),
-            });
+            app.manage(DesktopState { service });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap_state,
             commands::choose_folder,
-            commands::update_appearance
+            commands::update_appearance,
+            commands::query_wall,
+            commands::request_derivatives,
+            commands::set_wall_interaction,
+            commands::watch_wall_updates
         ])
         .run(tauri::generate_context!())
         .expect("error while running Photo Viewer");
