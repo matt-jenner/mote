@@ -290,4 +290,76 @@ mod tests {
             "descending wall order should not need a temporary sort: {details:?}"
         );
     }
+
+    #[test]
+    fn cursor_bearing_wall_queries_keep_using_group_keyset_indexes() {
+        let catalog = Catalog::open_in_memory().unwrap();
+        let group = vec![0_u8; 16];
+        let asset = vec![1_u8; 16];
+        let mut provisional = catalog
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id FROM assets
+                 WHERE folder_group_id = ?1
+                   AND shape_status IN ('ready', 'fallback')
+                   AND width IS NOT NULL
+                   AND height IS NOT NULL
+                   AND (provisional_order > ?2 OR (provisional_order = ?2 AND id > ?3))
+                 ORDER BY provisional_order, id
+                 LIMIT ?4",
+            )
+            .unwrap();
+        let provisional_details = provisional
+            .query_map(params![group, 42_i64, asset, 10_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            provisional_details
+                .iter()
+                .any(|detail| detail.contains("assets_group_provisional_wall")),
+            "expected provisional keyset index in query plan: {provisional_details:?}"
+        );
+
+        let group = vec![0_u8; 16];
+        let asset = vec![1_u8; 16];
+        let mut captured = catalog
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id FROM assets
+                 WHERE folder_group_id = ?1
+                   AND shape_status IN ('ready', 'fallback')
+                   AND width IS NOT NULL
+                   AND height IS NOT NULL
+                   AND (captured_at_utc, display_path, id) > (?2, ?3, ?4)
+                   AND captured_at_utc IS NOT NULL
+                 ORDER BY captured_at_utc ASC, display_path ASC, id ASC
+                 LIMIT ?5",
+            )
+            .unwrap();
+        let captured_details = captured
+            .query_map(
+                params![group, "2026-01-01T00:00:00Z", "photo.jpg", asset, 10_i64],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            captured_details
+                .iter()
+                .any(|detail| detail.contains("assets_group_capture_wall")),
+            "expected capture keyset index in query plan: {captured_details:?}"
+        );
+        assert!(
+            captured_details
+                .iter()
+                .all(|detail| !detail.contains("TEMP B-TREE")),
+            "capture keyset query should not need a temporary sort: {captured_details:?}"
+        );
+    }
 }

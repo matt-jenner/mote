@@ -664,7 +664,7 @@ impl AppService {
             {
                 return Ok(());
             }
-            let inserted = state.libraries.catalog_mut().record_warning_once(
+            state.libraries.catalog_mut().record_warning_once(
                 &photo_catalog::CatalogWarningRecord {
                     library_id: selection.library_id,
                     asset_id: None,
@@ -673,12 +673,17 @@ impl AppService {
                         .to_owned(),
                 },
             )?;
-            if inserted {
-                let _ = self.updates.send(WallUpdate::Warning {
-                    source_id: selection.library_id.as_uuid().hyphenated().to_string(),
-                    asset_id: None,
-                    warning,
-                });
+            if state.published_cache_warning != Some(selection)
+                && self
+                    .updates
+                    .send(WallUpdate::Warning {
+                        source_id: selection.library_id.as_uuid().hyphenated().to_string(),
+                        asset_id: None,
+                        warning,
+                    })
+                    .is_ok()
+            {
+                state.published_cache_warning = Some(selection);
             }
             Ok(())
         });
@@ -691,16 +696,32 @@ impl AppService {
             {
                 return Ok(());
             }
-            state.libraries.catalog_mut().clear_warning(
+            let asset_warning_removed = state.libraries.catalog_mut().clear_warning(
                 selection.library_id,
                 Some(asset_id),
                 ASSET_DERIVATIVE_WARNING,
             )?;
-            state.libraries.catalog_mut().clear_warning(
+            let cache_warning_removed = state.libraries.catalog_mut().clear_warning(
                 selection.library_id,
                 None,
                 CACHE_DERIVATIVE_WARNING,
             )?;
+            let source_id = selection.library_id.as_uuid().hyphenated().to_string();
+            if asset_warning_removed > 0 {
+                let _ = self.updates.send(WallUpdate::WarningCleared {
+                    source_id: source_id.clone(),
+                    asset_id: Some(asset_id.as_uuid().hyphenated().to_string()),
+                    code: "derivativeUnavailable".to_owned(),
+                });
+            }
+            if cache_warning_removed > 0 {
+                state.published_cache_warning = None;
+                let _ = self.updates.send(WallUpdate::WarningCleared {
+                    source_id,
+                    asset_id: None,
+                    code: "cacheUnavailable".to_owned(),
+                });
+            }
             Ok(())
         });
     }
@@ -789,9 +810,7 @@ mod tests {
     use photo_indexer::{IndexJob, IndexScheduler, JobPriority, SchedulerConfig};
 
     use crate::service::SelectionToken;
-    use crate::{
-        AppConfig, AppService, DerivativeClass, DerivativeReference, DerivativeRequest, WallUpdate,
-    };
+    use crate::{AppConfig, AppService, DerivativeClass, DerivativeReference, WallUpdate};
 
     use super::{DerivativeQueue, PendingDerivative};
 
@@ -1019,9 +1038,12 @@ mod tests {
             .map(|asset| asset.id)
             .collect::<Vec<_>>();
         service
-            .request_derivatives(DerivativeRequest::visible(ids.clone()))
-            .await
-            .unwrap();
+            .prefetch_screen_previews(
+                ids.iter()
+                    .map(|id| AssetId::from_uuid(uuid::Uuid::parse_str(id).unwrap()))
+                    .collect(),
+            )
+            .await;
         let warning = receive_until(&mut updates, |event| {
             matches!(event, WallUpdate::Warning { .. })
         })
@@ -1033,6 +1055,20 @@ mod tests {
         let warning_json = serde_json::to_string(&warning).unwrap();
         assert!(warning_json.len() < 512);
         assert!(!warning_json.contains(&source.to_string_lossy().into_owned()));
+        let mut cache_warning_updates = 1;
+        while let Ok(update) = updates.try_recv() {
+            if matches!(
+                update,
+                WallUpdate::Warning {
+                    asset_id: None,
+                    warning: crate::WallWarningState { ref code, .. },
+                    ..
+                } if code == "cacheUnavailable"
+            ) {
+                cache_warning_updates += 1;
+            }
+        }
+        assert_eq!(cache_warning_updates, 1);
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             while !service.derivative_queue.is_empty().await {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1049,17 +1085,68 @@ mod tests {
             "250 cache failures must produce one library warning"
         );
 
-        service.cache_budget = CacheBudget::from_total_space(10_000_000);
-        service
-            .request_derivatives(DerivativeRequest::visible(ids))
-            .await
+        drop(service);
+        let reopen_config = config.clone();
+        let mut service = std::thread::spawn(move || AppService::open(reopen_config))
+            .join()
+            .unwrap()
             .unwrap();
-        receive_until(&mut updates, |event| {
-            matches!(event, WallUpdate::DerivativesReady { derivatives } if
-                derivatives.len() == 250
-                && derivatives.iter().all(|item| item.kind == DerivativeClass::ScreenPreview))
+        service.cache_budget = CacheBudget::from_total_space(0);
+        let mut updates = service.subscribe_wall_updates();
+        let (_, ready_after_reopen, pending_after_reopen) = service
+            .resolve_derivatives(
+                &ids.iter()
+                    .map(|id| AssetId::from_uuid(uuid::Uuid::parse_str(id).unwrap()))
+                    .collect::<Vec<_>>(),
+                DerivativeClass::ScreenPreview,
+            )
+            .unwrap();
+        assert_eq!(ready_after_reopen.len(), 0);
+        assert_eq!(pending_after_reopen.len(), 250);
+        service
+            .run_derivative_jobs(pending_after_reopen, JobPriority::NearViewport)
+            .await;
+        let repeated = receive_until(&mut updates, |event| {
+            matches!(event, WallUpdate::Warning { asset_id: None, .. })
         })
         .await;
+        assert!(matches!(
+            repeated,
+            WallUpdate::Warning {
+                asset_id: None,
+                warning: crate::WallWarningState { ref code, .. },
+                ..
+            } if code == "cacheUnavailable"
+        ));
+
+        service.cache_budget = CacheBudget::from_total_space(10_000_000);
+        let (_, cached_after_recovery, pending_after_recovery) = service
+            .resolve_derivatives(
+                &ids.iter()
+                    .map(|id| AssetId::from_uuid(uuid::Uuid::parse_str(id).unwrap()))
+                    .collect::<Vec<_>>(),
+                DerivativeClass::ScreenPreview,
+            )
+            .unwrap();
+        assert!(cached_after_recovery.is_empty());
+        let recovered = service
+            .run_derivative_jobs(pending_after_recovery, JobPriority::NearViewport)
+            .await;
+        assert_eq!(recovered.len(), 250);
+        let cleared = receive_until(&mut updates, |event| {
+            matches!(
+                event,
+                WallUpdate::WarningCleared {
+                    asset_id: None,
+                    code,
+                    ..
+                } if code == "cacheUnavailable"
+            )
+        })
+        .await;
+        let cleared_json = serde_json::to_string(&cleared).unwrap();
+        assert!(cleared_json.len() < 256);
+        assert!(!cleared_json.contains(&source.to_string_lossy().into_owned()));
         assert_eq!(
             photo_catalog::Catalog::open(&config.catalog_path())
                 .unwrap()
@@ -1080,7 +1167,10 @@ mod tests {
                 Ok(Ok(event)) if predicate(&event) => return event,
                 Ok(Ok(event)) => last = Some(event),
                 Ok(Err(error)) => panic!("update receiver failed after {last:?}: {error}"),
-                Err(_) => panic!("timed out waiting for update, last event: {last:?}"),
+                Err(_) => panic!(
+                    "timed out waiting for update; received a prior event: {}",
+                    last.is_some()
+                ),
             }
         }
     }

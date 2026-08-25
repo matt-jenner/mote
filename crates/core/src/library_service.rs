@@ -12,6 +12,18 @@ pub struct LibraryService<F> {
     local_state_roots: Vec<PathBuf>,
 }
 
+#[derive(Clone)]
+pub struct SourceValidator<F> {
+    source_fs: F,
+    local_state_roots: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedSourceFolder {
+    canonical: PathBuf,
+    display_path: PathBuf,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceSelection {
     pub library_id: LibraryId,
@@ -110,11 +122,29 @@ impl<F: SourceFs> LibraryService<F> {
             .map_err(AddLibraryError::from)
     }
 
-    pub fn open_recent(&mut self, folder: &Path) -> Result<SourceSelection, AddLibraryError> {
-        let canonical = self.canonical_directory(folder)?;
-        if self.overlaps_local_state(&canonical) {
-            return Err(AddLibraryError::OverlapsLocalState);
+    pub fn source_validator(&self) -> SourceValidator<F>
+    where
+        F: Clone,
+    {
+        SourceValidator {
+            source_fs: self.source_fs.clone(),
+            local_state_roots: self.local_state_roots.clone(),
         }
+    }
+
+    pub fn open_recent(&mut self, folder: &Path) -> Result<SourceSelection, AddLibraryError>
+    where
+        F: Clone,
+    {
+        let validated = self.source_validator().validate_recent(folder)?;
+        self.open_validated_recent(validated)
+    }
+
+    pub fn open_validated_recent(
+        &mut self,
+        validated: ValidatedSourceFolder,
+    ) -> Result<SourceSelection, AddLibraryError> {
+        let canonical = validated.canonical;
         let libraries = self.catalog.list_libraries()?;
         for existing in libraries {
             let existing_path = existing
@@ -144,7 +174,7 @@ impl<F: SourceFs> LibraryService<F> {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Selected folder".to_owned());
         let mut recent = NewLibrary::recent(display_name, &canonical);
-        recent.display_path = folder.to_string_lossy().into_owned();
+        recent.display_path = validated.display_path.to_string_lossy().into_owned();
         let library = self.catalog.add_library(&recent)?;
         Ok(SourceSelection {
             library_id: library.id,
@@ -232,6 +262,26 @@ impl<F: SourceFs> LibraryService<F> {
         self.local_state_roots
             .iter()
             .any(|state| paths_overlap(source, state))
+    }
+}
+
+impl<F: SourceFs> SourceValidator<F> {
+    pub fn validate_recent(&self, folder: &Path) -> Result<ValidatedSourceFolder, AddLibraryError> {
+        let canonical = self.source_fs.canonicalize(folder)?;
+        if !self.source_fs.is_dir(&canonical) {
+            return Err(AddLibraryError::NotDirectory(canonical));
+        }
+        if self
+            .local_state_roots
+            .iter()
+            .any(|state| paths_overlap(&canonical, state))
+        {
+            return Err(AddLibraryError::OverlapsLocalState);
+        }
+        Ok(ValidatedSourceFolder {
+            canonical,
+            display_path: folder.to_path_buf(),
+        })
     }
 }
 

@@ -180,7 +180,7 @@ async fn enrichment_admission_tracks_mode_changes_during_one_scan() {
         write_png(&fixture.path().join(format!("{index:02}.png")), [1, 2, 3]);
     }
     let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig {
-        idle_workers: 4,
+        idle_workers: 2,
         active_workers: 1,
     }));
     let (reader, notifications, release) = AdmissionReader::new();

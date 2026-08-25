@@ -1,11 +1,15 @@
 use crate::{AppConfig, BootstrapState, SettingsState, SourceAvailability, SourceSummary};
 use photo_cache::{CacheBudget, CacheError, CacheWriter, ProtectedGroups};
 use photo_catalog::{Catalog, CatalogError, NewFolderGroup, StoredSourceSelection, WallOrder};
-use photo_core::{AddLibraryError, LibraryService, LocalStateError, RealSourceFs};
+use photo_core::{
+    AddLibraryError, LibraryService, LocalStateError, RealSourceFs, SourceFs, SourceValidator,
+    ValidatedSourceFolder,
+};
 use photo_domain::{Appearance, AssetId, Availability, MediaKind};
 use photo_indexer::{DefaultMetadataReader, IndexScheduler, MetadataReader};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
@@ -16,8 +20,7 @@ pub(crate) struct ServiceState {
     pub(crate) protected_group: Option<photo_domain::FolderGroupId>,
     pub(crate) recent_derivative_ids: Vec<AssetId>,
     pub(crate) selection_epoch: u64,
-    #[cfg(test)]
-    pub(crate) selection_barrier: Option<Arc<std::sync::Barrier>>,
+    pub(crate) published_cache_warning: Option<SelectionToken>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,6 +34,16 @@ pub(crate) struct SelectionToken {
 pub(crate) struct ScanOwner {
     pub(crate) selection: SelectionToken,
     pub(crate) generation: u64,
+}
+
+trait RecentSourceValidator: Send + Sync {
+    fn validate_recent(&self, folder: &Path) -> Result<ValidatedSourceFolder, AddLibraryError>;
+}
+
+impl<F: SourceFs> RecentSourceValidator for SourceValidator<F> {
+    fn validate_recent(&self, folder: &Path) -> Result<ValidatedSourceFolder, AddLibraryError> {
+        SourceValidator::validate_recent(self, folder)
+    }
 }
 
 #[derive(Clone)]
@@ -57,6 +70,9 @@ pub struct AppService {
     pub(crate) protected_groups: ProtectedGroups,
     pub(crate) derivative_queue: Arc<crate::derivatives::DerivativeQueue>,
     pub(crate) metadata_reader: ReaderAdapter,
+    source_validator: Arc<dyn RecentSourceValidator>,
+    selection_request_sequence: Arc<AtomicU64>,
+    latest_validated_selection: Arc<AtomicU64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -87,6 +103,8 @@ pub enum AppServiceError {
     UnknownAsset,
     #[error("derivative generation failed")]
     DerivativeFailed,
+    #[error("folder selection was superseded by a newer valid selection")]
+    SelectionSuperseded,
 }
 
 impl AppService {
@@ -110,6 +128,8 @@ impl AppService {
             vec![config.data_dir().to_owned(), config.cache_dir().to_owned()],
         )
         .map_err(AppServiceError::LibrarySetup)?;
+        let source_validator: Arc<dyn RecentSourceValidator> =
+            Arc::new(libraries.source_validator());
         let (updates, _) = tokio::sync::broadcast::channel(256);
         let cache_root = config.cache_dir().to_owned();
         let cache_budget = CacheBudget::automatic(&cache_root)?;
@@ -122,8 +142,7 @@ impl AppService {
                 protected_group: None,
                 recent_derivative_ids: Vec::new(),
                 selection_epoch: u64::from(should_reconcile),
-                #[cfg(test)]
-                selection_barrier: None,
+                published_cache_warning: None,
             })),
             scheduler: Arc::new(IndexScheduler::new(Default::default())),
             updates,
@@ -133,6 +152,9 @@ impl AppService {
             protected_groups: ProtectedGroups::default(),
             derivative_queue: Arc::new(crate::derivatives::DerivativeQueue::default()),
             metadata_reader: ReaderAdapter(reader),
+            source_validator,
+            selection_request_sequence: Arc::new(AtomicU64::new(0)),
+            latest_validated_selection: Arc::new(AtomicU64::new(0)),
         };
         if should_reconcile {
             let active_group = {
@@ -232,16 +254,19 @@ impl AppService {
         &self,
         folder: &Path,
     ) -> Result<(BootstrapState, SelectionToken), AppServiceError> {
-        #[cfg(test)]
-        if let Some(barrier) = self
-            .state()
-            .ok()
-            .and_then(|state| state.selection_barrier.clone())
-        {
-            barrier.wait();
-        }
+        let request_id = self
+            .selection_request_sequence
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
+            .max(1);
+        let validated = self.source_validator.validate_recent(folder)?;
+        self.latest_validated_selection
+            .fetch_max(request_id, Ordering::SeqCst);
         let mut state = self.state()?;
-        let selection = state.libraries.open_recent(folder)?;
+        if self.latest_validated_selection.load(Ordering::SeqCst) != request_id {
+            return Err(AppServiceError::SelectionSuperseded);
+        }
+        let selection = state.libraries.open_validated_recent(validated)?;
         let display_path = folder
             .file_name()
             .map(|v| v.to_string_lossy().into_owned())
@@ -278,6 +303,7 @@ impl AppService {
             let _ = cancel.send(true);
         }
         state.active_scan = None;
+        state.published_cache_warning = None;
         state.selection_epoch = state.selection_epoch.wrapping_add(1).max(1);
         if previous != Some(group) {
             if let Some(previous) = previous {
@@ -512,15 +538,53 @@ fn map_media_kind(kind: MediaKind) -> crate::WallMediaKind {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::path::Path;
-    use std::sync::{Arc, Barrier, Condvar, Mutex};
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::time::Duration;
 
     use chrono::{FixedOffset, TimeZone};
     use image::{ImageBuffer, Rgb};
+    use photo_catalog::{AssetShapeUpdate, CatalogIndexRecord, NewAsset, ShapeStatus};
+    use photo_domain::{Appearance, MediaKind, RelativePathKey};
     use photo_metadata::{MetadataBundle, MetadataCandidate, MetadataReadWarning, MetadataSource};
 
-    use super::{AppConfig, AppService};
+    use super::{AppConfig, AppService, AppServiceError, RecentSourceValidator};
+
+    struct BlockingSourceValidator {
+        delegate: Arc<dyn RecentSourceValidator>,
+        target: std::path::PathBuf,
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl BlockingSourceValidator {
+        fn install(
+            service: &mut AppService,
+            target: std::path::PathBuf,
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        ) {
+            service.source_validator = Arc::new(Self {
+                delegate: service.source_validator.clone(),
+                target,
+                entered,
+                release: Mutex::new(release),
+            });
+        }
+    }
+
+    impl RecentSourceValidator for BlockingSourceValidator {
+        fn validate_recent(
+            &self,
+            folder: &Path,
+        ) -> Result<photo_core::ValidatedSourceFolder, photo_core::AddLibraryError> {
+            if folder == self.target {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+            self.delegate.validate_recent(folder)
+        }
+    }
 
     #[derive(Clone)]
     struct BlockingReader(Arc<(Mutex<bool>, Condvar)>);
@@ -566,8 +630,68 @@ mod tests {
         assert!(reopened.state().unwrap().protected_group.is_some());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_source_validation_does_not_block_cached_wall_or_settings_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("active");
+        let stalled = temp.path().join("stalled");
+        std::fs::create_dir_all(&active).unwrap();
+        std::fs::create_dir_all(&stalled).unwrap();
+        let mut service = AppService::open(AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let (_, selection) = service.select_recent(&active).unwrap();
+        seed_wall_asset(&service, selection, "cached.jpg");
+        let (entered_send, entered_receive) = mpsc::channel();
+        let (release_send, release_receive) = mpsc::channel();
+        BlockingSourceValidator::install(
+            &mut service,
+            stalled.clone(),
+            entered_send,
+            release_receive,
+        );
+
+        let selecting_service = service.clone();
+        let selecting_path = stalled.clone();
+        let selecting =
+            std::thread::spawn(move || selecting_service.select_recent(&selecting_path));
+        entered_receive
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let wall = tokio::time::timeout(
+            Duration::from_millis(250),
+            service.query_wall(crate::WallQueryRequest::oldest_first()),
+        )
+        .await
+        .expect("cached wall access must not wait for source validation")
+        .unwrap();
+        assert_eq!(wall.items.len(), 1);
+        let settings_service = service.clone();
+        let (settings_send, settings_receive) = mpsc::channel();
+        std::thread::spawn(move || {
+            settings_send
+                .send(settings_service.update_appearance(Appearance::Dark))
+                .unwrap();
+        });
+        assert_eq!(
+            settings_receive
+                .recv_timeout(Duration::from_millis(250))
+                .expect("bounded catalog updates must not wait for source validation")
+                .unwrap()
+                .settings
+                .appearance,
+            Appearance::Dark
+        );
+
+        release_send.send(()).unwrap();
+        selecting.join().unwrap().unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_selections_keep_the_active_scan_and_catalog_on_one_epoch() {
+    async fn newer_valid_selection_supersedes_an_older_stalled_selection() {
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first");
         let second = temp.path().join("second");
@@ -580,28 +704,34 @@ mod tests {
             .save(second.join("second.jpg"))
             .unwrap();
         let reader_gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let service = AppService::open_with_reader(
+        let mut service = AppService::open_with_reader(
             AppConfig::new(temp.path().join("data"), temp.path().join("cache")),
             Arc::new(BlockingReader(reader_gate.clone())),
         )
         .unwrap();
-        service.state().unwrap().selection_barrier = Some(Arc::new(Barrier::new(2)));
+        let (entered_send, entered_receive) = mpsc::channel();
+        let (release_send, release_receive) = mpsc::channel();
+        BlockingSourceValidator::install(
+            &mut service,
+            first.clone(),
+            entered_send,
+            release_receive,
+        );
 
         let first_service = service.clone();
         let first_path = first.clone();
         let first_call = std::thread::spawn(move || first_service.select_recent(&first_path));
-        let second_service = service.clone();
-        let second_path = second.clone();
-        let second_call = std::thread::spawn(move || second_service.select_recent(&second_path));
-        let first_token = first_call.join().unwrap().unwrap().1;
-        let second_token = second_call.join().unwrap().unwrap().1;
+        entered_receive
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let second_token = service.select_recent(&second).unwrap().1;
+        release_send.send(()).unwrap();
+        assert!(matches!(
+            first_call.join().unwrap(),
+            Err(AppServiceError::SelectionSuperseded)
+        ));
 
-        assert_eq!(
-            HashSet::from([first_token.epoch, second_token.epoch]).len(),
-            2,
-            "each serialized selection must own a distinct epoch"
-        );
-        let (final_token, stale_token) = {
+        let final_token = {
             let state = service.state().unwrap();
             let stored = state
                 .libraries
@@ -616,22 +746,14 @@ mod tests {
                 .folder_group_for_path(stored.library_id, &stored.relative_folder)
                 .unwrap()
                 .unwrap();
-            let final_token = [first_token, second_token]
-                .into_iter()
-                .find(|token| token.epoch == state.selection_epoch)
-                .unwrap();
-            let stale_token = [first_token, second_token]
-                .into_iter()
-                .find(|token| *token != final_token)
-                .unwrap();
+            let final_token = second_token;
             assert_eq!(final_token.library_id, stored.library_id);
             assert_eq!(final_token.group_id, stored_group);
             assert_eq!(state.protected_group, Some(stored_group));
-            (final_token, stale_token)
+            final_token
         };
 
         let mut updates = service.subscribe_wall_updates();
-        service.start_selected_scan(stale_token).await.unwrap();
         service.start_selected_scan(final_token).await.unwrap();
         assert_eq!(
             service.state().unwrap().active_scan.unwrap().selection,
@@ -662,7 +784,33 @@ mod tests {
         assert_eq!(active.items.len(), 1);
         assert!(
             published.iter().all(|id| id == &active.items[0].id),
-            "the stale selection committed or published wall rows"
+            "only the latest valid selection may publish wall rows"
         );
+    }
+
+    fn seed_wall_asset(service: &AppService, selection: super::SelectionToken, name: &str) {
+        let mut state = service.state().unwrap();
+        let mut asset = NewAsset::minimal(
+            selection.library_id,
+            RelativePathKey::from_relative_path(Path::new(name)).unwrap(),
+            name.to_owned(),
+            MediaKind::Jpeg,
+            1,
+        );
+        asset.folder_group_id = Some(selection.group_id);
+        let id = asset.id;
+        state.libraries.catalog_mut().upsert_asset(&asset).unwrap();
+        state
+            .libraries
+            .catalog_mut()
+            .apply_index_batch(&[CatalogIndexRecord::Shaped(AssetShapeUpdate {
+                asset_id: id,
+                width: 16,
+                height: 9,
+                orientation: Some(1),
+                representative_rgb: None,
+                shape_status: ShapeStatus::Ready,
+            })])
+            .unwrap();
     }
 }

@@ -165,6 +165,11 @@ pub enum WallUpdate {
         asset_id: Option<String>,
         warning: WallWarningState,
     },
+    WarningCleared {
+        source_id: String,
+        asset_id: Option<String>,
+        code: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
