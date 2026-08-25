@@ -74,6 +74,9 @@ pub struct ScanHandle {
 }
 
 impl ScanHandle {
+    pub fn cancellation_sender(&self) -> watch::Sender<bool> {
+        self.cancel.clone()
+    }
     pub fn cancel(&self) -> Result<(), IndexError> {
         self.cancel
             .send(true)

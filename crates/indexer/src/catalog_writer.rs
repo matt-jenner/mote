@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 use crate::IndexEvent;
 
-const MAX_BATCH_EVENTS: usize = 500;
+const MAX_BATCH_EVENTS: usize = 200;
 const MAX_BATCH_WAIT: Duration = Duration::from_millis(50);
 
 pub struct CatalogWriter<'a> {

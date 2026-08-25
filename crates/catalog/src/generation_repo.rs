@@ -10,6 +10,18 @@ pub struct GenerationCompletion {
 }
 
 impl Catalog {
+    pub fn has_completed_generation_for_library(
+        &self,
+        library: LibraryId,
+    ) -> Result<bool, CatalogError> {
+        let completed: Option<i64> = self.connection.query_row(
+            "SELECT completed_at FROM scan_generations WHERE library_id = ?1 AND completed_at IS NOT NULL ORDER BY generation DESC LIMIT 1",
+            params![library.as_uuid().as_bytes()],
+            |row| row.get(0),
+        ).optional()?;
+        Ok(completed.is_some())
+    }
+
     pub fn has_completed_generation(
         &self,
         library: LibraryId,

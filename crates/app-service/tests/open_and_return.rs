@@ -8,7 +8,7 @@ fn source_and_appearance_restore_from_the_same_profile() {
     std::fs::create_dir(&photos).unwrap();
     let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
 
-    let mut first = AppService::open(config.clone()).unwrap();
+    let first = AppService::open(config.clone()).unwrap();
     let selected = first.open_recent(&photos).unwrap();
     assert_eq!(selected.active_source.unwrap().display_name, "Iceland 2025");
     first.update_appearance(Appearance::Dark).unwrap();
@@ -28,7 +28,7 @@ fn selecting_a_child_folder_restores_its_basename_after_reopen() {
     std::fs::create_dir_all(&child).unwrap();
     let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
 
-    let mut first = AppService::open(config.clone()).unwrap();
+    let first = AppService::open(config.clone()).unwrap();
     first.open_recent(&library_root).unwrap();
     let selected = first.open_recent(&child).unwrap();
     assert_eq!(selected.active_source.unwrap().display_name, "Iceland 2025");
@@ -73,10 +73,27 @@ fn bootstrap_does_not_expose_a_native_source_path() {
     let photos = temp.path().join("Private Folder Name");
     std::fs::create_dir(&photos).unwrap();
     let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
-    let mut service = AppService::open(config).unwrap();
+    let service = AppService::open(config).unwrap();
     let state = service.open_recent(&photos).unwrap();
 
     let json = serde_json::to_string(&state).unwrap();
     assert!(json.contains("Private Folder Name"));
     assert!(!json.contains(&temp.path().to_string_lossy().to_string()));
+}
+
+#[test]
+fn cloned_services_share_selection_and_appearance() {
+    let temp = tempfile::tempdir().unwrap();
+    let photos = temp.path().join("Shared Folder");
+    std::fs::create_dir(&photos).unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let first = AppService::open(config).unwrap();
+    let second = first.clone();
+
+    first.open_recent(&photos).unwrap();
+    second.update_appearance(Appearance::Dark).unwrap();
+
+    let state = first.bootstrap().unwrap();
+    assert_eq!(state.settings.appearance, Appearance::Dark);
+    assert_eq!(state.active_source.unwrap().display_name, "Shared Folder");
 }

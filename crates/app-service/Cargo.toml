@@ -9,9 +9,15 @@ photo-cache = { path = "../cache" }
 photo-catalog = { path = "../catalog" }
 photo-core = { path = "../core" }
 photo-domain = { path = "../domain" }
+photo-indexer = { path = "../indexer" }
+photo-metadata = { path = "../metadata" }
 serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
+image.workspace = true
+chrono.workspace = true
