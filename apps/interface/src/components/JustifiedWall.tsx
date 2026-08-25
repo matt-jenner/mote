@@ -96,19 +96,33 @@ export function JustifiedWall({
 			},
 			{ root, rootMargin: "720px 0px" },
 		);
-		const observeTiles = () => {
-			for (const tile of root.querySelectorAll<HTMLElement>(
-				"[data-asset-id]",
-			)) {
-				visibleObserver.observe(tile);
-				nearObserver.observe(tile);
-			}
+		const visitTiles = (node: Node, visit: (tile: HTMLElement) => void) => {
+			if (!(node instanceof Element)) return;
+			if (node.matches("[data-asset-id]")) visit(node as HTMLElement);
+			for (const tile of node.querySelectorAll<HTMLElement>("[data-asset-id]"))
+				visit(tile);
 		};
-		observeTiles();
+		const observeTile = (tile: HTMLElement) => {
+			visibleObserver.observe(tile);
+			nearObserver.observe(tile);
+		};
+		const unobserveTile = (tile: HTMLElement) => {
+			visibleObserver.unobserve(tile);
+			nearObserver.unobserve(tile);
+		};
+		for (const tile of root.querySelectorAll<HTMLElement>("[data-asset-id]"))
+			observeTile(tile);
 		const mutationObserver =
 			typeof MutationObserver === "undefined"
 				? null
-				: new MutationObserver(observeTiles);
+				: new MutationObserver((records) => {
+						for (const record of records) {
+							for (const node of record.addedNodes)
+								visitTiles(node, observeTile);
+							for (const node of record.removedNodes)
+								visitTiles(node, unobserveTile);
+						}
+					});
 		mutationObserver?.observe(root, { childList: true, subtree: true });
 		return () => {
 			if (frame !== null) window.cancelAnimationFrame(frame);

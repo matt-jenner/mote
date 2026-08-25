@@ -112,6 +112,13 @@ class TestIntersectionObserver {
 	static isObserving(kind: "visible" | "near", root: Element, assetId: string) {
 		const target = root.querySelector(`[data-asset-id='${assetId}']`);
 		if (!target) return false;
+		return TestIntersectionObserver.isObservingElement(kind, root, target);
+	}
+	static isObservingElement(
+		kind: "visible" | "near",
+		root: Element,
+		target: Element,
+	) {
 		return [...TestIntersectionObserver.instances]
 			.reverse()
 			.some((candidate) => {
@@ -470,36 +477,60 @@ describe("progressive photo wall", () => {
 		await expect
 			.poll(() => wall.element().querySelector("[data-asset-id='coast']"))
 			.not.toBeNull();
-		const before = new Set([
-			...wall.element().querySelectorAll("[data-asset-id]"),
-		]);
-		await page.viewport(390, 844);
-		await expect
-			.poll(() =>
-				[...wall.element().querySelectorAll("[data-asset-id]")].some(
-					(tile) => !before.has(tile),
-				),
-			)
-			.toBe(true);
-		const replacement = [
+		const before = new Set<HTMLElement>([
 			...wall.element().querySelectorAll<HTMLElement>("[data-asset-id]"),
-		].find((tile) => !before.has(tile));
-		const replacementId = replacement?.dataset.assetId;
-		expect(replacementId).toBeTruthy();
-		if (!replacementId) return;
-		await expect
-			.poll(() =>
-				TestIntersectionObserver.isObserving(
-					"visible",
-					wall.element(),
-					replacementId,
-				),
-			)
-			.toBe(true);
-		TestIntersectionObserver.trigger("visible", wall.element(), [
-			replacementId,
 		]);
-		TestIntersectionObserver.trigger("near", wall.element(), ["coast"]);
+		for (const [width, height] of [
+			[390, 844],
+			[1440, 1024],
+			[390, 844],
+		] as const) {
+			await page.viewport(width, height);
+			await expect
+				.poll(() =>
+					[
+						...wall.element().querySelectorAll<HTMLElement>("[data-asset-id]"),
+					].some((tile) => !before.has(tile)),
+				)
+				.toBe(true);
+			const current = new Set([
+				...wall.element().querySelectorAll<HTMLElement>("[data-asset-id]"),
+			]);
+			const removed = [...before].filter((tile) => !current.has(tile));
+			expect(removed.length).toBeGreaterThan(0);
+			for (const tile of removed) {
+				expect(
+					TestIntersectionObserver.isObservingElement(
+						"visible",
+						wall.element(),
+						tile,
+					),
+				).toBe(false);
+				expect(
+					TestIntersectionObserver.isObservingElement(
+						"near",
+						wall.element(),
+						tile,
+					),
+				).toBe(false);
+			}
+			const replacement = [...current].find((tile) => !before.has(tile));
+			expect(replacement).toBeTruthy();
+			if (!replacement) return;
+			await expect
+				.poll(() =>
+					TestIntersectionObserver.isObservingElement(
+						"visible",
+						wall.element(),
+						replacement,
+					),
+				)
+				.toBe(true);
+			before.clear();
+			for (const tile of current) before.add(tile);
+		}
+		TestIntersectionObserver.trigger("visible", wall.element(), ["coast"]);
+		TestIntersectionObserver.trigger("near", wall.element(), ["forest"]);
 		await expect.poll(() => service.derivativeRequests.length).toBe(2);
 		screen.unmount();
 	});
