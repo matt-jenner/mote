@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { PhotoServiceProvider } from "../app/PhotoServiceContext";
@@ -304,6 +304,107 @@ describe("immersive photo viewer checkpoint", () => {
 				),
 			)
 			.toBe(true);
+	});
+
+	it("opens information only from Info and keeps it open during navigation", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		await view.getByTestId("viewer-stage").click();
+		expect(
+			view.getByRole("complementary", { name: "Photo information" }).query(),
+		).toBeNull();
+		await view.getByRole("button", { name: "Photo information" }).click();
+		await expect.element(view.getByText("Unrated")).toBeVisible();
+		await userEvent.keyboard("{ArrowRight}");
+		await expect
+			.element(view.getByRole("complementary", { name: "Photo information" }))
+			.toBeVisible();
+	});
+
+	it("closes information on the first Escape and returns to the wall on the second", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await view.getByRole("button", { name: "Photo information" }).click();
+		await expect
+			.element(view.getByRole("complementary", { name: "Photo information" }))
+			.toBeVisible();
+		await userEvent.keyboard("{Escape}");
+		expect(
+			view.getByRole("complementary", { name: "Photo information" }).query(),
+		).toBeNull();
+		await userEvent.keyboard("{Escape}");
+		expect(
+			view.getByRole("dialog", { name: "Photo viewer" }).query(),
+		).toBeNull();
+	});
+
+	it("announces the current position and loads more when pagination remains", async () => {
+		const { view } = await openManyAsset("Coast");
+		const tile = view.getByRole("button", { name: "Open Coast", exact: true });
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByTestId("viewer-status"))
+			.toHaveTextContent("Coast, photo 1 of 100 loaded");
+	});
+
+	it("uses quiet mouse timers and toggles touch controls with the stage", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const overlay = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		const controls = overlay.querySelector<HTMLElement>(
+			'[aria-hidden="false"]',
+		);
+		const stage = view.getByTestId("viewer-stage").element();
+		vi.useFakeTimers();
+		try {
+			stage.dispatchEvent(
+				new PointerEvent("pointerup", {
+					bubbles: true,
+					pointerType: "touch",
+				}),
+			);
+			await expect.element(view.getByTestId("viewer-stage")).toBeVisible();
+			await expect
+				.poll(() => controls?.getAttribute("aria-hidden"))
+				.toBe("true");
+			expect(
+				view.getByRole("group", { name: "Photo filmstrip" }).query(),
+			).toBeNull();
+			overlay.dispatchEvent(
+				new PointerEvent("pointermove", {
+					bubbles: true,
+					clientY: 1024,
+					pointerType: "mouse",
+				}),
+			);
+			await expect
+				.element(view.getByRole("group", { name: "Photo filmstrip" }))
+				.toBeVisible();
+
+			overlay.dispatchEvent(
+				new PointerEvent("pointermove", {
+					bubbles: true,
+					clientY: 100,
+					pointerType: "mouse",
+				}),
+			);
+			await vi.advanceTimersByTimeAsync(2499);
+			expect(controls?.getAttribute("aria-hidden")).toBe("false");
+			await vi.advanceTimersByTimeAsync(1);
+			await expect
+				.poll(() => controls?.getAttribute("aria-hidden"))
+				.toBe("true");
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("retries a rejected screen-preview request", async () => {

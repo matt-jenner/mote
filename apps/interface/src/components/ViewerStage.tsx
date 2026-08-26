@@ -12,6 +12,7 @@ interface ViewerStageProps {
 	baseUrl?: string | null;
 	currentUrl?: string | null;
 	largePreviewUnavailable?: boolean;
+	onPreviewFailure?: () => void;
 	previewGeneration?: number;
 }
 
@@ -61,6 +62,7 @@ export function ViewerStage({
 	baseUrl: suppliedBaseUrl,
 	currentUrl: suppliedCurrentUrl,
 	largePreviewUnavailable = false,
+	onPreviewFailure,
 	previewGeneration = 0,
 }: ViewerStageProps) {
 	const stageRef = useRef<HTMLDivElement>(null);
@@ -116,9 +118,10 @@ export function ViewerStage({
 			() => {
 				if (activeDecodeRef.current !== decodeToken) return;
 				setScreenFailed(true);
+				onPreviewFailure?.();
 			},
 		);
-	}, [currentUrl, decodeToken]);
+	}, [currentUrl, decodeToken, onPreviewFailure]);
 
 	// The URL is part of the base-layer identity; reset its error state when it changes.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: baseUrl is the identity being watched.
@@ -188,8 +191,10 @@ export function ViewerStage({
 						decoding="async"
 						draggable={false}
 						onError={() => {
-							if (activeDecodeRef.current === decodeToken)
+							if (activeDecodeRef.current === decodeToken) {
 								setScreenFailed(true);
+								onPreviewFailure?.();
+							}
 						}}
 						ref={screenImageRef}
 						src={currentUrl}

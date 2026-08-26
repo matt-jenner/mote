@@ -13,6 +13,8 @@
 	top: var(--safe-area-top);
 	left: var(--safe-area-left);
 	z-index: 1;
+	display: flex;
+	gap: 8px;
 }
 
 .viewerBack {
@@ -111,6 +113,109 @@
 	cursor: default;
 }
 
+.viewerInfoButton,
+.viewerInfoClose {
+	display: grid;
+	place-items: center;
+	min-width: 44px;
+	height: 44px;
+	padding: 0 10px;
+	color: #f4f5f6;
+	background: rgb(8 9 11 / 62%);
+	border: 1px solid rgb(255 255 255 / 14%);
+	border-radius: 22px;
+	cursor: pointer;
+}
+
+.viewerInfoButton {
+	position: absolute;
+	top: var(--safe-area-top);
+	left: calc(var(--safe-area-left) + 52px);
+}
+
+.viewerInfoClose {
+	font-size: 0.78rem;
+}
+
+.viewerControlsHidden {
+	visibility: hidden;
+	opacity: 0;
+	pointer-events: none;
+}
+
+.viewerControls {
+	transition: opacity 180ms ease;
+}
+
+.viewerInfoDrawer {
+	position: absolute;
+	top: 0;
+	right: 0;
+	bottom: 0;
+	z-index: 2;
+	width: 320px;
+	max-width: 100%;
+	overflow-y: auto;
+	padding: calc(var(--safe-area-top) + 20px) 24px 24px;
+	color: #f4f5f6;
+	background: rgb(19 21 25 / 96%);
+	box-shadow: -14px 0 30px rgb(0 0 0 / 24%);
+}
+
+.viewerInfoHeader {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 16px;
+	margin-bottom: 24px;
+}
+
+.viewerInfoHeader h2 {
+	margin: 0;
+	font-size: 1.05rem;
+	font-weight: 600;
+}
+
+.viewerInfoList {
+	display: grid;
+	gap: 18px;
+	margin: 0;
+}
+
+.viewerInfoList div {
+	display: grid;
+	gap: 4px;
+}
+
+.viewerInfoList dt {
+	color: rgb(244 245 246 / 62%);
+	font-size: 0.72rem;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+}
+
+.viewerInfoList dd {
+	margin: 0;
+	font-size: 0.95rem;
+	word-break: break-word;
+}
+
+.viewerInfoWarning {
+	margin: 24px 0 0;
+	color: #f3c36a;
+	font-size: 0.88rem;
+}
+
+.viewerStatus {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip: rect(0 0 0 0);
+	white-space: nowrap;
+	clip-path: inset(50%);
+}
+
 .viewerFilmstrip {
 	position: absolute;
 	right: 0;
@@ -161,6 +266,12 @@
 }
 
 @media (max-width: 639px) {
+	.viewerInfoDrawer {
+		width: 88%;
+		padding-right: 20px;
+		padding-left: 20px;
+	}
+
 	.viewerControls {
 		right: calc(var(--safe-area-right) + 8px);
 		left: calc(var(--safe-area-left) + 8px);
@@ -173,7 +284,8 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-	.viewerPreview {
+	.viewerPreview,
+	.viewerControls {
 		transition-duration: 0s;
 	}
 }

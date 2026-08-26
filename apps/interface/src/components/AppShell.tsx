@@ -227,6 +227,14 @@ export function AppShell() {
 				<PhotoViewerOverlay
 					assets={wall.state.items}
 					onClose={handleCloseViewer}
+					onSetInfoOpen={(open) =>
+						dispatchViewer({ type: "setInfoOpen", open })
+					}
+					onShowControls={() => dispatchViewer({ type: "showControls" })}
+					onHideControls={() => dispatchViewer({ type: "hideControls" })}
+					onToggleTouchControls={() =>
+						dispatchViewer({ type: "toggleTouchControls" })
+					}
 					service={service}
 					state={viewer}
 					onLoadMore={wall.loadMore}
