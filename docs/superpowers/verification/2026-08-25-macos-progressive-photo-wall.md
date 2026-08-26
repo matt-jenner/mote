@@ -107,7 +107,12 @@ mountain.jpg 79bcb7af04b68935b29b5e0a80afb17d1823dde94a5fdbc75e3d5adf7a6e62ae
 portrait.jpg d1844a9747c7acfb36b10651ce79acff5c9d35b30a7b54323dbb171aed0bdfd0
 ```
 
-## Fresh verification
+## Earlier baseline verification (commit `3186354`; 2026-08-26 02:18 +0100)
+
+The following block is historical evidence recorded for the earlier
+`3186354` implementation, before the Task 1 and Task 2 thumbnail-first
+remediation commits. It is retained for context and is not the current Task 3
+verification; the current counts are recorded in the Task 3 section below.
 
 All commands below exited 0.
 
@@ -249,13 +254,21 @@ distribution purposes despite the linker ad-hoc signature.
 
 ## Task 3 source audit and native limitation
 
-The production diff `d63cc9a..9cad2b0` changes only the app-service source,
-desktop manifest, and progressive-wall tests. The filesystem-call scan found
-no production source-path write, rename, move, copy, or delete operation. The
-only `create_dir_all` hits in the changed app-service file are test fixture
-setup under `cfg(test)`. `git diff --quiet -- apps/interface/public/demo-photos`
-returned exit 0 both before and after verification, and the fixture directory
-had no status entries. The before/after SHA-256 values are identical:
+The full changed range `d63cc9a..9cad2b0` includes the interface production
+source, interface tests and styles, app-service production source,
+app-service tests, the desktop manifest, and the thumbnail-first spec/plan
+documents, in addition to the verification document. The filesystem and
+source-media mutation audit covered every changed production file in the
+interface, app-service, and desktop source scopes. The scan found no
+source-path write, rename, move, copy, or delete operation: the
+`derivativeRequests.current.delete(...)` hits are in-memory map removals,
+`tokio::spawn`/queue hits are task scheduling, and the only filesystem
+`create_dir_all` hits are temporary test-fixture setup under `cfg(test)`.
+This is a source audit, not a claim of exhaustive runtime instrumentation.
+
+`git diff --quiet -- apps/interface/public/demo-photos` returned exit 0 both
+before and after verification, and the fixture directory had no status
+entries. The before/after SHA-256 values are identical:
 
 ```text
 city.jpg      44faf249868e8d3ae81c0b532c460711526fbf17a66b82ee43ac805b3591cad1
@@ -277,3 +290,10 @@ contact-sheet, preview-gating, pending-sort, or progress-transition timings
 are claimed. The dev process was stopped after the attempt; no desktop app is
 left running. Native interaction remains user-verified rather than
 automation-verified in this environment.
+
+The exact repository checks were rerun against the pre-fix-round HEAD
+`b9388bb`: `git diff --check` exited 0, `git diff --quiet` exited 0,
+`git diff --cached --quiet` exited 0, and
+`git status --short --untracked-files=no` produced no output. After the
+documentation fix commit, the same `git diff --check` and tracked-status
+checks were rerun and again exited 0 with no tracked changes.
