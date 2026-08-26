@@ -20,6 +20,7 @@ import type {
 	WallWarningState,
 } from "../services/photoService";
 import { AppShell } from "./AppShell";
+import { PhotoTile } from "./PhotoTile";
 import "../styles/tokens.css";
 import "../styles/global.css";
 
@@ -215,6 +216,9 @@ class ControlledWallService implements PhotoService {
 			selectionId: this.sourceState.activeSource?.selectionId ?? "",
 			derivatives: [reference],
 		});
+	};
+	setDerivativeUrl = (key: string, url: string) => {
+		this.urls.set(key, url);
 	};
 	emit = (update: WallUpdate) => {
 		for (const listener of this.listeners) listener(update);
@@ -512,6 +516,14 @@ describe("progressive photo wall", () => {
 			service.derivativeRequests.map((request) => request.priority),
 		).toEqual(["visible", "nearViewport"]);
 		expect(idleCallbacks).toHaveLength(0);
+		const wall = screen.getByRole("region", { name: "Photos" });
+		TestIntersectionObserver.trigger("near", wall.element(), [
+			"provisional-40",
+		]);
+		await new Promise((resolve) => window.setTimeout(resolve, 25));
+		expect(
+			service.derivativeRequests.flatMap((request) => request.assetIds),
+		).not.toContain("provisional-40");
 
 		service.emit({
 			kind: "metadataSettled",
@@ -525,16 +537,75 @@ describe("progressive photo wall", () => {
 		await expect
 			.poll(() => service.derivativeRequests.length)
 			.toBeGreaterThan(settledStart);
-		expect(service.derivativeRequests[settledStart]?.priority).toBe("visible");
+		const settledRows = [
+			...wall
+				.element()
+				.querySelectorAll<HTMLElement>("[data-testid^='photo-row-']"),
+		];
+		const wallRect = wall.element().getBoundingClientRect();
+		const visibleRows = settledRows
+			.map((row, index) => {
+				const top =
+					row.getBoundingClientRect().top -
+					wallRect.top +
+					wall.element().scrollTop;
+				const bottom = top + row.getBoundingClientRect().height;
+				return top < wall.element().scrollTop + wall.element().clientHeight &&
+					bottom > wall.element().scrollTop
+					? index
+					: -1;
+			})
+			.filter((index) => index >= 0);
+		const lastVisible = visibleRows.at(-1) ?? 0;
+		const nearRows = [lastVisible + 1, lastVisible + 2].filter(
+			(index) => index < settledRows.length,
+		);
+		const idsInRows = (indices: readonly number[]) =>
+			indices.flatMap((index) =>
+				[
+					...(settledRows[index]?.querySelectorAll<HTMLElement>(
+						"[data-asset-id]",
+					) ?? []),
+				].map((tile) => tile.dataset.assetId ?? ""),
+			);
+		const settledVisibleIds = idsInRows(visibleRows);
+		const settledNearIds = idsInRows(nearRows);
+		const settledRemainingIds = idsInRows(
+			settledRows
+				.map((_row, index) => index)
+				.filter(
+					(index) => !visibleRows.includes(index) && !nearRows.includes(index),
+				),
+		);
+		const previouslyRequested = new Set(
+			service.derivativeRequests
+				.slice(0, settledStart)
+				.flatMap((request) => request.assetIds),
+		);
+		const expectedIdleIds = settledRemainingIds.filter(
+			(id) => !previouslyRequested.has(id),
+		);
+		expect(service.derivativeRequests[settledStart]).toEqual({
+			assetIds: settledVisibleIds,
+			priority: "visible",
+		});
+		expect(service.derivativeRequests[settledStart + 1]).toEqual({
+			assetIds: settledNearIds,
+			priority: "nearViewport",
+		});
 		const settledIdle = idleCallbacks.splice(0);
 		expect(settledIdle.length).toBeGreaterThan(0);
 		for (const callback of settledIdle) callback();
+		while (idleCallbacks.length > 0)
+			for (const callback of idleCallbacks.splice(0)) callback();
 		await expect
 			.poll(() => service.derivativeRequests.length)
 			.toBeGreaterThan(settledStart + 1);
-		expect(service.derivativeRequests[settledStart + 1]?.priority).toBe(
-			"nearViewport",
-		);
+		expect(
+			service.derivativeRequests
+				.slice(settledStart + 2)
+				.flatMap((request) => request.assetIds),
+		).toEqual(expectedIdleIds);
 		screen.unmount();
 	});
 
@@ -804,6 +875,49 @@ describe("progressive photo wall", () => {
 				),
 			)
 			.toBe(true);
+		expect(
+			wall.element().querySelectorAll<HTMLImageElement>("img").length,
+		).toBe(realFixtureAssets.length);
+		screen.unmount();
+	});
+
+	it("resets a replacement thumbnail until its own load event", async () => {
+		const service = new ControlledWallService();
+		service.setDerivativeUrl("swap-old", "/demo-photos/coast.jpg");
+		service.setDerivativeUrl("swap-new", "/demo-photos/forest.jpg?swap=1");
+		function SwapHarness() {
+			const [key, setKey] = useState("swap-old");
+			const positioned = {
+				asset: asset("coast", "Coast", 1, {
+					wallThumbnail: {
+						assetId: "coast",
+						kind: "wallThumbnail" as const,
+						key,
+					},
+				}),
+				left: 0,
+				width: 320,
+				height: 220,
+			};
+			return (
+				<div>
+					<button onClick={() => setKey("swap-new")} type="button">
+						Swap thumbnail
+					</button>
+					<PhotoTile positioned={positioned} service={service} />
+				</div>
+			);
+		}
+		const screen = await render(<SwapHarness />);
+		await expect
+			.element(screen.getByRole("img", { name: "Coast" }))
+			.toBeVisible();
+		await screen.getByRole("button", { name: "Swap thumbnail" }).click();
+		const image = screen.getByRole("img", { name: "Coast" }).element();
+		await expect.poll(() => image.getAttribute("src")).toContain("swap=1");
+		expect(getComputedStyle(image).opacity).toBe("0");
+		image.dispatchEvent(new Event("load"));
+		await expect.poll(() => getComputedStyle(image).opacity).toBe("1");
 		screen.unmount();
 	});
 

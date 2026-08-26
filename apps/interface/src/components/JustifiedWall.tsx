@@ -55,6 +55,7 @@ export function JustifiedWall({
 	);
 	const sentinelRef = useRef<HTMLDivElement>(null);
 	const missingWallIdsRef = useRef<Set<string>>(new Set());
+	const provisionalNearIdsRef = useRef<Set<string>>(new Set());
 	missingWallIdsRef.current = new Set(
 		assets
 			.filter((asset) => asset.wallThumbnail === null)
@@ -98,6 +99,7 @@ export function JustifiedWall({
 					.map((item) => item.asset.id) ?? [],
 		);
 		const claimed = new Set([...visibleIds, ...nearIds]);
+		provisionalNearIdsRef.current = claimed;
 		const remainingIds = rows
 			.flatMap((row) =>
 				row.items
@@ -208,7 +210,12 @@ export function JustifiedWall({
 				for (const entry of entries) {
 					if (!entry.isIntersecting) continue;
 					const id = (entry.target as HTMLElement).dataset.assetId;
-					if (id && missingWallIdsRef.current.has(id)) nearIds.add(id);
+					if (
+						id &&
+						missingWallIdsRef.current.has(id) &&
+						(orderState === "settled" || provisionalNearIdsRef.current.has(id))
+					)
+						nearIds.add(id);
 				}
 				schedule();
 			},
@@ -251,6 +258,7 @@ export function JustifiedWall({
 		};
 	}, [
 		loadMore,
+		orderState,
 		requestNearViewportDerivatives,
 		requestVisibleDerivatives,
 		root,

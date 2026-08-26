@@ -270,12 +270,15 @@ describe("Tauri PhotoService", () => {
 	});
 
 	it("resyncs exactly once after the first successful wall-update registration", async () => {
+		const calls: Array<[string, Record<string, unknown> | undefined]> = [];
 		const received: WallUpdate[] = [];
 		const service = createTauriPhotoService(
-			async <T>(command: string) =>
-				(command === "watch_wall_updates"
-					? "initial-subscription"
-					: undefined) as T,
+			async <T>(command: string, args?: Record<string, unknown>) => {
+				calls.push([command, args]);
+				return (
+					command === "watch_wall_updates" ? "initial-subscription" : undefined
+				) as T;
+			},
 			(listener) => new FakeChannel(listener),
 		);
 
@@ -284,6 +287,10 @@ describe("Tauri PhotoService", () => {
 
 		expect(received).toEqual([{ kind: "resyncRequired", selectionId: "" }]);
 		stop();
+		expect(calls).toContainEqual([
+			"unwatch_wall_updates",
+			{ subscriptionId: "initial-subscription" },
+		]);
 	});
 
 	it("keeps registration failure delivery synchronous with unsubscribe", async () => {
