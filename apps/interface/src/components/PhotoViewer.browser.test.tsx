@@ -498,6 +498,33 @@ describe("immersive photo viewer checkpoint", () => {
 		}
 	});
 
+	it("starts the desktop inactivity timer when the viewer opens", async () => {
+		const { view, tile } = await openAsset("Coast");
+		vi.useFakeTimers();
+		try {
+			(tile.element() as HTMLButtonElement).click();
+			await expect
+				.element(view.getByRole("dialog", { name: "Photo viewer" }))
+				.toBeVisible();
+			const controls = document.querySelector<HTMLElement>(
+				"[data-viewer-controls]",
+			);
+			await vi.advanceTimersByTimeAsync(2500);
+			await expect
+				.poll(() => controls?.getAttribute("aria-hidden"))
+				.toBe("true");
+			expect(
+				view.getByRole("group", { name: "Photo filmstrip" }).query(),
+			).toBeNull();
+			const hiddenNavigation = controls?.querySelectorAll("button") ?? [];
+			expect([...hiddenNavigation].every((button) => button.tabIndex < 0)).toBe(
+				true,
+			);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("cycles only visible controls when primary controls are hidden", async () => {
 		const { view, tile } = await openAsset("Coast");
 		(tile.element() as HTMLButtonElement).click();
