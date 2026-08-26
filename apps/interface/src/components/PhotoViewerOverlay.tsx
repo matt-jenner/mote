@@ -106,13 +106,19 @@ export function PhotoViewerOverlay({
 		const first = focusable[0];
 		const last = focusable.at(-1);
 		if (!first || !last) return;
-		if (event.shiftKey && document.activeElement === first) {
+		const activeIndex = focusable.indexOf(
+			document.activeElement as HTMLElement,
+		);
+		if (activeIndex < 0) {
 			event.preventDefault();
-			last.focus();
-		} else if (!event.shiftKey && document.activeElement === last) {
-			event.preventDefault();
-			first.focus();
+			(event.shiftKey ? last : first).focus();
+			return;
 		}
+		event.preventDefault();
+		const nextIndex =
+			(activeIndex + (event.shiftKey ? -1 : 1) + focusable.length) %
+			focusable.length;
+		focusable[nextIndex]?.focus();
 	};
 	return (
 		<section
@@ -128,12 +134,6 @@ export function PhotoViewerOverlay({
 					aria-label="Back to photos"
 					className={styles.viewerBack}
 					onClick={onClose}
-					onBlur={() => {
-						queueMicrotask(() => {
-							if (!dialogRef.current?.contains(document.activeElement))
-								backRef.current?.focus();
-						});
-					}}
 					ref={backRef}
 					type="button"
 				>
@@ -157,7 +157,6 @@ export function PhotoViewerOverlay({
 						const previous = assets[currentIndex - 1];
 						if (previous) onSelectAsset(previous.id);
 					}}
-					tabIndex={-1}
 					type="button"
 				>
 					<ChevronLeft aria-hidden="true" size={24} strokeWidth={1.7} />
@@ -170,7 +169,6 @@ export function PhotoViewerOverlay({
 						const next = assets[currentIndex + 1];
 						if (next) onSelectAsset(next.id);
 					}}
-					tabIndex={-1}
 					type="button"
 				>
 					<ChevronRight aria-hidden="true" size={24} strokeWidth={1.7} />

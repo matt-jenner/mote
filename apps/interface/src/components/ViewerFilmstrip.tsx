@@ -77,7 +77,6 @@ export function ViewerFilmstrip({
 							className={styles.viewerFilmstripItem}
 							onClick={() => onSelectAsset(asset.id)}
 							ref={isCurrent ? currentButtonRef : undefined}
-							tabIndex={-1}
 							type="button"
 						>
 							{url ? (

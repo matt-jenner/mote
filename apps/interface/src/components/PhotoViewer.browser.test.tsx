@@ -9,14 +9,17 @@ import {
 	type InMemoryPhotoService,
 } from "../services/inMemoryPhotoService";
 import type {
+	DerivativeRequest,
 	PhotoService,
 	WallAsset,
 	WallPage,
+	WallQueryRequest,
 } from "../services/photoService";
 import "../styles/tokens.css";
 import "../styles/global.css";
 import { useViewerPreview } from "../viewer/useViewerPreview";
 import { AppShell } from "./AppShell";
+import { ViewerFilmstrip } from "./ViewerFilmstrip";
 import { ViewerStage } from "./ViewerStage";
 
 function asset(id: string, displayName: string, order: number): WallAsset {
@@ -62,9 +65,13 @@ function serviceWithReadyPhotos(
 			asset(`photo-${index}`, `Photo ${index}`, index + 2),
 		),
 	];
+	const datedAssets = assets.map((item, index) => ({
+		...item,
+		capturedAtUtc: new Date(Date.UTC(2024, 0, index + 1)).toISOString(),
+	}));
 	return createInMemoryPhotoService({
 		selectedFolderName: "Iceland 2025",
-		wallAssets: assets.map((item) => ({
+		wallAssets: datedAssets.map((item) => ({
 			...item,
 			wallThumbnailUrl: `/demo-photos/${item.id}.jpg`,
 			screenPreviewUrl:
@@ -73,8 +80,46 @@ function serviceWithReadyPhotos(
 	});
 }
 
+interface PageGate {
+	request: WallQueryRequest;
+	resolve: (page: WallPage) => void;
+}
+
+function delayedPaginationService() {
+	const service = serviceWithReadyPhotos(false, 120);
+	const queryRequests: WallQueryRequest[] = [];
+	const queryWall = service.queryWall.bind(service);
+	let heldPage: PageGate | null = null;
+	service.queryWall = (request) => {
+		queryRequests.push(request);
+		if (request.cursor === "100" && heldPage === null) {
+			return new Promise<WallPage>((resolve) => {
+				heldPage = { request, resolve };
+			});
+		}
+		return queryWall(request);
+	};
+	return {
+		service,
+		queryRequests,
+		releaseNextPage: async () => {
+			if (!heldPage) throw new Error("No delayed page is pending");
+			const page = await queryWall(heldPage.request);
+			heldPage.resolve(page);
+			heldPage = null;
+		},
+	};
+}
+
 async function openManyAsset(name: string) {
 	const service = serviceWithReadyPhotos(false, 120);
+	return openAssetWithService(service, name);
+}
+
+async function openAssetWithService(
+	service: InMemoryPhotoService,
+	name: string,
+) {
 	const view = await renderViewerWall(service);
 	await view.getByRole("button", { name: "Choose Folder" }).click();
 	await service.finishFixtureScan();
@@ -197,7 +242,7 @@ async function openAsset(name: string, brokenScreenPreview = false) {
 			],
 		});
 	}
-	const tile = view.getByRole("button", { name: `Open ${name}` });
+	const tile = view.getByRole("button", { name: `Open ${name}`, exact: true });
 	await expect.element(tile).toBeVisible();
 	return { service, view, tile };
 }
@@ -398,14 +443,28 @@ describe("immersive photo viewer checkpoint", () => {
 	});
 
 	it("keeps keyboard focus inside the viewer instead of covered source controls", async () => {
-		const { view, tile } = await openAsset("Coast");
+		const { view, tile } = await openAsset("Photo 1");
 		(tile.element() as HTMLButtonElement).click();
 		const back = view.getByRole("button", { name: "Back to photos" });
 		await expect.element(back).toBeVisible();
+		const previous = view.getByRole("button", { name: "Previous photo" });
+		const next = view.getByRole("button", { name: "Next photo" });
 		const folders = view.getByRole("button", { name: "Folders" });
+		const firstThumb = view
+			.getByRole("group", { name: "Photo filmstrip" })
+			.getByRole("button", { name: "Coast", exact: true });
+		await back.element().focus();
 		await userEvent.keyboard("{Tab}");
-		expect(document.activeElement).toBe(back.element());
+		expect(document.activeElement).toBe(previous.element());
+		await userEvent.keyboard("{Tab}");
+		expect(document.activeElement).toBe(next.element());
+		await userEvent.keyboard("{Tab}");
+		expect(document.activeElement).toBe(firstThumb.element());
 		expect(document.activeElement).not.toBe(folders.element());
+		await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
+		expect(document.activeElement).toBe(next.element());
+		await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
+		expect(document.activeElement).toBe(previous.element());
 		await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
 		expect(document.activeElement).toBe(back.element());
 	});
@@ -452,5 +511,102 @@ describe("immersive photo viewer checkpoint", () => {
 				.querySelector("button[aria-current='true']")
 				?.getAttribute("aria-label"),
 		).toBe("Coast");
+	});
+
+	it("holds the current photo while loading and then continues into the next page", async () => {
+		const delayed = delayedPaginationService();
+		const { view } = await openAssetWithService(delayed.service, "Photo 96");
+		await expect
+			.poll(
+				() =>
+					delayed.queryRequests.filter((request) => request.cursor === "100")
+						.length,
+			)
+			.toBe(1);
+		const next = view.getByRole("button", { name: "Next photo" });
+		await expect.element(next).toBeEnabled();
+		await next.click();
+		await next.click();
+		await expect.element(next).toBeDisabled();
+		await expect
+			.element(view.getByTestId("viewer-stage"))
+			.toHaveAttribute("data-current-asset", "photo-98");
+		await delayed.releaseNextPage();
+		await expect.element(next).toBeEnabled();
+		await next.click();
+		await expect
+			.element(view.getByTestId("viewer-stage"))
+			.toHaveAttribute("data-current-asset", "photo-99");
+		expect(
+			delayed.queryRequests.filter((request) => request.cursor === "100"),
+		).toHaveLength(1);
+	});
+
+	it("routes visible controls and filmstrip selection through ordered navigation", async () => {
+		const { view } = await openManyAsset("Photo 1");
+		await view.getByRole("button", { name: "Previous photo" }).click();
+		await expect
+			.element(view.getByTestId("viewer-stage"))
+			.toHaveAttribute("data-current-asset", "photo-0");
+		await view.getByRole("button", { name: "Next photo" }).click();
+		await expect
+			.element(view.getByTestId("viewer-stage"))
+			.toHaveAttribute("data-current-asset", "photo-1");
+		await view
+			.getByRole("group", { name: "Photo filmstrip" })
+			.getByRole("button", { name: "Photo 2", exact: true })
+			.click();
+		await expect
+			.element(view.getByTestId("viewer-stage"))
+			.toHaveAttribute("data-current-asset", "photo-2");
+	});
+
+	it("requests missing filmstrip thumbnails near the viewport and scrolls immediately for reduced motion", async () => {
+		const requests: DerivativeRequest[] = [];
+		const service = previewService(async (request) => {
+			requests.push({ ...request, assetIds: [...request.assetIds] });
+		});
+		const assets = [1, 2, 3, 4].map((order) => ({
+			...asset(`film-${order}`, `Film ${order}`, order),
+			wallThumbnail: null,
+		}));
+		const scrollCalls: ScrollIntoViewOptions[] = [];
+		const originalScrollIntoView = Element.prototype.scrollIntoView;
+		const originalMatchMedia = window.matchMedia;
+		Element.prototype.scrollIntoView = (options) => {
+			scrollCalls.push(options as ScrollIntoViewOptions);
+		};
+		window.matchMedia = (() =>
+			({ matches: true }) as MediaQueryList) as typeof window.matchMedia;
+		try {
+			await render(
+				<ViewerFilmstrip
+					assets={assets}
+					currentIndex={1}
+					onRequestNearViewportDerivatives={(ids) =>
+						service.requestDerivatives({
+							assetIds: [...ids],
+							kind: "wallThumbnail",
+							priority: "nearViewport",
+						})
+					}
+					onSelectAsset={() => undefined}
+					service={service}
+				/>,
+			);
+			await expect.poll(() => requests.length).toBeGreaterThan(0);
+			expect(requests[0]).toMatchObject({
+				kind: "wallThumbnail",
+				priority: "nearViewport",
+			});
+			expect(scrollCalls[0]).toMatchObject({
+				behavior: "auto",
+				block: "nearest",
+				inline: "center",
+			});
+		} finally {
+			Element.prototype.scrollIntoView = originalScrollIntoView;
+			window.matchMedia = originalMatchMedia;
+		}
 	});
 });
