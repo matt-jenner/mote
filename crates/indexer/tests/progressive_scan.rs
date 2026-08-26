@@ -239,7 +239,6 @@ async fn enrichment_admission_tracks_mode_changes_during_one_scan() {
     // Both idle admissions are held, so the mode change is observed before either read completes.
     release.release(2);
     let notifications = wait_for_starts(notifications, 1).await;
-    tokio::task::yield_now().await;
     let active_starts = reader.starts.load(Ordering::SeqCst);
 
     scheduler.set_interaction_mode(InteractionMode::Idle).await;

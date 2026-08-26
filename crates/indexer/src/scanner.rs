@@ -415,17 +415,23 @@ async fn admit_enrichment(
         if *cancel.borrow() {
             return false;
         }
-        let limit = scheduler.available_background_permits().clamp(1, 2);
-        let current = admissions.load(Ordering::Acquire);
-        if current < limit
-            && admissions
-                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
+        if try_admit_enrichment(scheduler, admissions) {
             return true;
         }
         tokio::task::yield_now().await;
     }
+}
+
+fn try_admit_enrichment(
+    scheduler: &IndexScheduler,
+    admissions: &std::sync::atomic::AtomicUsize,
+) -> bool {
+    let limit = scheduler.available_background_permits().clamp(1, 2);
+    let current = admissions.load(Ordering::Acquire);
+    current < limit
+        && admissions
+            .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
 }
 
 struct ProcessedAsset {
@@ -496,4 +502,26 @@ fn discover_all(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::try_admit_enrichment;
+    use crate::{IndexScheduler, InteractionMode, SchedulerConfig};
+    use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test]
+    async fn admission_decision_respects_active_limit() {
+        let scheduler = IndexScheduler::new(SchedulerConfig {
+            idle_workers: 2,
+            active_workers: 1,
+        });
+        scheduler
+            .set_interaction_mode(InteractionMode::Active)
+            .await;
+        let admissions = AtomicUsize::new(0);
+
+        assert!(try_admit_enrichment(&scheduler, &admissions));
+        assert!(!try_admit_enrichment(&scheduler, &admissions));
+    }
 }

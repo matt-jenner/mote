@@ -2,7 +2,7 @@
 
 ## Status
 
-Complete. The repair is test-only and local to `crates/indexer/tests/progressive_scan.rs`.
+Complete. The integration repair remains local to `crates/indexer/tests/progressive_scan.rs`; a small private admission-decision extraction and unit test in `crates/indexer/src/scanner.rs` provide deterministic proof where the integration observation point cannot.
 
 ## Root cause
 
@@ -24,10 +24,10 @@ The extra start was a normal post-release read completing before the assertion, 
 
 - Added a small local `PermitMetadataReader` with a per-read permit count and start notifications.
 - The test starts the scan with two idle workers and waits until both per-read permits are blocked before switching the shared scheduler to active mode.
-- It releases those two reads, observes exactly one new active admission, then yields once to let the second worker reach the active admission check before recording the count.
+- It releases those two reads, observes exactly one new active admission, and records the active count without a scheduler yield.
 - It switches the same running scan to idle mode, releases the first new read, and observes exactly two newly admitted starts.
 - It cancels and opens the permit gate before joining, then asserts the observed active and idle counts (`3` and `5`).
-- No production code, scheduler logic, source media, or catalog data changed.
+- No scheduler logic, public API, source media, or catalog data changed.
 
 ## Mutation check
 
@@ -69,4 +69,14 @@ right: 3
 
 The mutation was restored before the final verification.
 
-Final fix-round verification: 20 consecutive focused runs passed; the complete `photo-indexer` suite passed 30 tests; fmt, Clippy with warnings denied, and `git diff --check` all passed.
+Final fix-round verification: 20 consecutive focused runs passed; the complete `photo-indexer` suite passed 31 tests (1 scanner unit, 18 progressive scan, 5 reconciliation, 7 scheduler priority); fmt, Clippy with warnings denied, and `git diff --check` all passed.
+
+## Fix-round 2 evidence
+
+The remaining yield-based sampling race was removed. Since an integration-only assertion cannot deterministically prove that no second active admission is pending after the first notification, the smallest behavior-preserving private extraction was made: `try_admit_enrichment` owns the scheduler-limit clamp and atomic admission decision, while `admit_enrichment` retains the same cancellation and yield loop. The public API and scheduler behavior are unchanged.
+
+RED: after adding the direct admission test before the extraction existed, the focused command failed at compile time with `no try_admit_enrichment in scanner`.
+
+GREEN: after the extraction, `cargo test -p photo-indexer admission_decision_respects_active_limit` passed; the mode-transition integration test passed in 20 consecutive runs without `yield_now`.
+
+Mutation: temporarily changed the extracted active-limit clamp from `.clamp(1, 2)` to `.max(2)`. The direct test failed deterministically and exited promptly at its second-admission assertion (`assertion failed: !try_admit_enrichment(&scheduler, &admissions)`). The mutation was restored before final verification.
