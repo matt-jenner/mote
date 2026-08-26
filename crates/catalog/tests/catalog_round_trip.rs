@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use photo_catalog::{Catalog, NewAsset, NewFolderGroup, NewLibrary, SqliteVersion};
+use photo_catalog::{
+    Catalog, CatalogWarningRecord, NewAsset, NewFolderGroup, NewLibrary, SqliteVersion,
+};
 use photo_domain::{Availability, FolderGroupId, MediaKind, RelativePathKey};
 
 #[test]
@@ -105,6 +107,34 @@ fn unavailable_asset_count_tracks_retained_offline_rows() {
     assert_eq!(catalog.unavailable_asset_count(library.id).unwrap(), 0);
     assert_eq!(catalog.mark_root_offline(library.id).unwrap(), 3);
     assert_eq!(catalog.unavailable_asset_count(library.id).unwrap(), 3);
+}
+
+#[test]
+fn source_warning_snapshot_exposes_only_path_free_codes() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured(
+            "Pictures",
+            Path::new("/mounted/Pictures"),
+        ))
+        .unwrap();
+    catalog
+        .record_warning_once(&CatalogWarningRecord {
+            library_id: library.id,
+            asset_id: None,
+            code: "screen_preview_cache_unavailable".to_owned(),
+            message: "/private/source/path must never cross the boundary".to_owned(),
+        })
+        .unwrap();
+    let warnings = catalog.source_warning_summaries(library.id).unwrap();
+    assert_eq!(
+        warnings
+            .iter()
+            .map(|warning| warning.code.as_str())
+            .collect::<Vec<_>>(),
+        vec!["screen_preview_cache_unavailable"]
+    );
+    assert!(!format!("{warnings:?}").contains("/private/source/path"));
 }
 
 #[test]

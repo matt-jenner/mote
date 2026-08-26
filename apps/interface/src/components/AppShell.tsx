@@ -16,7 +16,7 @@ export function AppShell() {
 	const drawerCloseRef = useRef<HTMLButtonElement>(null);
 	const drawerWasOpen = useRef(false);
 	const source = controller.state?.activeSource ?? null;
-	const wall = usePhotoWall(source?.id ?? null);
+	const wall = usePhotoWall(source?.selectionId ?? null);
 	const appearance = controller.state?.settings.appearance ?? "system";
 	const chooseFolder = () => controller.chooseFolder();
 

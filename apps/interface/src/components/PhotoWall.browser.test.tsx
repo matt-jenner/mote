@@ -17,6 +17,7 @@ import type {
 	WallPage,
 	WallQueryRequest,
 	WallUpdate,
+	WallWarningState,
 } from "../services/photoService";
 import { AppShell } from "./AppShell";
 import "../styles/tokens.css";
@@ -146,6 +147,7 @@ class ControlledWallService implements PhotoService {
 			settings: { appearance: "system" },
 			activeSource: {
 				id: sourceId,
+				selectionId: sourceId,
 				displayName: sourceId,
 				availability: "available",
 			},
@@ -196,7 +198,11 @@ class ControlledWallService implements PhotoService {
 			key: `${assetId}-wall`,
 		};
 		this.urls.set(reference.key, url);
-		this.emit({ kind: "derivativesReady", derivatives: [reference] });
+		this.emit({
+			kind: "derivativesReady",
+			selectionId: this.sourceState.activeSource?.selectionId ?? "",
+			derivatives: [reference],
+		});
 	};
 	emit = (update: WallUpdate) => {
 		for (const listener of this.listeners) listener(update);
@@ -252,10 +258,12 @@ const pageOf = (
 	items: readonly WallAsset[],
 	orderState: "provisional" | "settled" = "provisional",
 	nextCursor: string | null = null,
+	sourceWarnings: readonly WallWarningState[] = [],
 ): WallPage => ({
 	items: [...items],
 	orderState,
 	nextCursor,
+	sourceWarnings: [...sourceWarnings],
 });
 
 function renderWall(service: PhotoService) {
@@ -272,11 +280,11 @@ function renderWall(service: PhotoService) {
 }
 
 function SourceSwapHarness() {
-	const [sourceId, setSourceId] = useState("source-a");
-	const wall = usePhotoWall(sourceId);
+	const [selectionId, setSelectionId] = useState("selection-parent");
+	const wall = usePhotoWall(selectionId);
 	return (
 		<div>
-			<button onClick={() => setSourceId("source-b")} type="button">
+			<button onClick={() => setSelectionId("selection-child")} type="button">
 				Switch source
 			</button>
 			<div data-testid="swap-items">
@@ -381,7 +389,12 @@ describe("progressive photo wall", () => {
 		await expect
 			.poll(() => screen.getByTestId("photo-row-0").query())
 			.not.toBeNull();
-		service.emit({ kind: "metadataSettled", sourceId: "source-a" });
+		service.emit({
+			kind: "metadataSettled",
+			selectionId: "source-a",
+			sourceId: "source-a",
+			generation: 1,
+		});
 		await expect.poll(() => service.queryRequests.length).toBe(3);
 		expect(service.queryRequests[2]).toMatchObject({
 			direction: "newestFirst",
@@ -663,7 +676,12 @@ describe("progressive photo wall", () => {
 				.getByText("No photos found", { exact: true })
 				.query(),
 		).toBeNull();
-		service.emit({ kind: "metadataSettled", sourceId: "source-a" });
+		service.emit({
+			kind: "metadataSettled",
+			selectionId: "source-a",
+			sourceId: "source-a",
+			generation: 1,
+		});
 		await expect.poll(() => service.queryRequests.length).toBe(2);
 		service.releaseQuery(1, pageOf([], "settled"));
 		await expect
@@ -748,7 +766,12 @@ describe("progressive photo wall", () => {
 				callback();
 			});
 			await expect.poll(() => service.queryRequests.length).toBe(1);
-			service.emit({ kind: "metadataSettled", sourceId: "source-a" });
+			service.emit({
+				kind: "metadataSettled",
+				selectionId: "source-a",
+				sourceId: "source-a",
+				generation: 1,
+			});
 			service.releaseQuery(0, pageOf(realFixtureAssets));
 			await expect.poll(() => queued.length).toBeGreaterThan(0);
 			await screen.unmount();
@@ -782,16 +805,238 @@ describe("progressive photo wall", () => {
 		}
 	});
 
-	it("ignores a pending source A completion after source B takes ownership", async () => {
+	it("ignores a pending parent completion after a same-library child selection", async () => {
 		const service = new ControlledWallService();
 		const screen = await renderSwap(service);
 		await expect.poll(() => service.queryRequests.length).toBe(1);
 		await screen.getByRole("button", { name: "Switch source" }).click();
 		await expect.poll(() => service.queryRequests.length).toBe(2);
+		await expect
+			.poll(() => screen.getByTestId("swap-items").element().textContent)
+			.toBe("");
 		service.releaseQuery(1, pageOf([asset("b", "B", 1)], "settled"));
 		service.releaseQuery(0, pageOf([asset("a", "A", 1)], "settled"));
+		service.emit({
+			kind: "catalogBatch",
+			selectionId: "selection-parent",
+			assets: [asset("stale", "Stale parent", 1)],
+			orderState: "provisional",
+			generation: 1,
+			progress: { discovered: 1, shaped: 1, enriched: 0, total: 1 },
+		});
 		await expect
 			.poll(() => screen.getByTestId("swap-items").element().textContent)
 			.toBe("b");
+	});
+
+	it("resyncs the current direction after a typed lag notification", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		await screen.getByRole("button", { name: "Newest first" }).click();
+		await expect.poll(() => service.queryRequests.length).toBe(2);
+		service.releaseQuery(1, pageOf([...settledFixtures].reverse(), "settled"));
+		await expect
+			.element(screen.getByRole("img").first())
+			.toHaveAttribute("alt", "Interior");
+
+		service.emit({ kind: "resyncRequired", selectionId: "source-a" });
+		await expect.poll(() => service.queryRequests.length).toBe(3);
+		expect(service.queryRequests[2]).toMatchObject({
+			cursor: null,
+			direction: "newestFirst",
+		});
+		service.releaseQuery(2, pageOf([...settledFixtures].reverse(), "settled"));
+		await expect
+			.element(screen.getByRole("img").first())
+			.toHaveAttribute("alt", "Interior");
+	});
+
+	it("restores and independently clears source cache warnings from page snapshots", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		const sourceWarnings = [
+			{ code: "wallThumbnailCacheUnavailable", retryable: true },
+			{ code: "screenPreviewCacheUnavailable", retryable: true },
+		] as const;
+		service.releaseQuery(
+			0,
+			pageOf(settledFixtures, "settled", null, sourceWarnings),
+		);
+		await expect
+			.element(screen.getByText("Some previews need attention"))
+			.toBeVisible();
+
+		await screen.getByRole("button", { name: "Newest first" }).click();
+		await expect.poll(() => service.queryRequests.length).toBe(2);
+		service.emit({
+			kind: "warningCleared",
+			selectionId: "source-a",
+			sourceId: "source-a",
+			assetId: null,
+			code: "wallThumbnailCacheUnavailable",
+		});
+		service.releaseQuery(
+			1,
+			pageOf([...settledFixtures].reverse(), "settled", null, sourceWarnings),
+		);
+		await expect
+			.element(screen.getByText("Some previews need attention"))
+			.toBeVisible();
+
+		service.emit({
+			kind: "warningCleared",
+			selectionId: "source-a",
+			sourceId: "source-a",
+			assetId: null,
+			code: "screenPreviewCacheUnavailable",
+		});
+		await expect
+			.poll(() => screen.getByRole("status").element().textContent)
+			.toBe("6 photos ready");
+	});
+
+	it("distinguishes a preview warning from an unavailable asset", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		const unavailable = asset("offline", "Offline", 7, {
+			availability: "missing",
+			shapeState: "fallback",
+		});
+		service.releaseQuery(
+			0,
+			pageOf([...realFixtureAssets, unavailable], "settled"),
+		);
+		await expect
+			.poll(() => screen.getByTestId("photo-row-0").query())
+			.not.toBeNull();
+		service.emit({
+			kind: "warning",
+			selectionId: "source-a",
+			sourceId: "source-a",
+			assetId: "coast",
+			warning: { code: "derivativeUnavailable", retryable: true },
+		});
+		const wall = screen.getByRole("region", { name: "Photos" });
+		const warnedTile = () =>
+			wall.element().querySelector<HTMLElement>('[data-asset-id="coast"]');
+		await expect
+			.poll(() =>
+				warnedTile()?.querySelector('[aria-label="Photo preview warning"]'),
+			)
+			.not.toBeNull();
+		expect(
+			warnedTile()?.querySelector('[data-testid="photo-fallback"]'),
+		).toBeNull();
+		expect(warnedTile()?.textContent).not.toContain("File unavailable");
+		expect(warnedTile()?.textContent).not.toContain("/");
+		await expect
+			.element(screen.getByTestId("photo-fallback").last())
+			.toBeVisible();
+		service.emit({
+			kind: "warningCleared",
+			selectionId: "source-a",
+			sourceId: "source-a",
+			assetId: "coast",
+			code: "derivativeUnavailable",
+		});
+		await expect
+			.poll(() =>
+				warnedTile()?.querySelector('[aria-label="Photo preview warning"]'),
+			)
+			.toBeNull();
+		expect(
+			warnedTile()?.querySelector('[data-testid="photo-fallback"]'),
+		).toBeNull();
+		await expect
+			.element(screen.getByTestId("photo-fallback").last())
+			.toBeVisible();
+	});
+
+	it("keeps a later unrelated asset warning after a stale derivative page", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(0, pageOf(settledFixtures, "settled"));
+		await expect
+			.poll(() => screen.getByTestId("photo-row-0").query())
+			.not.toBeNull();
+		service.emit({
+			kind: "warning",
+			selectionId: "source-a",
+			sourceId: "source-a",
+			assetId: "coast",
+			warning: { code: "derivativeUnavailable", retryable: true },
+		});
+		await screen.getByRole("button", { name: "Newest first" }).click();
+		await expect.poll(() => service.queryRequests.length).toBe(2);
+		service.emit({
+			kind: "warningCleared",
+			selectionId: "source-a",
+			sourceId: "source-a",
+			assetId: "coast",
+			code: "derivativeUnavailable",
+		});
+		service.emit({
+			kind: "warning",
+			selectionId: "source-a",
+			sourceId: "source-a",
+			assetId: "coast",
+			warning: { code: "assetWarning", retryable: true },
+		});
+		const staleItems = settledFixtures.map((item) =>
+			item.id === "coast"
+				? {
+						...item,
+						warning: { code: "derivativeUnavailable", retryable: true },
+					}
+				: item,
+		);
+		service.releaseQuery(1, pageOf(staleItems, "settled"));
+		const coastTile = () =>
+			screen
+				.getByRole("region", { name: "Photos" })
+				.element()
+				.querySelector<HTMLElement>('[data-asset-id="coast"]');
+		await expect
+			.poll(() =>
+				coastTile()?.querySelector('[aria-label="Photo preview warning"]'),
+			)
+			.not.toBeNull();
+	});
+
+	it("keeps an available asset geometry when its preview image fails", async () => {
+		const service = new ControlledWallService();
+		const broken = asset("broken", "Broken", 1);
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(0, pageOf([broken], "settled"));
+		await expect
+			.poll(() => screen.getByTestId("photo-row-0").query())
+			.not.toBeNull();
+		service.releaseThumbnail(
+			"broken",
+			"data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==",
+		);
+		const tile = screen
+			.getByRole("region", { name: "Photos" })
+			.element()
+			.querySelector<HTMLElement>('[data-asset-id="broken"]');
+		await expect
+			.poll(() => tile?.querySelector<HTMLImageElement>('img[alt="Broken"]'))
+			.not.toBeNull();
+		const image = tile?.querySelector<HTMLImageElement>('img[alt="Broken"]');
+		expect(image).not.toBeNull();
+		image?.dispatchEvent(new Event("error"));
+		await expect
+			.poll(() =>
+				tile?.querySelector('[aria-label="Photo preview unavailable"]'),
+			)
+			.not.toBeNull();
+		expect(tile?.querySelector('[data-testid="photo-fallback"]')).toBeNull();
+		expect(tile?.textContent).not.toContain("File unavailable");
+		expect(tile?.textContent).not.toContain("/");
 	});
 });

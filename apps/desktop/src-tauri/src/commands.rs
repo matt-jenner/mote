@@ -8,8 +8,8 @@ use tauri::{AppHandle, State, Theme, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::dto::{ChooseFolderResult, CommandError};
-use crate::protocol::forward_wall_updates;
-use crate::state::DesktopState;
+use crate::protocol::forward_wall_updates_for_service;
+use crate::state::{DesktopState, WallSubscriptionId};
 
 #[tauri::command]
 pub fn get_bootstrap_state(state: State<'_, DesktopState>) -> Result<BootstrapState, CommandError> {
@@ -102,9 +102,26 @@ pub async fn set_wall_interaction(
 pub fn watch_wall_updates(
     on_event: tauri::ipc::Channel<WallUpdate>,
     state: State<'_, DesktopState>,
-) {
+) -> Result<WallSubscriptionId, CommandError> {
     let receiver = state.service.subscribe_wall_updates();
-    tauri::async_runtime::spawn(forward_wall_updates(receiver, on_event));
+    let service = state.service.clone();
+    let (subscription_id, cancellation) = state.wall_subscriptions.register();
+    let registry = state.wall_subscriptions.clone();
+    let registered_id = subscription_id.clone();
+    tauri::async_runtime::spawn(async move {
+        forward_wall_updates_for_service(receiver, on_event, service, cancellation).await;
+        registry.finish(&registered_id);
+    });
+    Ok(subscription_id)
+}
+
+#[tauri::command]
+pub fn unwatch_wall_updates(
+    subscription_id: WallSubscriptionId,
+    state: State<'_, DesktopState>,
+) -> Result<(), CommandError> {
+    state.wall_subscriptions.cancel(&subscription_id);
+    Ok(())
 }
 
 fn map_service_error(error: AppServiceError) -> CommandError {

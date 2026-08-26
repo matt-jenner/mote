@@ -134,6 +134,22 @@
 	opacity: 1;
 }
 
+.tileWarning {
+	position: absolute;
+	top: 6px;
+	right: 6px;
+	display: grid;
+	place-items: center;
+	width: 18px;
+	height: 18px;
+	color: var(--text-primary);
+	font-size: 12px;
+	font-weight: 650;
+	background: color-mix(in srgb, var(--canvas) 78%, transparent);
+	border: 1px solid var(--separator);
+	border-radius: 50%;
+}
+
 .fallback {
 	display: grid;
 	place-content: center;

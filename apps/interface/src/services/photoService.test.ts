@@ -63,6 +63,8 @@ const thumbnailReference: WallAsset["wallThumbnail"] = {
 
 const sampleProgressUpdate: WallUpdate = {
 	kind: "progress",
+	selectionId: "memory-selection-1",
+	generation: 1,
 	progress: { discovered: 1, shaped: 1, enriched: 1, total: 1 },
 };
 
@@ -177,6 +179,39 @@ describe("PhotoService contract", () => {
 		).rejects.toMatchObject({ code: "invalidLimit" });
 	});
 
+	it("returns and updates the authoritative source warning snapshot", async () => {
+		const service = createInMemoryPhotoService({
+			sourceWarnings: [
+				{ code: "wallThumbnailCacheUnavailable", retryable: true },
+				{ code: "screenPreviewCacheUnavailable", retryable: true },
+			],
+		});
+		const initial = await service.queryWall({
+			cursor: null,
+			limit: 10,
+			direction: "oldestFirst",
+		});
+		expect(initial.sourceWarnings.map((warning) => warning.code)).toEqual([
+			"wallThumbnailCacheUnavailable",
+			"screenPreviewCacheUnavailable",
+		]);
+		service.emitForTest({
+			kind: "warningCleared",
+			selectionId: "memory-selection-1",
+			sourceId: "memory-source",
+			assetId: null,
+			code: "wallThumbnailCacheUnavailable",
+		});
+		const cleared = await service.queryWall({
+			cursor: null,
+			limit: 10,
+			direction: "oldestFirst",
+		});
+		expect(cleared.sourceWarnings.map((warning) => warning.code)).toEqual([
+			"screenPreviewCacheUnavailable",
+		]);
+	});
+
 	it("clones query results and delivered updates", async () => {
 		const service = createInMemoryPhotoService({ wallAssets: fixtureAssets });
 		const page = await service.queryWall({
@@ -238,5 +273,20 @@ describe("PhotoService contract", () => {
 		expect(service.derivativeUrl(thumbnailReference)).toBe(
 			"https://fixtures.invalid/thumb-a.jpg",
 		);
+	});
+
+	it("allows a later reconciliation to settle as a newer generation", async () => {
+		const service = createInMemoryPhotoService({ wallAssets: fixtureAssets });
+		const events: WallUpdate[] = [];
+		service.watchWallUpdates((update) => events.push(update));
+
+		await service.finishFixtureScan();
+		await service.finishFixtureScan();
+
+		expect(
+			events
+				.filter((event) => event.kind === "metadataSettled")
+				.map((event) => event.generation),
+		).toEqual([1, 2]);
 	});
 });

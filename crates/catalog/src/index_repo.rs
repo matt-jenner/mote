@@ -54,6 +54,12 @@ pub struct CatalogWarningRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogWarningSummary {
+    pub asset_id: Option<AssetId>,
+    pub code: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CatalogIndexRecord {
     Discovered(NewAsset),
     Shaped(AssetShapeUpdate),
@@ -63,6 +69,28 @@ pub enum CatalogIndexRecord {
 }
 
 impl Catalog {
+    pub fn source_warning_summaries(
+        &self,
+        library_id: LibraryId,
+    ) -> Result<Vec<CatalogWarningSummary>, CatalogError> {
+        let mut statement = self.connection.prepare(
+            "SELECT asset_id, code FROM warnings WHERE library_id = ?1 AND asset_id IS NULL ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![library_id.as_uuid().as_bytes()], |row| {
+            let raw_asset_id: Option<Vec<u8>> = row.get(0)?;
+            let asset_id = raw_asset_id
+                .map(|value| crate::library_repo::decode_uuid(value, 0))
+                .transpose()?
+                .map(AssetId::from_uuid);
+            Ok(CatalogWarningSummary {
+                asset_id,
+                code: row.get(1)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(CatalogError::from)
+    }
+
     pub fn record_warning_once(
         &mut self,
         warning: &CatalogWarningRecord,

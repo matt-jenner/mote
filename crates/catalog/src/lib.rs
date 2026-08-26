@@ -19,7 +19,7 @@ pub use generation_repo::GenerationCompletion;
 pub use health_repo::CatalogHealthSnapshot;
 pub use index_repo::{
     AssetColourUpdate, AssetMetadataUpdate, AssetShapeUpdate, CatalogIndexRecord, CatalogKeyword,
-    CatalogProvenance, CatalogWarningRecord,
+    CatalogProvenance, CatalogWarningRecord, CatalogWarningSummary,
 };
 pub use library_repo::{LibraryRootRecord, NewLibrary};
 use rusqlite::Connection;

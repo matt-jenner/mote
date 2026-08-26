@@ -3,6 +3,7 @@ import type {
 	OrderState,
 	SortDirection,
 	WallAsset,
+	WallWarningState,
 } from "../services/photoService";
 
 export interface WallState {
@@ -13,7 +14,12 @@ export interface WallState {
 	scrollEpoch: number;
 	scanComplete: boolean;
 	pagesExhausted: boolean;
-	settled: boolean;
+	settledGeneration: number | null;
+	sourceWarnings: Record<string, NonNullable<WallAsset["warning"]>>;
+	sourceWarningTombstones: Record<string, string>;
+	assetWarnings: Record<string, NonNullable<WallAsset["warning"]>>;
+	warningTombstones: Record<string, string>;
+	selectionId: string | null;
 	activeRequest: PageRequest | null;
 	sourceGeneration: number;
 	error: string | null;
@@ -32,6 +38,8 @@ export type WallAction =
 			type: "catalogBatch";
 			assets: readonly WallAsset[];
 			orderState: OrderState;
+			selectionId?: string;
+			generation?: number;
 	  }
 	| {
 			type: "pageLoaded";
@@ -42,6 +50,7 @@ export type WallAction =
 			requestEpoch: number;
 			requestId: WallRequestId;
 			sourceGeneration?: number;
+			sourceWarnings?: readonly WallWarningState[];
 	  }
 	| {
 			type: "pageRequestStarted";
@@ -63,7 +72,7 @@ export type WallAction =
 			error: string;
 			sourceGeneration?: number;
 	  }
-	| { type: "resetSource"; sourceGeneration: number }
+	| { type: "resetSource"; sourceGeneration: number; selectionId?: string }
 	| { type: "retryStarted" }
 	| { type: "derivativesReady"; derivatives: readonly DerivativeReference[] }
 	| {
@@ -74,7 +83,24 @@ export type WallAction =
 			requestCursor: string | null;
 			requestId: WallRequestId;
 			sourceGeneration?: number;
+			generation?: number;
+			sourceWarnings?: readonly WallWarningState[];
 	  }
+	| {
+			type: "warning";
+			selectionId?: string;
+			sourceId: string;
+			assetId: string | null;
+			warning: NonNullable<WallAsset["warning"]>;
+	  }
+	| {
+			type: "warningCleared";
+			selectionId?: string;
+			sourceId: string;
+			assetId: string | null;
+			code: string;
+	  }
+	| { type: "resyncRequired"; selectionId: string }
 	| { type: "setDirection"; direction: SortDirection };
 
 export const initialWallState: WallState = {
@@ -85,7 +111,12 @@ export const initialWallState: WallState = {
 	scrollEpoch: 0,
 	scanComplete: false,
 	pagesExhausted: false,
-	settled: false,
+	settledGeneration: null,
+	sourceWarnings: {},
+	sourceWarningTombstones: {},
+	assetWarnings: {},
+	warningTombstones: {},
+	selectionId: null,
 	activeRequest: null,
 	sourceGeneration: 0,
 	error: null,
@@ -120,6 +151,14 @@ function matchesSource(state: WallState, sourceGeneration?: number): boolean {
 	);
 }
 
+function matchesSelection(state: WallState, selectionId?: string): boolean {
+	return (
+		selectionId === undefined ||
+		state.selectionId === null ||
+		selectionId === state.selectionId
+	);
+}
+
 interface MergeResult {
 	items: WallAsset[];
 	changed: boolean;
@@ -130,6 +169,33 @@ function sameWarning(
 	right: WallAsset["warning"],
 ): boolean {
 	return left?.code === right?.code && left?.retryable === right?.retryable;
+}
+
+const maxWarningTombstones = 128;
+
+function warningKey(assetId: string, code: string): string {
+	return `${assetId}\u0000${code}`;
+}
+
+function requestToken(request: PageRequest | null): string | null {
+	return request === null
+		? null
+		: `${String(request.id)}\u0000${request.epoch}\u0000${request.cursor ?? ""}`;
+}
+
+function addBoundedTombstone(
+	tombstones: Record<string, string>,
+	key: string,
+	token: string | null,
+): Record<string, string> {
+	if (token === null) return tombstones;
+	const next = { ...tombstones, [key]: token };
+	const keys = Object.keys(next);
+	while (keys.length > maxWarningTombstones) {
+		const oldest = keys.shift();
+		if (oldest !== undefined) delete next[oldest];
+	}
+	return next;
 }
 
 function sameDerivative(
@@ -199,6 +265,90 @@ function mergeAssets(
 	return { items: [...byId.values()], changed };
 }
 
+interface RememberedWarningsResult {
+	assets: WallAsset[];
+	warnings: Record<string, NonNullable<WallAsset["warning"]>>;
+	tombstones: Record<string, string>;
+	changed: boolean;
+}
+
+function rememberWarnings(
+	current: Record<string, NonNullable<WallAsset["warning"]>>,
+	currentTombstones: Record<string, string>,
+	incoming: readonly WallAsset[],
+	token: string | null,
+	consumeToken: boolean,
+): RememberedWarningsResult {
+	const warnings = { ...current };
+	const tombstones = { ...currentTombstones };
+	let changed = false;
+	const assets: WallAsset[] = incoming.map((asset) => {
+		const incomingKey = asset.warning
+			? warningKey(asset.id, asset.warning.code)
+			: null;
+		const isTombstoned =
+			incomingKey !== null &&
+			token !== null &&
+			tombstones[incomingKey] === token;
+		if (asset.warning && !isTombstoned) {
+			if (!sameWarning(warnings[asset.id] ?? null, asset.warning)) {
+				warnings[asset.id] = asset.warning;
+				changed = true;
+			}
+		}
+		const warning = warnings[asset.id];
+		if (isTombstoned) return { ...asset, warning: warning ?? null };
+		return warning !== undefined && asset.warning === null
+			? { ...asset, warning }
+			: asset;
+	});
+	if (consumeToken && token !== null) {
+		for (const [key, value] of Object.entries(tombstones)) {
+			if (value === token) delete tombstones[key];
+		}
+	}
+	return { assets, warnings, tombstones, changed };
+}
+
+interface RememberedSourceWarningsResult {
+	warnings: Record<string, NonNullable<WallAsset["warning"]>>;
+	tombstones: Record<string, string>;
+	changed: boolean;
+}
+
+function rememberSourceWarnings(
+	current: Record<string, NonNullable<WallAsset["warning"]>>,
+	currentTombstones: Record<string, string>,
+	incoming: readonly WallWarningState[] | undefined,
+	token: string | null,
+	consumeToken: boolean,
+): RememberedSourceWarningsResult {
+	const tombstones = { ...currentTombstones };
+	if (incoming === undefined) {
+		if (consumeToken && token !== null) {
+			for (const [key, value] of Object.entries(tombstones)) {
+				if (value === token) delete tombstones[key];
+			}
+		}
+		return { warnings: current, tombstones, changed: false };
+	}
+	const warnings = { ...current };
+	let changed = false;
+	for (const warning of incoming) {
+		if (token !== null && currentTombstones[warning.code] === token) continue;
+		if (!sameWarning(warnings[warning.code] ?? null, warning)) {
+			warnings[warning.code] = warning;
+			changed = true;
+		}
+	}
+	if (consumeToken && token !== null) {
+		for (const [key, value] of Object.entries(tombstones)) {
+			if (value === token) delete tombstones[key];
+		}
+	}
+	return { warnings, tombstones, changed };
+}
+
 function sortProvisional(assets: readonly WallAsset[]): WallAsset[] {
 	return [...assets].sort(
 		(left, right) =>
@@ -234,14 +384,33 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			) {
 				return state;
 			}
-			return { ...state, activeRequest };
+			return {
+				...state,
+				activeRequest,
+				warningTombstones: {},
+				sourceWarningTombstones: {},
+			};
 		}
 		case "catalogBatch": {
-			const merged = mergeAssets(state.items, action.assets);
-			const orderState = state.settled ? "settled" : action.orderState;
-			if (!merged.changed && state.orderState === orderState) return state;
+			if (!matchesSelection(state, action.selectionId)) return state;
+			const remembered = rememberWarnings(
+				state.assetWarnings,
+				state.warningTombstones,
+				action.assets,
+				requestToken(state.activeRequest),
+				false,
+			);
+			const merged = mergeAssets(state.items, remembered.assets);
+			const orderState =
+				state.settledGeneration !== null ? "settled" : action.orderState;
+			if (
+				!merged.changed &&
+				state.orderState === orderState &&
+				!remembered.changed
+			)
+				return state;
 			const sorted =
-				!state.settled && action.orderState === "provisional"
+				state.settledGeneration === null && action.orderState === "provisional"
 					? sortProvisional(merged.items)
 					: merged.items;
 			const items = reuseSequence(state.items, sorted);
@@ -249,6 +418,10 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				...state,
 				items,
 				orderState,
+				assetWarnings: remembered.changed
+					? remembered.warnings
+					: state.assetWarnings,
+				warningTombstones: remembered.tombstones,
 			};
 		}
 		case "pageLoaded": {
@@ -264,13 +437,31 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				return state;
 			const firstPage = action.requestCursor === null;
 			const settledPage = action.orderState === "settled";
+			const remembered = rememberWarnings(
+				state.assetWarnings,
+				state.warningTombstones,
+				action.assets,
+				requestToken(state.activeRequest),
+				true,
+			);
+			const rememberedSource = rememberSourceWarnings(
+				state.sourceWarnings,
+				state.sourceWarningTombstones,
+				action.sourceWarnings,
+				requestToken(state.activeRequest),
+				true,
+			);
 			const merged = firstPage
-				? mergeAssets([], action.assets)
-				: mergeAssets(state.items, action.assets);
+				? mergeAssets([], remembered.assets)
+				: mergeAssets(state.items, remembered.assets);
 			const orderState =
-				state.settled || settledPage ? "settled" : action.orderState;
+				state.settledGeneration !== null || settledPage
+					? "settled"
+					: action.orderState;
 			const sorted =
-				!state.settled && !settledPage && action.orderState === "provisional"
+				state.settledGeneration === null &&
+				!settledPage &&
+				action.orderState === "provisional"
 					? sortProvisional(merged.items)
 					: merged.items;
 			const items = reuseSequence(state.items, sorted);
@@ -280,7 +471,9 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				state.orderState === orderState &&
 				state.cursor === action.nextCursor &&
 				state.pagesExhausted === pagesExhausted &&
-				state.activeRequest === null
+				state.activeRequest === null &&
+				!remembered.changed &&
+				!rememberedSource.changed
 			) {
 				return state;
 			}
@@ -291,7 +484,16 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				orderState,
 				pagesExhausted,
 				scanComplete: state.scanComplete || settledPage,
-				settled: state.settled || settledPage,
+				settledGeneration:
+					settledPage && state.settledGeneration === null
+						? 1
+						: state.settledGeneration,
+				assetWarnings: remembered.changed
+					? remembered.warnings
+					: state.assetWarnings,
+				warningTombstones: remembered.tombstones,
+				sourceWarnings: rememberedSource.warnings,
+				sourceWarningTombstones: rememberedSource.tombstones,
 				activeRequest: null,
 				error: null,
 			};
@@ -349,8 +551,27 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				)
 			)
 				return state;
-			if (state.settled) return { ...state, activeRequest: null };
-			const merged = mergeAssets([], action.assets);
+			const generation = action.generation ?? 1;
+			if (
+				state.settledGeneration !== null &&
+				generation <= state.settledGeneration
+			)
+				return { ...state, activeRequest: null };
+			const remembered = rememberWarnings(
+				state.assetWarnings,
+				state.warningTombstones,
+				action.assets,
+				requestToken(state.activeRequest),
+				true,
+			);
+			const rememberedSource = rememberSourceWarnings(
+				state.sourceWarnings,
+				state.sourceWarningTombstones,
+				action.sourceWarnings,
+				requestToken(state.activeRequest),
+				true,
+			);
+			const merged = mergeAssets([], remembered.assets);
 			return {
 				...state,
 				items: merged.items,
@@ -358,7 +579,13 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				orderState: "settled",
 				scanComplete: true,
 				pagesExhausted: action.nextCursor === null,
-				settled: true,
+				settledGeneration: generation,
+				assetWarnings: remembered.changed
+					? remembered.warnings
+					: state.assetWarnings,
+				warningTombstones: remembered.tombstones,
+				sourceWarnings: rememberedSource.warnings,
+				sourceWarningTombstones: rememberedSource.tombstones,
 				activeRequest: null,
 				error: null,
 			};
@@ -367,6 +594,69 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			return {
 				...initialWallState,
 				sourceGeneration: action.sourceGeneration,
+				selectionId: action.selectionId ?? null,
+			};
+		case "warning": {
+			if (!matchesSelection(state, action.selectionId)) return state;
+			if (action.assetId === null) {
+				const sourceWarningTombstones = { ...state.sourceWarningTombstones };
+				delete sourceWarningTombstones[action.warning.code];
+				return {
+					...state,
+					sourceWarnings: {
+						...state.sourceWarnings,
+						[action.warning.code]: action.warning,
+					},
+					sourceWarningTombstones,
+				};
+			}
+			const assetWarnings = {
+				...state.assetWarnings,
+				[action.assetId]: action.warning,
+			};
+			const warningTombstones = { ...state.warningTombstones };
+			delete warningTombstones[warningKey(action.assetId, action.warning.code)];
+			const items = state.items.map((asset) =>
+				asset.id === action.assetId
+					? { ...asset, warning: action.warning }
+					: asset,
+			);
+			return { ...state, assetWarnings, warningTombstones, items };
+		}
+		case "warningCleared": {
+			if (!matchesSelection(state, action.selectionId)) return state;
+			if (action.assetId === null) {
+				const sourceWarnings = { ...state.sourceWarnings };
+				delete sourceWarnings[action.code];
+				const sourceWarningTombstones = addBoundedTombstone(
+					state.sourceWarningTombstones,
+					action.code,
+					requestToken(state.activeRequest),
+				);
+				return { ...state, sourceWarnings, sourceWarningTombstones };
+			}
+			const current = state.assetWarnings[action.assetId];
+			const assetWarnings = { ...state.assetWarnings };
+			if (current?.code === action.code) delete assetWarnings[action.assetId];
+			const warningTombstones = addBoundedTombstone(
+				state.warningTombstones,
+				warningKey(action.assetId, action.code),
+				requestToken(state.activeRequest),
+			);
+			const items = state.items.map((asset) =>
+				asset.id === action.assetId && asset.warning?.code === action.code
+					? { ...asset, warning: null }
+					: asset,
+			);
+			return { ...state, assetWarnings, warningTombstones, items };
+		}
+		case "resyncRequired":
+			return {
+				...initialWallState,
+				direction: state.direction,
+				scrollEpoch: state.scrollEpoch + 1,
+				sourceGeneration: state.sourceGeneration,
+				selectionId: action.selectionId,
 			};
 		case "retryStarted":
 			return state.error ? { ...state, error: null } : state;

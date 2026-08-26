@@ -164,6 +164,24 @@ fn query(direction: SortDirection) -> WallQueryRequest {
     }
 }
 
+#[test]
+fn same_library_parent_and_child_have_distinct_opaque_selection_identity() {
+    let fixture = ProgressiveFixture::new(1);
+    let child = fixture.source.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    let service = AppService::open(fixture.config.clone()).unwrap();
+
+    let parent = service.open_recent(&fixture.source).unwrap();
+    let child_state = service.open_recent(&child).unwrap();
+    let parent_source = parent.active_source.unwrap();
+    let child_source = child_state.active_source.unwrap();
+
+    assert_eq!(parent_source.id, child_source.id);
+    assert_ne!(parent_source.selection_id, child_source.selection_id);
+    assert!(!child_source.selection_id.contains("child"));
+    assert!(!child_source.selection_id.contains('/'));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uncached_folder_emits_geometry_before_metadata_settles_and_reopens_from_cache() {
     let fixture = ProgressiveFixture::new(12);
@@ -686,7 +704,7 @@ async fn one_visible_request_produces_one_ready_batch() {
     })
     .await;
     match ready {
-        WallUpdate::DerivativesReady { derivatives } => {
+        WallUpdate::DerivativesReady { derivatives, .. } => {
             assert_eq!(derivatives.len(), 8);
             assert_eq!(
                 derivatives
@@ -707,7 +725,7 @@ async fn one_visible_request_produces_one_ready_batch() {
     })
     .await;
     assert!(
-        matches!(second, WallUpdate::DerivativesReady { ref derivatives } if derivatives.len() == 8)
+        matches!(second, WallUpdate::DerivativesReady { ref derivatives, .. } if derivatives.len() == 8)
     );
 }
 
@@ -741,7 +759,7 @@ async fn read_derivative_returns_bytes_for_the_active_ready_asset() {
     })
     .await
     {
-        WallUpdate::DerivativesReady { derivatives } => derivatives[0].clone(),
+        WallUpdate::DerivativesReady { derivatives, .. } => derivatives[0].clone(),
         _ => unreachable!(),
     };
 
@@ -786,7 +804,7 @@ async fn read_derivative_fails_closed_after_switching_active_source() {
     })
     .await
     {
-        WallUpdate::DerivativesReady { derivatives } => derivatives[0].clone(),
+        WallUpdate::DerivativesReady { derivatives, .. } => derivatives[0].clone(),
         _ => unreachable!(),
     };
 
@@ -856,7 +874,7 @@ async fn derivative_failure_records_and_publishes_a_retryable_asset_warning() {
         page.items[0]
             .warning
             .as_ref()
-            .is_some_and(|warning| warning.retryable)
+            .is_some_and(|warning| warning.retryable && warning.code == "derivativeUnavailable")
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
@@ -876,7 +894,7 @@ async fn derivative_failure_records_and_publishes_a_retryable_asset_warning() {
         .await
         .unwrap();
     recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives } if
+        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
             derivatives.len() == 1
             && derivatives[0].kind == DerivativeClass::WallThumbnail)
     })
@@ -961,18 +979,18 @@ async fn visible_wall_work_finishes_before_screen_preview_prefetch() {
     })
     .await;
     assert!(
-        matches!(wall, WallUpdate::DerivativesReady { derivatives } if
+        matches!(wall, WallUpdate::DerivativesReady { derivatives, .. } if
         derivatives.len() == 4
         && derivatives.iter().all(|item| item.kind == DerivativeClass::WallThumbnail))
     );
     let screen = recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives } if
+        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
             !derivatives.is_empty()
             && derivatives.iter().all(|item| item.kind == DerivativeClass::ScreenPreview))
     })
     .await;
     assert!(
-        matches!(screen, WallUpdate::DerivativesReady { derivatives } if
+        matches!(screen, WallUpdate::DerivativesReady { derivatives, .. } if
         derivatives.iter().map(|item| item.asset_id.clone()).collect::<Vec<_>>() == ids)
     );
 }
@@ -1004,7 +1022,7 @@ async fn second_identical_wall_request_reuses_cache_after_the_source_goes_offlin
         .await
         .unwrap();
     recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives } if
+        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
             derivatives.iter().all(|item| item.kind == DerivativeClass::ScreenPreview))
     })
     .await;
@@ -1016,20 +1034,22 @@ async fn second_identical_wall_request_reuses_cache_after_the_source_goes_offlin
         .await
         .unwrap();
     let wall = recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives } if
+        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
             !derivatives.is_empty()
             && derivatives.iter().all(|item| item.kind == DerivativeClass::WallThumbnail))
     })
     .await;
     let screen = recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives } if
+        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
             !derivatives.is_empty()
             && derivatives.iter().all(|item| item.kind == DerivativeClass::ScreenPreview))
     })
     .await;
-    assert!(matches!(wall, WallUpdate::DerivativesReady { derivatives } if derivatives.len() == 2));
     assert!(
-        matches!(screen, WallUpdate::DerivativesReady { derivatives } if derivatives.len() == 2)
+        matches!(wall, WallUpdate::DerivativesReady { derivatives, .. } if derivatives.len() == 2)
+    );
+    assert!(
+        matches!(screen, WallUpdate::DerivativesReady { derivatives, .. } if derivatives.len() == 2)
     );
     std::fs::rename(unavailable, &fixture.source).unwrap();
 }
@@ -1061,7 +1081,7 @@ async fn offline_reopen_keeps_cached_references() {
         .await
         .unwrap();
     recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives } if
+        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
             derivatives.len() == 4
             && derivatives.iter().all(|item| item.kind == DerivativeClass::WallThumbnail))
     })
@@ -1112,7 +1132,7 @@ async fn reconciliation_batches_preserve_cached_wall_and_screen_references_onlin
         .await
         .unwrap();
     recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives } if
+        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
             derivatives.len() == 2
             && derivatives.iter().all(|item| item.kind == DerivativeClass::ScreenPreview))
     })
@@ -1186,7 +1206,7 @@ async fn returning_to_idle_resumes_remaining_screen_preview_prefetch() {
         .await
         .unwrap();
     recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives } if
+        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
             derivatives.len() == 1
             && derivatives.iter().all(|item| item.kind == DerivativeClass::ScreenPreview))
     })
@@ -1195,7 +1215,7 @@ async fn returning_to_idle_resumes_remaining_screen_preview_prefetch() {
         tokio::time::timeout(Duration::from_millis(150), async {
             loop {
                 let event = updates.recv().await.unwrap();
-                if matches!(event, WallUpdate::DerivativesReady { derivatives } if
+                if matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
                     derivatives.iter().any(|item| item.kind == DerivativeClass::ScreenPreview))
                 {
                     return;
@@ -1211,12 +1231,12 @@ async fn returning_to_idle_resumes_remaining_screen_preview_prefetch() {
         .set_interaction(photo_app_service::InteractionState::Idle)
         .await;
     let remaining = recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives } if
+        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
             derivatives.iter().all(|item| item.kind == DerivativeClass::ScreenPreview))
     })
     .await;
     assert!(
-        matches!(remaining, WallUpdate::DerivativesReady { derivatives } if derivatives.len() == 3)
+        matches!(remaining, WallUpdate::DerivativesReady { derivatives, .. } if derivatives.len() == 3)
     );
 }
 
@@ -1245,7 +1265,7 @@ async fn screen_preview_prefetch_waits_for_foreground_indexing_to_drain() {
         .await
         .unwrap();
     recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives } if
+        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
             derivatives.iter().all(|item| item.kind == DerivativeClass::WallThumbnail))
     })
     .await;
@@ -1253,7 +1273,7 @@ async fn screen_preview_prefetch_waits_for_foreground_indexing_to_drain() {
         tokio::time::timeout(Duration::from_millis(150), async {
             loop {
                 let event = updates.recv().await.unwrap();
-                if matches!(event, WallUpdate::DerivativesReady { derivatives } if
+                if matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
                     derivatives.iter().any(|item| item.kind == DerivativeClass::ScreenPreview))
                 {
                     return;
@@ -1271,12 +1291,12 @@ async fn screen_preview_prefetch_waits_for_foreground_indexing_to_drain() {
     })
     .await;
     let screen = recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives } if
+        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
             derivatives.iter().all(|item| item.kind == DerivativeClass::ScreenPreview))
     })
     .await;
     assert!(
-        matches!(screen, WallUpdate::DerivativesReady { derivatives } if derivatives.len() == 4)
+        matches!(screen, WallUpdate::DerivativesReady { derivatives, .. } if derivatives.len() == 4)
     );
 }
 
@@ -1308,6 +1328,7 @@ fn wall_dtos_never_serialize_native_paths() {
         }],
         next_cursor: Some("opaque-cursor".to_owned()),
         order_state: OrderState::Settled,
+        source_warnings: Vec::new(),
     };
     let json = serde_json::to_string(&page).unwrap();
     assert!(!json.contains("/Users/"));

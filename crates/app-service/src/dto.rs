@@ -108,6 +108,7 @@ pub struct WallPage {
     pub items: Vec<WallAsset>,
     pub next_cursor: Option<String>,
     pub order_state: OrderState,
+    pub source_warnings: Vec<WallWarningState>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -144,31 +145,62 @@ pub enum InteractionState {
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum WallUpdate {
     CatalogBatch {
+        #[serde(rename = "selectionId")]
+        selection_id: String,
         assets: Vec<WallAsset>,
+        #[serde(rename = "orderState")]
         order_state: OrderState,
+        #[serde(rename = "generation")]
+        generation: u64,
         progress: ScanProgressDto,
     },
     DerivativesReady {
+        #[serde(rename = "selectionId")]
+        selection_id: String,
         derivatives: Vec<DerivativeReference>,
     },
     MetadataSettled {
+        #[serde(rename = "selectionId")]
+        selection_id: String,
+        #[serde(rename = "sourceId")]
         source_id: String,
+        #[serde(rename = "generation")]
+        generation: u64,
     },
     Progress {
+        #[serde(rename = "selectionId")]
+        selection_id: String,
+        #[serde(rename = "generation")]
+        generation: u64,
         progress: ScanProgressDto,
     },
     SourceUnavailable {
+        #[serde(rename = "selectionId")]
+        selection_id: String,
+        #[serde(rename = "sourceId")]
         source_id: String,
     },
     Warning {
+        #[serde(rename = "selectionId")]
+        selection_id: String,
+        #[serde(rename = "sourceId")]
         source_id: String,
+        #[serde(rename = "assetId")]
         asset_id: Option<String>,
         warning: WallWarningState,
     },
     WarningCleared {
+        #[serde(rename = "selectionId")]
+        selection_id: String,
+        #[serde(rename = "sourceId")]
         source_id: String,
+        #[serde(rename = "assetId")]
         asset_id: Option<String>,
         code: String,
+    },
+    ResyncRequired {
+        #[serde(rename = "selectionId")]
+        selection_id: String,
     },
 }
 
@@ -198,6 +230,7 @@ pub struct SettingsState {
 #[serde(rename_all = "camelCase")]
 pub struct SourceSummary {
     pub id: String,
+    pub selection_id: String,
     pub display_name: String,
     pub availability: SourceAvailability,
 }
@@ -209,4 +242,46 @@ pub enum SourceAvailability {
     RootOffline,
     Missing,
     Unreadable,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ScanProgressDto, WallPage, WallUpdate, WallWarningState};
+
+    #[test]
+    fn wall_updates_serialize_selection_identity_and_generation() {
+        let update = WallUpdate::Progress {
+            selection_id: "selection-opaque".to_owned(),
+            generation: 7,
+            progress: ScanProgressDto {
+                discovered: 1,
+                shaped: 1,
+                enriched: 0,
+                total: Some(1),
+            },
+        };
+        let value = serde_json::to_value(update).unwrap();
+        assert_eq!(value["kind"], "progress");
+        assert_eq!(value["selectionId"], "selection-opaque");
+        assert_eq!(value["generation"], 7);
+    }
+
+    #[test]
+    fn wall_page_serializes_path_free_source_warning_snapshot() {
+        let page = WallPage {
+            items: Vec::new(),
+            next_cursor: None,
+            order_state: super::OrderState::Provisional,
+            source_warnings: vec![WallWarningState {
+                code: "screenPreviewCacheUnavailable".to_owned(),
+                retryable: true,
+            }],
+        };
+        let value = serde_json::to_value(page).unwrap();
+        assert_eq!(
+            value["sourceWarnings"][0]["code"],
+            "screenPreviewCacheUnavailable"
+        );
+        assert!(!value.to_string().contains('/'));
+    }
 }

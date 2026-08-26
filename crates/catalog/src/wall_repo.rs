@@ -66,6 +66,7 @@ pub struct WallCatalogRecord {
     pub representative_rgb: Option<u32>,
     pub availability: Availability,
     pub has_warning: bool,
+    pub warning_code: Option<String>,
     pub shape_status: ShapeStatus,
 }
 
@@ -83,7 +84,8 @@ impl Catalog {
     ) -> Result<Vec<WallCatalogRecord>, CatalogError> {
         let mut statement = self.connection.prepare(
             "SELECT id, display_path, media_kind, provisional_order, captured_at_utc, width, height, representative_rgb, availability, shape_status, \
-                    EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id) \
+                    EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id), \
+                    (SELECT code FROM warnings WHERE warnings.asset_id = assets.id ORDER BY CASE code WHEN 'derivative_generation_failed' THEN 0 ELSE 1 END, occurred_at DESC, id DESC LIMIT 1) \
              FROM assets WHERE folder_group_id = ?1 AND id = ?2 \
                AND shape_status IN ('ready','fallback') AND width IS NOT NULL AND height IS NOT NULL",
         )?;
@@ -123,7 +125,8 @@ impl Catalog {
         }
         let mut sql = String::from(
             "SELECT id, display_path, media_kind, provisional_order, captured_at_utc, width, height, representative_rgb, availability, shape_status, \
-                    EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id) \
+                    EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id), \
+                    (SELECT code FROM warnings WHERE warnings.asset_id = assets.id ORDER BY CASE code WHEN 'derivative_generation_failed' THEN 0 ELSE 1 END, occurred_at DESC, id DESC LIMIT 1) \
              FROM assets WHERE folder_group_id = ?1 AND shape_status IN ('ready','fallback') AND width IS NOT NULL AND height IS NOT NULL",
         );
         match order {
@@ -211,6 +214,7 @@ fn decode_wall_record(row: &rusqlite::Row<'_>) -> Result<WallCatalogRecord, rusq
         availability: crate::asset_repo::decode_availability(row.get::<_, String>(8)?.as_str(), 8)?,
         shape_status: ShapeStatus::decode(row.get::<_, String>(9)?.as_str(), 9)?,
         has_warning: row.get(10)?,
+        warning_code: row.get(11)?,
     })
 }
 

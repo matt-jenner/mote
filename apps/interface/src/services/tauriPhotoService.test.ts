@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { PhotoServiceError, type WallUpdate } from "./photoService";
 import {
 	type ChannelFactory,
@@ -33,6 +33,7 @@ class FakeChannel<T> {
 
 const sampleCatalogBatch: WallUpdate = {
 	kind: "catalogBatch",
+	selectionId: "sample-selection",
 	assets: [
 		{
 			id: "asset-a",
@@ -52,11 +53,14 @@ const sampleCatalogBatch: WallUpdate = {
 		},
 	],
 	orderState: "provisional",
+	generation: 1,
 	progress: { discovered: 1, shaped: 1, enriched: 0, total: 1 },
 };
 
 const sampleProgressUpdate: WallUpdate = {
 	kind: "progress",
+	selectionId: "sample-selection",
+	generation: 1,
 	progress: { discovered: 1, shaped: 1, enriched: 1, total: 1 },
 };
 
@@ -212,5 +216,254 @@ describe("Tauri PhotoService", () => {
 		expect(firstReceived).toEqual([sampleCatalogBatch]);
 		expect(secondReceived).toEqual([sampleCatalogBatch, sampleProgressUpdate]);
 		stopSecond();
+	});
+
+	it("turns wall-update registration failure into a bounded resync", async () => {
+		const invoke: InvokeCommand = async <T>(command: string) => {
+			if (command === "watch_wall_updates") throw new Error("listen failed");
+			return undefined as T;
+		};
+		const received: WallUpdate[] = [];
+		const service = createTauriPhotoService(
+			invoke,
+			(listener) => new FakeChannel(listener),
+		);
+
+		const stop = service.watchWallUpdates((update) => received.push(update));
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+		expect(received).toEqual([{ kind: "resyncRequired", selectionId: "" }]);
+		stop();
+	});
+
+	it("keeps registration failure delivery synchronous with unsubscribe", async () => {
+		const invoke: InvokeCommand = async <T>(command: string) => {
+			if (command === "watch_wall_updates") throw new Error("listen failed");
+			return undefined as T;
+		};
+		const received: WallUpdate[] = [];
+		const service = createTauriPhotoService(
+			invoke,
+			(listener) => new FakeChannel(listener),
+		);
+
+		const stop = service.watchWallUpdates((update) => received.push(update));
+		stop();
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+		expect(received).toEqual([]);
+	});
+
+	it("retries failed registrations with bounded fake-timer backoff", async () => {
+		vi.useFakeTimers();
+		try {
+			const calls: string[] = [];
+			let registrationAttempts = 0;
+			const channels: FakeChannel<WallUpdate>[] = [];
+			const invoke: InvokeCommand = async <T>(command: string) => {
+				calls.push(command);
+				if (command === "watch_wall_updates") {
+					registrationAttempts += 1;
+					if (registrationAttempts < 4) throw new Error("listen failed");
+					return "wall-subscription-recovered" as T;
+				}
+				return undefined as T;
+			};
+			const received: WallUpdate[] = [];
+			const service = createTauriPhotoService(invoke, (listener) => {
+				const channel = new FakeChannel(listener);
+				channels.push(channel);
+				return channel;
+			});
+			const stop = service.watchWallUpdates((update) => received.push(update));
+			await vi.runAllTicks();
+			await vi.advanceTimersByTimeAsync(0);
+			expect(calls).toEqual(["watch_wall_updates"]);
+			expect(received).toHaveLength(1);
+
+			await vi.advanceTimersByTimeAsync(99);
+			expect(calls).toEqual(["watch_wall_updates"]);
+			await vi.advanceTimersByTimeAsync(1);
+			await vi.runAllTicks();
+			expect(calls).toEqual(["watch_wall_updates", "watch_wall_updates"]);
+			expect(received).toHaveLength(2);
+
+			await vi.advanceTimersByTimeAsync(199);
+			expect(calls).toHaveLength(2);
+			await vi.advanceTimersByTimeAsync(1);
+			await vi.runAllTicks();
+			expect(calls).toHaveLength(3);
+			expect(received).toHaveLength(3);
+
+			await vi.advanceTimersByTimeAsync(299);
+			expect(calls).toHaveLength(3);
+			channels[0]?.emit(sampleCatalogBatch);
+			expect(received).toHaveLength(4);
+			await vi.advanceTimersByTimeAsync(1);
+			await vi.runAllTicks();
+			expect(calls).toHaveLength(4);
+			expect(received).toEqual([
+				{ kind: "resyncRequired", selectionId: "" },
+				{ kind: "resyncRequired", selectionId: "" },
+				{ kind: "resyncRequired", selectionId: "" },
+				sampleCatalogBatch,
+				{ kind: "resyncRequired", selectionId: "" },
+			]);
+			channels[0]?.emit(sampleProgressUpdate);
+			expect(received).toEqual([
+				{ kind: "resyncRequired", selectionId: "" },
+				{ kind: "resyncRequired", selectionId: "" },
+				{ kind: "resyncRequired", selectionId: "" },
+				sampleCatalogBatch,
+				{ kind: "resyncRequired", selectionId: "" },
+				sampleProgressUpdate,
+			]);
+
+			stop();
+			await vi.advanceTimersByTimeAsync(10_000);
+			expect(
+				calls.filter((command) => command === "watch_wall_updates"),
+			).toHaveLength(4);
+			expect(calls.at(-1)).toBe("unwatch_wall_updates");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("unwatches a recovered registration when resync stops synchronously", async () => {
+		vi.useFakeTimers();
+		try {
+			let attempts = 0;
+			const calls: Array<[string, Record<string, unknown> | undefined]> = [];
+			const channels: FakeChannel<WallUpdate>[] = [];
+			const invoke: InvokeCommand = async <T>(
+				command: string,
+				args?: Record<string, unknown>,
+			) => {
+				calls.push([command, args]);
+				if (command === "watch_wall_updates") {
+					attempts += 1;
+					if (attempts === 1) throw new Error("listen failed");
+					return "recovered-subscription" as T;
+				}
+				return undefined as T;
+			};
+			let stop: () => void = () => undefined;
+			const received: WallUpdate[] = [];
+			const service = createTauriPhotoService(invoke, (listener) => {
+				const channel = new FakeChannel(listener);
+				channels.push(channel);
+				return channel;
+			});
+			stop = service.watchWallUpdates((update) => {
+				received.push(update);
+				if (update.kind === "resyncRequired" && attempts === 2) stop();
+			});
+
+			await vi.runAllTicks();
+			await vi.advanceTimersByTimeAsync(100);
+			await vi.runAllTicks();
+
+			expect(attempts).toBe(2);
+			expect(received).toEqual([
+				{ kind: "resyncRequired", selectionId: "" },
+				{ kind: "resyncRequired", selectionId: "" },
+			]);
+			expect(calls.map(([command]) => command)).toEqual([
+				"watch_wall_updates",
+				"watch_wall_updates",
+				"unwatch_wall_updates",
+			]);
+			expect(calls[2]?.[1]).toEqual({
+				subscriptionId: "recovered-subscription",
+			});
+			channels[0]?.emit(sampleProgressUpdate);
+			await vi.advanceTimersByTimeAsync(10_000);
+			expect(received).toHaveLength(2);
+			expect(
+				calls.filter(([command]) => command === "unwatch_wall_updates"),
+			).toHaveLength(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not retry or leak when the recovered resync listener throws", async () => {
+		vi.useFakeTimers();
+		try {
+			let attempts = 0;
+			const calls: string[] = [];
+			const invoke: InvokeCommand = async <T>(command: string) => {
+				calls.push(command);
+				if (command === "watch_wall_updates") {
+					attempts += 1;
+					if (attempts === 1) throw new Error("listen failed");
+					return "throwing-subscription" as T;
+				}
+				return undefined as T;
+			};
+			const received: WallUpdate[] = [];
+			const service = createTauriPhotoService(
+				invoke,
+				(listener) => new FakeChannel(listener),
+			);
+			service.watchWallUpdates((update) => {
+				received.push(update);
+				if (update.kind === "resyncRequired" && attempts === 2) {
+					throw new Error("consumer failed");
+				}
+			});
+
+			await vi.runAllTicks();
+			await vi.advanceTimersByTimeAsync(100);
+			await vi.runAllTicks();
+			await vi.advanceTimersByTimeAsync(10_000);
+
+			expect(received).toEqual([
+				{ kind: "resyncRequired", selectionId: "" },
+				{ kind: "resyncRequired", selectionId: "" },
+			]);
+			expect(calls).toEqual([
+				"watch_wall_updates",
+				"watch_wall_updates",
+				"unwatch_wall_updates",
+			]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("unwatches a registration that resolves after synchronous unsubscribe", async () => {
+		let resolveWatch!: (subscriptionId: string) => void;
+		const watchPromise = new Promise<string>((resolve) => {
+			resolveWatch = resolve;
+		});
+		const calls: Array<[string, Record<string, unknown> | undefined]> = [];
+		const invoke: InvokeCommand = async <T>(
+			command: string,
+			args?: Record<string, unknown>,
+		) => {
+			calls.push([command, args]);
+			if (command === "watch_wall_updates") return watchPromise as T;
+			return undefined as T;
+		};
+		const service = createTauriPhotoService(
+			invoke,
+			(listener) => new FakeChannel(listener),
+		);
+
+		const stop = service.watchWallUpdates(() => undefined);
+		stop();
+		resolveWatch("wall-subscription-race");
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+		expect(calls[0]?.[0]).toBe("watch_wall_updates");
+		expect(JSON.stringify(calls[0]?.[1])).toBe(
+			'{"onEvent":"__CHANNEL__:fake"}',
+		);
+		expect(calls[1]).toEqual([
+			"unwatch_wall_updates",
+			{ subscriptionId: "wall-subscription-race" },
+		]);
 	});
 });

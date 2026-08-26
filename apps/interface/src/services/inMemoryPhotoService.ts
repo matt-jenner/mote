@@ -10,6 +10,7 @@ import type {
 	WallPage,
 	WallQueryRequest,
 	WallUpdate,
+	WallWarningState,
 } from "./photoService";
 import { PhotoServiceError } from "./photoService";
 
@@ -27,6 +28,7 @@ export interface InMemoryOptions {
 	geometryDelayMs?: number;
 	thumbnailDelayMs?: number;
 	metadataDelayMs?: number;
+	sourceWarnings?: readonly WallWarningState[];
 }
 
 export interface InMemoryPhotoService extends PhotoService {
@@ -38,6 +40,7 @@ export interface InMemoryPhotoService extends PhotoService {
 type WallListener = (update: WallUpdate) => void;
 
 const sourceId = "memory-source";
+const selectionId = "memory-selection-1";
 const maxWallPageSize = 250;
 
 const clone = <T>(value: T): T => structuredClone(value);
@@ -56,9 +59,11 @@ export function createInMemoryPhotoService(
 	const listeners = new Set<WallListener>();
 	const derivativeUrls = new Map<string, string>();
 	let settled = false;
+	let scanGeneration = 0;
 	let scanPromise: Promise<void> | null = null;
 	let derivativePhasePromise: Promise<void> | null = null;
 	let settlementPromise: Promise<void> | null = null;
+	let sourceWarnings: WallWarningState[] = [...(options.sourceWarnings ?? [])];
 	let state: BootstrapState = {
 		settings: { appearance: "system" },
 		activeSource: null,
@@ -116,6 +121,7 @@ export function createInMemoryPhotoService(
 				...state,
 				activeSource: {
 					id: sourceId,
+					selectionId,
 					displayName: options.selectedFolderName ?? "Selected Folder",
 					availability: "available",
 				},
@@ -168,6 +174,7 @@ export function createInMemoryPhotoService(
 				items,
 				nextCursor,
 				orderState: settled ? "settled" : "provisional",
+				sourceWarnings: clone(sourceWarnings),
 			};
 		},
 		async requestDerivatives(_request: DerivativeRequest) {
@@ -192,6 +199,7 @@ export function createInMemoryPhotoService(
 		},
 		startFixtureScan() {
 			if (scanPromise && !settled) return scanPromise;
+			const generation = ++scanGeneration;
 			settled = false;
 			settlementPromise = null;
 			derivativePhasePromise = null;
@@ -212,9 +220,11 @@ export function createInMemoryPhotoService(
 				await delay(options.geometryDelayMs ?? 0);
 				publish({
 					kind: "catalogBatch",
+					selectionId,
 					sourceId,
 					assets: clone(assets),
 					orderState: "provisional",
+					generation,
 					progress: progress(0),
 				});
 				derivativePhasePromise = (async () => {
@@ -241,6 +251,7 @@ export function createInMemoryPhotoService(
 					}
 					publish({
 						kind: "derivativesReady",
+						selectionId,
 						derivatives: clone(derivatives),
 					});
 				})();
@@ -248,6 +259,11 @@ export function createInMemoryPhotoService(
 			return scanPromise;
 		},
 		finishFixtureScan() {
+			if (settled) {
+				scanPromise = null;
+				settlementPromise = null;
+				void service.startFixtureScan();
+			}
 			if (settlementPromise) return settlementPromise;
 			settlementPromise = (async () => {
 				if (!scanPromise) await service.startFixtureScan();
@@ -257,11 +273,28 @@ export function createInMemoryPhotoService(
 				if (settled) return;
 				settled = true;
 				assets = assets.map((asset) => ({ ...asset, dateState: "settled" }));
-				publish({ kind: "metadataSettled", sourceId });
+				publish({
+					kind: "metadataSettled",
+					selectionId,
+					sourceId,
+					generation: scanGeneration,
+				});
 			})();
 			return settlementPromise;
 		},
 		emitForTest(update: WallUpdate) {
+			if (update.kind === "warning" && update.assetId === null) {
+				sourceWarnings = [
+					...sourceWarnings.filter(
+						(warning) => warning.code !== update.warning.code,
+					),
+					clone(update.warning),
+				];
+			} else if (update.kind === "warningCleared" && update.assetId === null) {
+				sourceWarnings = sourceWarnings.filter(
+					(warning) => warning.code !== update.code,
+				);
+			}
 			publish(update);
 		},
 	};

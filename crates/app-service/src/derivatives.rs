@@ -240,6 +240,9 @@ impl AppService {
         let ids = parse_ids(request.asset_ids)?;
         if ids.is_empty() {
             let _ = self.updates.send(WallUpdate::DerivativesReady {
+                selection_id: self
+                    .active_selection_id()
+                    .unwrap_or_else(|| "selection-none".to_owned()),
                 derivatives: Vec::new(),
             });
             return Ok(());
@@ -618,9 +621,10 @@ impl AppService {
         {
             return false;
         }
-        let _ = self
-            .updates
-            .send(WallUpdate::DerivativesReady { derivatives });
+        let _ = self.updates.send(WallUpdate::DerivativesReady {
+            selection_id: selection.selection_id(),
+            derivatives,
+        });
         true
     }
 
@@ -646,6 +650,7 @@ impl AppService {
             )?;
             if inserted {
                 let _ = self.updates.send(WallUpdate::Warning {
+                    selection_id: selection.selection_id(),
                     source_id: selection.library_id.as_uuid().hyphenated().to_string(),
                     asset_id: Some(asset_id.as_uuid().hyphenated().to_string()),
                     warning,
@@ -683,6 +688,7 @@ impl AppService {
                 && self
                     .updates
                     .send(WallUpdate::Warning {
+                        selection_id: selection.selection_id(),
                         source_id: selection.library_id.as_uuid().hyphenated().to_string(),
                         asset_id: None,
                         warning,
@@ -721,6 +727,7 @@ impl AppService {
             let source_id = selection.library_id.as_uuid().hyphenated().to_string();
             if asset_warning_removed > 0 {
                 let _ = self.updates.send(WallUpdate::WarningCleared {
+                    selection_id: selection.selection_id(),
                     source_id: source_id.clone(),
                     asset_id: Some(asset_id.as_uuid().hyphenated().to_string()),
                     code: "derivativeUnavailable".to_owned(),
@@ -736,6 +743,7 @@ impl AppService {
                     }
                 }
                 let _ = self.updates.send(WallUpdate::WarningCleared {
+                    selection_id: selection.selection_id(),
                     source_id,
                     asset_id: None,
                     code: public_code.to_owned(),
@@ -1118,6 +1126,18 @@ mod tests {
             1,
             "250 cache failures must produce one library warning"
         );
+        let source_snapshot = service
+            .query_wall(crate::WallQueryRequest::oldest_first())
+            .await
+            .unwrap();
+        assert_eq!(
+            source_snapshot
+                .source_warnings
+                .iter()
+                .map(|warning| warning.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["screenPreviewCacheUnavailable"]
+        );
 
         drop(service);
         let reopen_config = config.clone();
@@ -1127,6 +1147,18 @@ mod tests {
             .unwrap();
         service.cache_budget = CacheBudget::from_total_space(0);
         let mut updates = service.subscribe_wall_updates();
+        let reopened_snapshot = service
+            .query_wall(crate::WallQueryRequest::oldest_first())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened_snapshot
+                .source_warnings
+                .iter()
+                .map(|warning| warning.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["screenPreviewCacheUnavailable"]
+        );
         let (_, ready_after_reopen, pending_after_reopen) = service
             .resolve_derivatives(
                 &ids.iter()

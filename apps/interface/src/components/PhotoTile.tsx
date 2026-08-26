@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { CircleAlert } from "lucide-react";
+import { useEffect, useState } from "react";
 import type { PhotoService } from "../services/photoService";
 import styles from "../styles/photoWall.module.css";
 import type { PositionedWallAsset } from "../wall/layoutJustifiedRows";
@@ -20,10 +21,9 @@ export function PhotoTile({ positioned, service }: PhotoTileProps) {
 	const { asset } = positioned;
 	const [loaded, setLoaded] = useState(false);
 	const [failed, setFailed] = useState(false);
+	const [previewFailed, setPreviewFailed] = useState(false);
 	const thumbnail = asset.wallThumbnail;
 	const shapeState = asset.shapeState;
-	const thumbnailKey = thumbnail?.key;
-	const previousThumbnailKey = useRef(thumbnailKey);
 	let url: string | null = null;
 	if (thumbnail) {
 		try {
@@ -34,12 +34,12 @@ export function PhotoTile({ positioned, service }: PhotoTileProps) {
 	}
 
 	useEffect(() => {
-		if (previousThumbnailKey.current !== thumbnailKey) setLoaded(false);
-		previousThumbnailKey.current = thumbnailKey;
+		setLoaded(false);
+		setPreviewFailed(false);
 		setFailed(
 			(shapeState === "fallback" || asset.availability !== "available") && !url,
 		);
-	}, [asset.availability, shapeState, thumbnailKey, url]);
+	}, [asset.availability, shapeState, url]);
 
 	const style = {
 		width: `${positioned.width}px`,
@@ -60,16 +60,34 @@ export function PhotoTile({ positioned, service }: PhotoTileProps) {
 				<>
 					<div aria-hidden="true" className={styles.neutralLayer} />
 					<div aria-hidden="true" className={styles.colourLayer} />
-					{url ? (
+					{url && !previewFailed ? (
 						<img
 							alt={asset.displayName}
 							className={`${styles.imageLayer} ${loaded ? styles.imageLoaded : ""}`}
 							decoding="async"
 							draggable={false}
-							onError={() => setFailed(true)}
+							onError={() => setPreviewFailed(true)}
 							onLoad={() => setLoaded(true)}
 							src={url}
 						/>
+					) : null}
+					{previewFailed || asset.warning ? (
+						<span
+							aria-label={
+								previewFailed
+									? "Photo preview unavailable"
+									: "Photo preview warning"
+							}
+							className={styles.tileWarning}
+							role="img"
+							title={
+								previewFailed
+									? "Photo preview unavailable"
+									: "Photo preview warning"
+							}
+						>
+							<CircleAlert aria-hidden="true" size={14} strokeWidth={1.7} />
+						</span>
 					) : null}
 				</>
 			)}

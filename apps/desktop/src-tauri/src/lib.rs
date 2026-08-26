@@ -58,7 +58,10 @@ pub fn run() {
                 Appearance::Dark => Some(Theme::Dark),
             };
             window.set_theme(theme).map_err(StartupError::NativeTheme)?;
-            app.manage(DesktopState { service });
+            app.manage(DesktopState {
+                service,
+                wall_subscriptions: Default::default(),
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -68,7 +71,8 @@ pub fn run() {
             commands::query_wall,
             commands::request_derivatives,
             commands::set_wall_interaction,
-            commands::watch_wall_updates
+            commands::watch_wall_updates,
+            commands::unwatch_wall_updates
         ])
         .run(tauri::generate_context!())
         .expect("error while running Photo Viewer");

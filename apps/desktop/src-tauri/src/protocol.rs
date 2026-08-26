@@ -67,11 +67,29 @@ fn empty_response(status: StatusCode) -> Response<Vec<u8>> {
         .expect("empty protocol response is valid")
 }
 
-pub(crate) async fn forward_wall_updates(
+#[cfg(test)]
+async fn forward_wall_updates(
     receiver: tokio::sync::broadcast::Receiver<WallUpdate>,
     channel: tauri::ipc::Channel<WallUpdate>,
 ) {
-    forward_wall_updates_inner(receiver, channel, |_| {}).await;
+    let (_cancel_sender, cancellation) = tokio::sync::watch::channel(false);
+    forward_wall_updates_inner(receiver, channel, || None, |_| {}, cancellation).await;
+}
+
+pub(crate) async fn forward_wall_updates_for_service(
+    receiver: tokio::sync::broadcast::Receiver<WallUpdate>,
+    channel: tauri::ipc::Channel<WallUpdate>,
+    service: AppService,
+    cancellation: tokio::sync::watch::Receiver<bool>,
+) {
+    forward_wall_updates_inner(
+        receiver,
+        channel,
+        move || service.active_selection_id(),
+        |_| {},
+        cancellation,
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -82,18 +100,38 @@ async fn forward_wall_updates_with_lag_hook<F>(
 ) where
     F: FnMut(usize) + Send,
 {
-    forward_wall_updates_inner(receiver, channel, on_lag).await;
+    let (_cancel_sender, cancellation) = tokio::sync::watch::channel(false);
+    forward_wall_updates_inner(
+        receiver,
+        channel,
+        || Some("current-selection".to_owned()),
+        on_lag,
+        cancellation,
+    )
+    .await;
 }
 
-async fn forward_wall_updates_inner<F>(
+async fn forward_wall_updates_inner<F, G>(
     mut receiver: tokio::sync::broadcast::Receiver<WallUpdate>,
     channel: tauri::ipc::Channel<WallUpdate>,
+    current_selection_id: G,
     mut on_lag: F,
+    mut cancellation: tokio::sync::watch::Receiver<bool>,
 ) where
     F: FnMut(usize) + Send,
+    G: Fn() -> Option<String> + Send,
 {
     loop {
-        match receiver.recv().await {
+        let received = tokio::select! {
+            changed = cancellation.changed() => {
+                if changed.is_err() || *cancellation.borrow() {
+                    return;
+                }
+                continue;
+            }
+            received = receiver.recv() => received,
+        };
+        match received {
             Ok(update) => {
                 if channel.send(update).is_err() {
                     return;
@@ -103,19 +141,12 @@ async fn forward_wall_updates_inner<F>(
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                 let retained_window = receiver.len();
                 on_lag(retained_window);
-                let mut newest_progress = None;
                 let mut remaining = retained_window;
                 while remaining > 0 {
                     match receiver.try_recv() {
                         Ok(update) => {
                             remaining = remaining.saturating_sub(1);
-                            match update {
-                                WallUpdate::CatalogBatch { progress, .. }
-                                | WallUpdate::Progress { progress } => {
-                                    newest_progress = Some(progress)
-                                }
-                                _ => {}
-                            }
+                            drop(update);
                         }
                         Err(tokio::sync::broadcast::error::TryRecvError::Empty)
                         | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
@@ -125,8 +156,12 @@ async fn forward_wall_updates_inner<F>(
                         }
                     }
                 }
-                if let Some(progress) = newest_progress
-                    && channel.send(WallUpdate::Progress { progress }).is_err()
+                let Some(selection_id) = current_selection_id() else {
+                    continue;
+                };
+                if channel
+                    .send(WallUpdate::ResyncRequired { selection_id })
+                    .is_err()
                 {
                     return;
                 }
@@ -206,7 +241,7 @@ mod tests {
                         .await
                         .unwrap();
                     let reference = loop {
-                        if let WallUpdate::DerivativesReady { derivatives } = updates.recv().await.unwrap() {
+                        if let WallUpdate::DerivativesReady { derivatives, .. } = updates.recv().await.unwrap() {
                             break derivatives[0].clone();
                         }
                     };
@@ -307,6 +342,7 @@ mod tests {
 
     fn sample_catalog_batch() -> WallUpdate {
         WallUpdate::CatalogBatch {
+            selection_id: "sample-selection".to_owned(),
             assets: vec![WallAsset {
                 id: "00000000-0000-0000-0000-000000000001".to_owned(),
                 display_name: "sample.jpg".to_owned(),
@@ -324,6 +360,7 @@ mod tests {
                 screen_preview: None,
             }],
             order_state: OrderState::Provisional,
+            generation: 1,
             progress: ScanProgressDto {
                 discovered: 1,
                 shaped: 1,
@@ -354,8 +391,46 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn wall_update_forwarder_stops_when_subscription_is_cancelled() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(4);
+        let received = Arc::new(Mutex::new(Vec::<WallUpdate>::new()));
+        let sink = received.clone();
+        let (sent, delivered) = tokio::sync::oneshot::channel();
+        let sent = Arc::new(Mutex::new(Some(sent)));
+        let signal = sent.clone();
+        let channel = tauri::ipc::Channel::new(move |body| {
+            sink.lock()
+                .unwrap()
+                .push(body.deserialize::<WallUpdate>().unwrap());
+            if let Some(signal) = signal.lock().unwrap().take() {
+                let _ = signal.send(());
+            }
+            Ok(())
+        });
+        let (cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(forward_wall_updates_inner(
+            receiver,
+            channel,
+            || Some("current-selection".to_owned()),
+            |_| {},
+            cancel_receiver,
+        ));
+        sender.send(progress(1)).unwrap();
+        delivered.await.unwrap();
+        cancel_sender.send(true).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = sender.send(progress(2));
+        assert_eq!(received.lock().unwrap().len(), 1);
+    }
+
     fn progress(discovered: u64) -> WallUpdate {
         WallUpdate::Progress {
+            selection_id: "current-selection".to_owned(),
+            generation: 1,
             progress: ScanProgressDto {
                 discovered,
                 shaped: discovered,
@@ -367,6 +442,7 @@ mod tests {
 
     fn later_source_update(source_id: &str) -> WallUpdate {
         WallUpdate::SourceUnavailable {
+            selection_id: "current-selection".to_owned(),
             source_id: source_id.to_owned(),
         }
     }
@@ -388,7 +464,7 @@ mod tests {
         let first_signal = first.clone();
         let channel = tauri::ipc::Channel::new(move |body| {
             let update = body.deserialize::<WallUpdate>().unwrap();
-            if matches!(update, WallUpdate::Progress { .. })
+            if matches!(update, WallUpdate::ResyncRequired { .. })
                 && let Some(signal) = first_signal.lock().unwrap().take()
             {
                 let _ = signal.send(());
@@ -414,10 +490,10 @@ mod tests {
         assert!(matches!(
             received.as_slice(),
             [
-                WallUpdate::Progress { progress: ScanProgressDto { discovered: 6, .. } },
-                WallUpdate::SourceUnavailable { source_id },
-                WallUpdate::SourceUnavailable { source_id: second },
-            ] if source_id == "live-7" && second == "live-8"
+                WallUpdate::ResyncRequired { selection_id },
+                WallUpdate::SourceUnavailable { source_id, .. },
+                WallUpdate::SourceUnavailable { source_id: second, .. },
+            ] if selection_id == "current-selection" && source_id == "live-7" && second == "live-8"
         ));
     }
 }

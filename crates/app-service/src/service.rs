@@ -33,6 +33,39 @@ pub(crate) struct SelectionToken {
     pub(crate) epoch: u64,
 }
 
+impl SelectionToken {
+    pub(crate) fn selection_id(self) -> String {
+        opaque_selection_id(
+            self.library_id.as_uuid().as_bytes(),
+            self.group_id.as_uuid().as_bytes(),
+            self.epoch,
+        )
+    }
+}
+
+fn opaque_selection_id(library: &[u8], group: &[u8], epoch: u64) -> String {
+    let mut identity = Vec::with_capacity(library.len() + group.len() + 8);
+    identity.extend_from_slice(library);
+    identity.extend_from_slice(group);
+    identity.extend_from_slice(&epoch.to_be_bytes());
+    format!(
+        "selection-{}",
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &identity).hyphenated()
+    )
+}
+
+fn fallback_selection_id(
+    library: photo_domain::LibraryId,
+    relative_folder: &photo_domain::RelativePathKey,
+    epoch: u64,
+) -> String {
+    opaque_selection_id(
+        library.as_uuid().as_bytes(),
+        relative_folder.as_bytes(),
+        epoch,
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ScanOwner {
     pub(crate) selection: SelectionToken,
@@ -219,8 +252,29 @@ impl AppService {
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or(library.display_name);
+                    let group = state
+                        .libraries
+                        .catalog()
+                        .folder_group_for_path(selection.library_id, &selection.relative_folder)?;
+                    let selection_id = group
+                        .map(|group_id| {
+                            SelectionToken {
+                                library_id: selection.library_id,
+                                group_id,
+                                epoch: state.selection_epoch,
+                            }
+                            .selection_id()
+                        })
+                        .unwrap_or_else(|| {
+                            fallback_selection_id(
+                                selection.library_id,
+                                &selection.relative_folder,
+                                state.selection_epoch,
+                            )
+                        });
                     Some(SourceSummary {
                         id: library.id.as_uuid().hyphenated().to_string(),
+                        selection_id,
                         display_name,
                         availability: map_availability(library.availability),
                     })
@@ -339,6 +393,34 @@ impl AppService {
         self.updates.subscribe()
     }
 
+    pub fn active_selection_id(&self) -> Option<String> {
+        let state = self.state.lock().ok()?;
+        let selection = state
+            .libraries
+            .catalog()
+            .load_app_state()
+            .ok()?
+            .active_selection?;
+        let group = state
+            .libraries
+            .catalog()
+            .folder_group_for_path(selection.library_id, &selection.relative_folder)
+            .ok()?;
+        Some(match group {
+            Some(group_id) => SelectionToken {
+                library_id: selection.library_id,
+                group_id,
+                epoch: state.selection_epoch,
+            }
+            .selection_id(),
+            None => fallback_selection_id(
+                selection.library_id,
+                &selection.relative_folder,
+                state.selection_epoch,
+            ),
+        })
+    }
+
     /// Read a generated derivative from the managed cache after revalidating its active wall
     /// identity. This method deliberately returns bytes, never a native cache path.
     pub fn read_derivative(
@@ -439,6 +521,13 @@ impl AppService {
         };
         let items =
             wall_assets_with_derivatives(state.libraries.catalog(), &page.items, date_state)?;
+        let source_warnings = state
+            .libraries
+            .catalog()
+            .source_warning_summaries(selection.library_id)?
+            .into_iter()
+            .map(|warning| map_source_warning_code(&warning.code))
+            .collect::<Vec<_>>();
         let next_cursor = page
             .next
             .as_ref()
@@ -452,6 +541,7 @@ impl AppService {
             } else {
                 crate::OrderState::Provisional
             },
+            source_warnings,
         })
     }
 
@@ -477,6 +567,7 @@ fn empty_page() -> crate::WallPage {
         items: Vec::new(),
         next_cursor: None,
         order_state: crate::OrderState::Provisional,
+        source_warnings: Vec::new(),
     }
 }
 
@@ -511,10 +602,9 @@ pub(crate) fn wall_asset_from_record(
             retryable: true,
         })
     } else if item.has_warning {
-        Some(crate::WallWarningState {
-            code: "assetWarning".to_owned(),
-            retryable: true,
-        })
+        Some(map_asset_warning_code(
+            item.warning_code.as_deref().unwrap_or(""),
+        ))
     } else {
         None
     };
@@ -545,6 +635,30 @@ pub(crate) fn wall_asset_from_record(
             kind: crate::DerivativeClass::ScreenPreview,
             key: key.to_owned(),
         }),
+    }
+}
+
+fn map_asset_warning_code(code: &str) -> crate::WallWarningState {
+    let public_code = if code == "derivative_generation_failed" {
+        "derivativeUnavailable"
+    } else {
+        "assetWarning"
+    };
+    crate::WallWarningState {
+        code: public_code.to_owned(),
+        retryable: true,
+    }
+}
+
+fn map_source_warning_code(code: &str) -> crate::WallWarningState {
+    let public_code = match code {
+        "wall_thumbnail_cache_unavailable" => "wallThumbnailCacheUnavailable",
+        "screen_preview_cache_unavailable" => "screenPreviewCacheUnavailable",
+        _ => "sourceWarning",
+    };
+    crate::WallWarningState {
+        code: public_code.to_owned(),
+        retryable: true,
     }
 }
 

@@ -88,6 +88,7 @@ impl AppService {
                 mark_unavailable_selection(&mut state, owner)?;
                 state.active_scan = None;
                 let _ = self.updates.send(WallUpdate::SourceUnavailable {
+                    selection_id: owner.selection.selection_id(),
                     source_id: owner
                         .selection
                         .library_id
@@ -195,6 +196,7 @@ impl AppService {
                     let _ = mark_unavailable_selection(&mut state, owner);
                     state.active_scan = None;
                     let _ = self.updates.send(WallUpdate::SourceUnavailable {
+                        selection_id: owner.selection.selection_id(),
                         source_id: owner
                             .selection
                             .library_id
@@ -284,14 +286,18 @@ impl AppService {
                     .unwrap_or_default();
                 if !assets.is_empty() {
                     let _ = self.updates.send(WallUpdate::CatalogBatch {
+                        selection_id: owner.selection.selection_id(),
                         assets,
                         order_state: crate::OrderState::Provisional,
+                        generation: owner.generation,
                         progress: progress_dto(last),
                     });
                 }
             }
             if last.discovered > 0 {
                 let _ = self.updates.send(WallUpdate::Progress {
+                    selection_id: owner.selection.selection_id(),
+                    generation: owner.generation,
                     progress: progress_dto(last),
                 });
             }
@@ -323,12 +329,14 @@ impl AppService {
                     return;
                 }
                 let _ = self.updates.send(WallUpdate::MetadataSettled {
+                    selection_id: owner.selection.selection_id(),
                     source_id: owner
                         .selection
                         .library_id
                         .as_uuid()
                         .hyphenated()
                         .to_string(),
+                    generation: owner.generation,
                 });
                 Some(state.recent_derivative_ids.clone())
             } else {

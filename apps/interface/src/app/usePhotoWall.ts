@@ -22,6 +22,7 @@ interface RequestOwner {
 	requestId: WallRequestId;
 	cursor: string | null;
 	epoch: number;
+	settlementGeneration: number | null;
 }
 
 export interface PhotoWallController {
@@ -39,6 +40,8 @@ export interface PhotoWallController {
 
 function wallStatus(state: typeof initialWallState): string {
 	if (state.error) return state.error;
+	if (Object.keys(state.sourceWarnings).length > 0)
+		return "Some previews need attention";
 	if (!state.scanComplete)
 		return state.items.length === 0
 			? "Folder ready · Indexing photos"
@@ -58,7 +61,7 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 	const sourceIdRef = useRef(sourceId);
 	const sourceGeneration = useRef(0);
 	const ownerRef = useRef<RequestOwner | null>(null);
-	const settlementPending = useRef(false);
+	const settlementPending = useRef<number | null>(null);
 	const failedCursor = useRef<string | null>(null);
 	const derivativeRequests = useRef(new Map<string, DerivativePriority>());
 	const wallInteractionTimer = useRef<number | null>(null);
@@ -77,11 +80,15 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 			settle = false,
 			generationOverride?: number,
 			initialSourceQuery = false,
+			settlementGeneration?: number,
 		) => {
 			const expectedSourceId = sourceId;
 			if (!expectedSourceId) return;
 			const generation = generationOverride ?? sourceGeneration.current;
 			if (!isLive(generation, expectedSourceId) || ownerRef.current) return;
+			const targetSettlementGeneration = settle
+				? (settlementGeneration ?? 1)
+				: null;
 			const requestId: WallRequestId = ++requestNumber.current;
 			const owner: RequestOwner = {
 				sourceId: expectedSourceId,
@@ -89,6 +96,7 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 				requestId,
 				cursor,
 				epoch: initialSourceQuery ? 0 : stateRef.current.scrollEpoch,
+				settlementGeneration: targetSettlementGeneration,
 			};
 			ownerRef.current = owner;
 			dispatch({
@@ -117,10 +125,12 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 							type: "metadataSettled",
 							assets: page.items,
 							nextCursor: page.nextCursor,
+							sourceWarnings: page.sourceWarnings,
 							requestEpoch: owner.epoch,
 							requestCursor: cursor,
 							requestId,
 							sourceGeneration: generation,
+							generation: targetSettlementGeneration ?? undefined,
 						});
 					} else {
 						dispatch({
@@ -128,6 +138,7 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 							assets: page.items,
 							orderState: page.orderState,
 							nextCursor: page.nextCursor,
+							sourceWarnings: page.sourceWarnings,
 							requestEpoch: owner.epoch,
 							requestCursor: cursor,
 							requestId,
@@ -158,9 +169,12 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 					)
 						return;
 					ownerRef.current = null;
-					if (settlementPending.current) {
-						settlementPending.current = false;
-						queueMicrotask(() => loadPage(null, true, generation));
+					if (settlementPending.current !== null) {
+						const pendingGeneration = settlementPending.current;
+						settlementPending.current = null;
+						queueMicrotask(() =>
+							loadPage(null, true, generation, false, pendingGeneration),
+						);
 					}
 				});
 		},
@@ -173,7 +187,7 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 		sourceGeneration.current = generation;
 		sourceIdRef.current = expectedSourceId;
 		ownerRef.current = null;
-		settlementPending.current = false;
+		settlementPending.current = null;
 		failedCursor.current = null;
 		derivativeRequests.current.clear();
 		if (wallInteractionTimer.current !== null) {
@@ -184,11 +198,28 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 			wallInteractionActive.current = false;
 			void service.setWallInteraction(false);
 		}
-		dispatch({ type: "resetSource", sourceGeneration: generation });
+		dispatch({
+			type: "resetSource",
+			sourceGeneration: generation,
+			selectionId: expectedSourceId ?? undefined,
+		});
 		if (!expectedSourceId) return;
 		const stop = service.watchWallUpdates((update: WallUpdate) => {
 			if (!isLive(generation, expectedSourceId)) return;
-			if ("sourceId" in update && update.sourceId !== expectedSourceId) return;
+			if (
+				"selectionId" in update &&
+				update.selectionId &&
+				update.selectionId !== expectedSourceId
+			)
+				return;
+			const hasSelectionId =
+				"selectionId" in update && Boolean(update.selectionId);
+			if (
+				!hasSelectionId &&
+				"sourceId" in update &&
+				update.sourceId !== expectedSourceId
+			)
+				return;
 			switch (update.kind) {
 				case "catalogBatch":
 					dispatch({ type: "catalogBatch", ...update });
@@ -200,8 +231,21 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 					});
 					break;
 				case "metadataSettled":
-					if (ownerRef.current) settlementPending.current = true;
-					else loadPage(null, true, generation);
+					{
+						const settledGeneration = update.generation ?? 1;
+						const knownGeneration = Math.max(
+							stateRef.current.settledGeneration ?? 0,
+							ownerRef.current?.settlementGeneration ?? 0,
+							settlementPending.current ?? 0,
+						);
+						if (settledGeneration <= knownGeneration) break;
+						if (ownerRef.current)
+							settlementPending.current = Math.max(
+								settlementPending.current ?? 0,
+								settledGeneration,
+							);
+						else loadPage(null, true, generation, false, settledGeneration);
+					}
 					break;
 				case "sourceUnavailable":
 					dispatch({
@@ -209,6 +253,17 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 						sourceGeneration: generation,
 						error: "Source unavailable. Try again.",
 					});
+					break;
+				case "warning":
+					dispatch({ type: "warning", ...update });
+					break;
+				case "warningCleared":
+					dispatch({ type: "warningCleared", ...update });
+					break;
+				case "resyncRequired":
+					ownerRef.current = null;
+					settlementPending.current = null;
+					dispatch({ type: "resyncRequired", selectionId: expectedSourceId });
 					break;
 				default:
 					break;
@@ -225,7 +280,7 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 				sourceGeneration.current += 1;
 				sourceIdRef.current = null;
 				ownerRef.current = null;
-				settlementPending.current = false;
+				settlementPending.current = null;
 			}
 		};
 	}, [isLive, loadPage, service, sourceId]);
@@ -243,7 +298,7 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 
 	const setDirection = useCallback((direction: SortDirection) => {
 		ownerRef.current = null;
-		settlementPending.current = false;
+		settlementPending.current = null;
 		dispatch({ type: "setDirection", direction });
 	}, []);
 

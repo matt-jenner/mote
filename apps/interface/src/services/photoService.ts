@@ -11,6 +11,8 @@ export interface SettingsState {
 
 export interface SourceSummary {
 	id: string;
+	/** Opaque host identity for the selected folder and selection epoch. */
+	selectionId: string;
 	displayName: string;
 	availability: SourceAvailability;
 }
@@ -77,6 +79,7 @@ export interface WallPage {
 	items: WallAsset[];
 	nextCursor: string | null;
 	orderState: OrderState;
+	sourceWarnings: WallWarningState[];
 }
 
 export interface WallQueryRequest {
@@ -97,30 +100,55 @@ export interface ScanProgressDto {
 	total: number | null;
 }
 
-export type WallUpdate =
+export type WallUpdateBase =
 	| {
 			kind: "catalogBatch";
+			selectionId: string;
 			sourceId?: string;
 			assets: WallAsset[];
 			orderState: OrderState;
+			generation: number;
 			progress: ScanProgressDto;
 	  }
-	| { kind: "derivativesReady"; derivatives: DerivativeReference[] }
-	| { kind: "metadataSettled"; sourceId: string }
-	| { kind: "progress"; progress: ScanProgressDto }
-	| { kind: "sourceUnavailable"; sourceId: string }
+	| {
+			kind: "derivativesReady";
+			selectionId: string;
+			derivatives: DerivativeReference[];
+	  }
+	| {
+			kind: "metadataSettled";
+			selectionId: string;
+			sourceId: string;
+			generation: number;
+	  }
+	| {
+			kind: "progress";
+			selectionId: string;
+			generation: number;
+			progress: ScanProgressDto;
+	  }
+	| { kind: "sourceUnavailable"; selectionId: string; sourceId: string }
 	| {
 			kind: "warning";
+			selectionId: string;
 			sourceId: string;
 			assetId: string | null;
 			warning: WallWarningState;
 	  }
 	| {
 			kind: "warningCleared";
+			selectionId: string;
 			sourceId: string;
 			assetId: string | null;
 			code: string;
 	  };
+
+export type ResyncRequiredUpdate = {
+	kind: "resyncRequired";
+	selectionId: string;
+};
+
+export type WallUpdate = WallUpdateBase | ResyncRequiredUpdate;
 
 export interface PhotoService {
 	readonly capabilities: PhotoServiceCapabilities;

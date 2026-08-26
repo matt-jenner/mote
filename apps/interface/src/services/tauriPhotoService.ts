@@ -27,6 +27,11 @@ const nativeErrorMessages: Readonly<Record<string, string>> = {
 const internalError = () =>
 	new PhotoServiceError("internal", internalErrorMessage);
 
+const wallWatchRetryDelayMs = 100;
+const maxWallWatchRetryDelayMs = 1_000;
+
+export type WallSubscriptionId = string;
+
 export type InvokeCommand = <T>(
 	command: string,
 	args?: Record<string, unknown>,
@@ -70,14 +75,81 @@ export function createTauriPhotoService(
 		setWallInteraction: (active: boolean) =>
 			invokePhotoCommand(invokeCommand, "set_wall_interaction", { active }),
 		watchWallUpdates(listener) {
-			const channel = channelFactory(listener);
-			void invokePhotoCommand<void>(invokeCommand, "watch_wall_updates", {
-				onEvent: channel,
-			}).catch(() => undefined);
-			channel.onmessage = listener;
-			return () => {
-				channel.onmessage = () => undefined;
+			let active = true;
+			let attempts = 0;
+			let hadRegistrationFailure = false;
+			let registrationInFlight = false;
+			let subscriptionId: WallSubscriptionId | null = null;
+			let retryTimer: ReturnType<typeof setTimeout> | null = null;
+			let channel: ServiceChannel<WallUpdate> | null = null;
+			const unwatch = (id: WallSubscriptionId) => {
+				void invokePhotoCommand<void>(invokeCommand, "unwatch_wall_updates", {
+					subscriptionId: id,
+				}).catch(() => undefined);
 			};
+			const stop = () => {
+				active = false;
+				if (retryTimer !== null) {
+					clearTimeout(retryTimer);
+					retryTimer = null;
+				}
+				const id = subscriptionId;
+				subscriptionId = null;
+				if (id !== null) unwatch(id);
+				if (channel !== null) channel.onmessage = () => undefined;
+			};
+			const deliver = (update: WallUpdate) => {
+				if (!active) return;
+				try {
+					listener(update);
+				} catch {
+					stop();
+				}
+			};
+			channel = channelFactory(deliver);
+			channel.onmessage = active ? deliver : () => undefined;
+			const register = () => {
+				if (!active || registrationInFlight || subscriptionId !== null) return;
+				registrationInFlight = true;
+				attempts += 1;
+				void invokePhotoCommand<WallSubscriptionId>(
+					invokeCommand,
+					"watch_wall_updates",
+					{ onEvent: channel },
+				)
+					.then((id) => {
+						registrationInFlight = false;
+						if (!active) {
+							unwatch(id);
+							return;
+						}
+						subscriptionId = id;
+						if (hadRegistrationFailure) {
+							deliver({ kind: "resyncRequired", selectionId: "" });
+							if (!active) return;
+						}
+					})
+					.catch(() => {
+						registrationInFlight = false;
+						if (!active) return;
+						hadRegistrationFailure = true;
+						queueMicrotask(() => {
+							if (active) deliver({ kind: "resyncRequired", selectionId: "" });
+						});
+						retryTimer = setTimeout(
+							() => {
+								retryTimer = null;
+								register();
+							},
+							Math.min(
+								wallWatchRetryDelayMs * attempts,
+								maxWallWatchRetryDelayMs,
+							),
+						);
+					});
+			};
+			register();
+			return stop;
 		},
 		derivativeUrl(reference: DerivativeReference) {
 			return `photo-derivative://localhost/${reference.assetId}/${reference.kind}/${reference.key}`;

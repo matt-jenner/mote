@@ -310,7 +310,7 @@ describe("wallReducer", () => {
 		expect(provisional.pagesExhausted).toBe(false);
 		expect(provisional.scanComplete).toBe(true);
 		expect(provisional.orderState).toBe("settled");
-		expect(provisional.settled).toBe(true);
+		expect(provisional.settledGeneration).toBe(1);
 	});
 
 	it("starts settled from a cached nonterminal page and preserves server order", () => {
@@ -329,7 +329,7 @@ describe("wallReducer", () => {
 			requestEpoch: 0,
 			requestId: "cached",
 		});
-		expect(cached.settled).toBe(true);
+		expect(cached.settledGeneration).toBe(1);
 		expect(cached.scanComplete).toBe(true);
 		expect(cached.pagesExhausted).toBe(false);
 		expect(cached.cursor).toBe("cached-next");
@@ -362,7 +362,7 @@ describe("wallReducer", () => {
 			requestId: "cached-terminal",
 		});
 
-		expect(cached.settled).toBe(true);
+		expect(cached.settledGeneration).toBe(1);
 		expect(cached.scanComplete).toBe(true);
 		expect(cached.pagesExhausted).toBe(true);
 		expect(isWallLayoutComplete(cached)).toBe(true);
@@ -646,7 +646,7 @@ describe("wallReducer", () => {
 			assets: [wallAsset("b", 1, 2)],
 			orderState: "provisional",
 		});
-		expect(streamed.settled).toBe(true);
+		expect(streamed.settledGeneration).toBe(1);
 		expect(streamed.scanComplete).toBe(true);
 		expect(streamed.pagesExhausted).toBe(true);
 		expect(
@@ -735,6 +735,363 @@ describe("wallReducer", () => {
 		});
 		expect(paged.orderState).toBe("settled");
 		expect(paged.items.map((item) => item.id)).toEqual(["b", "a", "c", "d"]);
+	});
+
+	it("accepts one atomic replacement for each newer scan generation", () => {
+		const firstRequest = reduce(initialWallState, {
+			type: "pageRequestStarted",
+			requestId: "generation-1",
+			requestCursor: null,
+			requestEpoch: 0,
+		});
+		const first = reduce(firstRequest, {
+			type: "metadataSettled",
+			generation: 1,
+			assets: [wallAsset("first", 1, 1)],
+			nextCursor: null,
+			requestEpoch: 0,
+			requestCursor: null,
+			requestId: "generation-1",
+		});
+		const secondRequest = reduce(first, {
+			type: "pageRequestStarted",
+			requestId: "generation-2",
+			requestCursor: null,
+			requestEpoch: 0,
+		});
+		const second = reduce(secondRequest, {
+			type: "metadataSettled",
+			generation: 2,
+			assets: [wallAsset("second", 2, 1)],
+			nextCursor: null,
+			requestEpoch: 0,
+			requestCursor: null,
+			requestId: "generation-2",
+		});
+		expect(second.items.map((item) => item.id)).toEqual(["second"]);
+
+		const duplicateRequest = reduce(second, {
+			type: "pageRequestStarted",
+			requestId: "generation-2-duplicate",
+			requestCursor: null,
+			requestEpoch: 0,
+		});
+		const duplicate = reduce(duplicateRequest, {
+			type: "metadataSettled",
+			generation: 2,
+			assets: [wallAsset("stale", 3, 1)],
+			nextCursor: null,
+			requestEpoch: 0,
+			requestCursor: null,
+			requestId: "generation-2-duplicate",
+		});
+		expect(duplicate.items.map((item) => item.id)).toEqual(["second"]);
+
+		const staleRequest = reduce(second, {
+			type: "pageRequestStarted",
+			requestId: "generation-1-stale",
+			requestCursor: null,
+			requestEpoch: 0,
+		});
+		const stale = reduce(staleRequest, {
+			type: "metadataSettled",
+			generation: 1,
+			assets: [wallAsset("stale", 4, 1)],
+			nextCursor: null,
+			requestEpoch: 0,
+			requestCursor: null,
+			requestId: "generation-1-stale",
+		});
+		expect(stale.items.map((item) => item.id)).toEqual(["second"]);
+	});
+
+	it("stores and clears source and asset warnings", () => {
+		const source = reduce(initialWallState, {
+			type: "catalogBatch",
+			assets: [wallAsset("warned", 1, 1)],
+			orderState: "provisional",
+		});
+		const warned = reduce(source, {
+			type: "warning",
+			sourceId: "source",
+			assetId: "warned",
+			warning: { code: "derivativeUnavailable", retryable: true },
+		});
+		expect(warned.items[0]?.warning?.code).toBe("derivativeUnavailable");
+		expect(warned.assetWarnings.warned?.code).toBe("derivativeUnavailable");
+
+		const cleared = reduce(warned, {
+			type: "warningCleared",
+			sourceId: "source",
+			assetId: "warned",
+			code: "derivativeUnavailable",
+		});
+		expect(cleared.items[0]?.warning).toBeNull();
+		expect(cleared.assetWarnings.warned).toBeUndefined();
+		expect(cleared.warningTombstones).toEqual({});
+
+		const earlyWarning = reduce(initialWallState, {
+			type: "warning",
+			sourceId: "source",
+			assetId: "future",
+			warning: { code: "derivativeUnavailable", retryable: true },
+		});
+		const materialized = reduce(earlyWarning, {
+			type: "catalogBatch",
+			assets: [wallAsset("future", 1, 1)],
+			orderState: "provisional",
+		});
+		expect(materialized.items[0]?.warning?.code).toBe("derivativeUnavailable");
+	});
+
+	it("keeps source warning codes independent", () => {
+		const withThumbnailWarning = reduce(initialWallState, {
+			type: "warning",
+			sourceId: "source",
+			assetId: null,
+			warning: { code: "wallThumbnailUnavailable", retryable: true },
+		});
+		const withBothWarnings = reduce(withThumbnailWarning, {
+			type: "warning",
+			sourceId: "source",
+			assetId: null,
+			warning: { code: "screenPreviewUnavailable", retryable: false },
+		});
+		expect(Object.keys(withBothWarnings.sourceWarnings)).toEqual([
+			"wallThumbnailUnavailable",
+			"screenPreviewUnavailable",
+		]);
+
+		const withScreenWarning = reduce(withBothWarnings, {
+			type: "warningCleared",
+			sourceId: "source",
+			assetId: null,
+			code: "wallThumbnailUnavailable",
+		});
+		expect(withScreenWarning.sourceWarnings).toEqual({
+			screenPreviewUnavailable: {
+				code: "screenPreviewUnavailable",
+				retryable: false,
+			},
+		});
+		expect(withScreenWarning.sourceWarningTombstones).toEqual({});
+		const clear = reduce(withScreenWarning, {
+			type: "warningCleared",
+			sourceId: "source",
+			assetId: null,
+			code: "screenPreviewUnavailable",
+		});
+		expect(clear.sourceWarnings).toEqual({});
+	});
+
+	it("hydrates source warnings from a page snapshot without resurrecting a clear", () => {
+		const request = reduce(initialWallState, {
+			type: "pageRequestStarted",
+			requestId: "source-snapshot",
+			requestCursor: null,
+			requestEpoch: 0,
+		});
+		const snapshot = reduce(request, {
+			type: "pageLoaded",
+			assets: [],
+			sourceWarnings: [
+				{ code: "wallThumbnailCacheUnavailable", retryable: true },
+				{ code: "screenPreviewCacheUnavailable", retryable: true },
+			],
+			orderState: "settled",
+			nextCursor: null,
+			requestCursor: null,
+			requestEpoch: 0,
+			requestId: "source-snapshot",
+		});
+		expect(Object.keys(snapshot.sourceWarnings)).toEqual([
+			"wallThumbnailCacheUnavailable",
+			"screenPreviewCacheUnavailable",
+		]);
+
+		const refreshRequest = reduce(snapshot, {
+			type: "pageRequestStarted",
+			requestId: "stale-source-snapshot",
+			requestCursor: null,
+			requestEpoch: snapshot.scrollEpoch,
+		});
+		const cleared = reduce(refreshRequest, {
+			type: "warningCleared",
+			sourceId: "source",
+			assetId: null,
+			code: "wallThumbnailCacheUnavailable",
+		});
+		const staleSnapshot = reduce(cleared, {
+			type: "pageLoaded",
+			assets: [],
+			sourceWarnings: [
+				{ code: "wallThumbnailCacheUnavailable", retryable: true },
+				{ code: "screenPreviewCacheUnavailable", retryable: true },
+			],
+			orderState: "settled",
+			nextCursor: null,
+			requestCursor: null,
+			requestEpoch: snapshot.scrollEpoch,
+			requestId: "stale-source-snapshot",
+		});
+		expect(staleSnapshot.sourceWarnings).toEqual({
+			screenPreviewCacheUnavailable: {
+				code: "screenPreviewCacheUnavailable",
+				retryable: true,
+			},
+		});
+	});
+
+	it("does not resurrect an asset warning from a stale page after clear", () => {
+		const warned = reduce(
+			reduce(initialWallState, {
+				type: "catalogBatch",
+				assets: [wallAsset("race", 1)],
+				orderState: "provisional",
+			}),
+			{
+				type: "warning",
+				sourceId: "source",
+				assetId: "race",
+				warning: { code: "derivativeUnavailable", retryable: true },
+			},
+		);
+		const request = reduce(warned, {
+			type: "pageRequestStarted",
+			requestId: "stale-page",
+			requestCursor: null,
+			requestEpoch: warned.scrollEpoch,
+		});
+		const cleared = reduce(request, {
+			type: "warningCleared",
+			sourceId: "source",
+			assetId: "race",
+			code: "derivativeUnavailable",
+		});
+		const stalePage = reduce(cleared, {
+			type: "pageLoaded",
+			assets: [
+				{
+					...wallAsset("race", 1),
+					warning: { code: "derivativeUnavailable", retryable: true },
+				},
+			],
+			orderState: "provisional",
+			nextCursor: null,
+			requestCursor: null,
+			requestEpoch: warned.scrollEpoch,
+			requestId: "stale-page",
+		});
+		expect(stalePage.items[0]?.warning).toBeNull();
+		expect(stalePage.assetWarnings.race).toBeUndefined();
+		expect(
+			stalePage.warningTombstones["race\u0000derivativeUnavailable"],
+		).toBeUndefined();
+
+		const liveWarning = reduce(stalePage, {
+			type: "warning",
+			sourceId: "source",
+			assetId: "race",
+			warning: { code: "derivativeUnavailable", retryable: true },
+		});
+		expect(liveWarning.items[0]?.warning?.code).toBe("derivativeUnavailable");
+		expect(
+			liveWarning.warningTombstones["race\u0000derivativeUnavailable"],
+		).toBeUndefined();
+	});
+
+	it("fences asset warning clears by asset and warning code", () => {
+		const assetState = reduce(
+			reduce(initialWallState, {
+				type: "catalogBatch",
+				assets: [wallAsset("identity", 1)],
+				orderState: "provisional",
+			}),
+			{
+				type: "warning",
+				sourceId: "source",
+				assetId: "identity",
+				warning: { code: "derivativeUnavailable", retryable: true },
+			},
+		);
+		const request = reduce(assetState, {
+			type: "pageRequestStarted",
+			requestId: "identity-stale-page",
+			requestCursor: null,
+			requestEpoch: assetState.scrollEpoch,
+		});
+		const clearedDerivative = reduce(request, {
+			type: "warningCleared",
+			sourceId: "source",
+			assetId: "identity",
+			code: "derivativeUnavailable",
+		});
+		const unrelatedWarning = reduce(clearedDerivative, {
+			type: "warning",
+			sourceId: "source",
+			assetId: "identity",
+			warning: { code: "assetWarning", retryable: true },
+		});
+		const staleDerivative = reduce(unrelatedWarning, {
+			type: "pageLoaded",
+			assets: [
+				{
+					...wallAsset("identity", 1),
+					warning: { code: "derivativeUnavailable", retryable: true },
+				},
+			],
+			orderState: "provisional",
+			nextCursor: null,
+			requestCursor: null,
+			requestEpoch: assetState.scrollEpoch,
+			requestId: "identity-stale-page",
+		});
+		expect(staleDerivative.items[0]?.warning?.code).toBe("assetWarning");
+		expect(
+			staleDerivative.warningTombstones["identity\u0000derivativeUnavailable"],
+		).toBeUndefined();
+	});
+
+	it("bounds and consumes request-scoped warning tombstones", () => {
+		let state = reduce(initialWallState, {
+			type: "pageRequestStarted",
+			requestId: "bounded",
+			requestCursor: null,
+			requestEpoch: 0,
+		});
+		for (let index = 0; index < 1000; index += 1) {
+			state = reduce(state, {
+				type: "warningCleared",
+				sourceId: "source",
+				assetId: `asset-${index}`,
+				code: `warning-${index}`,
+			});
+			state = reduce(state, {
+				type: "warningCleared",
+				sourceId: "source",
+				assetId: null,
+				code: `source-warning-${index}`,
+			});
+		}
+		expect(Object.keys(state.warningTombstones).length).toBeLessThanOrEqual(
+			128,
+		);
+		expect(
+			Object.keys(state.sourceWarningTombstones).length,
+		).toBeLessThanOrEqual(128);
+
+		const settled = reduce(state, {
+			type: "pageLoaded",
+			assets: [],
+			orderState: "settled",
+			nextCursor: null,
+			requestCursor: null,
+			requestEpoch: 0,
+			requestId: "bounded",
+			sourceWarnings: [],
+		});
+		expect(settled.warningTombstones).toEqual({});
+		expect(settled.sourceWarningTombstones).toEqual({});
 	});
 
 	it("treats cloned nested warning and derivative records as a semantic no-op", () => {
