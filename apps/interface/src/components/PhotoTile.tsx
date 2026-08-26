@@ -1,5 +1,5 @@
 import { CircleAlert } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useLayoutEffect, useState } from "react";
 import type { PhotoService } from "../services/photoService";
 import styles from "../styles/photoWall.module.css";
 import type { PositionedWallAsset } from "../wall/layoutJustifiedRows";
@@ -33,7 +33,7 @@ export function PhotoTile({ positioned, service }: PhotoTileProps) {
 		}
 	}
 
-	useEffect(() => {
+	useLayoutEffect(() => {
 		setLoaded(false);
 		setPreviewFailed(false);
 		setFailed(

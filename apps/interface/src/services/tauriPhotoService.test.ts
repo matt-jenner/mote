@@ -228,13 +228,26 @@ describe("Tauri PhotoService", () => {
 		).toBe("photo-derivative://localhost/asset-a/wallThumbnail/abc");
 		channels[0]?.emit(sampleCatalogBatch);
 		channels[1]?.emit(sampleCatalogBatch);
-		expect(firstReceived).toEqual([sampleCatalogBatch]);
-		expect(secondReceived).toEqual([sampleCatalogBatch]);
+		expect(firstReceived).toEqual([
+			{ kind: "resyncRequired", selectionId: "" },
+			sampleCatalogBatch,
+		]);
+		expect(secondReceived).toEqual([
+			{ kind: "resyncRequired", selectionId: "" },
+			sampleCatalogBatch,
+		]);
 		stopFirst();
 		channels[0]?.emit(sampleProgressUpdate);
 		channels[1]?.emit(sampleProgressUpdate);
-		expect(firstReceived).toEqual([sampleCatalogBatch]);
-		expect(secondReceived).toEqual([sampleCatalogBatch, sampleProgressUpdate]);
+		expect(firstReceived).toEqual([
+			{ kind: "resyncRequired", selectionId: "" },
+			sampleCatalogBatch,
+		]);
+		expect(secondReceived).toEqual([
+			{ kind: "resyncRequired", selectionId: "" },
+			sampleCatalogBatch,
+			sampleProgressUpdate,
+		]);
 		stopSecond();
 	});
 
@@ -246,6 +259,23 @@ describe("Tauri PhotoService", () => {
 		const received: WallUpdate[] = [];
 		const service = createTauriPhotoService(
 			invoke,
+			(listener) => new FakeChannel(listener),
+		);
+
+		const stop = service.watchWallUpdates((update) => received.push(update));
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+		expect(received).toEqual([{ kind: "resyncRequired", selectionId: "" }]);
+		stop();
+	});
+
+	it("resyncs exactly once after the first successful wall-update registration", async () => {
+		const received: WallUpdate[] = [];
+		const service = createTauriPhotoService(
+			async <T>(command: string) =>
+				(command === "watch_wall_updates"
+					? "initial-subscription"
+					: undefined) as T,
 			(listener) => new FakeChannel(listener),
 		);
 

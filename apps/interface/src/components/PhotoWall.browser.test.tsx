@@ -488,6 +488,56 @@ describe("progressive photo wall", () => {
 			expect(request.assetIds.length).toBeLessThanOrEqual(50);
 	});
 
+	it("defers the provisional remainder until settlement and promotes settled viewport first", async () => {
+		await page.viewport(1440, 520);
+		const idleCallbacks: Array<() => void> = [];
+		Object.defineProperty(window, "requestIdleCallback", {
+			configurable: true,
+			value: (callback: () => void) => {
+				idleCallbacks.push(callback);
+				return idleCallbacks.length;
+			},
+		});
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		const provisional = Array.from({ length: 60 }, (_, index) =>
+			asset(`provisional-${index}`, `Provisional ${index}`, index + 1),
+		);
+		service.releaseQuery(0, pageOf(provisional, "provisional"));
+		await expect
+			.poll(() => service.derivativeRequests.length)
+			.toBeGreaterThan(0);
+		expect(
+			service.derivativeRequests.map((request) => request.priority),
+		).toEqual(["visible", "nearViewport"]);
+		expect(idleCallbacks).toHaveLength(0);
+
+		service.emit({
+			kind: "metadataSettled",
+			selectionId: "source-a",
+			sourceId: "source-a",
+			generation: 1,
+		});
+		await expect.poll(() => service.queryRequests.length).toBe(2);
+		service.releaseQuery(1, pageOf([...provisional].reverse(), "settled"));
+		const settledStart = service.derivativeRequests.length;
+		await expect
+			.poll(() => service.derivativeRequests.length)
+			.toBeGreaterThan(settledStart);
+		expect(service.derivativeRequests[settledStart]?.priority).toBe("visible");
+		const settledIdle = idleCallbacks.splice(0);
+		expect(settledIdle.length).toBeGreaterThan(0);
+		for (const callback of settledIdle) callback();
+		await expect
+			.poll(() => service.derivativeRequests.length)
+			.toBeGreaterThan(settledStart + 1);
+		expect(service.derivativeRequests[settledStart + 1]?.priority).toBe(
+			"nearViewport",
+		);
+		screen.unmount();
+	});
+
 	it("does not submit an idle request for a thumbnail that became ready before the flush", async () => {
 		await page.viewport(1440, 520);
 		const idleCallbacks: Array<() => void> = [];
@@ -720,6 +770,41 @@ describe("progressive photo wall", () => {
 			.element(screen.getByRole("img").first())
 			.toHaveAttribute("alt", "Interior");
 		expect(wall.element().scrollTop).toBe(0);
+	});
+
+	it("keeps fixture thumbnails visible after responsive row regrouping", async () => {
+		await page.viewport(1440, 900);
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(0, pageOf(settledFixtures, "settled"));
+		const wall = screen.getByRole("region", { name: "Photos" });
+		await expect
+			.poll(() => wall.element().querySelectorAll("img").length)
+			.toBe(realFixtureAssets.length);
+		await expect
+			.element(screen.getByRole("img", { name: "Coast" }))
+			.toBeVisible();
+		const beforeRows = wall
+			.element()
+			.querySelectorAll("[data-testid^='photo-row-']").length;
+
+		await page.viewport(320, 900);
+		window.dispatchEvent(new Event("resize"));
+		await expect
+			.poll(
+				() =>
+					wall.element().querySelectorAll("[data-testid^='photo-row-']").length,
+			)
+			.not.toBe(beforeRows);
+		await expect
+			.poll(() =>
+				[...wall.element().querySelectorAll<HTMLImageElement>("img")].every(
+					(image) => getComputedStyle(image).opacity === "1",
+				),
+			)
+			.toBe(true);
+		screen.unmount();
 	});
 
 	it("shows contact-preview and larger-preview progress stages", async () => {

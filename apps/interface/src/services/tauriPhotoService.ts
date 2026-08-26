@@ -79,6 +79,7 @@ export function createTauriPhotoService(
 			let active = true;
 			let attempts = 0;
 			let hadRegistrationFailure = false;
+			let deliveredInitialResync = false;
 			let registrationInFlight = false;
 			let subscriptionId: WallSubscriptionId | null = null;
 			let retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -125,7 +126,8 @@ export function createTauriPhotoService(
 							return;
 						}
 						subscriptionId = id;
-						if (hadRegistrationFailure) {
+						if (!deliveredInitialResync || hadRegistrationFailure) {
+							deliveredInitialResync = true;
 							deliver({ kind: "resyncRequired", selectionId: "" });
 							if (!active) return;
 						}

@@ -5,7 +5,11 @@ import {
 	useRef,
 	useState,
 } from "react";
-import type { PhotoService, WallAsset } from "../services/photoService";
+import type {
+	OrderState,
+	PhotoService,
+	WallAsset,
+} from "../services/photoService";
 import styles from "../styles/photoWall.module.css";
 import type { JustifiedRow } from "../wall/layoutJustifiedRows";
 import { PhotoTile } from "./PhotoTile";
@@ -17,6 +21,7 @@ interface JustifiedWallProps {
 	loadMore: () => void;
 	requestVisibleDerivatives: (assetIds: readonly string[]) => void;
 	requestNearViewportDerivatives: (assetIds: readonly string[]) => void;
+	orderState: OrderState;
 	setWallInteraction: (active: boolean) => void;
 	showEmpty: boolean;
 	scrollEpoch: number;
@@ -31,6 +36,7 @@ export function JustifiedWall({
 	loadMore,
 	requestVisibleDerivatives,
 	requestNearViewportDerivatives,
+	orderState,
 	setWallInteraction,
 	showEmpty,
 	scrollEpoch,
@@ -132,7 +138,7 @@ export function JustifiedWall({
 			if (requestIdle) idleHandle = requestIdle(run);
 			else timerHandle = window.setTimeout(run, 0);
 		};
-		scheduleRemaining();
+		if (orderState === "settled") scheduleRemaining();
 		return () => {
 			if (idleHandle !== null) {
 				const cancelIdle = (
@@ -147,6 +153,7 @@ export function JustifiedWall({
 	}, [
 		requestNearViewportDerivatives,
 		requestVisibleDerivatives,
+		orderState,
 		root,
 		rows,
 		scrollEpoch,

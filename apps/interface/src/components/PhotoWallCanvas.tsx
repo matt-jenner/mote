@@ -74,6 +74,7 @@ export function PhotoWallCanvas({
 				regionRef={regionRef}
 				requestNearViewportDerivatives={wall.requestNearViewportDerivatives}
 				requestVisibleDerivatives={wall.requestVisibleDerivatives}
+				orderState={wall.state.orderState}
 				rows={rows}
 				service={service}
 				setWallInteraction={wall.setWallInteraction}
