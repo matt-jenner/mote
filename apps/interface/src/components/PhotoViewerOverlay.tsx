@@ -1,4 +1,4 @@
-import { ChevronLeft } from "lucide-react";
+import { ChevronLeft, ChevronRight } from "lucide-react";
 import {
 	type KeyboardEvent as ReactKeyboardEvent,
 	useEffect,
@@ -6,9 +6,10 @@ import {
 } from "react";
 import type { PhotoService, WallAsset } from "../services/photoService";
 import styles from "../styles/photoViewer.module.css";
-import { findViewerIndex } from "../viewer/photoSequence";
+import { findViewerIndex, shouldLoadViewerPage } from "../viewer/photoSequence";
 import { useViewerPreview } from "../viewer/useViewerPreview";
 import type { ViewerState } from "../viewer/viewerReducer";
+import { ViewerFilmstrip } from "./ViewerFilmstrip";
 import { ViewerStage } from "./ViewerStage";
 
 interface PhotoViewerOverlayProps {
@@ -16,6 +17,11 @@ interface PhotoViewerOverlayProps {
 	assets: readonly WallAsset[];
 	service: PhotoService;
 	onClose: () => void;
+	onSelectAsset: (assetId: string) => void;
+	loading: boolean;
+	nextCursor: string | null;
+	onLoadMore: () => void;
+	onRequestNearViewportDerivatives: (assetIds: readonly string[]) => void;
 }
 
 export function PhotoViewerOverlay({
@@ -23,6 +29,11 @@ export function PhotoViewerOverlay({
 	assets,
 	service,
 	onClose,
+	onSelectAsset,
+	loading,
+	nextCursor,
+	onLoadMore,
+	onRequestNearViewportDerivatives,
 }: PhotoViewerOverlayProps) {
 	const backRef = useRef<HTMLButtonElement>(null);
 	const dialogRef = useRef<HTMLElement>(null);
@@ -40,13 +51,50 @@ export function PhotoViewerOverlay({
 			if (event.key === "Escape") {
 				event.preventDefault();
 				onClose();
+			} else if (
+				event.key === "Tab" &&
+				!dialogRef.current?.contains(document.activeElement)
+			) {
+				event.preventDefault();
+				backRef.current?.focus();
 			}
 		};
-		window.addEventListener("keydown", onKeyDown);
-		return () => window.removeEventListener("keydown", onKeyDown);
+		window.addEventListener("keydown", onKeyDown, true);
+		return () => window.removeEventListener("keydown", onKeyDown, true);
 	}, [onClose]);
 
+	useEffect(() => {
+		if (
+			shouldLoadViewerPage(
+				currentIndex,
+				assets.length,
+				Boolean(nextCursor),
+				loading,
+			)
+		)
+			onLoadMore();
+	}, [assets.length, currentIndex, loading, nextCursor, onLoadMore]);
+
 	if (!asset) return null;
+	const handleKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+		const target = event.target as HTMLElement;
+		const isEditable =
+			target.isContentEditable ||
+			Boolean(
+				target.closest("input, textarea, select, [contenteditable='true']"),
+			);
+		if (
+			!isEditable &&
+			(event.key === "ArrowLeft" || event.key === "ArrowRight")
+		) {
+			event.preventDefault();
+			const nextIndex = currentIndex + (event.key === "ArrowRight" ? 1 : -1);
+			const nextAsset = assets[nextIndex];
+			if (nextAsset) onSelectAsset(nextAsset.id);
+			return;
+		}
+		trapFocus(event);
+	};
 	const trapFocus = (event: ReactKeyboardEvent<HTMLElement>) => {
 		if (event.key !== "Tab") return;
 		const focusable = [
@@ -71,7 +119,7 @@ export function PhotoViewerOverlay({
 			aria-label="Photo viewer"
 			aria-modal="true"
 			className={styles.viewerOverlay}
-			onKeyDown={trapFocus}
+			onKeyDownCapture={handleKeyDown}
 			ref={dialogRef}
 			role="dialog"
 		>
@@ -80,6 +128,12 @@ export function PhotoViewerOverlay({
 					aria-label="Back to photos"
 					className={styles.viewerBack}
 					onClick={onClose}
+					onBlur={() => {
+						queueMicrotask(() => {
+							if (!dialogRef.current?.contains(document.activeElement))
+								backRef.current?.focus();
+						});
+					}}
 					ref={backRef}
 					type="button"
 				>
@@ -92,6 +146,41 @@ export function PhotoViewerOverlay({
 				currentUrl={preview.currentUrl}
 				largePreviewUnavailable={preview.largePreviewUnavailable}
 				previewGeneration={state.previewGeneration}
+				service={service}
+			/>
+			<div className={styles.viewerControls}>
+				<button
+					aria-label="Previous photo"
+					className={styles.viewerNavigate}
+					disabled={currentIndex <= 0}
+					onClick={() => {
+						const previous = assets[currentIndex - 1];
+						if (previous) onSelectAsset(previous.id);
+					}}
+					tabIndex={-1}
+					type="button"
+				>
+					<ChevronLeft aria-hidden="true" size={24} strokeWidth={1.7} />
+				</button>
+				<button
+					aria-label="Next photo"
+					className={styles.viewerNavigate}
+					disabled={currentIndex < 0 || currentIndex >= assets.length - 1}
+					onClick={() => {
+						const next = assets[currentIndex + 1];
+						if (next) onSelectAsset(next.id);
+					}}
+					tabIndex={-1}
+					type="button"
+				>
+					<ChevronRight aria-hidden="true" size={24} strokeWidth={1.7} />
+				</button>
+			</div>
+			<ViewerFilmstrip
+				assets={assets}
+				currentIndex={currentIndex}
+				onRequestNearViewportDerivatives={onRequestNearViewportDerivatives}
+				onSelectAsset={onSelectAsset}
 				service={service}
 			/>
 		</section>

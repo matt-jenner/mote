@@ -65,6 +65,13 @@ export function AppShell() {
 		closingAnchorRef.current = viewer.returnAnchor;
 		dispatchViewer({ type: "close" });
 	}, [viewer.returnAnchor]);
+	const handleSelectViewerAsset = useCallback(
+		(assetId: string) => {
+			if (!wall.state.items.some((item) => item.id === assetId)) return;
+			dispatchViewer({ type: "select", assetId });
+		},
+		[wall.state.items],
+	);
 
 	useLayoutEffect(() => {
 		if (viewer.open) {
@@ -222,6 +229,11 @@ export function AppShell() {
 					onClose={handleCloseViewer}
 					service={service}
 					state={viewer}
+					onLoadMore={wall.loadMore}
+					onRequestNearViewportDerivatives={wall.requestNearViewportDerivatives}
+					onSelectAsset={handleSelectViewerAsset}
+					loading={wall.loading}
+					nextCursor={wall.state.cursor}
 				/>
 			) : null}
 			{drawerOpen ? (

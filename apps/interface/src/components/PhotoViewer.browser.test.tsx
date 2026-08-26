@@ -45,6 +45,7 @@ function asset(id: string, displayName: string, order: number): WallAsset {
 
 function serviceWithReadyPhotos(
 	brokenScreenPreview = false,
+	photoCount = 60,
 ): InMemoryPhotoService {
 	const assets = [
 		{
@@ -57,7 +58,7 @@ function serviceWithReadyPhotos(
 					}
 				: null,
 		},
-		...Array.from({ length: 60 }, (_, index) =>
+		...Array.from({ length: photoCount }, (_, index) =>
 			asset(`photo-${index}`, `Photo ${index}`, index + 2),
 		),
 	];
@@ -70,6 +71,20 @@ function serviceWithReadyPhotos(
 				item.id === "coast" ? "/demo-photos/missing.jpg" : undefined,
 		})),
 	});
+}
+
+async function openManyAsset(name: string) {
+	const service = serviceWithReadyPhotos(false, 120);
+	const view = await renderViewerWall(service);
+	await view.getByRole("button", { name: "Choose Folder" }).click();
+	await service.finishFixtureScan();
+	const tile = view.getByRole("button", { name: `Open ${name}`, exact: true });
+	await expect.element(tile).toBeVisible();
+	(tile.element() as HTMLButtonElement).click();
+	await expect
+		.element(view.getByRole("dialog", { name: "Photo viewer" }))
+		.toBeVisible();
+	return { service, view };
 }
 
 function renderViewerWall(service: InMemoryPhotoService) {
@@ -412,5 +427,30 @@ describe("immersive photo viewer checkpoint", () => {
 		await expect
 			.poll(() => (workspace.element() as HTMLElement).inert)
 			.toBe(false);
+	});
+
+	it("navigates in wall order without wrapping and bounds the filmstrip", async () => {
+		const { view } = await openManyAsset("Coast");
+		await userEvent.keyboard("{ArrowRight}");
+		await expect
+			.element(view.getByTestId("viewer-stage"))
+			.toHaveAttribute("data-current-asset", "photo-0");
+		await userEvent.keyboard("{ArrowLeft}");
+		await expect
+			.element(view.getByTestId("viewer-stage"))
+			.toHaveAttribute("data-current-asset", "coast");
+		await expect
+			.element(view.getByRole("button", { name: "Previous photo" }))
+			.toBeDisabled();
+		const filmstrip = view.getByRole("group", { name: "Photo filmstrip" });
+		expect(
+			filmstrip.element().querySelectorAll("button").length,
+		).toBeLessThanOrEqual(31);
+		expect(
+			filmstrip
+				.element()
+				.querySelector("button[aria-current='true']")
+				?.getAttribute("aria-label"),
+		).toBe("Coast");
 	});
 });
