@@ -1,5 +1,9 @@
 import { useLayoutEffect, useRef, useState } from "react";
-import type { PhotoService, WallAsset } from "../services/photoService";
+import type {
+	DerivativeReference,
+	PhotoService,
+	WallAsset,
+} from "../services/photoService";
 import styles from "../styles/photoViewer.module.css";
 
 interface ViewerStageProps {
@@ -36,24 +40,32 @@ export function fitViewerFrame(
 }
 
 function derivativeUrl(service: PhotoService, asset: WallAsset) {
-	for (const [reference, layer] of [
+	const references: Array<
+		[DerivativeReference | null, "screenPreview" | "wallThumbnail"]
+	> = [
 		[asset.screenPreview, "screenPreview"],
 		[asset.wallThumbnail, "wallThumbnail"],
-	] as const) {
-		if (!reference) continue;
+	];
+	return references.flatMap(([reference, layer]) => {
+		if (!reference) return [];
 		try {
-			return { layer, url: service.derivativeUrl(reference) };
+			return [{ layer, url: service.derivativeUrl(reference) }];
 		} catch {
-			// A stale derivative reference should reveal the next available layer.
+			return [];
 		}
-	}
-	return null;
+	});
 }
 
 export function ViewerStage({ asset, service }: ViewerStageProps) {
 	const stageRef = useRef<HTMLDivElement>(null);
 	const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
-	const selected = derivativeUrl(service, asset);
+	const candidates = derivativeUrl(service, asset);
+	const [candidateIndex, setCandidateIndex] = useState(0);
+	const candidateKey = `${asset.id}:${asset.screenPreview?.key ?? ""}:${asset.wallThumbnail?.key ?? ""}`;
+	useLayoutEffect(() => {
+		if (candidateKey) setCandidateIndex(0);
+	}, [candidateKey]);
+	const selected = candidates[candidateIndex];
 
 	useLayoutEffect(() => {
 		const stage = stageRef.current;
@@ -95,6 +107,7 @@ export function ViewerStage({ asset, service }: ViewerStageProps) {
 						data-viewer-layer={selected.layer}
 						decoding="async"
 						draggable={false}
+						onError={() => setCandidateIndex((index) => index + 1)}
 						src={selected.url}
 					/>
 				) : (

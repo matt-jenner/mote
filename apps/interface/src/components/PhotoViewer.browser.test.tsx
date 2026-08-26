@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { page } from "vitest/browser";
+import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { PhotoServiceProvider } from "../app/PhotoServiceContext";
 import {
@@ -36,9 +36,20 @@ function asset(id: string, displayName: string, order: number): WallAsset {
 	};
 }
 
-function serviceWithReadyPhotos(): InMemoryPhotoService {
+function serviceWithReadyPhotos(
+	brokenScreenPreview = false,
+): InMemoryPhotoService {
 	const assets = [
-		asset("coast", "Coast", 1),
+		{
+			...asset("coast", "Coast", 1),
+			screenPreview: brokenScreenPreview
+				? {
+						assetId: "coast",
+						kind: "screenPreview" as const,
+						key: "coast-screen",
+					}
+				: null,
+		},
 		...Array.from({ length: 60 }, (_, index) =>
 			asset(`photo-${index}`, `Photo ${index}`, index + 2),
 		),
@@ -47,7 +58,9 @@ function serviceWithReadyPhotos(): InMemoryPhotoService {
 		selectedFolderName: "Iceland 2025",
 		wallAssets: assets.map((item) => ({
 			...item,
-			wallThumbnailUrl: `/demo-photos/${item.id}-wall.jpg`,
+			wallThumbnailUrl: `/demo-photos/${item.id}.jpg`,
+			screenPreviewUrl:
+				item.id === "coast" ? "/demo-photos/missing.jpg" : undefined,
 		})),
 	});
 }
@@ -65,11 +78,24 @@ function renderViewerWall(service: InMemoryPhotoService) {
 	);
 }
 
-async function openAsset(name: string) {
-	const service = serviceWithReadyPhotos();
+async function openAsset(name: string, brokenScreenPreview = false) {
+	const service = serviceWithReadyPhotos(brokenScreenPreview);
 	const view = await renderViewerWall(service);
 	await view.getByRole("button", { name: "Choose Folder" }).click();
 	await service.finishFixtureScan();
+	if (brokenScreenPreview) {
+		service.emitForTest({
+			kind: "derivativesReady",
+			selectionId: "memory-selection-1",
+			derivatives: [
+				{
+					assetId: "coast",
+					kind: "screenPreview",
+					key: "coast-screen",
+				},
+			],
+		});
+	}
 	const tile = view.getByRole("button", { name: `Open ${name}` });
 	await expect.element(tile).toBeVisible();
 	return { service, view, tile };
@@ -110,6 +136,63 @@ describe("immersive photo viewer checkpoint", () => {
 		const image = document.querySelector<HTMLImageElement>(
 			"[data-viewer-layer='wallThumbnail']",
 		);
-		expect(image?.src).toContain("coast-wall");
+		expect(image?.src).toContain("/demo-photos/coast.jpg");
+		await expect
+			.poll(() => (image?.complete ? image.naturalWidth : 0))
+			.toBeGreaterThan(0);
+	});
+
+	it("advances from a broken screen preview to a decoding wall thumbnail", async () => {
+		const { view, tile } = await openAsset("Coast", true);
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		await expect
+			.poll(
+				() =>
+					document.querySelector<HTMLImageElement>(
+						"[data-viewer-layer='wallThumbnail']",
+					)?.src ?? "",
+			)
+			.toContain("/demo-photos/coast.jpg");
+		const image = document.querySelector<HTMLImageElement>(
+			"[data-viewer-layer='wallThumbnail']",
+		);
+		await expect
+			.poll(() => (image?.complete ? image.naturalWidth : 0))
+			.toBeGreaterThan(0);
+	});
+
+	it("keeps keyboard focus inside the viewer instead of covered source controls", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		const back = view.getByRole("button", { name: "Back to photos" });
+		await expect.element(back).toBeVisible();
+		const folders = view.getByRole("button", { name: "Folders" });
+		await userEvent.keyboard("{Tab}");
+		expect(document.activeElement).toBe(back.element());
+		expect(document.activeElement).not.toBe(folders.element());
+		await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
+		expect(document.activeElement).toBe(back.element());
+	});
+
+	it("closes when the current asset disappears during an open viewer", async () => {
+		const { service, view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		service.emitForTest({
+			kind: "resyncRequired",
+			selectionId: "memory-selection-1",
+		});
+		await expect
+			.poll(() => view.getByRole("dialog", { name: "Photo viewer" }).query())
+			.toBeNull();
+		const workspace = view.getByRole("region", { name: "Photo workspace" });
+		await expect
+			.poll(() => (workspace.element() as HTMLElement).inert)
+			.toBe(false);
 	});
 });

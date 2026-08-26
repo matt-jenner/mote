@@ -87,6 +87,22 @@ export function AppShell() {
 	}, [viewer.open, viewer.returnAnchor]);
 
 	useEffect(() => {
+		if (
+			!viewer.open ||
+			!viewer.currentAssetId ||
+			wall.state.items.some((item) => item.id === viewer.currentAssetId)
+		)
+			return;
+		closingAnchorRef.current = viewer.returnAnchor;
+		dispatchViewer({ type: "close" });
+	}, [
+		viewer.currentAssetId,
+		viewer.open,
+		viewer.returnAnchor,
+		wall.state.items,
+	]);
+
+	useEffect(() => {
 		if (drawerOpen) {
 			drawerWasOpen.current = true;
 			drawerCloseRef.current?.focus();
@@ -140,7 +156,7 @@ export function AppShell() {
 			<NavigationRail
 				chooseFolderAvailable={controller.capabilities.chooseFolder}
 				className={styles.permanentRail}
-				inert={drawerOpen}
+				inert={drawerOpen || viewer.open}
 				onChooseFolder={chooseFolder}
 			/>
 			<section

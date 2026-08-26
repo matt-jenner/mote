@@ -70,3 +70,52 @@ No long-running native GUI process was started in this subtask. The automated We
 
 - Native macOS smoke remains outstanding for the coordinator, per the task brief.
 - Viewer navigation beyond the open/close checkpoint (filmstrip, next/previous, metadata controls) is intentionally deferred to later tasks.
+
+## Fix round 1
+
+### RED evidence
+
+Added three focused WebKit regressions before changing production code:
+
+- A broken screen-preview URL must advance to the real wall-thumbnail candidate and decode it.
+- Tab and Shift+Tab must remain inside the viewer and never reach the permanent Folders/source controls.
+- Removing the current asset during a resync must close the viewer instead of leaving an inert workspace behind.
+
+The focused command initially failed with 3 expected failures:
+
+```text
+Test Files  1 failed (1)
+Tests       5 tests | 3 failed
+```
+
+The failures were the missing wall-candidate transition (`expected '' to contain '/demo-photos/coast.jpg'`), focus escaping to `<body>` after Tab, and the still-mounted dialog after `resyncRequired`.
+
+### GREEN evidence
+
+After implementing ordered image candidates with `onError` advancement, permanent-rail inerting plus viewer Tab trapping, and current-asset disappearance closure, the focused command passed:
+
+```text
+Test Files  1 passed (1)
+Tests       5 passed (5)
+```
+
+The final required verification set passed:
+
+```text
+npm run test:browser --workspace @photo-viewer/interface  # Test Files 3 passed, Tests 54 passed
+npm test                                                   # Test Files 6 passed, Tests 78 passed
+npm run typecheck                                          # exit 0
+npm run check                                              # Checked 44 files; no fixes applied
+git diff --check                                           # exit 0
+```
+
+The first-frame and fallback tests use checked-in `/demo-photos/coast.jpg` and assert `naturalWidth > 0`, so they fail if the broken screen candidate does not advance to a loaded wall candidate.
+
+### Fix files and self-review
+
+- `apps/interface/src/components/ViewerStage.tsx`: maintains the fixed fitted frame while advancing screen preview → wall thumbnail → representative colour/neutral fallback on image load errors.
+- `apps/interface/src/components/PhotoViewerOverlay.tsx`: traps Tab and Shift+Tab within viewer controls.
+- `apps/interface/src/components/AppShell.tsx`: makes the permanent rail inert during viewing and closes/restores when the current asset disappears.
+- `apps/interface/src/components/PhotoViewer.browser.test.tsx`: adds the three regressions and real-image decode assertions.
+
+Generated Vitest attachments/screenshots were removed and are not tracked. No native GUI process was started; the coordinator still owns the bounded native smoke pass.
