@@ -620,6 +620,57 @@ describe("progressive photo wall", () => {
 			.toHaveAttribute("alt", "Interior");
 	});
 
+	it("retains thumbnail references through a deferred settlement after sort", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(0, pageOf(settledFixtures, "settled"));
+		await expect
+			.poll(
+				() =>
+					screen
+						.getByRole("region", { name: "Photos" })
+						.element()
+						.querySelectorAll("img").length,
+			)
+			.toBe(6);
+		await screen.getByRole("button", { name: "Newest first" }).click();
+		await expect.poll(() => service.queryRequests.length).toBe(2);
+		service.emit({
+			kind: "metadataSettled",
+			selectionId: "source-a",
+			sourceId: "source-a",
+			generation: 2,
+		});
+		service.releaseQuery(1, pageOf([...settledFixtures].reverse(), "settled"));
+		await expect.poll(() => service.queryRequests.length).toBe(3);
+		const wall = screen.getByRole("region", { name: "Photos" });
+		expect(wall.element().querySelectorAll("img").length).toBe(6);
+		await expect
+			.element(screen.getByRole("img").first())
+			.toHaveAttribute("alt", "Interior");
+		service.releaseQuery(
+			2,
+			pageOf(
+				[...settledFixtures].reverse().map((item) => ({
+					...item,
+					wallThumbnail: null,
+					screenPreview: null,
+				})),
+				"settled",
+			),
+		);
+		await expect
+			.poll(() => wall.element().querySelectorAll("img").length)
+			.toBe(6);
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("Photos ready · preparing larger previews · 0 of 6");
+		await expect
+			.element(screen.getByRole("img").first())
+			.toHaveAttribute("alt", "Interior");
+	});
+
 	it("settles provisional newest-first data with the current direction and epoch", async () => {
 		const service = new ControlledWallService();
 		const screen = await renderWall(service);

@@ -654,9 +654,10 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				requestToken(state.activeRequest),
 				true,
 			);
-			const replacementPage = state.sortPending
-				? mergeDerivativeReferences(state.items, remembered.assets)
-				: remembered.assets;
+			const replacementPage = mergeDerivativeReferences(
+				state.items,
+				remembered.assets,
+			);
 			const merged = mergeAssets([], replacementPage);
 			return {
 				...state,
