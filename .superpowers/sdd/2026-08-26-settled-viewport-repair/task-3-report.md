@@ -23,9 +23,10 @@ The extra start was a normal post-release read completing before the assertion, 
 ## Implementation
 
 - Added a small local `PermitMetadataReader` with a per-read permit count and start notifications.
-- The test starts the scan with two workers, switches the shared scheduler to active mode, and observes exactly one start with no second notification.
-- It switches the same running scan to idle mode, releases the first read, and observes exactly two newly admitted starts.
-- It cancels and releases the remaining blocked reads before joining, then asserts the observed active and idle counts (`1` and `3`).
+- The test starts the scan with two idle workers and waits until both per-read permits are blocked before switching the shared scheduler to active mode.
+- It releases those two reads, observes exactly one new active admission, then yields once to let the second worker reach the active admission check before recording the count.
+- It switches the same running scan to idle mode, releases the first new read, and observes exactly two newly admitted starts.
+- It cancels and opens the permit gate before joining, then asserts the observed active and idle counts (`3` and `5`).
 - No production code, scheduler logic, source media, or catalog data changed.
 
 ## Mutation check
@@ -48,8 +49,24 @@ The mutation was restored before verification and commit.
 
 ## Commit
 
-`df43448` (`test(indexer): gate admission mode transitions`).
+`b8afd1e` (`test(indexer): make admission transition cleanup safe`).
 
 ## Concerns
 
 No known concerns. The native app was not launched; no source media or user catalog data was touched.
+
+## Fix-round 1 evidence
+
+The active-start race is removed by waiting for both initial idle reads to announce entry before changing to Active. The `PermitRelease` guard is drop-safe: it opens the gate to `usize::MAX` for all current and future reads, and the test explicitly opens it after cancellation so assertion failures or mutation failures cannot strand `spawn_blocking` readers.
+
+With `admit_enrichment` temporarily mutated to use `max(2)` (ignoring the Active limit), the test exited promptly with the expected count failure:
+
+```text
+assertion `left == right` failed
+left: 4
+right: 3
+```
+
+The mutation was restored before the final verification.
+
+Final fix-round verification: 20 consecutive focused runs passed; the complete `photo-indexer` suite passed 30 tests; fmt, Clippy with warnings denied, and `git diff --check` all passed.
