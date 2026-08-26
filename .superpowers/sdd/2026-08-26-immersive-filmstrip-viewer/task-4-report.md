@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented and committed as `c432ec6` (`feat: refine viewer photos from preview cache`).
+Implemented and committed as `cef2e7d` (`feat: refine viewer photos from preview cache`).
 
 ## TDD evidence
 
