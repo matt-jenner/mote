@@ -972,6 +972,86 @@ describe("progressive photo wall", () => {
 		screen.unmount();
 	});
 
+	it("reveals a cached image when its load event does not reach React", async () => {
+		const service = new ControlledWallService();
+		service.setDerivativeUrl(
+			"cached-completion",
+			"/demo-photos/coast.jpg?cached-completion=1",
+		);
+		const positioned = {
+			asset: asset("coast", "Coast", 1, {
+				wallThumbnail: {
+					assetId: "coast",
+					kind: "wallThumbnail" as const,
+					key: "cached-completion",
+				},
+			}),
+			left: 0,
+			width: 320,
+			height: 220,
+		};
+		const warmImage = new Image();
+		warmImage.src = "/demo-photos/coast.jpg?cached-completion=1";
+		await expect
+			.poll(() => warmImage.complete && warmImage.naturalWidth > 0)
+			.toBe(true);
+		const suppressImageLoad = (event: Event) => {
+			event.stopImmediatePropagation();
+		};
+		window.addEventListener("load", suppressImageLoad, true);
+		document.addEventListener("load", suppressImageLoad, true);
+		try {
+			const screen = await render(
+				<PhotoTile positioned={positioned} service={service} />,
+			);
+			const image = screen.getByRole("img", { name: "Coast" });
+			await expect
+				.poll(() => {
+					const element = image.element() as HTMLImageElement;
+					return element.complete && element.naturalWidth > 0;
+				})
+				.toBe(true);
+			expect(image.element().getAttribute("src")).toBe(
+				"/demo-photos/coast.jpg?cached-completion=1",
+			);
+			await expect
+				.poll(() => getComputedStyle(image.element()).opacity)
+				.toBe("1");
+			screen.unmount();
+		} finally {
+			window.removeEventListener("load", suppressImageLoad, true);
+			document.removeEventListener("load", suppressImageLoad, true);
+		}
+	});
+
+	it("keeps a zero-width completed image on the preview failure path", async () => {
+		const service = new ControlledWallService();
+		service.setDerivativeUrl(
+			"zero-width",
+			"/demo-photos/missing-zero-width.jpg?zero-width=1",
+		);
+		const positioned = {
+			asset: asset("coast", "Coast", 1, {
+				wallThumbnail: {
+					assetId: "coast",
+					kind: "wallThumbnail" as const,
+					key: "zero-width",
+				},
+			}),
+			left: 0,
+			width: 320,
+			height: 220,
+		};
+		const screen = await render(
+			<PhotoTile positioned={positioned} service={service} />,
+		);
+		await expect
+			.element(screen.getByRole("img", { name: "Photo preview unavailable" }))
+			.toBeVisible();
+		expect(screen.getByRole("img", { name: "Coast" }).query()).toBeNull();
+		screen.unmount();
+	});
+
 	it("resets a replacement thumbnail until its own load event", async () => {
 		const service = new ControlledWallService();
 		service.setDerivativeUrl("swap-old", "/demo-photos/coast.jpg");

@@ -1,5 +1,5 @@
 import { CircleAlert } from "lucide-react";
-import { useLayoutEffect, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import type { PhotoService } from "../services/photoService";
 import styles from "../styles/photoWall.module.css";
 import type { PositionedWallAsset } from "../wall/layoutJustifiedRows";
@@ -22,6 +22,7 @@ export function PhotoTile({ positioned, service }: PhotoTileProps) {
 	const [loaded, setLoaded] = useState(false);
 	const [failed, setFailed] = useState(false);
 	const [previewFailed, setPreviewFailed] = useState(false);
+	const imageRef = useRef<HTMLImageElement | null>(null);
 	const thumbnail = asset.wallThumbnail;
 	const shapeState = asset.shapeState;
 	let url: string | null = null;
@@ -39,6 +40,27 @@ export function PhotoTile({ positioned, service }: PhotoTileProps) {
 		setFailed(
 			(shapeState === "fallback" || asset.availability !== "available") && !url,
 		);
+		let cancelled = false;
+		const markCachedImageLoaded = () => {
+			if (cancelled) return;
+			const image = imageRef.current;
+			if (
+				url &&
+				image &&
+				(image.getAttribute("src") === url ||
+					image.src === new URL(url, image.baseURI).href) &&
+				image.complete &&
+				image.naturalWidth > 0
+			) {
+				setLoaded(true);
+			}
+		};
+		markCachedImageLoaded();
+		const frame = window.requestAnimationFrame(markCachedImageLoaded);
+		return () => {
+			cancelled = true;
+			window.cancelAnimationFrame(frame);
+		};
 	}, [asset.availability, shapeState, url]);
 
 	const style = {
@@ -66,8 +88,18 @@ export function PhotoTile({ positioned, service }: PhotoTileProps) {
 							className={`${styles.imageLayer} ${loaded ? styles.imageLoaded : ""}`}
 							decoding="async"
 							draggable={false}
+							key={url}
 							onError={() => setPreviewFailed(true)}
-							onLoad={() => setLoaded(true)}
+							onLoad={(event) => {
+								const image = event.currentTarget;
+								if (
+									image === imageRef.current &&
+									(image.getAttribute("src") === url ||
+										image.src === new URL(url, image.baseURI).href)
+								)
+									setLoaded(true);
+							}}
+							ref={imageRef}
 							src={url}
 						/>
 					) : null}
