@@ -115,6 +115,83 @@ describe("wallReducer", () => {
 		});
 	});
 
+	it("keeps the retained sort sequence while a catalog update races replacement", () => {
+		const retained = loadedState([
+			{ ...wallAsset("old", 1), wallThumbnail: thumbnail("old") },
+		]);
+		const pending = reduce(retained, {
+			type: "setDirection",
+			direction: "newestFirst",
+		});
+		const raced = reduce(pending, {
+			type: "catalogBatch",
+			assets: [wallAsset("catalog-race", 1)],
+			orderState: "provisional",
+			selectionId: "selection-a",
+		});
+		expect(raced.items.map((item) => item.id)).toEqual(["old"]);
+		expect(raced.sortPending).toBe(true);
+	});
+
+	it("atomically replaces a sorted wall from metadata settlement and merges references", () => {
+		const retained = loadedState([
+			{
+				...wallAsset("old", 1),
+				wallThumbnail: thumbnail("old"),
+				screenPreview: {
+					assetId: "old",
+					kind: "screenPreview",
+					key: "old-screen",
+				},
+			},
+		]);
+		const pending = reduce(retained, {
+			type: "setDirection",
+			direction: "newestFirst",
+		});
+		const request = reduce(pending, {
+			type: "pageRequestStarted",
+			requestId: "settled-replacement",
+			requestCursor: null,
+			requestEpoch: pending.scrollEpoch,
+		});
+		const settled = reduce(request, {
+			type: "metadataSettled",
+			assets: [wallAsset("old", 1)],
+			nextCursor: null,
+			requestEpoch: pending.scrollEpoch,
+			requestCursor: null,
+			requestId: "settled-replacement",
+		});
+		expect(settled.items.map((item) => item.id)).toEqual(["old"]);
+		expect(settled.items[0]?.wallThumbnail?.key).toBe("old-thumb");
+		expect(settled.items[0]?.screenPreview?.key).toBe("old-screen");
+		expect(settled.sortPending).toBe(false);
+	});
+
+	it("does not regress scan progress from an older catalog generation", () => {
+		const current = reduce(activeState(), {
+			type: "progress",
+			selectionId: "selection-a",
+			generation: 3,
+			progress: { discovered: 30, shaped: 20, enriched: 10, total: 30 },
+		});
+		const stale = reduce(current, {
+			type: "catalogBatch",
+			assets: [wallAsset("stale", 1)],
+			orderState: "provisional",
+			selectionId: "selection-a",
+			generation: 2,
+			progress: { discovered: 20, shaped: 12, enriched: 4, total: 20 },
+		});
+		expect(stale.scanProgress).toEqual({
+			discovered: 30,
+			shaped: 20,
+			enriched: 10,
+			total: 30,
+		});
+	});
+
 	it("resets a source and ignores stale failures from the prior source", () => {
 		const request = reduce(initialWallState, {
 			type: "pageRequestStarted",

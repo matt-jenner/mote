@@ -136,6 +136,7 @@ class ControlledWallService implements PhotoService {
 	readonly capabilities = { chooseFolder: true, locateFolder: false };
 	readonly queryRequests: WallQueryRequest[] = [];
 	readonly derivativeRequests: DerivativeRequest[] = [];
+	derivativeRejectsRemaining = 0;
 	readonly interactionCalls: boolean[] = [];
 	readonly gates: Gate<WallPage>[] = [];
 	private readonly listeners = new Set<(update: WallUpdate) => void>();
@@ -173,6 +174,10 @@ class ControlledWallService implements PhotoService {
 			...request,
 			assetIds: [...request.assetIds],
 		});
+		if (this.derivativeRejectsRemaining > 0) {
+			this.derivativeRejectsRemaining -= 1;
+			throw new Error("derivative request rejected");
+		}
 	};
 	setWallInteraction = async (active: boolean) => {
 		this.interactionCalls.push(active);
@@ -344,7 +349,9 @@ describe("progressive photo wall", () => {
 			.getByTestId("photo-row-0")
 			.element()
 			.querySelector<HTMLElement>("[data-asset-id='coast']");
-		await expect.element(screen.getByText("Indexing photos")).toBeVisible();
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("Preparing previews · 0 of 6");
 		expect(tile).not.toBeNull();
 		if (!tile) return;
 		const before = tile.getBoundingClientRect().toJSON();
@@ -397,25 +404,65 @@ describe("progressive photo wall", () => {
 		await expect
 			.poll(() => service.derivativeRequests.length)
 			.toBeGreaterThan(0);
-		expect(service.derivativeRequests[0]?.priority).toBe("visible");
-		const visible = service.derivativeRequests[0]?.assetIds ?? [];
+		const wall = screen.getByRole("region", { name: "Photos" }).element();
+		const rowNodes = [
+			...wall.querySelectorAll<HTMLElement>("[data-testid^='photo-row-']"),
+		];
+		const wallRect = wall.getBoundingClientRect();
+		const visibleRows = rowNodes
+			.map((row, index) => {
+				const top =
+					row.getBoundingClientRect().top - wallRect.top + wall.scrollTop;
+				const bottom = top + row.getBoundingClientRect().height;
+				return top < wall.scrollTop + wall.clientHeight &&
+					bottom > wall.scrollTop
+					? index
+					: -1;
+			})
+			.filter((index) => index >= 0);
+		const visibleEnd = visibleRows.at(-1) ?? 0;
+		const nearRows = [visibleEnd + 1, visibleEnd + 2].filter(
+			(index) => index < rowNodes.length,
+		);
+		const idsInRows = (indices: readonly number[]) =>
+			indices.flatMap((index) =>
+				[
+					...(rowNodes[index]?.querySelectorAll<HTMLElement>(
+						"[data-asset-id]",
+					) ?? []),
+				].map((tile) => tile.dataset.assetId ?? ""),
+			);
+		const expectedVisibleIds = idsInRows(visibleRows);
+		const expectedNearIds = idsInRows(nearRows);
+		const expectedRemainingIds = idsInRows(
+			rowNodes
+				.map((_row, index) => index)
+				.filter(
+					(index) => !visibleRows.includes(index) && !nearRows.includes(index),
+				),
+		);
+		expect(service.derivativeRequests[0]).toEqual({
+			assetIds: expectedVisibleIds,
+			priority: "visible",
+		});
 		const near = service.derivativeRequests.find(
 			(request) => request.priority === "nearViewport",
 		);
-		expect(near).toBeTruthy();
-		expect(near?.assetIds.some((id) => visible.includes(id))).toBe(false);
+		expect(near?.assetIds).toEqual(expectedNearIds);
 		for (const callback of idleCallbacks.splice(0))
 			callback({ didTimeout: false, timeRemaining: () => 50 });
+		while (idleCallbacks.length > 0)
+			for (const callback of idleCallbacks.splice(0))
+				callback({ didTimeout: false, timeRemaining: () => 50 });
 		await expect
 			.poll(() => service.derivativeRequests.length)
 			.toBeGreaterThan(1);
-		const requested = service.derivativeRequests.flatMap(
-			(request) => request.assetIds,
-		);
-		expect(new Set(requested).size).toBe(requested.length);
-		for (const request of service.derivativeRequests) {
+		const idleRequests = service.derivativeRequests
+			.filter((request) => request.priority === "nearViewport")
+			.flatMap((request) => request.assetIds);
+		expect(idleRequests).toEqual(expectedNearIds.concat(expectedRemainingIds));
+		for (const request of service.derivativeRequests)
 			expect(request.assetIds.length).toBeLessThanOrEqual(50);
-		}
 	});
 
 	it("retries a missing thumbnail after changing sort direction", async () => {
@@ -441,6 +488,69 @@ describe("progressive photo wall", () => {
 			assetIds: ["retry"],
 			priority: "visible",
 		});
+	});
+
+	it("retries a rejected visible thumbnail request and reports the retry", async () => {
+		const service = new ControlledWallService();
+		service.derivativeRejectsRemaining = 1;
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(
+			0,
+			pageOf([asset("retry-visible", "Retry visible", 1)], "settled"),
+		);
+		await expect.poll(() => service.derivativeRequests.length).toBe(1);
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("Retrying previews");
+		await expect.poll(() => service.derivativeRequests.length).toBe(2);
+		expect(service.derivativeRequests.at(-1)).toMatchObject({
+			assetIds: ["retry-visible"],
+			priority: "visible",
+		});
+	});
+
+	it("does not re-request a thumbnail after it becomes ready", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(
+			0,
+			pageOf([asset("ready-once", "Ready once", 1)], "settled"),
+		);
+		await expect.poll(() => service.derivativeRequests.length).toBe(1);
+		service.releaseThumbnail("ready-once", "/demo-photos/ready-once.jpg");
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("Photos ready");
+		const wall = screen.getByRole("region", { name: "Photos" });
+		TestIntersectionObserver.trigger("visible", wall.element(), ["ready-once"]);
+		await new Promise((resolve) => window.setTimeout(resolve, 25));
+		expect(service.derivativeRequests).toHaveLength(1);
+	});
+
+	it("does not retry wall thumbnails for a screen-preview warning", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(
+			0,
+			pageOf([asset("screen-warning", "Screen warning", 1)], "settled"),
+		);
+		await expect.poll(() => service.derivativeRequests.length).toBe(1);
+		service.emit({
+			kind: "warning",
+			selectionId: "source-a",
+			sourceId: "source-a",
+			assetId: "screen-warning",
+			warning: { code: "screenPreviewUnavailable", retryable: true },
+		});
+		const wall = screen.getByRole("region", { name: "Photos" });
+		TestIntersectionObserver.trigger("visible", wall.element(), [
+			"screen-warning",
+		]);
+		await new Promise((resolve) => window.setTimeout(resolve, 25));
+		expect(service.derivativeRequests).toHaveLength(1);
 	});
 
 	it("keeps loaded images painted while a replacement sort query is pending", async () => {
@@ -831,6 +941,12 @@ describe("progressive photo wall", () => {
 					.getByText("No photos found", { exact: true }),
 			)
 			.toBeVisible();
+		expect(screen.getByRole("progressbar").element()).not.toHaveAttribute(
+			"max",
+		);
+		expect(screen.getByRole("progressbar").element()).not.toHaveAttribute(
+			"value",
+		);
 	});
 
 	it("reports interaction quieting, retry, and source swaps without stale assets", async () => {

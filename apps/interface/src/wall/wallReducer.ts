@@ -27,6 +27,7 @@ export interface WallState {
 	scanProgress: ScanProgressDto | null;
 	scanProgressGeneration: number | null;
 	sortPending: boolean;
+	derivativeRetrying: boolean;
 }
 
 export type WallRequestId = string | number;
@@ -69,6 +70,11 @@ export type WallAction =
 			selectionId: string;
 			generation: number;
 			progress: ScanProgressDto;
+	  }
+	| {
+			type: "derivativeRetrying";
+			sourceGeneration: number;
+			retrying: boolean;
 	  }
 	| {
 			type: "pageRequestFailed";
@@ -134,6 +140,7 @@ export const initialWallState: WallState = {
 	scanProgress: null,
 	scanProgressGeneration: null,
 	sortPending: false,
+	derivativeRetrying: false,
 };
 
 export function isWallLayoutComplete(
@@ -423,18 +430,28 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 		}
 		case "catalogBatch": {
 			if (!matchesSelection(state, action.selectionId)) return state;
+			const catalogAssets = state.sortPending
+				? action.assets.filter((asset) =>
+						state.items.some((current) => current.id === asset.id),
+					)
+				: action.assets;
 			const remembered = rememberWarnings(
 				state.assetWarnings,
 				state.warningTombstones,
-				action.assets,
+				catalogAssets,
 				requestToken(state.activeRequest),
 				false,
 			);
 			const merged = mergeAssets(state.items, remembered.assets);
 			const orderState =
 				state.settledGeneration !== null ? "settled" : action.orderState;
-			const progressChanged =
+			const acceptsProgress =
 				action.progress !== undefined &&
+				(action.generation === undefined ||
+					state.scanProgressGeneration === null ||
+					action.generation >= state.scanProgressGeneration);
+			const progressChanged =
+				acceptsProgress &&
 				(state.scanProgressGeneration !== action.generation ||
 					JSON.stringify(state.scanProgress) !==
 						JSON.stringify(action.progress));
@@ -458,9 +475,12 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 					? remembered.warnings
 					: state.assetWarnings,
 				warningTombstones: remembered.tombstones,
-				scanProgress: action.progress ?? state.scanProgress,
-				scanProgressGeneration:
-					action.generation ?? state.scanProgressGeneration,
+				scanProgress: acceptsProgress
+					? (action.progress ?? state.scanProgress)
+					: state.scanProgress,
+				scanProgressGeneration: acceptsProgress
+					? (action.generation ?? state.scanProgressGeneration)
+					: state.scanProgressGeneration,
 			};
 		}
 		case "progress": {
@@ -476,6 +496,11 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				scanProgressGeneration: action.generation,
 			};
 		}
+		case "derivativeRetrying":
+			if (!matchesSource(state, action.sourceGeneration)) return state;
+			return state.derivativeRetrying === action.retrying
+				? state
+				: { ...state, derivativeRetrying: action.retrying };
 		case "pageLoaded": {
 			if (!matchesSource(state, action.sourceGeneration)) return state;
 			if (
@@ -553,6 +578,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				activeRequest: null,
 				error: null,
 				sortPending: firstPage ? false : state.sortPending,
+				derivativeRetrying: firstPage ? false : state.derivativeRetrying,
 			};
 		}
 		case "pageRequestFailed": {
@@ -628,7 +654,10 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				requestToken(state.activeRequest),
 				true,
 			);
-			const merged = mergeAssets([], remembered.assets);
+			const replacementPage = state.sortPending
+				? mergeDerivativeReferences(state.items, remembered.assets)
+				: remembered.assets;
+			const merged = mergeAssets([], replacementPage);
 			return {
 				...state,
 				items: merged.items,
@@ -645,6 +674,8 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				sourceWarningTombstones: rememberedSource.tombstones,
 				activeRequest: null,
 				error: null,
+				sortPending: false,
+				derivativeRetrying: false,
 			};
 		}
 		case "resetSource":
@@ -729,6 +760,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				direction: action.direction,
 				scrollEpoch: state.scrollEpoch + 1,
 				sortPending: true,
+				derivativeRetrying: false,
 			};
 		}
 	}

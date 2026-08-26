@@ -48,6 +48,12 @@ export function JustifiedWall({
 		[forwardedRegionRef],
 	);
 	const sentinelRef = useRef<HTMLDivElement>(null);
+	const missingWallIdsRef = useRef<Set<string>>(new Set());
+	missingWallIdsRef.current = new Set(
+		assets
+			.filter((asset) => asset.wallThumbnail === null)
+			.map((asset) => asset.id),
+	);
 
 	useEffect(() => {
 		if (!root || rows.length === 0 || scrollEpoch < 0) return;
@@ -174,7 +180,7 @@ export function JustifiedWall({
 				for (const entry of entries) {
 					if (!entry.isIntersecting) continue;
 					const id = (entry.target as HTMLElement).dataset.assetId;
-					if (id) visibleIds.add(id);
+					if (id && missingWallIdsRef.current.has(id)) visibleIds.add(id);
 				}
 				schedule();
 			},
@@ -185,7 +191,7 @@ export function JustifiedWall({
 				for (const entry of entries) {
 					if (!entry.isIntersecting) continue;
 					const id = (entry.target as HTMLElement).dataset.assetId;
-					if (id) nearIds.add(id);
+					if (id && missingWallIdsRef.current.has(id)) nearIds.add(id);
 				}
 				schedule();
 			},

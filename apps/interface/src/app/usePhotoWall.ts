@@ -46,15 +46,27 @@ export interface WallProgress {
 	busy: boolean;
 }
 
+function isWallThumbnailWarning(code: string): boolean {
+	return (
+		code === "wallThumbnailUnavailable" || code === "derivativeUnavailable"
+	);
+}
+
 function wallProgress(state: typeof initialWallState): WallProgress {
 	if (state.error)
-		return { status: state.error, value: null, max: null, busy: false };
+		return {
+			status: state.error,
+			value: null,
+			max: null,
+			busy: state.activeRequest !== null || state.sortPending,
+		};
 	const known = state.items.length;
 	const wallReady = state.items.filter((item) => item.wallThumbnail).length;
 	const screenReady = state.items.filter((item) => item.screenPreview).length;
 	const missingWall = known - wallReady;
 	const missingScreen = known - screenReady;
-	const busy = state.activeRequest !== null || missingWall > 0;
+	const busy =
+		state.activeRequest !== null || missingWall > 0 || state.sortPending;
 	if (
 		Object.keys(state.sourceWarnings).length > 0 ||
 		Object.keys(state.assetWarnings).length > 0
@@ -65,10 +77,14 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 			max: null,
 			busy,
 		};
-	if (
-		missingWall > 0 &&
-		(state.scanComplete || (state.scanProgress?.shaped ?? 0) > 0)
-	)
+	if (state.derivativeRetrying)
+		return {
+			status: `Retrying previews · ${wallReady} of ${known}`,
+			value: wallReady,
+			max: known > 0 ? known : null,
+			busy: true,
+		};
+	if (missingWall > 0)
 		return {
 			status: `Preparing previews · ${wallReady} of ${known}`,
 			value: wallReady,
@@ -92,11 +108,11 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 			status: `${state.items.length === 0 ? "Folder ready · " : ""}Indexing photos${suffix}`,
 			value: progress?.total === null ? null : (progress?.shaped ?? null),
 			max: progress?.total ?? null,
-			busy: state.activeRequest !== null,
+			busy,
 		};
 	}
 	if (known === 0 && state.pagesExhausted && !state.activeRequest)
-		return { status: "No photos found", value: 0, max: 0, busy: false };
+		return { status: "No photos found", value: null, max: null, busy: false };
 	return {
 		status: `${known} photos ready`,
 		value: known,
@@ -122,6 +138,17 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 			{ sourceGeneration: number; epoch: number; priority: DerivativePriority }
 		>(),
 	);
+	const derivativeRetryTimer = useRef<number | null>(null);
+	const derivativeRetryQueue = useRef(
+		new Map<
+			string,
+			{ priority: DerivativePriority; sourceGeneration: number; epoch: number }
+		>(),
+	);
+	const derivativeRetryAttempts = useRef(new Map<string, number>());
+	const requestDerivativesRef = useRef<
+		(assetIds: readonly string[], priority: DerivativePriority) => void
+	>(() => undefined);
 	const wallInteractionTimer = useRef<number | null>(null);
 	const wallInteractionActive = useRef(false);
 
@@ -131,6 +158,19 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 			sourceIdRef.current === expectedSourceId,
 		[],
 	);
+	const cancelDerivativeRetry = useCallback(() => {
+		if (derivativeRetryTimer.current !== null) {
+			window.clearTimeout(derivativeRetryTimer.current);
+			derivativeRetryTimer.current = null;
+		}
+		derivativeRetryQueue.current.clear();
+		derivativeRetryAttempts.current.clear();
+		dispatch({
+			type: "derivativeRetrying",
+			sourceGeneration: sourceGeneration.current,
+			retrying: false,
+		});
+	}, []);
 
 	const loadPage = useCallback(
 		(
@@ -248,6 +288,7 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 		settlementPending.current = null;
 		failedCursor.current = null;
 		derivativeRequests.current.clear();
+		cancelDerivativeRetry();
 		if (wallInteractionTimer.current !== null) {
 			window.clearTimeout(wallInteractionTimer.current);
 			wallInteractionTimer.current = null;
@@ -287,8 +328,11 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 					break;
 				case "derivativesReady":
 					for (const derivative of update.derivatives) {
-						if (derivative.kind === "wallThumbnail")
+						if (derivative.kind === "wallThumbnail") {
 							derivativeRequests.current.delete(derivative.assetId);
+							derivativeRetryQueue.current.delete(derivative.assetId);
+							derivativeRetryAttempts.current.delete(derivative.assetId);
+						}
 					}
 					dispatch({
 						type: "derivativesReady",
@@ -320,7 +364,11 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 					});
 					break;
 				case "warning":
-					if (update.assetId !== null && update.warning.retryable)
+					if (
+						update.assetId !== null &&
+						update.warning.retryable &&
+						isWallThumbnailWarning(update.warning.code)
+					)
 						derivativeRequests.current.delete(update.assetId);
 					dispatch({ type: "warning", ...update });
 					break;
@@ -350,7 +398,7 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 				settlementPending.current = null;
 			}
 		};
-	}, [isLive, loadPage, service, sourceId]);
+	}, [cancelDerivativeRetry, isLive, loadPage, service, sourceId]);
 
 	useEffect(() => {
 		if (
@@ -363,14 +411,18 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 		loadPage(null);
 	}, [loadPage, sourceId, state.scrollEpoch, state.sourceGeneration]);
 
-	const setDirection = useCallback((direction: SortDirection) => {
-		ownerRef.current = null;
-		settlementPending.current = null;
-		for (const asset of stateRef.current.items) {
-			if (!asset.wallThumbnail) derivativeRequests.current.delete(asset.id);
-		}
-		dispatch({ type: "setDirection", direction });
-	}, []);
+	const setDirection = useCallback(
+		(direction: SortDirection) => {
+			ownerRef.current = null;
+			settlementPending.current = null;
+			cancelDerivativeRetry();
+			for (const asset of stateRef.current.items) {
+				if (!asset.wallThumbnail) derivativeRequests.current.delete(asset.id);
+			}
+			dispatch({ type: "setDirection", direction });
+		},
+		[cancelDerivativeRetry],
+	);
 
 	const loadMore = useCallback(() => {
 		if (state.pagesExhausted || state.error || ownerRef.current) return;
@@ -406,22 +458,73 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 				next.push(assetId);
 			}
 			if (next.length > 0) {
-				void service
-					.requestDerivatives({ assetIds: next, priority })
+				void Promise.resolve()
+					.then(() => service.requestDerivatives({ assetIds: next, priority }))
 					.catch(() => {
+						let retryDelay = 50;
 						for (const assetId of next) {
 							const record = derivativeRequests.current.get(assetId);
 							if (
-								record?.sourceGeneration === sourceGenerationAtRequest &&
-								record.epoch === epoch
+								record?.sourceGeneration !== sourceGenerationAtRequest ||
+								record.epoch !== epoch
 							)
-								derivativeRequests.current.delete(assetId);
+								continue;
+							derivativeRequests.current.delete(assetId);
+							const attempt =
+								(derivativeRetryAttempts.current.get(assetId) ?? 0) + 1;
+							derivativeRetryAttempts.current.set(assetId, attempt);
+							if (attempt > 3) continue;
+							derivativeRetryQueue.current.set(assetId, {
+								priority,
+								sourceGeneration: sourceGenerationAtRequest,
+								epoch,
+							});
+							retryDelay = Math.max(retryDelay, 50 * 2 ** (attempt - 1));
 						}
+						if (derivativeRetryQueue.current.size === 0) {
+							dispatch({
+								type: "derivativeRetrying",
+								sourceGeneration: sourceGenerationAtRequest,
+								retrying: false,
+							});
+							return;
+						}
+						dispatch({
+							type: "derivativeRetrying",
+							sourceGeneration: sourceGenerationAtRequest,
+							retrying: true,
+						});
+						if (derivativeRetryTimer.current !== null) return;
+						derivativeRetryTimer.current = window.setTimeout(() => {
+							derivativeRetryTimer.current = null;
+							const retryGroups = new Map<DerivativePriority, string[]>();
+							for (const [assetId, queued] of derivativeRetryQueue.current) {
+								if (
+									queued.sourceGeneration !== sourceGeneration.current ||
+									queued.epoch !== stateRef.current.scrollEpoch ||
+									stateRef.current.items.find((item) => item.id === assetId)
+										?.wallThumbnail
+								)
+									continue;
+								const group = retryGroups.get(queued.priority) ?? [];
+								group.push(assetId);
+								retryGroups.set(queued.priority, group);
+							}
+							derivativeRetryQueue.current.clear();
+							dispatch({
+								type: "derivativeRetrying",
+								sourceGeneration: sourceGeneration.current,
+								retrying: false,
+							});
+							for (const [retryPriority, retryIds] of retryGroups)
+								requestDerivativesRef.current(retryIds, retryPriority);
+						}, retryDelay);
 					});
 			}
 		},
 		[service],
 	);
+	requestDerivativesRef.current = requestDerivatives;
 	const requestVisibleDerivatives = useCallback(
 		(ids: readonly string[]) => requestDerivatives(ids, "visible"),
 		[requestDerivatives],
@@ -459,6 +562,11 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 		() => () => {
 			if (wallInteractionTimer.current !== null)
 				window.clearTimeout(wallInteractionTimer.current);
+			if (derivativeRetryTimer.current !== null)
+				window.clearTimeout(derivativeRetryTimer.current);
+			derivativeRetryTimer.current = null;
+			derivativeRetryQueue.current.clear();
+			derivativeRetryAttempts.current.clear();
 			if (wallInteractionActive.current) void service.setWallInteraction(false);
 		},
 		[service],
