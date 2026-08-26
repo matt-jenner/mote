@@ -67,7 +67,7 @@ export function ViewerStage({
 	const screenImageRef = useRef<HTMLImageElement>(null);
 	const activeDecodeRef = useRef("");
 	const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
-	const [screenReady, setScreenReady] = useState(false);
+	const [decodedToken, setDecodedToken] = useState<string | null>(null);
 	const [screenFailed, setScreenFailed] = useState(false);
 	const [baseFailed, setBaseFailed] = useState(false);
 	const baseUrl =
@@ -97,7 +97,7 @@ export function ViewerStage({
 
 	useEffect(() => {
 		activeDecodeRef.current = decodeToken;
-		setScreenReady(false);
+		setDecodedToken(null);
 		setScreenFailed(false);
 		if (!currentUrl) return;
 		const image = screenImageRef.current;
@@ -111,7 +111,7 @@ export function ViewerStage({
 		void decodeResult.then(
 			() => {
 				if (activeDecodeRef.current !== decodeToken) return;
-				setScreenReady(true);
+				setDecodedToken(decodeToken);
 			},
 			() => {
 				if (activeDecodeRef.current !== decodeToken) return;
@@ -137,7 +137,8 @@ export function ViewerStage({
 			? { width: `${frame.width}px`, height: `${frame.height}px` }
 			: undefined;
 	const hasBaseImage = Boolean(baseUrl) && !baseFailed;
-	const showPreview = Boolean(currentUrl) && screenReady && !screenFailed;
+	const showPreview =
+		Boolean(currentUrl) && decodedToken === decodeToken && !screenFailed;
 
 	return (
 		<div

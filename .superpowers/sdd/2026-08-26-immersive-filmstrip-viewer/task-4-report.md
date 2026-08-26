@@ -90,3 +90,68 @@ exit 0
 
 - Viewer navigation and information UI are intentionally deferred by the Task 4 scope, so the stale-completion path is implemented at the stage boundary but not exercised by a navigation browser test in this task.
 - Native macOS smoke remains the coordinator's responsibility.
+
+## Fix round 1
+
+### Findings addressed
+
+- Retry ticks are now observable dependencies of the request effect, so a rejected request clears its matching attempt and deterministically re-runs the current plan.
+- Request records retain priority and generation. A near-viewport request is promoted to a visible request on selection unless a visible request for that asset and generation is already recorded.
+- ViewerStage stores the exact decoded token and only renders a ready screen layer when that token equals the current asset/generation/URL token, eliminating one-commit readiness leakage.
+- Added a WebKit harness using the real `useViewerPreview` and `ViewerStage`: it controls decode promises for assets A and B, switches generation/current asset, resolves B, then resolves stale A and verifies B remains current and ready.
+
+### RED evidence
+
+Before the fix, the focused WebKit run showed the two production regressions:
+
+```text
+npm run test:browser --workspace @photo-viewer/interface -- PhotoViewer.browser.test.tsx
+Test Files  1 failed (1)
+Tests       3 failed | 6 passed (9)
+```
+
+The failures were `retries a rejected screen-preview request` (only the initial attempt), `promotes a near-viewport request to visible after switching assets` (no visible promotion), and the initial stale-decode harness fixture (the first data-GIF fixture was invalid and could not reach ready state; it was corrected before the final GREEN run).
+
+### GREEN evidence
+
+After the fixes and valid deterministic image fixture, the focused viewer WebKit tests passed:
+
+```text
+npm run test:browser --workspace @photo-viewer/interface -- PhotoViewer.browser.test.tsx
+Test Files  1 passed (1)
+Tests       9 passed (9)
+```
+
+The complete verification set passed:
+
+```text
+npm exec --workspace @photo-viewer/interface -- vitest run --project unit
+Test Files  7 passed (7)
+Tests       80 passed (80)
+
+npm run test:browser --workspace @photo-viewer/interface
+Test Files  3 passed (3)
+Tests       58 passed (58)
+
+npm run typecheck
+exit 0
+
+npm run check
+Checked 47 files in 72ms. No fixes applied.
+
+git diff --check
+exit 0
+```
+
+### Fix-round files and self-review
+
+- `apps/interface/src/viewer/useViewerPreview.ts`: observable retry trigger and priority/generation-aware promotion.
+- `apps/interface/src/components/ViewerStage.tsx`: exact decoded-token readiness.
+- `apps/interface/src/components/PhotoViewer.browser.test.tsx`: deterministic rejection/retry, near-to-visible promotion, and real hook/stage stale-decode regressions.
+
+The retry test rejects only the first A request and observes the second request. The promotion test first observes B near-viewport, then switches to B and requires a one-asset visible request. The stale test resolves B before stale A and confirms the stage remains on B with its ready layer.
+
+### Fix-round concerns
+
+- Navigation controls remain deferred to Task 5; the stale harness supplies only the minimal current-index/generation switch needed to exercise the product path.
+- Native macOS smoke and the unavailable-marker/reduced-motion/report-tracking Minor ledger items remain coordinator scope.

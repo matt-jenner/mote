@@ -19,6 +19,7 @@ interface RequestRecord {
 	warningCode: string | null;
 	retryable: boolean;
 	generation: number;
+	priority: "visible" | "nearViewport";
 }
 
 const idle = (callback: () => void): { cancel: () => void } => {
@@ -54,10 +55,12 @@ export function useViewerPreview({
 	previewGeneration,
 }: ViewerPreviewOptions): ViewerPreviewState {
 	const service = usePhotoService();
-	const [, setRetryTick] = useState(0);
+	const [retryTick, setRetryTick] = useState(0);
 	const requestRecords = useRef(new Map<string, RequestRecord>());
 	const retryTimers = useRef(new Set<number>());
 
+	// Retry tick intentionally re-runs the current plan after a rejected request.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: retryTick is an explicit effect trigger.
 	useEffect(() => {
 		let cancelled = false;
 		const plans = buildViewerPreviewPlan(assets, currentIndex);
@@ -79,13 +82,16 @@ export function useViewerPreview({
 				if (
 					previous &&
 					previous.warningCode === warningCode &&
-					previous.retryable === retryable
+					previous.retryable === retryable &&
+					previous.generation === previewGeneration &&
+					!(priority === "visible" && previous.priority === "nearViewport")
 				)
 					continue;
 				const record = {
 					warningCode,
 					retryable,
 					generation: previewGeneration,
+					priority,
 				};
 				requestRecords.current.set(key, record);
 				attempts.set(asset.id, record);
@@ -126,7 +132,7 @@ export function useViewerPreview({
 			for (const timer of retryTimers.current) window.clearTimeout(timer);
 			retryTimers.current.clear();
 		};
-	}, [assets, currentIndex, previewGeneration, service]);
+	}, [assets, currentIndex, previewGeneration, retryTick, service]);
 
 	const current = assets[Math.trunc(currentIndex)];
 	const currentUrl = toUrl(service, current?.screenPreview ?? null);

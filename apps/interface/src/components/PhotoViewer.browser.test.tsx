@@ -1,4 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
@@ -7,10 +8,16 @@ import {
 	createInMemoryPhotoService,
 	type InMemoryPhotoService,
 } from "../services/inMemoryPhotoService";
-import type { WallAsset } from "../services/photoService";
+import type {
+	PhotoService,
+	WallAsset,
+	WallPage,
+} from "../services/photoService";
 import "../styles/tokens.css";
 import "../styles/global.css";
+import { useViewerPreview } from "../viewer/useViewerPreview";
 import { AppShell } from "./AppShell";
+import { ViewerStage } from "./ViewerStage";
 
 function asset(id: string, displayName: string, order: number): WallAsset {
 	return {
@@ -75,6 +82,85 @@ function renderViewerWall(service: InMemoryPhotoService) {
 				<AppShell />
 			</PhotoServiceProvider>
 		</QueryClientProvider>,
+	);
+}
+
+function previewAsset(id: string, order: number): WallAsset {
+	return {
+		...asset(id, id.toUpperCase(), order),
+		screenPreview: {
+			assetId: id,
+			kind: "screenPreview",
+			key: `${id}-screen`,
+		},
+	};
+}
+
+function previewService(
+	requestDerivatives: PhotoService["requestDerivatives"],
+): PhotoService {
+	return {
+		capabilities: { chooseFolder: false, locateFolder: false },
+		getBootstrapState: async () => ({
+			settings: { appearance: "system" },
+			activeSource: null,
+		}),
+		chooseFolder: async () => ({ kind: "cancelled" }),
+		updateAppearance: async (appearance) => ({
+			settings: { appearance },
+			activeSource: null,
+		}),
+		queryWall: async (): Promise<WallPage> => ({
+			items: [],
+			nextCursor: null,
+			orderState: "settled",
+			sourceWarnings: [],
+		}),
+		requestDerivatives,
+		setWallInteraction: async () => undefined,
+		watchWallUpdates: () => () => undefined,
+		derivativeUrl: (reference) =>
+			`data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==#${reference.assetId}-${reference.kind}`,
+	};
+}
+
+function PreviewHarness({
+	assets,
+	service,
+}: {
+	assets: readonly WallAsset[];
+	service: PhotoService;
+}) {
+	const [currentIndex, setCurrentIndex] = useState(0);
+	const [generation, setGeneration] = useState(1);
+	const preview = useViewerPreview({
+		assets,
+		currentIndex,
+		previewGeneration: generation,
+	});
+	const current = assets[currentIndex];
+	if (!current) return null;
+	return (
+		<>
+			<button
+				data-testid="switch-preview"
+				onClick={() => {
+					setCurrentIndex(1);
+					setGeneration(2);
+				}}
+				type="button"
+			>
+				Switch
+			</button>
+			<ViewerStage
+				asset={current}
+				baseUrl={preview.baseUrl}
+				currentUrl={preview.currentUrl}
+				largePreviewUnavailable={preview.largePreviewUnavailable}
+				previewGeneration={generation}
+				service={service}
+			/>
+		</>
 	);
 }
 
@@ -158,6 +244,120 @@ describe("immersive photo viewer checkpoint", () => {
 				),
 			)
 			.toBe(true);
+	});
+
+	it("retries a rejected screen-preview request", async () => {
+		const requests: string[][] = [];
+		let attempts = 0;
+		const service = previewService(async (request) => {
+			if (request.assetIds.includes("a")) {
+				requests.push([...request.assetIds]);
+				if (attempts++ === 0) throw new Error("temporary failure");
+			}
+		});
+		await render(
+			<PhotoServiceProvider service={service}>
+				<PreviewHarness
+					assets={[asset("a", "A", 1), asset("b", "B", 2)]}
+					service={service}
+				/>
+			</PhotoServiceProvider>,
+		);
+
+		await expect
+			.poll(() => requests.filter((ids) => ids.includes("a")).length)
+			.toBe(2);
+	});
+
+	it("promotes a near-viewport request to visible after switching assets", async () => {
+		const requests: Array<{ assetIds: string[]; priority: string }> = [];
+		const service = previewService(async (request) => {
+			requests.push({
+				assetIds: [...request.assetIds],
+				priority: request.priority,
+			});
+		});
+		const assets = [asset("a", "A", 1), asset("b", "B", 2), asset("c", "C", 3)];
+		const view = await render(
+			<PhotoServiceProvider service={service}>
+				<PreviewHarness assets={assets} service={service} />
+			</PhotoServiceProvider>,
+		);
+		await expect
+			.poll(() =>
+				requests.some(
+					(request) =>
+						request.assetIds.includes("b") &&
+						request.priority === "nearViewport",
+				),
+			)
+			.toBe(true);
+		await view.getByTestId("switch-preview").click();
+		await expect
+			.poll(() =>
+				requests.some(
+					(request) =>
+						request.assetIds.length === 1 &&
+						request.assetIds[0] === "b" &&
+						request.priority === "visible",
+				),
+			)
+			.toBe(true);
+	});
+
+	it("fences an older decode completion when the current asset changes", async () => {
+		const pending = new Map<string, () => void>();
+		const originalDecode = HTMLImageElement.prototype.decode;
+		HTMLImageElement.prototype.decode = function () {
+			const id = this.src.includes("a-screenPreview") ? "a" : "b";
+			return new Promise<void>((resolve) => pending.set(id, resolve));
+		};
+		try {
+			const service = previewService(async () => undefined);
+			const assets = [previewAsset("a", 1), previewAsset("b", 2)];
+			const view = await render(
+				<PhotoServiceProvider service={service}>
+					<PreviewHarness assets={assets} service={service} />
+				</PhotoServiceProvider>,
+			);
+			await expect.poll(() => pending.has("a")).toBe(true);
+			pending.get("a")?.();
+			await expect
+				.poll(
+					() =>
+						document.querySelector<HTMLImageElement>(
+							"[data-viewer-layer='screenPreview']",
+						)?.dataset.ready,
+				)
+				.toBe("true");
+			await view.getByTestId("switch-preview").click();
+			await expect
+				.element(view.getByTestId("viewer-stage"))
+				.toHaveAttribute("data-current-asset", "b");
+			await expect
+				.poll(
+					() =>
+						document.querySelector<HTMLImageElement>(
+							"[data-viewer-layer='screenPreview']",
+						)?.dataset.ready,
+				)
+				.toBe("false");
+			pending.get("b")?.();
+			await expect
+				.poll(
+					() =>
+						document.querySelector<HTMLImageElement>(
+							"[data-viewer-layer='screenPreview']",
+						)?.dataset.ready,
+				)
+				.toBe("true");
+			pending.get("a")?.();
+			await expect
+				.element(view.getByTestId("viewer-stage"))
+				.toHaveAttribute("data-current-asset", "b");
+		} finally {
+			HTMLImageElement.prototype.decode = originalDecode;
+		}
 	});
 
 	it("advances from a broken screen preview to a decoding wall thumbnail", async () => {
