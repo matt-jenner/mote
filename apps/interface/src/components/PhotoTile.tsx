@@ -41,9 +41,9 @@ export function PhotoTile({ positioned, service }: PhotoTileProps) {
 			(shapeState === "fallback" || asset.availability !== "available") && !url,
 		);
 		let cancelled = false;
+		const image = imageRef.current;
 		const markCachedImageLoaded = () => {
-			if (cancelled) return;
-			const image = imageRef.current;
+			if (cancelled || imageRef.current !== image) return;
 			if (
 				url &&
 				image &&
@@ -57,6 +57,13 @@ export function PhotoTile({ positioned, service }: PhotoTileProps) {
 		};
 		markCachedImageLoaded();
 		const frame = window.requestAnimationFrame(markCachedImageLoaded);
+		if (image) {
+			try {
+				void image.decode().then(markCachedImageLoaded, () => undefined);
+			} catch {
+				// The normal load/error handlers remain responsible for this image.
+			}
+		}
 		return () => {
 			cancelled = true;
 			window.cancelAnimationFrame(frame);

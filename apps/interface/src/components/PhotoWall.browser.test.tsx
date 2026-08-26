@@ -330,6 +330,65 @@ function renderSwap(service: PhotoService) {
 	);
 }
 
+interface ImageRuntimeOverrides {
+	complete?: (image: HTMLImageElement) => boolean;
+	naturalWidth?: (image: HTMLImageElement) => number;
+	decode?: (image: HTMLImageElement) => Promise<void>;
+}
+
+function overrideImageRuntime(overrides: ImageRuntimeOverrides) {
+	const descriptors = {
+		complete: Object.getOwnPropertyDescriptor(
+			HTMLImageElement.prototype,
+			"complete",
+		),
+		naturalWidth: Object.getOwnPropertyDescriptor(
+			HTMLImageElement.prototype,
+			"naturalWidth",
+		),
+		decode: Object.getOwnPropertyDescriptor(
+			HTMLImageElement.prototype,
+			"decode",
+		),
+	};
+	if (overrides.complete)
+		Object.defineProperty(HTMLImageElement.prototype, "complete", {
+			configurable: true,
+			get() {
+				return overrides.complete?.(this as HTMLImageElement);
+			},
+		});
+	if (overrides.naturalWidth)
+		Object.defineProperty(HTMLImageElement.prototype, "naturalWidth", {
+			configurable: true,
+			get() {
+				return overrides.naturalWidth?.(this as HTMLImageElement);
+			},
+		});
+	if (overrides.decode)
+		Object.defineProperty(HTMLImageElement.prototype, "decode", {
+			configurable: true,
+			value: function (this: HTMLImageElement) {
+				return overrides.decode?.(this);
+			},
+		});
+	return () => {
+		for (const [property, descriptor] of Object.entries(descriptors))
+			if (descriptor)
+				Object.defineProperty(HTMLImageElement.prototype, property, descriptor);
+	};
+}
+
+function suppressCapture(type: "error" | "load") {
+	const handler = (event: Event) => event.stopImmediatePropagation();
+	window.addEventListener(type, handler, true);
+	document.addEventListener(type, handler, true);
+	return () => {
+		window.removeEventListener(type, handler, true);
+		document.removeEventListener(type, handler, true);
+	};
+}
+
 function seriousViolations(result: axe.AxeResults) {
 	return result.violations.filter(
 		(entry) => entry.impact === "serious" || entry.impact === "critical",
@@ -1024,6 +1083,53 @@ describe("progressive photo wall", () => {
 		}
 	});
 
+	it("reveals a delayed decode after the image load event is suppressed", async () => {
+		const service = new ControlledWallService();
+		service.setDerivativeUrl(
+			"delayed-completion",
+			"/demo-photos/coast.jpg?delayed-completion=1",
+		);
+		const positioned = {
+			asset: asset("coast", "Coast", 1, {
+				wallThumbnail: {
+					assetId: "coast",
+					kind: "wallThumbnail" as const,
+					key: "delayed-completion",
+				},
+			}),
+			left: 0,
+			width: 320,
+			height: 220,
+		};
+		const decodeGate = gate<void>();
+		let complete = false;
+		let naturalWidth = 0;
+		const restoreImageRuntime = overrideImageRuntime({
+			complete: () => complete,
+			naturalWidth: () => naturalWidth,
+			decode: () => decodeGate.promise,
+		});
+		const restoreLoadCapture = suppressCapture("load");
+		try {
+			const screen = await render(
+				<PhotoTile positioned={positioned} service={service} />,
+			);
+			const image = screen.getByRole("img", { name: "Coast" });
+			await new Promise((resolve) => window.setTimeout(resolve, 75));
+			expect(getComputedStyle(image.element()).opacity).toBe("0");
+			complete = true;
+			naturalWidth = 320;
+			decodeGate.resolve();
+			await expect
+				.poll(() => getComputedStyle(image.element()).opacity)
+				.toBe("1");
+			screen.unmount();
+		} finally {
+			restoreLoadCapture();
+			restoreImageRuntime();
+		}
+	});
+
 	it("keeps a zero-width completed image on the preview failure path", async () => {
 		const service = new ControlledWallService();
 		service.setDerivativeUrl(
@@ -1042,14 +1148,110 @@ describe("progressive photo wall", () => {
 			width: 320,
 			height: 220,
 		};
-		const screen = await render(
-			<PhotoTile positioned={positioned} service={service} />,
+		const restoreImageRuntime = overrideImageRuntime({
+			complete: () => true,
+			naturalWidth: () => 0,
+		});
+		const restoreErrorCapture = suppressCapture("error");
+		try {
+			const screen = await render(
+				<PhotoTile positioned={positioned} service={service} />,
+			);
+			const image = screen.getByRole("img", { name: "Coast" });
+			expect((image.element() as HTMLImageElement).complete).toBe(true);
+			expect((image.element() as HTMLImageElement).naturalWidth).toBe(0);
+			expect(getComputedStyle(image.element()).opacity).toBe("0");
+			screen.unmount();
+		} finally {
+			restoreErrorCapture();
+			restoreImageRuntime();
+		}
+	});
+
+	it("does not let an old decode reveal a replacement thumbnail", async () => {
+		const service = new ControlledWallService();
+		service.setDerivativeUrl("fenced-old", "/demo-photos/coast.jpg");
+		service.setDerivativeUrl(
+			"fenced-new",
+			"/demo-photos/forest.jpg?fenced-replacement=1",
 		);
-		await expect
-			.element(screen.getByRole("img", { name: "Photo preview unavailable" }))
-			.toBeVisible();
-		expect(screen.getByRole("img", { name: "Coast" }).query()).toBeNull();
-		screen.unmount();
+		const oldDecode = gate<void>();
+		const newDecode = gate<void>();
+		const oldComplete = true;
+		let newComplete = false;
+		const restoreImageRuntime = overrideImageRuntime({
+			complete: (image) =>
+				image.src.includes("forest") ? newComplete : oldComplete,
+			naturalWidth: (image) =>
+				image.src.includes("forest")
+					? newComplete
+						? 320
+						: 0
+					: oldComplete
+						? 320
+						: 0,
+			decode: (image) =>
+				image.src.includes("forest") ? newDecode.promise : oldDecode.promise,
+		});
+		const restoreLoadCapture = suppressCapture("load");
+		function SwapHarness() {
+			const [key, setKey] = useState("fenced-old");
+			const positioned = {
+				asset: asset("coast", "Coast", 1, {
+					wallThumbnail: {
+						assetId: "coast",
+						kind: "wallThumbnail" as const,
+						key,
+					},
+				}),
+				left: 0,
+				width: 320,
+				height: 220,
+			};
+			return (
+				<div>
+					<button onClick={() => setKey("fenced-new")} type="button">
+						Swap thumbnail
+					</button>
+					<PhotoTile positioned={positioned} service={service} />
+				</div>
+			);
+		}
+		try {
+			const screen = await render(<SwapHarness />);
+			const tile = screen
+				.getByRole("img", { name: "Coast" })
+				.element().parentElement;
+			const suppressReplacementLoad = (event: Event) => {
+				event.stopImmediatePropagation();
+			};
+			tile?.addEventListener("load", suppressReplacementLoad, true);
+			await expect
+				.element(screen.getByRole("img", { name: "Coast" }))
+				.toBeVisible();
+			await screen.getByRole("button", { name: "Swap thumbnail" }).click();
+			const image = screen.getByRole("img", { name: "Coast" });
+			await expect
+				.poll(() => image.element().getAttribute("src"))
+				.toContain("fenced-replacement=1");
+			expect(getComputedStyle(image.element()).opacity).toBe("0");
+			await new Promise((resolve) =>
+				window.requestAnimationFrame(() => resolve(undefined)),
+			);
+			newComplete = true;
+			oldDecode.resolve();
+			await new Promise((resolve) => window.setTimeout(resolve, 25));
+			expect(getComputedStyle(image.element()).opacity).toBe("0");
+			newDecode.resolve();
+			await expect
+				.poll(() => getComputedStyle(image.element()).opacity)
+				.toBe("1");
+			tile?.removeEventListener("load", suppressReplacementLoad, true);
+			screen.unmount();
+		} finally {
+			restoreLoadCapture();
+			restoreImageRuntime();
+		}
 	});
 
 	it("resets a replacement thumbnail until its own load event", async () => {
