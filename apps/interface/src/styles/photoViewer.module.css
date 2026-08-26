@@ -44,6 +44,7 @@
 	max-width: 100%;
 	max-height: 100%;
 	overflow: hidden;
+	background: #08090b;
 }
 
 .viewerImage,
@@ -57,7 +58,32 @@
 	object-fit: contain;
 }
 
+.viewerBase,
+.viewerPreview {
+	position: absolute;
+	inset: 0;
+}
+
+.viewerBase {
+	position: relative;
+}
+
+.viewerPreview {
+	opacity: 0;
+	transition: opacity 180ms ease;
+}
+
+.viewerPreview[data-ready="true"] {
+	opacity: 1;
+}
+
 .viewerColour {
 	min-width: 120px;
 	min-height: 80px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.viewerPreview {
+		transition-duration: 0s;
+	}
 }

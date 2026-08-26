@@ -142,6 +142,24 @@ describe("immersive photo viewer checkpoint", () => {
 			.toBeGreaterThan(0);
 	});
 
+	it("requests the visible photo as a screen preview", async () => {
+		const { service, view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		await expect
+			.poll(() =>
+				service.derivativeRequests.some(
+					(request) =>
+						request.kind === "screenPreview" &&
+						request.priority === "visible" &&
+						request.assetIds.includes("coast"),
+				),
+			)
+			.toBe(true);
+	});
+
 	it("advances from a broken screen preview to a decoding wall thumbnail", async () => {
 		const { view, tile } = await openAsset("Coast", true);
 		(tile.element() as HTMLButtonElement).click();

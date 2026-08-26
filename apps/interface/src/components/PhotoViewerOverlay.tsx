@@ -6,6 +6,8 @@ import {
 } from "react";
 import type { PhotoService, WallAsset } from "../services/photoService";
 import styles from "../styles/photoViewer.module.css";
+import { findViewerIndex } from "../viewer/photoSequence";
+import { useViewerPreview } from "../viewer/useViewerPreview";
 import type { ViewerState } from "../viewer/viewerReducer";
 import { ViewerStage } from "./ViewerStage";
 
@@ -25,6 +27,12 @@ export function PhotoViewerOverlay({
 	const backRef = useRef<HTMLButtonElement>(null);
 	const dialogRef = useRef<HTMLElement>(null);
 	const asset = assets.find((item) => item.id === state.currentAssetId);
+	const currentIndex = findViewerIndex(assets, state.currentAssetId ?? "");
+	const preview = useViewerPreview({
+		assets,
+		currentIndex,
+		previewGeneration: state.previewGeneration,
+	});
 
 	useEffect(() => {
 		backRef.current?.focus();
@@ -78,7 +86,14 @@ export function PhotoViewerOverlay({
 					<ChevronLeft aria-hidden="true" size={22} strokeWidth={1.7} />
 				</button>
 			</div>
-			<ViewerStage asset={asset} service={service} />
+			<ViewerStage
+				asset={asset}
+				baseUrl={preview.baseUrl}
+				currentUrl={preview.currentUrl}
+				largePreviewUnavailable={preview.largePreviewUnavailable}
+				previewGeneration={state.previewGeneration}
+				service={service}
+			/>
 		</section>
 	);
 }

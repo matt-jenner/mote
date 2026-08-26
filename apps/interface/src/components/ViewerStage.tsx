@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type {
 	DerivativeReference,
 	PhotoService,
@@ -9,6 +9,10 @@ import styles from "../styles/photoViewer.module.css";
 interface ViewerStageProps {
 	asset: WallAsset;
 	service: PhotoService;
+	baseUrl?: string | null;
+	currentUrl?: string | null;
+	largePreviewUnavailable?: boolean;
+	previewGeneration?: number;
 }
 
 export interface ViewerFrameRect {
@@ -39,33 +43,42 @@ export function fitViewerFrame(
 	};
 }
 
-function derivativeUrl(service: PhotoService, asset: WallAsset) {
-	const references: Array<
-		[DerivativeReference | null, "screenPreview" | "wallThumbnail"]
-	> = [
-		[asset.screenPreview, "screenPreview"],
-		[asset.wallThumbnail, "wallThumbnail"],
-	];
-	return references.flatMap(([reference, layer]) => {
-		if (!reference) return [];
-		try {
-			return [{ layer, url: service.derivativeUrl(reference) }];
-		} catch {
-			return [];
-		}
-	});
+function safeDerivativeUrl(
+	service: PhotoService,
+	reference: DerivativeReference | null,
+): string | null {
+	if (!reference) return null;
+	try {
+		return service.derivativeUrl(reference);
+	} catch {
+		return null;
+	}
 }
 
-export function ViewerStage({ asset, service }: ViewerStageProps) {
+export function ViewerStage({
+	asset,
+	service,
+	baseUrl: suppliedBaseUrl,
+	currentUrl: suppliedCurrentUrl,
+	largePreviewUnavailable = false,
+	previewGeneration = 0,
+}: ViewerStageProps) {
 	const stageRef = useRef<HTMLDivElement>(null);
+	const screenImageRef = useRef<HTMLImageElement>(null);
+	const activeDecodeRef = useRef("");
 	const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
-	const candidates = derivativeUrl(service, asset);
-	const [candidateIndex, setCandidateIndex] = useState(0);
-	const candidateKey = `${asset.id}:${asset.screenPreview?.key ?? ""}:${asset.wallThumbnail?.key ?? ""}`;
-	useLayoutEffect(() => {
-		if (candidateKey) setCandidateIndex(0);
-	}, [candidateKey]);
-	const selected = candidates[candidateIndex];
+	const [screenReady, setScreenReady] = useState(false);
+	const [screenFailed, setScreenFailed] = useState(false);
+	const [baseFailed, setBaseFailed] = useState(false);
+	const baseUrl =
+		suppliedBaseUrl === undefined
+			? safeDerivativeUrl(service, asset.wallThumbnail)
+			: suppliedBaseUrl;
+	const currentUrl =
+		suppliedCurrentUrl === undefined
+			? safeDerivativeUrl(service, asset.screenPreview)
+			: suppliedCurrentUrl;
+	const decodeToken = `${asset.id}:${previewGeneration}:${currentUrl ?? ""}`;
 
 	useLayoutEffect(() => {
 		const stage = stageRef.current;
@@ -82,6 +95,37 @@ export function ViewerStage({ asset, service }: ViewerStageProps) {
 		return () => window.removeEventListener("resize", measure);
 	}, []);
 
+	useEffect(() => {
+		activeDecodeRef.current = decodeToken;
+		setScreenReady(false);
+		setScreenFailed(false);
+		if (!currentUrl) return;
+		const image = screenImageRef.current;
+		if (!image) return;
+		let decodeResult: Promise<void>;
+		try {
+			decodeResult = image.decode ? image.decode() : Promise.resolve();
+		} catch {
+			decodeResult = Promise.reject(new Error("preview decode failed"));
+		}
+		void decodeResult.then(
+			() => {
+				if (activeDecodeRef.current !== decodeToken) return;
+				setScreenReady(true);
+			},
+			() => {
+				if (activeDecodeRef.current !== decodeToken) return;
+				setScreenFailed(true);
+			},
+		);
+	}, [currentUrl, decodeToken]);
+
+	// The URL is part of the base-layer identity; reset its error state when it changes.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: baseUrl is the identity being watched.
+	useEffect(() => {
+		setBaseFailed(false);
+	}, [baseUrl]);
+
 	const frame = fitViewerFrame(
 		stageSize.width,
 		stageSize.height,
@@ -92,28 +136,38 @@ export function ViewerStage({ asset, service }: ViewerStageProps) {
 		frame.width > 0
 			? { width: `${frame.width}px`, height: `${frame.height}px` }
 			: undefined;
+	const hasBaseImage = Boolean(baseUrl) && !baseFailed;
+	const showPreview = Boolean(currentUrl) && screenReady && !screenFailed;
 
 	return (
-		<div className={styles.viewerStage} ref={stageRef}>
+		<div
+			className={styles.viewerStage}
+			data-current-asset={asset.id}
+			data-large-preview-unavailable={
+				largePreviewUnavailable || screenFailed ? "true" : "false"
+			}
+			data-testid="viewer-stage"
+			ref={stageRef}
+		>
 			<div
 				className={styles.viewerFrame}
 				data-testid="viewer-frame"
 				style={frameStyle}
 			>
-				{selected ? (
+				{hasBaseImage ? (
 					<img
 						alt={asset.displayName}
-						className={styles.viewerImage}
-						data-viewer-layer={selected.layer}
+						className={`${styles.viewerImage} ${styles.viewerBase}`}
+						data-viewer-layer="wallThumbnail"
 						decoding="async"
 						draggable={false}
-						onError={() => setCandidateIndex((index) => index + 1)}
-						src={selected.url}
+						onError={() => setBaseFailed(true)}
+						src={baseUrl ?? undefined}
 					/>
 				) : (
 					<div
 						aria-label={`${asset.displayName} representative colour`}
-						className={styles.viewerColour}
+						className={`${styles.viewerColour} ${styles.viewerBase}`}
 						data-viewer-layer="representativeColour"
 						role="img"
 						style={{
@@ -124,6 +178,22 @@ export function ViewerStage({ asset, service }: ViewerStageProps) {
 						}}
 					/>
 				)}
+				{currentUrl ? (
+					<img
+						alt=""
+						className={`${styles.viewerImage} ${styles.viewerPreview}`}
+						data-ready={showPreview ? "true" : "false"}
+						data-viewer-layer="screenPreview"
+						decoding="async"
+						draggable={false}
+						onError={() => {
+							if (activeDecodeRef.current === decodeToken)
+								setScreenFailed(true);
+						}}
+						ref={screenImageRef}
+						src={currentUrl}
+					/>
+				) : null}
 			</div>
 		</div>
 	);
