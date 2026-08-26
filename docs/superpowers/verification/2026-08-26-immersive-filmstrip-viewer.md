@@ -10,7 +10,7 @@ not stopped or replaced.
 ## Revision and changed files
 
 - Base: `6ce0e798e761d4f70a74ba5046c74c7b3325eb0b`
-- Final head: `daae9e8` (`test: verify immersive filmstrip viewer`)
+- Evidence commit: `2579c94` (`test: verify immersive filmstrip viewer`)
 - Modified: `README.md`
 - Modified: `apps/interface/src/components/PhotoViewer.browser.test.tsx`
 - Added: this verification document
