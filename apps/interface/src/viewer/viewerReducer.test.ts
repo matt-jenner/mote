@@ -20,6 +20,7 @@ describe("viewerReducer", () => {
 			currentAssetId: "b",
 			returnAnchor: { assetId: "b", scrollTop: 640 },
 		});
+		expect(opened.previewGeneration).toBe(1);
 		expect(moved.currentAssetId).toBe("c");
 		expect(moved.previewGeneration).toBe(opened.previewGeneration + 1);
 	});
@@ -35,8 +36,32 @@ describe("viewerReducer", () => {
 		expect(viewerReducer(info, { type: "select", assetId: "b" }).infoOpen).toBe(
 			true,
 		);
-		expect(viewerReducer(info, { type: "close" }).infoOpen).toBe(false);
-		expect(viewerReducer(info, { type: "close" })).toEqual(initialViewerState);
+		const closed = viewerReducer(info, { type: "close" });
+		expect(closed.infoOpen).toBe(false);
+		expect(closed).toEqual({
+			...initialViewerState,
+			previewGeneration: info.previewGeneration + 1,
+		});
+	});
+
+	it("advances the preview generation when opening, selecting, closing, and reopening", () => {
+		const opened = viewerReducer(initialViewerState, {
+			type: "open",
+			assetId: "a",
+			anchor: { assetId: "a", scrollTop: 20 },
+		});
+		const selected = viewerReducer(opened, { type: "select", assetId: "b" });
+		const closed = viewerReducer(selected, { type: "close" });
+		const reopened = viewerReducer(closed, {
+			type: "open",
+			assetId: "c",
+			anchor: { assetId: "c", scrollTop: 640 },
+		});
+
+		expect(opened.previewGeneration).toBe(1);
+		expect(selected.previewGeneration).toBe(2);
+		expect(closed.previewGeneration).toBe(3);
+		expect(reopened.previewGeneration).toBe(4);
 	});
 
 	it("shows and hides primary controls without changing the filmstrip", () => {
@@ -64,6 +89,20 @@ describe("viewerReducer", () => {
 			filmstripVisible: false,
 		});
 		expect(shown).toMatchObject({
+			controlsVisible: true,
+			filmstripVisible: true,
+		});
+	});
+
+	it("repairs a mixed visibility state when touch controls are toggled", () => {
+		const mixed = viewerReducer(initialViewerState, { type: "hideControls" });
+		const paired = viewerReducer(mixed, { type: "toggleTouchControls" });
+
+		expect(mixed).toMatchObject({
+			controlsVisible: false,
+			filmstripVisible: true,
+		});
+		expect(paired).toMatchObject({
 			controlsVisible: true,
 			filmstripVisible: true,
 		});

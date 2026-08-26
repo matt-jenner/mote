@@ -47,9 +47,13 @@ export function viewerReducer(
 				open: true,
 				currentAssetId: action.assetId,
 				returnAnchor: action.anchor,
+				previewGeneration: state.previewGeneration + 1,
 			};
 		case "close":
-			return initialViewerState;
+			return {
+				...initialViewerState,
+				previewGeneration: state.previewGeneration + 1,
+			};
 		case "select":
 			return {
 				...state,
@@ -62,11 +66,13 @@ export function viewerReducer(
 			return { ...state, controlsVisible: true };
 		case "hideControls":
 			return { ...state, controlsVisible: false };
-		case "toggleTouchControls":
+		case "toggleTouchControls": {
+			const controlsVisible = !state.controlsVisible;
 			return {
 				...state,
-				controlsVisible: !state.controlsVisible,
-				filmstripVisible: !state.filmstripVisible,
+				controlsVisible,
+				filmstripVisible: controlsVisible,
 			};
+		}
 	}
 }
