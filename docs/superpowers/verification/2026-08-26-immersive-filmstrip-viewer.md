@@ -145,3 +145,62 @@ the final browser run. Every required automated gate passes, including
 workspace Clippy. README gives the viewer controls and a clean-profile/native
 demonstration command. The app state at handoff is the coordinator's running
 `wall-demo` session, unchanged.
+
+## Final whole-branch fix wave (2026-08-26)
+
+The final-review fix wave starts from the required base
+`77cad56c3d0c055c0e2ceb2cda27b37ec846f5d7` and is recorded in implementation
+commit `f33a10b14ae17043dd5232b73a5a029a5694b16d` (`fix: close immersive viewer
+review gaps`). The full source audit range is `0ccfa7c..HEAD`; it covers the
+whole approved branch, not only the final Task 8 changes.
+
+Fresh final-wave gate results:
+
+- `npm test`: 11 files, 91 tests passed.
+- `npm run test:browser`: 3 files, 90 tests passed.
+- `npm exec --workspace @photo-viewer/interface -- vitest run --project browser-motion`: 1 test passed with WebKit `prefers-reduced-motion: no-preference`.
+- `npm run check`, `npm run typecheck`, and interface production build passed.
+- `cargo test --workspace --all-features`: 191 passed, 0 failed.
+- Workspace and desktop Clippy and format checks passed; desktop tests: 11
+  passed, 0 failed.
+- The 10,000-asset catalog benchmark and unsigned macOS app bundle build
+  passed.
+- `git diff --check` passed.
+
+The source audit commands were:
+
+```text
+git diff --name-only 0ccfa7c..HEAD
+git diff --unified=0 0ccfa7c..HEAD -- apps/interface/src crates apps/desktop/src-tauri/src | rg -n -i '(writeFile|write_file|rename|removeFile|remove_file|unlink|copyFile|copy_file|setRating|updateRating|deleteAsset|sourcePath|selectedFolder|folderPath|locateFolder)' || true
+```
+
+The targeted audit returned only path-free fixture/capability strings
+(`selectedFolderName` fixtures and `locateFolder: false`); it found no source
+media write, rename, remove, copy, rating/tag mutation, asset deletion, or
+selected-folder path operation.
+
+Immediately before and after controlled derivative generation, this command was
+run against only the checked-in fixture directory:
+
+```text
+find apps/interface/public/demo-photos -maxdepth 1 -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256
+```
+
+The aggregate SHA-256 was
+`a4c522354a075e2a6b6804a31b9df42dcd56b6509cef14ae4667e700227ae3e6` both
+before and after. Actual generation was verified by:
+
+```text
+cargo test -p photo-cache --test image_derivative controlled_demo_fixture_generation_leaves_source_unchanged
+```
+
+That test passed 1 (8 filtered), generated only under a temporary managed
+cache, and asserted source bytes and modification time were unchanged. Allowed
+writes are SQLite application state, managed derivative cache, test temporary
+directories, Rust `target`, Vite `dist`, and the unsigned app bundle. The
+source fixture and any user-selected folder remain read-only/path-free.
+
+The final browser run's generated `apps/interface/.vitest-attachments` and
+`apps/interface/src/components/__screenshots__` directories were removed. The
+coordinator-owned `wall-demo` app remained running and was not stopped or
+restarted. Native GUI interactions were not independently observed.
