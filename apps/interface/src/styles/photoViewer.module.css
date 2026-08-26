@@ -1,6 +1,10 @@
 .viewerOverlay {
 	position: fixed;
-	inset: 0;
+	top: 0;
+	left: 0;
+	width: var(--viewer-viewport-width, 100%);
+	height: var(--viewer-viewport-height, 100dvh);
+	min-height: 100dvh;
 	z-index: 20;
 	display: flex;
 	flex-direction: column;
@@ -10,8 +14,8 @@
 
 .viewerChrome {
 	position: absolute;
-	top: var(--safe-area-top);
-	left: var(--safe-area-left);
+	top: max(44px, var(--safe-area-top, 0px));
+	left: max(44px, var(--safe-area-left, 0px));
 	z-index: 1;
 	display: flex;
 	gap: 8px;
@@ -36,9 +40,12 @@
 	place-items: center;
 	min-width: 0;
 	min-height: 0;
-	padding: var(--safe-area-top) var(--safe-area-right) var(--safe-area-bottom)
-		var(--safe-area-left);
+	padding: max(44px, var(--safe-area-top, 0px))
+		max(44px, var(--safe-area-right, 0px))
+		max(44px, var(--safe-area-bottom, 0px))
+		max(44px, var(--safe-area-left, 0px));
 	background: #08090b;
+	touch-action: pan-y;
 }
 
 .viewerFrame {
@@ -86,7 +93,8 @@
 
 .viewerControls {
 	position: absolute;
-	inset: 50% var(--safe-area-right) auto var(--safe-area-left);
+	inset: 50% max(44px, var(--safe-area-right, 0px)) auto
+		max(44px, var(--safe-area-left, 0px));
 	z-index: 1;
 	display: flex;
 	justify-content: space-between;
@@ -129,8 +137,8 @@
 
 .viewerInfoButton {
 	position: absolute;
-	top: var(--safe-area-top);
-	left: calc(var(--safe-area-left) + 52px);
+	top: max(44px, var(--safe-area-top, 0px));
+	left: calc(max(44px, var(--safe-area-left, 0px)) + 52px);
 }
 
 .viewerInfoClose {
@@ -151,7 +159,7 @@
 	position: absolute;
 	top: 0;
 	right: 0;
-	bottom: 0;
+	bottom: max(44px, var(--safe-area-bottom, 0px));
 	z-index: 2;
 	width: 320px;
 	max-width: 100%;
@@ -160,6 +168,7 @@
 	color: #f4f5f6;
 	background: rgb(19 21 25 / 96%);
 	box-shadow: -14px 0 30px rgb(0 0 0 / 24%);
+	touch-action: pan-y;
 }
 
 .viewerInfoHeader {
@@ -219,10 +228,11 @@
 .viewerFilmstrip {
 	position: absolute;
 	right: 0;
-	bottom: var(--safe-area-bottom);
+	bottom: max(44px, var(--safe-area-bottom, 0px));
 	left: 0;
 	z-index: 1;
-	padding: 12px var(--safe-area-right) calc(12px + var(--safe-area-left));
+	padding: 12px max(44px, var(--safe-area-right, 0px))
+		calc(12px + max(44px, var(--safe-area-left, 0px)));
 	background: linear-gradient(transparent, rgb(8 9 11 / 88%));
 	margin: 0;
 	border: 0;
@@ -273,8 +283,8 @@
 	}
 
 	.viewerControls {
-		right: calc(var(--safe-area-right) + 8px);
-		left: calc(var(--safe-area-left) + 8px);
+		right: calc(max(44px, var(--safe-area-right, 0px)) + 8px);
+		left: calc(max(44px, var(--safe-area-left, 0px)) + 8px);
 	}
 
 	.viewerFilmstripItem {
@@ -285,7 +295,11 @@
 
 @media (prefers-reduced-motion: reduce) {
 	.viewerPreview,
-	.viewerControls {
+	.viewerControls,
+	.viewerStage,
+	.viewerInfoDrawer,
+	.viewerFilmstrip,
+	.viewerFilmstripTrack {
 		transition-duration: 0s;
 	}
 }

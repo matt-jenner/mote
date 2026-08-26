@@ -85,6 +85,29 @@ interface PageGate {
 	resolve: (page: WallPage) => void;
 }
 
+function installVisualViewportDouble(width: number, height: number) {
+	const viewport = new EventTarget() as EventTarget & {
+		width: number;
+		height: number;
+		setSize: (nextWidth: number, nextHeight: number) => void;
+	};
+	viewport.width = width;
+	viewport.height = height;
+	viewport.setSize = (nextWidth, nextHeight) => {
+		viewport.width = nextWidth;
+		viewport.height = nextHeight;
+	};
+	const descriptor = Object.getOwnPropertyDescriptor(window, "visualViewport");
+	Object.defineProperty(window, "visualViewport", {
+		configurable: true,
+		value: viewport,
+	});
+	return () => {
+		if (descriptor) Object.defineProperty(window, "visualViewport", descriptor);
+		else delete (window as { visualViewport?: VisualViewport }).visualViewport;
+	};
+}
+
 function delayedPaginationService() {
 	const service = serviceWithReadyPhotos(false, 120);
 	const queryRequests: WallQueryRequest[] = [];
@@ -304,6 +327,105 @@ describe("immersive photo viewer checkpoint", () => {
 				),
 			)
 			.toBe(true);
+	});
+
+	it("navigates with a horizontal touch swipe and toggles chrome on a tap", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const overlay = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		const dispatchTouch = (type: string, clientX: number, clientY: number) =>
+			overlay.dispatchEvent(
+				new PointerEvent(type, {
+					bubbles: true,
+					clientX,
+					clientY,
+					isPrimary: true,
+					pointerId: 7,
+					pointerType: "touch",
+				}),
+			);
+		dispatchTouch("pointerdown", 620, 400);
+		dispatchTouch("pointerup", 540, 410);
+		await expect
+			.element(view.getByTestId("viewer-stage"))
+			.toHaveAttribute("data-current-asset", "photo-0");
+		const controls = overlay.querySelector<HTMLElement>(
+			"[data-viewer-controls]",
+		);
+		const before = controls?.getAttribute("aria-hidden");
+		dispatchTouch("pointerdown", 620, 400);
+		dispatchTouch("pointerup", 620, 400);
+		await expect
+			.poll(() => controls?.getAttribute("aria-hidden"))
+			.not.toBe(before);
+	});
+
+	it("coalesces visual viewport rotation without resetting the viewer", async () => {
+		const restoreViewport = installVisualViewportDouble(390, 844);
+		try {
+			const { service, view, tile } = await openAsset("Coast");
+			(tile.element() as HTMLButtonElement).click();
+			await expect
+				.element(view.getByRole("dialog", { name: "Photo viewer" }))
+				.toBeVisible();
+			await view.getByRole("button", { name: "Photo information" }).click();
+			await expect
+				.element(view.getByRole("complementary", { name: "Photo information" }))
+				.toBeVisible();
+			await expect
+				.poll(() =>
+					service.derivativeRequests.some(
+						(request) =>
+							request.kind === "screenPreview" &&
+							request.assetIds.includes("coast"),
+					),
+				)
+				.toBe(true);
+			const overlay = view
+				.getByRole("dialog", { name: "Photo viewer" })
+				.element();
+			const beforeRevision = Number(overlay.dataset.viewportRevision);
+			const screen = overlay.querySelector<HTMLImageElement>(
+				"[data-viewer-layer='wallThumbnail']",
+			);
+			const beforeSrc = screen?.src;
+			const viewport = window.visualViewport as VisualViewport & {
+				setSize: (width: number, height: number) => void;
+			};
+			viewport.setSize(844, 390);
+			viewport.dispatchEvent(new Event("resize"));
+			window.dispatchEvent(new Event("orientationchange"));
+			expect(Number(overlay.dataset.viewportRevision)).toBe(beforeRevision);
+			await new Promise<void>((resolve) =>
+				requestAnimationFrame(() => resolve()),
+			);
+			await expect
+				.poll(() => Number(overlay.dataset.viewportRevision))
+				.toBe(beforeRevision + 1);
+			expect(
+				overlay.querySelector("[data-current-asset='coast']"),
+			).not.toBeNull();
+			expect(
+				overlay.querySelector("[data-testid='photo-info-drawer']"),
+			).not.toBeNull();
+			expect(
+				overlay
+					.querySelector("[aria-current='true']")
+					?.getAttribute("aria-label"),
+			).toBe("Coast");
+			expect(
+				overlay.querySelector<HTMLImageElement>(
+					"[data-viewer-layer='wallThumbnail']",
+				)?.src,
+			).toBe(beforeSrc);
+		} finally {
+			restoreViewport();
+		}
 	});
 
 	it("opens information only from Info and keeps it open during navigation", async () => {

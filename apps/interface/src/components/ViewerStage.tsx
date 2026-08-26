@@ -14,6 +14,8 @@ interface ViewerStageProps {
 	largePreviewUnavailable?: boolean;
 	onPreviewFailure?: () => void;
 	previewGeneration?: number;
+	viewportWidth?: number;
+	viewportHeight?: number;
 }
 
 export interface ViewerFrameRect {
@@ -64,6 +66,8 @@ export function ViewerStage({
 	largePreviewUnavailable = false,
 	onPreviewFailure,
 	previewGeneration = 0,
+	viewportWidth = 0,
+	viewportHeight = 0,
 }: ViewerStageProps) {
 	const stageRef = useRef<HTMLDivElement>(null);
 	const screenImageRef = useRef<HTMLImageElement>(null);
@@ -86,7 +90,16 @@ export function ViewerStage({
 		const stage = stageRef.current;
 		if (!stage) return;
 		const measure = () =>
-			setStageSize({ width: stage.clientWidth, height: stage.clientHeight });
+			setStageSize({
+				width:
+					viewportWidth > 0
+						? Math.min(stage.clientWidth, viewportWidth)
+						: stage.clientWidth,
+				height:
+					viewportHeight > 0
+						? Math.min(stage.clientHeight, viewportHeight)
+						: stage.clientHeight,
+			});
 		measure();
 		if (typeof ResizeObserver !== "undefined") {
 			const observer = new ResizeObserver(measure);
@@ -95,7 +108,7 @@ export function ViewerStage({
 		}
 		window.addEventListener("resize", measure);
 		return () => window.removeEventListener("resize", measure);
-	}, []);
+	}, [viewportHeight, viewportWidth]);
 
 	useEffect(() => {
 		activeDecodeRef.current = decodeToken;

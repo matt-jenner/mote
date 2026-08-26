@@ -10,8 +10,10 @@ import type { PhotoService, WallAsset } from "../services/photoService";
 import styles from "../styles/photoViewer.module.css";
 import { findViewerIndex, shouldLoadViewerPage } from "../viewer/photoSequence";
 import { useViewerControls } from "../viewer/useViewerControls";
+import { useViewerGestures } from "../viewer/useViewerGestures";
 import { useViewerPreview } from "../viewer/useViewerPreview";
 import type { ViewerState } from "../viewer/viewerReducer";
+import { useViewerViewport } from "../viewer/viewerViewport";
 import { PhotoInfoDrawer } from "./PhotoInfoDrawer";
 import { ViewerFilmstrip } from "./ViewerFilmstrip";
 import { ViewerStage } from "./ViewerStage";
@@ -91,6 +93,18 @@ export function PhotoViewerOverlay({
 		onShow: onShowControls,
 		onToggleTouch: onToggleTouchControls,
 	});
+	const viewport = useViewerViewport();
+	const gestures = useViewerGestures({
+		onNavigate: (direction) => {
+			const nextIndex = currentIndex + (direction === "next" ? 1 : -1);
+			const nextAsset = assets[nextIndex];
+			if (nextAsset) onSelectAsset(nextAsset.id);
+		},
+		onTap: () => controls.toggleTouch(),
+		viewportRevision: viewport.revision,
+		viewerOpen: state.open,
+		viewState: "fit",
+	});
 
 	useEffect(() => {
 		if (!previewFailureKey) return;
@@ -141,12 +155,6 @@ export function PhotoViewerOverlay({
 			controls.showForInput("mouse");
 		const bounds = event.currentTarget.getBoundingClientRect();
 		if (event.clientY >= bounds.bottom - 96) setFilmstripRevealed(true);
-	};
-	const handlePointerUpCapture = (event: React.PointerEvent<HTMLElement>) => {
-		if (event.pointerType !== "touch") return;
-		const target = event.target as HTMLElement;
-		if (target.closest("button, aside, fieldset")) return;
-		controls.toggleTouch();
 	};
 	const handleKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
 		const target = event.target as HTMLElement;
@@ -200,6 +208,13 @@ export function PhotoViewerOverlay({
 			aria-label="Photo viewer"
 			aria-modal="true"
 			className={styles.viewerOverlay}
+			data-viewport-revision={viewport.revision}
+			style={
+				{
+					"--viewer-viewport-width": `${viewport.width}px`,
+					"--viewer-viewport-height": `${viewport.height}px`,
+				} as React.CSSProperties
+			}
 			onFocusCapture={(event) => {
 				const target = event.target as HTMLElement;
 				if (target.closest(controlAreaSelector)) {
@@ -217,8 +232,14 @@ export function PhotoViewerOverlay({
 				}
 			}}
 			onKeyDownCapture={handleKeyDown}
-			onPointerMove={handlePointerMove}
-			onPointerUpCapture={handlePointerUpCapture}
+			onLostPointerCapture={gestures.onLostPointerCapture}
+			onPointerCancel={gestures.onPointerCancel}
+			onPointerDown={gestures.onPointerDown}
+			onPointerMove={(event) => {
+				handlePointerMove(event);
+				gestures.onPointerMove(event);
+			}}
+			onPointerUp={gestures.onPointerUp}
 			ref={dialogRef}
 			role="dialog"
 		>
@@ -241,6 +262,8 @@ export function PhotoViewerOverlay({
 				onPreviewFailure={handlePreviewFailure}
 				previewGeneration={state.previewGeneration}
 				service={service}
+				viewportHeight={viewport.height}
+				viewportWidth={viewport.width}
 			/>
 			<div
 				aria-hidden={!state.controlsVisible}
