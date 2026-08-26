@@ -1,4 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import axe from "axe-core";
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
@@ -215,6 +216,13 @@ function previewService(
 	};
 }
 
+function seriousViolations(result: axe.AxeResults) {
+	return result.violations.filter(
+		(violation) =>
+			violation.impact === "serious" || violation.impact === "critical",
+	);
+}
+
 function PreviewHarness({
 	assets,
 	service,
@@ -259,10 +267,11 @@ async function openAsset(
 	name: string,
 	brokenScreenPreview = false,
 	readyScreenPreview = false,
+	photoCount = 60,
 ) {
 	const service = serviceWithReadyPhotos(
 		brokenScreenPreview,
-		60,
+		photoCount,
 		readyScreenPreview,
 	);
 	const view = await renderViewerWall(service);
@@ -343,6 +352,144 @@ describe("immersive photo viewer checkpoint", () => {
 				),
 			)
 			.toBe(true);
+	});
+
+	it("keeps the open viewer and information drawer free of serious violations", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		expect(seriousViolations(await axe.run(document))).toEqual([]);
+
+		await view.getByRole("button", { name: "Photo information" }).click();
+		await expect
+			.element(view.getByRole("complementary", { name: "Photo information" }))
+			.toBeVisible();
+		expect(seriousViolations(await axe.run(document))).toEqual([]);
+	});
+
+	it("exposes current selection and disabled directions at both boundaries", async () => {
+		const { view, tile } = await openAsset("Coast", false, false, 1);
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const previous = view.getByRole("button", { name: "Previous photo" });
+		const next = view.getByRole("button", { name: "Next photo" });
+		const filmstrip = view.getByRole("group", { name: "Photo filmstrip" });
+		const current = filmstrip
+			.element()
+			.querySelector<HTMLButtonElement>("button[aria-current='true']");
+		expect(current?.getAttribute("aria-label")).toBe("Coast");
+		expect(previous.element()).toBeDisabled();
+		expect(next.element()).not.toBeDisabled();
+
+		await userEvent.keyboard("{ArrowRight}");
+		await expect
+			.element(view.getByTestId("viewer-status"))
+			.toHaveTextContent("Photo 0, photo 2 of 2");
+		const nextButton = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element()
+			.querySelector<HTMLButtonElement>("button[aria-label='Next photo']");
+		const previousButton = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element()
+			.querySelector<HTMLButtonElement>("button[aria-label='Previous photo']");
+		expect(nextButton?.disabled).toBe(true);
+		expect(previousButton?.disabled).toBe(false);
+		expect(seriousViolations(await axe.run(document))).toEqual([]);
+	});
+
+	it("keeps every phone viewer target at least 44 pixels", async () => {
+		await page.viewport(390, 844);
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const overlay = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		const targets = overlay.querySelectorAll<HTMLButtonElement>("button");
+		for (const target of targets) {
+			const bounds = target.getBoundingClientRect();
+			expect(bounds.width).toBeGreaterThanOrEqual(44);
+			expect(bounds.height).toBeGreaterThanOrEqual(44);
+		}
+	});
+
+	it("keeps ready derivative URLs usable after the source becomes unavailable", async () => {
+		const { service, view, tile } = await openAsset("Coast", false, true);
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const overlay = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		await expect
+			.poll(
+				() =>
+					overlay.querySelector<HTMLImageElement>(
+						"[data-viewer-layer='wallThumbnail']",
+					)?.src ?? "",
+			)
+			.toContain("/demo-photos/coast.jpg");
+		await expect
+			.poll(() =>
+				overlay.querySelector<HTMLImageElement>(
+					"[data-viewer-layer='screenPreview'][data-ready='true']",
+				),
+			)
+			.not.toBeNull();
+		const cachedScreenUrl = overlay.querySelector<HTMLImageElement>(
+			"[data-viewer-layer='screenPreview'][data-ready='true']",
+		)?.src;
+		service.emitForTest({
+			kind: "sourceUnavailable",
+			selectionId: "memory-selection-1",
+			sourceId: "memory-source",
+		});
+		await expect
+			.element(view.getByTestId("viewer-stage"))
+			.toHaveAttribute("data-current-asset", "coast");
+		expect(
+			overlay.querySelector<HTMLImageElement>(
+				"[data-viewer-layer='screenPreview'][data-ready='true']",
+			)?.src,
+		).toBe(cachedScreenUrl);
+		await userEvent.keyboard("{ArrowRight}");
+		await expect
+			.element(view.getByTestId("viewer-stage"))
+			.toHaveAttribute("data-current-asset", "photo-0");
+		const neighbour = overlay.querySelector<HTMLImageElement>(
+			"[data-filmstrip-capacity] button[aria-current='true'] img",
+		);
+		expect(neighbour?.src).toContain("/demo-photos/photo-0.jpg");
+		expect(neighbour?.src).not.toContain("memory-source");
+	});
+
+	it("marks unavailable larger previews and suppresses reduced-motion transitions", async () => {
+		const { view, tile } = await openAsset("Coast", true);
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const stage = view.getByTestId("viewer-stage").element();
+		await expect
+			.poll(() => stage.getAttribute("data-large-preview-unavailable"))
+			.toBe("true");
+		await view.getByRole("button", { name: "Photo information" }).click();
+		await expect
+			.element(view.getByText("Larger preview unavailable"))
+			.toBeVisible();
+		expect(
+			getComputedStyle(
+				stage.querySelector("[data-viewer-layer='screenPreview']") ?? stage,
+			).transitionDuration,
+		).toBe("0s");
 	});
 
 	it("navigates with a horizontal touch swipe and toggles chrome on a tap", async () => {
@@ -463,6 +610,7 @@ describe("immersive photo viewer checkpoint", () => {
 					"[data-viewer-layer='screenPreview'][data-ready='true']",
 				),
 			).toBe(screenPreview);
+			expect(seriousViolations(await axe.run(document))).toEqual([]);
 		} finally {
 			Element.prototype.scrollIntoView = originalScrollIntoView;
 			restoreViewport();

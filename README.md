@@ -76,6 +76,14 @@ reusing the first catalog or derivative cache. No command in this workflow
 copies, renames, deletes, or otherwise modifies photos in the selected source
 folder.
 
+When a wall tile opens the immersive viewer, use Left/Right (or the Previous
+and Next buttons) to move through the loaded order. Select a filmstrip item for
+a direct jump, or swipe horizontally on a fit-to-window photo. Photo
+information opens the read-only metadata drawer, and Back to photos or Escape
+returns to the wall and restores the selected tile. Ready cached derivatives
+remain usable if the selected source becomes unavailable. Zoom and pan are not
+part of this slice.
+
 To create an unsigned macOS application bundle:
 
 ```bash
