@@ -155,3 +155,31 @@ The retry test rejects only the first A request and observes the second request.
 
 - Navigation controls remain deferred to Task 5; the stale harness supplies only the minimal current-index/generation switch needed to exercise the product path.
 - Native macOS smoke and the unavailable-marker/reduced-motion/report-tracking Minor ledger items remain coordinator scope.
+
+## Fix round 2
+
+### Stale-decode regression correction
+
+Rewrote the WebKit harness sequence so asset A's decode promise remains unresolved across the switch to asset B (generation 2). The test now captures and resolves B first, verifies B's screen layer is ready and visible, then resolves A, flushes the completion, and verifies that B remains current and ready with no A URL/layer becoming visible.
+
+No production code changed in this round.
+
+### Verification evidence
+
+```text
+npm run test:browser --workspace @photo-viewer/interface -- PhotoViewer.browser.test.tsx
+Test Files  1 passed (1)
+Tests       9 passed (9)
+
+npx biome check --write apps/interface/src/components/PhotoViewer.browser.test.tsx
+Checked 1 file in 14ms. No fixes applied.
+
+git diff --check
+exit 0
+```
+
+### Self-review
+
+- A remains pending while B is selected, so the final A resolution is a genuine stale completion rather than a no-op.
+- B readiness is asserted before A is released; the post-flush assertions require the same B URL and ready state.
+- The harness invokes the real `useViewerPreview` and `ViewerStage` components and controls only the browser image decode boundary.

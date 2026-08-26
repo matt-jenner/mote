@@ -321,15 +321,7 @@ describe("immersive photo viewer checkpoint", () => {
 				</PhotoServiceProvider>,
 			);
 			await expect.poll(() => pending.has("a")).toBe(true);
-			pending.get("a")?.();
-			await expect
-				.poll(
-					() =>
-						document.querySelector<HTMLImageElement>(
-							"[data-viewer-layer='screenPreview']",
-						)?.dataset.ready,
-				)
-				.toBe("true");
+			// Keep A pending while changing the current asset and generation.
 			await view.getByTestId("switch-preview").click();
 			await expect
 				.element(view.getByTestId("viewer-stage"))
@@ -342,6 +334,7 @@ describe("immersive photo viewer checkpoint", () => {
 						)?.dataset.ready,
 				)
 				.toBe("false");
+			await expect.poll(() => pending.has("b")).toBe(true);
 			pending.get("b")?.();
 			await expect
 				.poll(
@@ -351,10 +344,17 @@ describe("immersive photo viewer checkpoint", () => {
 						)?.dataset.ready,
 				)
 				.toBe("true");
+			// A completes after B is ready; this stale completion must be ignored.
 			pending.get("a")?.();
+			await new Promise((resolve) => setTimeout(resolve, 0));
 			await expect
 				.element(view.getByTestId("viewer-stage"))
 				.toHaveAttribute("data-current-asset", "b");
+			const screen = document.querySelector<HTMLImageElement>(
+				"[data-viewer-layer='screenPreview']",
+			);
+			expect(screen?.src).toContain("b-screenPreview");
+			expect(screen?.dataset.ready).toBe("true");
 		} finally {
 			HTMLImageElement.prototype.decode = originalDecode;
 		}
