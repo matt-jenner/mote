@@ -25,6 +25,13 @@ interface RequestOwner {
 	settlementGeneration: number | null;
 }
 
+interface DerivativeRequestRecord {
+	sourceGeneration: number;
+	epoch: number;
+	priority: DerivativePriority;
+	attempt: number;
+}
+
 export interface PhotoWallController {
 	state: typeof initialWallState;
 	loading: boolean;
@@ -132,12 +139,9 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 	const ownerRef = useRef<RequestOwner | null>(null);
 	const settlementPending = useRef<number | null>(null);
 	const failedCursor = useRef<string | null>(null);
-	const derivativeRequests = useRef(
-		new Map<
-			string,
-			{ sourceGeneration: number; epoch: number; priority: DerivativePriority }
-		>(),
-	);
+	const readyWallIds = useRef(new Set<string>());
+	const derivativeRequests = useRef(new Map<string, DerivativeRequestRecord>());
+	const derivativeAttempt = useRef(0);
 	const derivativeRetryTimer = useRef<number | null>(null);
 	const derivativeRetryQueue = useRef(
 		new Map<
@@ -287,6 +291,7 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 		ownerRef.current = null;
 		settlementPending.current = null;
 		failedCursor.current = null;
+		readyWallIds.current.clear();
 		derivativeRequests.current.clear();
 		cancelDerivativeRetry();
 		if (wallInteractionTimer.current !== null) {
@@ -329,6 +334,7 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 				case "derivativesReady":
 					for (const derivative of update.derivatives) {
 						if (derivative.kind === "wallThumbnail") {
+							readyWallIds.current.add(derivative.assetId);
 							derivativeRequests.current.delete(derivative.assetId);
 							derivativeRetryQueue.current.delete(derivative.assetId);
 							derivativeRetryAttempts.current.delete(derivative.assetId);
@@ -364,6 +370,12 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 					});
 					break;
 				case "warning":
+					if (
+						update.assetId !== null &&
+						update.warning.retryable &&
+						isWallThumbnailWarning(update.warning.code)
+					)
+						readyWallIds.current.delete(update.assetId);
 					if (
 						update.assetId !== null &&
 						update.warning.retryable &&
@@ -439,9 +451,23 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 	const requestDerivatives = useCallback(
 		(assetIds: readonly string[], priority: DerivativePriority) => {
 			const next: string[] = [];
+			const attempts: Array<{
+				assetId: string;
+				record: DerivativeRequestRecord;
+			}> = [];
 			const sourceGenerationAtRequest = sourceGeneration.current;
 			const epoch = stateRef.current.scrollEpoch;
 			for (const assetId of new Set(assetIds)) {
+				if (
+					readyWallIds.current.has(assetId) ||
+					stateRef.current.items.find((item) => item.id === assetId)
+						?.wallThumbnail
+				) {
+					derivativeRequests.current.delete(assetId);
+					derivativeRetryQueue.current.delete(assetId);
+					derivativeRetryAttempts.current.delete(assetId);
+					continue;
+				}
 				const previous = derivativeRequests.current.get(assetId);
 				if (
 					previous &&
@@ -450,34 +476,32 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 					(previous.priority === "visible" || previous.priority === priority)
 				)
 					continue;
-				derivativeRequests.current.set(assetId, {
+				const record: DerivativeRequestRecord = {
 					sourceGeneration: sourceGenerationAtRequest,
 					epoch,
 					priority,
-				});
+					attempt: ++derivativeAttempt.current,
+				};
+				derivativeRequests.current.set(assetId, record);
 				next.push(assetId);
+				attempts.push({ assetId, record });
 			}
 			if (next.length > 0) {
 				void Promise.resolve()
 					.then(() => service.requestDerivatives({ assetIds: next, priority }))
 					.catch(() => {
 						let retryDelay = 50;
-						for (const assetId of next) {
-							const record = derivativeRequests.current.get(assetId);
-							if (
-								record?.sourceGeneration !== sourceGenerationAtRequest ||
-								record.epoch !== epoch
-							)
-								continue;
+						for (const { assetId, record } of attempts) {
+							if (derivativeRequests.current.get(assetId) !== record) continue;
 							derivativeRequests.current.delete(assetId);
 							const attempt =
 								(derivativeRetryAttempts.current.get(assetId) ?? 0) + 1;
 							derivativeRetryAttempts.current.set(assetId, attempt);
 							if (attempt > 3) continue;
 							derivativeRetryQueue.current.set(assetId, {
-								priority,
-								sourceGeneration: sourceGenerationAtRequest,
-								epoch,
+								priority: record.priority,
+								sourceGeneration: record.sourceGeneration,
+								epoch: record.epoch,
 							});
 							retryDelay = Math.max(retryDelay, 50 * 2 ** (attempt - 1));
 						}

@@ -96,6 +96,7 @@ pub(crate) struct DerivativeRequestTestHook {
 #[derive(Default)]
 pub(crate) struct PreviewGateState {
     pub(crate) recent_ids: Vec<AssetId>,
+    pub(crate) full_group_prefetch: bool,
     pub(crate) generation: u64,
     pub(crate) task_running: bool,
     pub(crate) wall_requests_in_flight: usize,
@@ -185,6 +186,8 @@ pub enum AppServiceError {
     InvalidDerivativeKey,
     #[error("derivative generation failed")]
     DerivativeFailed,
+    #[error("one or more requested previews could not be generated")]
+    DerivativeUnavailable,
     #[error("folder selection was superseded by a newer valid selection")]
     SelectionSuperseded,
 }

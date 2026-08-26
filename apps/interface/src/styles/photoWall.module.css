@@ -39,7 +39,20 @@
 
 @media (prefers-reduced-motion: reduce) {
 	.progressTrack:indeterminate {
+		appearance: none;
+		-webkit-appearance: none;
+		animation: none;
 		background: var(--separator);
+	}
+
+	.progressTrack:indeterminate::-webkit-progress-bar {
+		background: var(--separator);
+	}
+
+	.progressTrack:indeterminate::-webkit-progress-value {
+		width: 50%;
+		background: var(--progress-accent);
+		animation: none;
 	}
 }
 

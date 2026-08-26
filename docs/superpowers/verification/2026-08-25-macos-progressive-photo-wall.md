@@ -297,3 +297,95 @@ The exact repository checks were rerun against the pre-fix-round HEAD
 `git status --short --untracked-files=no` produced no output. After the
 documentation fix commit, the same `git diff --check` and tracked-status
 checks were rerun and again exited 0 with no tracked changes.
+
+## Final-review fix wave: thumbnail-first remediation
+
+This wave starts at reviewed base `67678aa` and covers the five final-review
+findings. The implementation keeps derivative requests bounded and typed:
+`request_derivatives` returns `DerivativeUnavailable` when any pending wall
+asset remains unresolved, the desktop command maps it to the fixed
+`derivativeUnavailable` message, and the interface retries only the exact
+attempt record that still owns an asset. A mixed request publishes successful
+assets once; their ready events remove those records before the rejected batch
+is handled. The preview gate now carries a separate full-group request bit, so
+successful scan settlement on online reopen enumerates screen previews even
+when recent derivative IDs are empty. RAF and idle batches re-check missing
+wall readiness, the controller filters ready assets, and reduced-motion
+WebKit progress uses a static accessible treatment.
+
+Focused RED/GREEN evidence against `67678aa`:
+
+| Finding | RED evidence | GREEN evidence |
+| --- | --- | --- |
+| Repeated derivative failure convergence | `repeated_derivative_failures_return_errors_until_the_asset_recovers` returned `Ok(())` on the first corrupt-source request; the focused browser mixed-request ownership case also retried a promoted asset. | `cargo test -p photo-app-service --test progressive_wall repeated_derivative_failures_return_errors_until_the_asset_recovers -- --exact --nocapture`: 1 passed; the service integration now proves two failures followed by recovery. `npm run test:browser --workspace @photo-viewer/interface -- src/components/PhotoWall.browser.test.tsx -t 'does not let a rejected near request'`: 1 passed. |
+| Online reopen full-group preview | `online_reopen_prefetches_the_full_group_when_only_wall_rows_are_durable` timed out waiting for screen publication. | `cargo test -p photo-app-service --test progressive_wall online_reopen_prefetches_the_full_group_when_only_wall_rows_are_durable -- --exact --nocapture`: 1 passed. |
+| Stage timings | `derivative_timing_observer_reports_every_path_free_stage` failed with missing `source_read_decode`. | `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib protocol::tests::desktop_app_service_timing_observer_reports_every_path_free_stage -- --exact --nocapture`: 1 passed and observed all five stable stages. |
+| Stale scheduled UI requests | Focused WebKit run failed the idle-ready, near-rejection ownership, and controller-boundary cases (3 failures). | Focused WebKit run: 4 passed; full WebKit: 2 files, 41 passed. |
+| Reduced-motion progress | Focused WebKit computed native indeterminate appearance as `auto`, not static. | Focused WebKit and full WebKit both pass; computed appearance and animation are `none` under reduced motion, with role and label retained. |
+
+Focused/full counts from the final wave:
+
+| Command | Result |
+| --- | ---: |
+| `npm test --workspace @photo-viewer/interface` | 4 files, 65 passed |
+| `npm run test:browser --workspace @photo-viewer/interface` | 2 files, 41 passed |
+| `npm run typecheck --workspace @photo-viewer/interface` | pass |
+| `npm run check` | 36 files checked, no fixes |
+| `npm run --workspace @photo-viewer/interface build` | pass, 1,870 modules |
+| `cargo test -p photo-app-service --test progressive_wall` | 31 passed, 0 failed |
+| `cargo test --workspace --all-features` | 185 passed, 0 failed |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass |
+| `cargo fmt --all -- --check` | pass |
+| `cargo test -p catalog-bench --test benchmark_smoke` | 1 passed, 0 failed |
+| `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml` | 11 passed, 0 failed |
+| `cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --all-features -- -D warnings` | pass |
+| `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all -- --check` | pass |
+| `npm run desktop:build -- --bundles app` | 1 unsigned macOS app bundle created |
+
+The exact path-free timing observer command was:
+
+```text
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib protocol::tests::desktop_app_service_timing_observer_reports_every_path_free_stage -- --exact --nocapture
+```
+
+For the same controlled one-JPEG desktop AppService protocol workload, the
+compile-warm profile comparison used the exact command below after one warm-up
+run in each configuration. The standalone profile was temporarily removed,
+then restored without committing the disabled state:
+
+```text
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --lib protocol::tests::desktop_app_service_timing_observer_reports_every_path_free_stage -- --exact --nocapture
+```
+
+| Configuration | Stage observer result | `/usr/bin/time -p real` |
+| --- | --- | ---: |
+| Standalone dependency profile disabled | `source_read_decode=106618667 ns`, `transform_encode=453068750 ns`, `managed_cache_write=11288625 ns`, `catalog_commit=235458 ns`, `derivative_publication=13000 ns`; all five observed | 1.04 s |
+| `[profile.dev.package."*"] opt-level = 3` enabled | `source_read_decode=2364750 ns`, `transform_encode=19466792 ns`, `managed_cache_write=11405916 ns`, `catalog_commit=198334 ns`, `derivative_publication=5167 ns`; all five observed | 0.62 s |
+
+The disabled/enabled values above are machine observations for the same small
+fixture; no 24MP workload is claimed. Timing fields contain only stable stage
+names and nanoseconds, never source paths.
+
+The source/Tauri/path audit covered every changed production file. No source
+media write, rename, move, copy, or delete operation was added; derivative
+request deletion is only in-memory ownership cleanup. Native errors remain
+on a bounded Tauri/interface allowlist, and DTOs do not expose source paths.
+The WebKit test runner produced generated attachments during verification;
+`apps/interface/.vitest-attachments` and
+`apps/interface/src/components/__screenshots__` were removed before commit.
+
+The six demo fixture hashes were unchanged before and after verification:
+
+```text
+city.jpg      44faf249868e8d3ae81c0b532c460711526fbf17a66b82ee43ac805b3591cad1
+coast.jpg     ad6ba90e75709487ab6b927dc3f2781042e31312a4b7bc4606cddd4c0c5c4394
+forest.jpg    91c69c673ef96b8afff1c36da486de4dece98fcaeb178310d00b675f2e48a699
+interior.jpg c8cc481a50bc60cdfb34e7e6ff2a0ac2e7350dd8f934afae91f3c19b0a2d3a05
+mountain.jpg 79bcb7af04b68935b29b5e0a80afb17d1823dde94a5fdbc75e3d5adf7a6e62ae
+portrait.jpg d1844a9747c7acfb36b10651ce79acff5c9d35b30a7b54323dbb171aed0bdfd0
+```
+
+Concerns: the macOS bundle is ad-hoc/unsigned and native GUI interaction is
+not automated in this environment; the stage values are from a one-JPEG
+fixture rather than a production-scale 24MP workload. The ignored final-fix
+report contains the commit/file ledger and the same evidence.

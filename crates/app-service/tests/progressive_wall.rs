@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+use std::{io, sync::Once};
 
 use chrono::{FixedOffset, TimeZone};
 use image::{ImageBuffer, Rgb};
@@ -855,12 +856,16 @@ async fn derivative_failure_records_and_publishes_a_retryable_asset_warning() {
     )
     .unwrap();
 
-    service
+    let failure = service
         .request_derivatives(photo_app_service::DerivativeRequest::visible(vec![
             asset_id.clone(),
         ]))
         .await
-        .unwrap();
+        .expect_err("failed wall generation must return an unsuccessful outcome");
+    assert_eq!(
+        failure.to_string(),
+        "one or more requested previews could not be generated"
+    );
 
     let warning = recv_until(&mut updates, |event| {
         matches!(event, WallUpdate::Warning { .. })
@@ -924,6 +929,225 @@ async fn derivative_failure_records_and_publishes_a_retryable_asset_warning() {
             .warning
             .is_none()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_derivative_failures_return_errors_until_the_asset_recovers() {
+    let fixture = ProgressiveFixture::new(1);
+    let service =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
+            .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let asset_id = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items[0]
+        .id
+        .clone();
+    let original = std::fs::read(fixture.source.join("photo-000.jpg")).unwrap();
+    std::fs::write(
+        fixture.source.join("photo-000.jpg"),
+        b"damaged after indexing",
+    )
+    .unwrap();
+
+    let first = service
+        .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
+        .await;
+    let first = first.expect_err("a failed wall request must return an unsuccessful outcome");
+    assert_eq!(
+        first.to_string(),
+        "one or more requested previews could not be generated"
+    );
+    recv_until(
+        &mut updates,
+        |event| matches!(event, WallUpdate::Warning { asset_id: Some(id), .. } if id == &asset_id),
+    )
+    .await;
+
+    let second = service
+        .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
+        .await;
+    let second =
+        second.expect_err("a repeated failed wall request must return an unsuccessful outcome");
+    assert_eq!(
+        second.to_string(),
+        "one or more requested previews could not be generated"
+    );
+    assert!(
+        updates.try_recv().is_err(),
+        "the repeated failure must not publish a duplicate warning"
+    );
+
+    std::fs::write(fixture.source.join("photo-000.jpg"), original).unwrap();
+    service
+        .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
+        .await
+        .unwrap();
+    let ready = recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if derivatives.iter().any(|item| item.asset_id == asset_id && item.kind == DerivativeClass::WallThumbnail))
+    })
+    .await;
+    assert!(matches!(ready, WallUpdate::DerivativesReady { .. }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn online_reopen_prefetches_the_full_group_when_only_wall_rows_are_durable() {
+    let fixture = ProgressiveFixture::new(2);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let ids = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|asset| asset.id)
+        .collect::<Vec<_>>();
+    service
+        .request_derivatives(DerivativeRequest::visible(ids.clone()))
+        .await
+        .unwrap();
+    let _ = recv_derivatives_until(&mut updates, DerivativeClass::WallThumbnail, ids.len()).await;
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    let screen_ids = catalog
+        .all_derivatives()
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.kind == "screen_preview")
+        .map(|record| record.id)
+        .collect::<Vec<_>>();
+    catalog.delete_derivatives(&screen_ids).unwrap();
+    assert!(
+        Catalog::open(&fixture.config.catalog_path())
+            .unwrap()
+            .all_derivatives()
+            .unwrap()
+            .into_iter()
+            .all(|record| record.kind == "wall_thumbnail")
+    );
+    drop(service);
+
+    let reopened = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut reopened_updates = reopened.subscribe_wall_updates();
+    let page = reopened
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    assert!(
+        page.items
+            .iter()
+            .all(|asset| asset.wall_thumbnail.is_some())
+    );
+    assert!(
+        page.items
+            .iter()
+            .all(|asset| asset.screen_preview.is_none())
+    );
+    let screen = recv_derivatives_until(
+        &mut reopened_updates,
+        DerivativeClass::ScreenPreview,
+        ids.len(),
+    )
+    .await;
+    assert_eq!(
+        screen
+            .iter()
+            .map(|reference| reference.asset_id.as_str())
+            .collect::<std::collections::HashSet<_>>(),
+        ids.iter().map(String::as_str).collect()
+    );
+}
+
+#[derive(Clone)]
+struct TimingWriter(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for TimingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn derivative_timing_observer_reports_every_path_free_stage() {
+    static INIT: Once = Once::new();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let writer = output.clone();
+    INIT.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || TimingWriter(writer.clone()))
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+    });
+    let fixture = ProgressiveFixture::new(1);
+    let service = AppService::open(fixture.config.clone()).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let mut updates = service.subscribe_wall_updates();
+        service.start_scan(&fixture.source).await.unwrap();
+        recv_until(&mut updates, |event| {
+            matches!(event, WallUpdate::MetadataSettled { .. })
+        })
+        .await;
+        let id = service
+            .query_wall(query(SortDirection::OldestFirst))
+            .await
+            .unwrap()
+            .items[0]
+            .id
+            .clone();
+        service
+            .request_derivatives(DerivativeRequest::visible(vec![id]))
+            .await
+            .unwrap();
+        let _ = recv_derivatives_until(&mut updates, DerivativeClass::WallThumbnail, 1).await;
+    });
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    for stage in [
+        "source_read_decode",
+        "transform_encode",
+        "managed_cache_write",
+        "catalog_commit",
+        "derivative_publication",
+    ] {
+        if let Some(line) = logs.lines().find(|line| line.contains(stage)) {
+            println!("{line}");
+        }
+        assert!(
+            logs.contains(stage),
+            "missing timing stage {stage} in {logs}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -144,6 +144,10 @@ fn map_service_error(error: AppServiceError) -> CommandError {
         AppServiceError::InvalidLimit => {
             CommandError::new("invalidLimit", "The requested wall page is not valid.")
         }
+        AppServiceError::DerivativeUnavailable => CommandError::new(
+            "derivativeUnavailable",
+            "Some requested previews could not be generated.",
+        ),
         AppServiceError::InvalidAssetId
         | AppServiceError::ForeignAsset
         | AppServiceError::UnknownAsset => {
@@ -174,5 +178,15 @@ mod tests {
         assert_eq!(error.code, "folderNotDirectory");
         assert_eq!(error.message, "Choose a folder, not a file.");
         assert!(!error.message.contains("source-name"));
+    }
+
+    #[test]
+    fn derivative_unavailable_has_a_bounded_error() {
+        let error = map_service_error(AppServiceError::DerivativeUnavailable);
+        assert_eq!(error.code, "derivativeUnavailable");
+        assert_eq!(
+            error.message,
+            "Some requested previews could not be generated."
+        );
     }
 }

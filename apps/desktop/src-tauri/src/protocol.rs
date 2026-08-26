@@ -177,9 +177,10 @@ mod tests {
     use photo_app_service::{
         OrderState, ScanProgressDto, SourceAvailability, WallAsset, WallMediaKind, WallShapeState,
     };
+    use std::io;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, Once};
 
     static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -338,6 +339,57 @@ mod tests {
         let windows_response =
             handle_derivative_request(&fixture.service, request(&fixture.windows_uri()));
         assert_eq!(windows_response.status(), StatusCode::OK);
+    }
+
+    #[derive(Clone)]
+    struct TimingWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for TimingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn desktop_app_service_timing_observer_reports_every_path_free_stage() {
+        static INIT: Once = Once::new();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = output.clone();
+        INIT.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(move || TimingWriter(writer.clone()))
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+        });
+        let fixture = ProtocolFixture::with_ready_wall_thumbnail();
+        let response = handle_derivative_request(
+            &fixture.service,
+            request(&fixture.uri_with_authority("localhost")),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        for stage in [
+            "source_read_decode",
+            "transform_encode",
+            "managed_cache_write",
+            "catalog_commit",
+            "derivative_publication",
+        ] {
+            if let Some(line) = logs.lines().find(|line| line.contains(stage)) {
+                println!("{line}");
+            }
+            assert!(
+                logs.contains(stage),
+                "missing timing stage {stage} in {logs}"
+            );
+        }
     }
 
     fn sample_catalog_batch() -> WallUpdate {

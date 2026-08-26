@@ -398,9 +398,7 @@ impl AppService {
             return;
         };
         self.wake_preview_gate();
-        if let Some(recent) = recent
-            && !recent.is_empty()
-        {
+        if let Some(recent) = recent {
             self.prefetch_screen_previews(recent).await;
         }
     }

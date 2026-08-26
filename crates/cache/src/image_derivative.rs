@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use crate::{CacheBudget, ProtectedGroups};
 use image::{DynamicImage, ImageReader, codecs::jpeg::JpegEncoder};
@@ -13,6 +14,15 @@ use crate::{
 };
 
 pub const DECODER_VERSION: &str = "image-0.25-v1";
+
+fn record_timing_stage(stage: &'static str, started: Instant) {
+    tracing::debug!(
+        target: "photo_viewer::timing",
+        stage,
+        elapsed_nanos = started.elapsed().as_nanos() as u64,
+        "derivative_stage"
+    );
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GeneratedDerivative {
@@ -164,9 +174,12 @@ impl ImageDerivativeGenerator {
         )?;
         let key = DerivativeKey::compute(spec);
         let relative_path = key.sharded_path("jpg");
-        let write = self.writer.write_atomic(relative_path.clone(), |file| {
+        let write_started = Instant::now();
+        let write_result = self.writer.write_atomic(relative_path.clone(), |file| {
             std::io::Write::write_all(file, &encoded.bytes)
-        })?;
+        });
+        record_timing_stage("managed_cache_write", write_started);
+        let write = write_result?;
         let generated = GeneratedDerivative {
             key,
             relative_path,
@@ -176,7 +189,8 @@ impl ImageDerivativeGenerator {
             representative_rgb: encoded.representative_rgb,
             content_type: "image/jpeg",
         };
-        catalog.upsert_derivative(&NewDerivative {
+        let catalog_started = Instant::now();
+        let catalog_result = catalog.upsert_derivative(&NewDerivative {
             id: DerivativeId::new(),
             asset_id: spec.asset_id,
             folder_group_id,
@@ -186,7 +200,9 @@ impl ImageDerivativeGenerator {
             size_bytes: generated.size_bytes,
             durable: false,
             created_at: 0,
-        })?;
+        });
+        record_timing_stage("catalog_commit", catalog_started);
+        catalog_result?;
         Ok(generated)
     }
 
@@ -207,22 +223,36 @@ impl ImageDerivativeGenerator {
             _ => return Err(ImageDerivativeError::UnsupportedTarget),
         };
         let durable = spec.kind == DerivativeKind::WallThumbnail;
-        let image = apply_orientation(
-            ImageReader::open(source)?.with_guessed_format()?.decode()?,
-            spec.orientation,
-        );
-        let representative_rgb = average_rgb(&image.thumbnail(32, 32).to_rgb8());
-        let resized = resize_without_upscale(image, edge).to_rgb8();
-        let mut encoded = Vec::new();
-        JpegEncoder::new_with_quality(&mut encoded, quality).encode(
-            &resized,
-            resized.width(),
-            resized.height(),
-            image::ExtendedColorType::Rgb8,
-        )?;
-        let write = self.writer.write_atomic(relative_path.clone(), |file| {
+        let decode_started = Instant::now();
+        let image = (|| {
+            Ok::<_, ImageDerivativeError>(
+                ImageReader::open(source)?.with_guessed_format()?.decode()?,
+            )
+        })();
+        record_timing_stage("source_read_decode", decode_started);
+        let image = image?;
+        let transform_started = Instant::now();
+        let transformed = (|| {
+            let image = apply_orientation(image, spec.orientation);
+            let representative_rgb = average_rgb(&image.thumbnail(32, 32).to_rgb8());
+            let resized = resize_without_upscale(image, edge).to_rgb8();
+            let mut encoded = Vec::new();
+            JpegEncoder::new_with_quality(&mut encoded, quality).encode(
+                &resized,
+                resized.width(),
+                resized.height(),
+                image::ExtendedColorType::Rgb8,
+            )?;
+            Ok::<_, ImageDerivativeError>((encoded, representative_rgb))
+        })();
+        record_timing_stage("transform_encode", transform_started);
+        let (encoded, representative_rgb) = transformed?;
+        let write_started = Instant::now();
+        let write_result = self.writer.write_atomic(relative_path.clone(), |file| {
             std::io::Write::write_all(file, &encoded)
-        })?;
+        });
+        record_timing_stage("managed_cache_write", write_started);
+        let write = write_result?;
         Ok(GeneratedDerivative {
             key,
             relative_path,
@@ -239,20 +269,28 @@ fn encode_screen(
     source: &Path,
     spec: &DerivativeSpec,
 ) -> Result<(Vec<u8>, RepresentativeRgb), ImageDerivativeError> {
-    let image = apply_orientation(
-        ImageReader::open(source)?.with_guessed_format()?.decode()?,
-        spec.orientation,
-    );
-    let representative_rgb = average_rgb(&image.thumbnail(32, 32).to_rgb8());
-    let resized = resize_without_upscale(image, 4096).to_rgb8();
-    let mut bytes = Vec::new();
-    JpegEncoder::new_with_quality(&mut bytes, 90).encode(
-        &resized,
-        resized.width(),
-        resized.height(),
-        image::ExtendedColorType::Rgb8,
-    )?;
-    Ok((bytes, representative_rgb))
+    let decode_started = Instant::now();
+    let image = (|| {
+        Ok::<_, ImageDerivativeError>(ImageReader::open(source)?.with_guessed_format()?.decode()?)
+    })();
+    record_timing_stage("source_read_decode", decode_started);
+    let image = image?;
+    let transform_started = Instant::now();
+    let transformed = (|| {
+        let image = apply_orientation(image, spec.orientation);
+        let representative_rgb = average_rgb(&image.thumbnail(32, 32).to_rgb8());
+        let resized = resize_without_upscale(image, 4096).to_rgb8();
+        let mut bytes = Vec::new();
+        JpegEncoder::new_with_quality(&mut bytes, 90).encode(
+            &resized,
+            resized.width(),
+            resized.height(),
+            image::ExtendedColorType::Rgb8,
+        )?;
+        Ok::<_, ImageDerivativeError>((bytes, representative_rgb))
+    })();
+    record_timing_stage("transform_encode", transform_started);
+    transformed
 }
 
 fn validate_spec(spec: &DerivativeSpec) -> Result<(), ImageDerivativeError> {

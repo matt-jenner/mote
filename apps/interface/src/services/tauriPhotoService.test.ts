@@ -121,6 +121,26 @@ describe("Tauri PhotoService", () => {
 		});
 	});
 
+	it("keeps derivative-unavailable failures on the bounded native allowlist", async () => {
+		const invoke: InvokeCommand = async () => {
+			throw {
+				code: "derivativeUnavailable",
+				message: "Some requested previews could not be generated.",
+			};
+		};
+		const service = createTauriPhotoService(invoke);
+
+		const error = await service
+			.requestDerivatives({ assetIds: ["asset-a"], priority: "visible" })
+			.catch((reason: unknown) => reason);
+
+		expect(error).toBeInstanceOf(PhotoServiceError);
+		expect(error).toMatchObject({
+			code: "derivativeUnavailable",
+			message: "Some requested previews could not be generated.",
+		});
+	});
+
 	it("maps unknown native rejections to a fixed path-free internal error", async () => {
 		const nativeDetail = "SQLite failed near /Users/private/Photo Library";
 		for (const rejection of [

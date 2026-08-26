@@ -1055,6 +1055,8 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -1070,6 +1072,7 @@ dependencies = [
  "photo-metadata",
  "tempfile",
  "thiserror",
+ "tracing",
  "uuid",
  "walkdir",
 ]

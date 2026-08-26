@@ -21,6 +21,7 @@ const nativeErrorMessages: Readonly<Record<string, string>> = {
 	localStateUnavailable: "Photo Viewer cannot open its local data.",
 	invalidLimit: "The requested wall page is not valid.",
 	assetNotFound: "That photo is no longer available.",
+	derivativeUnavailable: "Some requested previews could not be generated.",
 	internal: internalErrorMessage,
 };
 

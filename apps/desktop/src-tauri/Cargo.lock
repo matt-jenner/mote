@@ -2548,6 +2548,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -2562,6 +2563,7 @@ dependencies = [
  "photo-domain",
  "photo-metadata",
  "thiserror 2.0.20",
+ "tracing",
  "uuid",
  "walkdir",
 ]

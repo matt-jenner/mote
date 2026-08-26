@@ -23,7 +23,9 @@ export default defineConfig({
 					include: ["src/**/*.browser.test.tsx"],
 					browser: {
 						enabled: true,
-						provider: playwright(),
+						provider: playwright({
+							contextOptions: { reducedMotion: "reduce" },
+						}),
 						headless: true,
 						instances: [{ browser: "webkit" }],
 					},

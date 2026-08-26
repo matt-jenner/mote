@@ -102,8 +102,12 @@ export function JustifiedWall({
 					.map((item) => item.asset.id),
 			)
 			.filter((id, index, ids) => ids.indexOf(id) === index);
-		if (visibleIds.length > 0) requestVisibleDerivatives(visibleIds);
-		if (nearIds.length > 0) requestNearViewportDerivatives(nearIds);
+		const currentMissing = (ids: readonly string[]) =>
+			ids.filter((id) => missingWallIdsRef.current.has(id));
+		const visibleMissing = currentMissing(visibleIds);
+		const nearMissing = currentMissing(nearIds);
+		if (visibleMissing.length > 0) requestVisibleDerivatives(visibleMissing);
+		if (nearMissing.length > 0) requestNearViewportDerivatives(nearMissing);
 
 		let idleHandle: number | null = null;
 		let timerHandle: number | null = null;
@@ -115,7 +119,9 @@ export function JustifiedWall({
 				timerHandle = null;
 				const batch = remainingIds.slice(offset, offset + 50);
 				offset += batch.length;
-				if (batch.length > 0) requestNearViewportDerivatives(batch);
+				const missingBatch = currentMissing(batch);
+				if (missingBatch.length > 0)
+					requestNearViewportDerivatives(missingBatch);
 				if (offset < remainingIds.length) scheduleRemaining();
 			};
 			const requestIdle = (
@@ -153,8 +159,12 @@ export function JustifiedWall({
 		let frame: number | null = null;
 		const flush = () => {
 			frame = null;
-			const visible = [...visibleIds];
-			const near = [...nearIds].filter((id) => !visibleIds.has(id));
+			const visible = [...visibleIds].filter((id) =>
+				missingWallIdsRef.current.has(id),
+			);
+			const near = [...nearIds].filter(
+				(id) => !visibleIds.has(id) && missingWallIdsRef.current.has(id),
+			);
 			visibleIds.clear();
 			nearIds.clear();
 			if (visible.length > 0) requestVisibleDerivatives(visible);

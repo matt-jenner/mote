@@ -31,6 +31,15 @@ const SCREEN_CACHE_DERIVATIVE_WARNING: &str = "screen_preview_cache_unavailable"
 const MAX_DERIVATIVE_WORKERS: usize = 2;
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(50);
 
+fn record_timing_stage(stage: &'static str, started: std::time::Instant) {
+    tracing::debug!(
+        target: "photo_viewer::timing",
+        stage,
+        elapsed_nanos = started.elapsed().as_nanos() as u64,
+        "derivative_stage"
+    );
+}
+
 #[derive(Debug)]
 enum DerivativeWorkError {
     Image(ImageDerivativeError),
@@ -297,6 +306,10 @@ impl AppService {
             DerivativePriority::Visible => JobPriority::Visible,
             DerivativePriority::NearViewport => JobPriority::NearViewport,
         };
+        let mut successful_ids = ready
+            .iter()
+            .map(|reference| reference.asset_id.clone())
+            .collect::<HashSet<_>>();
         if !ready.is_empty() {
             self.publish_derivatives_if_active(selection, ready);
         }
@@ -306,8 +319,22 @@ impl AppService {
         {
             append_unique(&mut state.recent_derivative_ids, ids.iter().copied());
         }
-        let _generated = self.run_derivative_jobs_publishing(pending, priority).await;
-        self.schedule_screen_preview_prefetch(ids);
+        let pending_ids = pending
+            .iter()
+            .map(|work| work.id.as_uuid().hyphenated().to_string())
+            .collect::<HashSet<_>>();
+        let generated = self.run_derivative_jobs_publishing(pending, priority).await;
+        successful_ids.extend(generated.iter().map(|reference| reference.asset_id.clone()));
+        let has_unresolved = pending_ids.difference(&successful_ids).next().is_some();
+        let successful_in_request = ids
+            .iter()
+            .copied()
+            .filter(|id| successful_ids.contains(&id.as_uuid().hyphenated().to_string()))
+            .collect::<Vec<_>>();
+        self.schedule_screen_preview_prefetch(successful_in_request);
+        if has_unresolved {
+            return Err(AppServiceError::DerivativeUnavailable);
+        }
         Ok(())
     }
 
@@ -625,7 +652,8 @@ impl AppService {
             let mut state = self
                 .state()
                 .map_err(|_| DerivativeWorkError::WorkerUnavailable)?;
-            state
+            let catalog_started = std::time::Instant::now();
+            let catalog_result = state
                 .libraries
                 .catalog_mut()
                 .upsert_derivative(&NewDerivative {
@@ -638,8 +666,9 @@ impl AppService {
                     size_bytes: generated.size_bytes,
                     durable: true,
                     created_at: 0,
-                })
-                .map_err(ImageDerivativeError::from)?;
+                });
+            record_timing_stage("catalog_commit", catalog_started);
+            catalog_result.map_err(ImageDerivativeError::from)?;
         }
         Ok(reference(id, class, generated.key.as_str().into()))
     }
@@ -761,7 +790,7 @@ impl AppService {
     }
 
     pub(crate) async fn prefetch_screen_previews(&self, recent: Vec<AssetId>) {
-        self.schedule_screen_preview_prefetch(recent);
+        self.schedule_screen_preview_prefetch_for_group(recent, true);
     }
 
     pub(crate) fn wake_preview_gate(&self) {
@@ -769,6 +798,10 @@ impl AppService {
     }
 
     fn schedule_screen_preview_prefetch(&self, recent: Vec<AssetId>) {
+        self.schedule_screen_preview_prefetch_for_group(recent, false);
+    }
+
+    fn schedule_screen_preview_prefetch_for_group(&self, recent: Vec<AssetId>, full_group: bool) {
         let stable_recent = self
             .state()
             .map(|state| state.recent_derivative_ids.clone())
@@ -779,8 +812,9 @@ impl AppService {
             };
             append_unique(&mut gate.recent_ids, stable_recent);
             append_unique(&mut gate.recent_ids, recent);
+            gate.full_group_prefetch |= full_group;
             gate.generation = gate.generation.wrapping_add(1).max(1);
-            if gate.task_running || gate.recent_ids.is_empty() {
+            if gate.task_running || (gate.recent_ids.is_empty() && !gate.full_group_prefetch) {
                 false
             } else {
                 gate.task_running = true;
@@ -806,6 +840,7 @@ impl AppService {
     pub(crate) fn reset_preview_gate(&self) {
         if let Ok(mut gate) = self.preview_gate.lock() {
             gate.recent_ids.clear();
+            gate.full_group_prefetch = false;
             gate.generation = gate.generation.wrapping_add(1).max(1);
             gate.wall_requests_in_flight = 0;
             gate.wall_request_selection = None;
@@ -868,7 +903,7 @@ impl AppService {
                 let Ok(mut gate) = self.preview_gate.lock() else {
                     return;
                 };
-                if gate.recent_ids.is_empty() {
+                if gate.recent_ids.is_empty() && !gate.full_group_prefetch {
                     gate.task_running = false;
                     return;
                 }
@@ -896,6 +931,7 @@ impl AppService {
                         };
                         if gate.generation == generation {
                             gate.recent_ids.clear();
+                            gate.full_group_prefetch = false;
                             gate.task_running = false;
                             false
                         } else {
@@ -916,6 +952,7 @@ impl AppService {
                     };
                     if gate.generation == generation {
                         gate.recent_ids.clear();
+                        gate.full_group_prefetch = false;
                         gate.task_running = false;
                         return;
                     }
@@ -1143,11 +1180,13 @@ impl AppService {
         {
             return false;
         }
-        let _ = self.updates.send(WallUpdate::DerivativesReady {
+        let publication_started = std::time::Instant::now();
+        let result = self.updates.send(WallUpdate::DerivativesReady {
             selection_id: selection.selection_id(),
             derivatives,
         });
-        true
+        record_timing_stage("derivative_publication", publication_started);
+        result.is_ok()
     }
 
     fn record_asset_derivative_warning(&self, selection: SelectionToken, asset_id: AssetId) {

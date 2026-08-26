@@ -137,6 +137,8 @@ class ControlledWallService implements PhotoService {
 	readonly queryRequests: WallQueryRequest[] = [];
 	readonly derivativeRequests: DerivativeRequest[] = [];
 	derivativeRejectsRemaining = 0;
+	derivativeHoldPriority: DerivativeRequest["priority"] | null = null;
+	readonly heldDerivativeRequests: Array<Gate<void>> = [];
 	readonly interactionCalls: boolean[] = [];
 	readonly gates: Gate<WallPage>[] = [];
 	private readonly listeners = new Set<(update: WallUpdate) => void>();
@@ -178,6 +180,11 @@ class ControlledWallService implements PhotoService {
 			this.derivativeRejectsRemaining -= 1;
 			throw new Error("derivative request rejected");
 		}
+		if (request.priority === this.derivativeHoldPriority) {
+			const pending = gate<void>();
+			this.heldDerivativeRequests.push(pending);
+			await pending.promise;
+		}
 	};
 	setWallInteraction = async (active: boolean) => {
 		this.interactionCalls.push(active);
@@ -212,6 +219,18 @@ class ControlledWallService implements PhotoService {
 	emit = (update: WallUpdate) => {
 		for (const listener of this.listeners) listener(update);
 	};
+}
+
+function ControllerRequestHarness() {
+	const wall = usePhotoWall("source-a");
+	return (
+		<button
+			onClick={() => wall.requestVisibleDerivatives(["ready-controller"])}
+			type="button"
+		>
+			Request thumbnail
+		</button>
+	);
 }
 
 function asset(
@@ -331,6 +350,10 @@ afterEach(() => {
 	Object.defineProperty(window, "IntersectionObserver", {
 		configurable: true,
 		value: originalIntersectionObserver,
+	});
+	Object.defineProperty(window, "requestIdleCallback", {
+		configurable: true,
+		value: originalRequestIdleCallback,
 	});
 	document.documentElement.style.removeProperty("--fade-duration");
 });
@@ -463,6 +486,131 @@ describe("progressive photo wall", () => {
 		expect(idleRequests).toEqual(expectedNearIds.concat(expectedRemainingIds));
 		for (const request of service.derivativeRequests)
 			expect(request.assetIds.length).toBeLessThanOrEqual(50);
+	});
+
+	it("does not submit an idle request for a thumbnail that became ready before the flush", async () => {
+		await page.viewport(1440, 520);
+		const idleCallbacks: Array<() => void> = [];
+		Object.defineProperty(window, "requestIdleCallback", {
+			configurable: true,
+			value: (callback: () => void) => {
+				idleCallbacks.push(callback);
+				return idleCallbacks.length;
+			},
+		});
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		const assets = Array.from({ length: 60 }, (_, index) =>
+			asset(`idle-ready-${index}`, `Idle ready ${index}`, index + 1),
+		);
+		service.releaseQuery(0, pageOf(assets, "settled"));
+		await expect.poll(() => idleCallbacks.length).toBeGreaterThan(0);
+		const initialIds = new Set(
+			service.derivativeRequests.flatMap((request) => request.assetIds),
+		);
+		const candidate = assets.find((item) => !initialIds.has(item.id));
+		expect(candidate).toBeDefined();
+		if (!candidate) return;
+		const initialRequestCount = service.derivativeRequests.length;
+		service.releaseThumbnail(candidate.id, `/demo-photos/${candidate.id}.jpg`);
+		for (const callback of idleCallbacks.splice(0)) callback();
+		await new Promise((resolve) => window.setTimeout(resolve, 25));
+		expect(
+			service.derivativeRequests
+				.slice(initialRequestCount)
+				.flatMap((request) => request.assetIds),
+		).not.toContain(candidate.id);
+		screen.unmount();
+	});
+
+	it("does not let a rejected near request erase a newer visible promotion", async () => {
+		const service = new ControlledWallService();
+		service.derivativeHoldPriority = "nearViewport";
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		const assets = Array.from({ length: 24 }, (_, index) =>
+			asset(`promote-${index}`, `Promote ${index}`, index + 1),
+		);
+		service.releaseQuery(0, pageOf(assets, "settled"));
+		await expect
+			.poll(() =>
+				service.derivativeRequests.some(
+					(request) => request.priority === "nearViewport",
+				),
+			)
+			.toBe(true);
+		const near = service.derivativeRequests.find(
+			(request) => request.priority === "nearViewport",
+		);
+		const promoted = near?.assetIds[0];
+		expect(promoted).toBeDefined();
+		if (!promoted) return;
+		TestIntersectionObserver.trigger(
+			"visible",
+			screen.getByRole("region", { name: "Photos" }).element(),
+			[promoted],
+		);
+		await expect
+			.poll(() =>
+				service.derivativeRequests.some(
+					(request) =>
+						request.priority === "visible" &&
+						request.assetIds.includes(promoted),
+				),
+			)
+			.toBe(true);
+		service.heldDerivativeRequests[0]?.reject(new Error("near failed"));
+		await new Promise((resolve) => window.setTimeout(resolve, 100));
+		expect(
+			service.derivativeRequests.filter(
+				(request) =>
+					request.priority === "nearViewport" &&
+					request.assetIds.includes(promoted),
+			),
+		).toHaveLength(1);
+		screen.unmount();
+	});
+
+	it("filters already-ready thumbnails at the controller boundary", async () => {
+		const service = new ControlledWallService();
+		const screen = await render(
+			<PhotoServiceProvider service={service}>
+				<ControllerRequestHarness />
+			</PhotoServiceProvider>,
+		);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(
+			0,
+			pageOf(
+				[
+					asset("ready-controller", "Ready controller", 1, {
+						wallThumbnail: {
+							assetId: "ready-controller",
+							kind: "wallThumbnail",
+							key: "ready-controller-wall",
+						},
+					}),
+				],
+				"settled",
+			),
+		);
+		await screen.getByRole("button", { name: "Request thumbnail" }).click();
+		await new Promise((resolve) => window.setTimeout(resolve, 25));
+		expect(service.derivativeRequests).toHaveLength(0);
+		screen.unmount();
+	});
+
+	it("renders an accessible static indeterminate progress track with reduced motion", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(0, pageOf([]));
+		const progress = screen.getByRole("progressbar").element();
+		expect(progress.getAttribute("aria-label")).toBe("Photo preview progress");
+		expect(progress.hasAttribute("value")).toBe(false);
+		expect(getComputedStyle(progress).appearance).toBe("none");
+		expect(getComputedStyle(progress).animationName).toBe("none");
 	});
 
 	it("retries a missing thumbnail after changing sort direction", async () => {
