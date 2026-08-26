@@ -6,7 +6,9 @@ mod writer;
 
 pub use budget::CacheBudget;
 pub use eviction::{ActiveWriteGuard, EvictionPlan, EvictionPlanner, ProtectedGroups};
-pub use image_derivative::{GeneratedDerivative, ImageDerivativeError, ImageDerivativeGenerator};
+pub use image_derivative::{
+    EncodedScreenPreview, GeneratedDerivative, ImageDerivativeError, ImageDerivativeGenerator,
+};
 pub use key::{DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget};
 pub use photo_metadata::RepresentativeRgb;
 pub use writer::{CacheReconcileReport, CacheWrite, CacheWriter};
@@ -25,6 +27,8 @@ pub enum CacheError {
     SizeOutOfRange,
     #[error("cache protection state is unavailable")]
     ProtectionUnavailable,
+    #[error("cache transaction lock is unavailable")]
+    TransactionUnavailable,
     #[error("an eviction group became protected before deletion")]
     GroupBecameProtected,
     #[error("cache preview budget cannot be satisfied")]

@@ -46,14 +46,7 @@ impl CacheBudget {
         estimated_bytes: u64,
         protected: &ProtectedGroups,
     ) -> Result<BudgetPreparation, CacheError> {
-        let used = catalog
-            .all_derivatives()?
-            .into_iter()
-            .filter(|d| !d.durable)
-            .try_fold(0_u64, |sum, d| {
-                sum.checked_add(d.size_bytes)
-                    .ok_or(CacheError::SizeOutOfRange)
-            })?;
+        let used = catalog.non_durable_size_bytes()?;
         let needed = used
             .checked_add(estimated_bytes)
             .ok_or(CacheError::SizeOutOfRange)?

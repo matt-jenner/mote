@@ -189,6 +189,31 @@ impl Catalog {
             .map_err(Into::into)
     }
 
+    /// Returns the aggregate size of non-durable derivatives without materializing every row.
+    ///
+    /// SQLite stores the derivative size as a signed integer, so an aggregate that exceeds the
+    /// representable range must be surfaced as the catalog's typed range error rather than being
+    /// treated as a valid cache size.
+    pub fn non_durable_size_bytes(&self) -> Result<u64, CatalogError> {
+        let total = self.connection.query_row(
+            "SELECT SUM(size_bytes) FROM derivatives WHERE durable = 0",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        );
+        match total {
+            Ok(Some(value)) => u64::try_from(value).map_err(|_| CatalogError::ValueOutOfRange),
+            Ok(None) => Ok(0),
+            Err(rusqlite::Error::SqliteFailure(_, message))
+                if message
+                    .as_deref()
+                    .is_some_and(|value| value.contains("integer overflow")) =>
+            {
+                Err(CatalogError::ValueOutOfRange)
+            }
+            Err(error) => Err(CatalogError::Sqlite(error)),
+        }
+    }
+
     pub fn non_durable_derivatives(
         &self,
         groups: &[FolderGroupId],

@@ -23,6 +23,7 @@ const DECODER_VERSION: &str = "image-0.25-v1";
 const ASSET_DERIVATIVE_WARNING: &str = "derivative_generation_failed";
 const WALL_CACHE_DERIVATIVE_WARNING: &str = "wall_thumbnail_cache_unavailable";
 const SCREEN_CACHE_DERIVATIVE_WARNING: &str = "screen_preview_cache_unavailable";
+const MAX_DERIVATIVE_WORKERS: usize = 2;
 
 #[derive(Debug)]
 enum DerivativeWorkError {
@@ -222,7 +223,7 @@ impl AppService {
             tokio::spawn(async move {
                 let has_paused_jobs = !service.derivative_queue.is_empty().await;
                 if has_paused_jobs {
-                    service.drive_derivative_queue().await;
+                    service.drive_derivative_queue(true).await;
                 } else {
                     service.prefetch_screen_previews(Vec::new()).await;
                 }
@@ -254,9 +255,10 @@ impl AppService {
             DerivativePriority::Visible => JobPriority::Visible,
             DerivativePriority::NearViewport => JobPriority::NearViewport,
         };
-        let generated = self.run_derivative_jobs(pending, priority).await;
-        let derivatives = merge_in_request_order(&ids, ready, generated);
-        self.publish_derivatives_if_active(selection, derivatives);
+        if !ready.is_empty() {
+            self.publish_derivatives_if_active(selection, ready);
+        }
+        let _generated = self.run_derivative_jobs_publishing(pending, priority).await;
 
         if let Ok(mut state) = self.state.lock()
             && state.selection_epoch == selection.epoch
@@ -352,10 +354,30 @@ impl AppService {
         Ok((selection_token, ready, pending))
     }
 
+    #[cfg(test)]
     async fn run_derivative_jobs(
         &self,
         pending: Vec<PendingDerivative>,
         priority: JobPriority,
+    ) -> Vec<DerivativeReference> {
+        self.run_derivative_jobs_with_publication(pending, priority, false)
+            .await
+    }
+
+    async fn run_derivative_jobs_publishing(
+        &self,
+        pending: Vec<PendingDerivative>,
+        priority: JobPriority,
+    ) -> Vec<DerivativeReference> {
+        self.run_derivative_jobs_with_publication(pending, priority, true)
+            .await
+    }
+
+    async fn run_derivative_jobs_with_publication(
+        &self,
+        pending: Vec<PendingDerivative>,
+        priority: JobPriority,
+        publish: bool,
     ) -> Vec<DerivativeReference> {
         let mut receivers = Vec::with_capacity(pending.len());
         for pending in pending {
@@ -368,7 +390,7 @@ impl AppService {
         if !receivers.is_empty() {
             let service = self.clone();
             tokio::spawn(async move {
-                service.drive_derivative_queue().await;
+                service.drive_derivative_queue(publish).await;
             });
         }
         let mut ready = Vec::new();
@@ -380,8 +402,25 @@ impl AppService {
         ready
     }
 
-    async fn drive_derivative_queue(&self) {
+    async fn drive_derivative_queue(&self, publish: bool) {
         let _driver = self.derivative_queue.driver.lock().await;
+        let worker_count = self
+            .scheduler
+            .available_background_permits()
+            .clamp(1, MAX_DERIVATIVE_WORKERS);
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let service = self.clone();
+            workers.push(tokio::spawn(async move {
+                service.drive_derivative_worker(publish).await;
+            }));
+        }
+        for worker in workers {
+            let _ = worker.await;
+        }
+    }
+
+    async fn drive_derivative_worker(&self, publish: bool) {
         loop {
             let Some((job, key, pending)) = self.derivative_queue.next_owned(&self.scheduler).await
             else {
@@ -402,6 +441,9 @@ impl AppService {
                 match self.generate_derivative(pending).await {
                     Ok(reference) => {
                         self.clear_derivative_warnings(selection, asset_id, class);
+                        if publish {
+                            self.publish_derivatives_if_active(selection, vec![reference.clone()]);
+                        }
                         Some(reference)
                     }
                     Err(error) => {
@@ -432,6 +474,8 @@ impl AppService {
         let group = pending.group;
         let class = pending.class;
         let selection = pending.selection;
+        #[cfg(test)]
+        self.wait_for_test_derivative_gate(id).await;
         let generated = match class {
             DerivativeClass::WallThumbnail => {
                 let source = pending.source;
@@ -446,17 +490,27 @@ impl AppService {
                 let catalog_path = self.catalog_path.clone();
                 let cache_budget = self.cache_budget;
                 let protected = self.protected_groups.clone();
+                let encoded = tokio::task::spawn_blocking({
+                    let generator = generator.clone();
+                    let spec = spec.clone();
+                    move || generator.encode_screen_preview(&source, &spec)
+                })
+                .await
+                .map_err(|_| DerivativeWorkError::WorkerUnavailable)??;
+                if !self.selection_is_active(selection) {
+                    return Err(DerivativeWorkError::WorkerUnavailable);
+                }
+                let service = self.clone();
                 tokio::task::spawn_blocking(move || {
-                    let mut catalog = Catalog::open(&catalog_path)?;
-                    generator.generate_screen_preview(
-                        &source,
-                        spec.asset_id,
-                        spec.signature,
-                        spec.orientation,
+                    service.commit_screen_preview_if_active(
+                        generator,
+                        encoded,
+                        &spec,
                         group,
-                        &mut catalog,
                         cache_budget,
                         &protected,
+                        selection,
+                        &catalog_path,
                     )
                 })
                 .await
@@ -489,6 +543,40 @@ impl AppService {
         Ok(reference(id, class, generated.key.as_str().into()))
     }
 
+    #[cfg(test)]
+    async fn wait_for_test_derivative_gate(&self, asset_id: AssetId) {
+        let gate = self.derivative_test_gate.lock().await.clone();
+        if let Some(gate) = gate.filter(|gate| gate.blocked_asset == asset_id) {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_screen_preview_if_active(
+        &self,
+        generator: ImageDerivativeGenerator,
+        encoded: photo_cache::EncodedScreenPreview,
+        spec: &DerivativeSpec,
+        group: FolderGroupId,
+        budget: photo_cache::CacheBudget,
+        protected: &photo_cache::ProtectedGroups,
+        selection: SelectionToken,
+        catalog_path: &std::path::Path,
+    ) -> Result<photo_cache::GeneratedDerivative, DerivativeWorkError> {
+        let _commit_guard = self
+            .screen_preview_commit_lock
+            .lock()
+            .map_err(|_| DerivativeWorkError::WorkerUnavailable)?;
+        if !self.selection_is_active(selection) {
+            return Err(DerivativeWorkError::WorkerUnavailable);
+        }
+        let mut catalog = Catalog::open(catalog_path).map_err(ImageDerivativeError::from)?;
+        generator
+            .commit_screen_preview(encoded, spec, group, &mut catalog, budget, protected)
+            .map_err(Into::into)
+    }
+
     pub(crate) async fn prefetch_screen_previews(&self, recent: Vec<AssetId>) {
         if self
             .state()
@@ -502,13 +590,12 @@ impl AppService {
         else {
             return;
         };
-        let generated = self
-            .run_derivative_jobs(pending, JobPriority::NearViewport)
-            .await;
-        let derivatives = merge_in_request_order(&recent, cached, generated);
-        if !derivatives.is_empty() {
-            self.publish_derivatives_if_active(selection, derivatives);
+        if !cached.is_empty() {
+            self.publish_derivatives_if_active(selection, cached);
         }
+        let _generated = self
+            .run_derivative_jobs_publishing(pending, JobPriority::NearViewport)
+            .await;
 
         let recent = recent.into_iter().collect::<HashSet<_>>();
         let mut cursor = None;
@@ -535,12 +622,9 @@ impl AppService {
                 if resolved_selection != selection {
                     return;
                 }
-                let derivatives = self
-                    .run_derivative_jobs(pending, JobPriority::IdleLibrary)
+                let _generated = self
+                    .run_derivative_jobs_publishing(pending, JobPriority::IdleLibrary)
                     .await;
-                if !derivatives.is_empty() {
-                    self.publish_derivatives_if_active(selection, derivatives);
-                }
             }
             let Some(next) = next else {
                 break;
@@ -817,44 +901,27 @@ fn reference(id: AssetId, kind: DerivativeClass, key: String) -> DerivativeRefer
     }
 }
 
-fn merge_in_request_order(
-    ids: &[AssetId],
-    ready: Vec<DerivativeReference>,
-    generated: Vec<DerivativeReference>,
-) -> Vec<DerivativeReference> {
-    let references = ready
-        .into_iter()
-        .chain(generated)
-        .map(|item| (item.asset_id.clone(), item))
-        .collect::<HashMap<_, _>>();
-    ids.iter()
-        .filter_map(|id| {
-            references
-                .get(&id.as_uuid().hyphenated().to_string())
-                .cloned()
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
 
     use image::{ImageBuffer, Rgb};
     use photo_cache::{
         CacheBudget, DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget,
+        EncodedScreenPreview, ImageDerivativeGenerator,
     };
-    use photo_catalog::{AssetShapeUpdate, CatalogIndexRecord, NewAsset, ShapeStatus};
+    use photo_catalog::{AssetShapeUpdate, Catalog, CatalogIndexRecord, NewAsset, ShapeStatus};
     use photo_domain::{
         AssetId, FileSignature, FolderGroupId, LibraryId, MediaKind, RelativePathKey,
     };
     use photo_indexer::{IndexJob, IndexScheduler, JobPriority, SchedulerConfig};
 
-    use crate::service::SelectionToken;
+    use crate::service::{DerivativeTestGate, SelectionToken};
     use crate::{AppConfig, AppService, DerivativeClass, DerivativeReference, WallUpdate};
 
-    use super::{DerivativeQueue, PendingDerivative};
+    use super::{DerivativeQueue, DerivativeWorkError, PendingDerivative};
 
     #[tokio::test]
     async fn derivative_driver_leaves_foreign_scheduler_jobs_available() {
@@ -922,6 +989,153 @@ mod tests {
             .await;
         assert_eq!(first.await.unwrap(), Some(reference.clone()));
         assert_eq!(second.await.unwrap(), Some(reference));
+    }
+
+    #[tokio::test]
+    async fn concurrent_workers_take_distinct_jobs_in_priority_order() {
+        let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig::default()));
+        let queue = Arc::new(DerivativeQueue::default());
+        let selection = SelectionToken {
+            library_id: LibraryId::new(),
+            group_id: FolderGroupId::new(),
+            epoch: 1,
+        };
+        let pending = |asset_id| PendingDerivative {
+            id: asset_id,
+            source: PathBuf::from("source.jpg"),
+            spec: DerivativeSpec {
+                asset_id,
+                signature: photo_domain::FileSignature {
+                    size_bytes: 1,
+                    modified_unix_ns: 1,
+                    sidecar_modified_unix_ns: None,
+                },
+                orientation: 1,
+                kind: DerivativeKind::WallThumbnail,
+                decoder_version: "decoder".to_owned(),
+                colour_space: "srgb".to_owned(),
+                target: DerivativeTarget::LongEdge(1024),
+            },
+            group: selection.group_id,
+            class: DerivativeClass::WallThumbnail,
+            selection,
+        };
+        let first_id = AssetId::from_uuid(uuid::Uuid::new_v4());
+        let second_id = AssetId::from_uuid(uuid::Uuid::new_v4());
+        let first = queue
+            .enqueue(&scheduler, pending(first_id), JobPriority::NearViewport)
+            .await;
+        let second = queue
+            .enqueue(&scheduler, pending(second_id), JobPriority::Visible)
+            .await;
+
+        let left = {
+            let queue = queue.clone();
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move { queue.next_owned(&scheduler).await.unwrap() })
+        };
+        let right = {
+            let queue = queue.clone();
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move { queue.next_owned(&scheduler).await.unwrap() })
+        };
+        let left = left.await.unwrap();
+        let right = right.await.unwrap();
+        assert!(
+            (left.0.priority() == JobPriority::Visible
+                && right.0.priority() == JobPriority::NearViewport)
+                || (right.0.priority() == JobPriority::Visible
+                    && left.0.priority() == JobPriority::NearViewport)
+        );
+        assert_ne!(left.2.id, right.2.id);
+        assert_eq!(
+            [left.2.id, right.2.id].into_iter().collect::<HashSet<_>>(),
+            [first_id, second_id].into_iter().collect()
+        );
+        drop(first);
+        drop(second);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn healthy_visible_derivative_publishes_before_a_blocked_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(&source).unwrap();
+        let blocked_path = source.join("blocked.jpg");
+        let healthy_path = source.join("healthy.jpg");
+        ImageBuffer::from_pixel(32, 24, Rgb([220_u8, 10, 20]))
+            .save(&blocked_path)
+            .unwrap();
+        ImageBuffer::from_pixel(32, 24, Rgb([10_u8, 180, 40]))
+            .save(&healthy_path)
+            .unwrap();
+        let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+        let service = AppService::open(config).unwrap();
+        let mut updates = service.subscribe_wall_updates();
+        service.start_scan(&source).await.unwrap();
+        receive_until(&mut updates, |event| {
+            matches!(event, WallUpdate::MetadataSettled { .. })
+        })
+        .await;
+        let page = service
+            .query_wall(crate::WallQueryRequest::oldest_first())
+            .await
+            .unwrap();
+        let blocked_id = page
+            .items
+            .iter()
+            .find(|asset| asset.display_name == "blocked.jpg")
+            .unwrap()
+            .id
+            .clone();
+        let healthy_id = page
+            .items
+            .iter()
+            .find(|asset| asset.display_name == "healthy.jpg")
+            .unwrap()
+            .id
+            .clone();
+        let blocked_before = std::fs::read(&blocked_path).unwrap();
+        let healthy_before = std::fs::read(&healthy_path).unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *service.derivative_test_gate.lock().await = Some(DerivativeTestGate {
+            blocked_asset: AssetId::from_uuid(uuid::Uuid::parse_str(&blocked_id).unwrap()),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let entered_wait = entered.notified();
+        let request_service = service.clone();
+        let healthy_id_for_request = healthy_id.clone();
+        let request = tokio::spawn(async move {
+            request_service
+                .request_derivatives(crate::DerivativeRequest::visible(vec![
+                    blocked_id,
+                    healthy_id_for_request,
+                ]))
+                .await
+        });
+        entered_wait.await;
+        let healthy_event = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            receive_until(&mut updates, |event| {
+                matches!(event, WallUpdate::DerivativesReady { derivatives, .. }
+                if derivatives.iter().any(|item| {
+                    item.kind == DerivativeClass::WallThumbnail && item.asset_id == healthy_id
+                }))
+            }),
+        )
+        .await
+        .expect("healthy visible derivative should publish while blocked work is held");
+        assert!(matches!(
+            healthy_event,
+            WallUpdate::DerivativesReady { ref derivatives, .. }
+                if derivatives.iter().any(|item| item.asset_id == healthy_id)
+        ));
+        release.notify_one();
+        request.await.unwrap().unwrap();
+        assert_eq!(std::fs::read(&blocked_path).unwrap(), blocked_before);
+        assert_eq!(std::fs::read(&healthy_path).unwrap(), healthy_before);
     }
 
     #[tokio::test]
@@ -1046,6 +1260,157 @@ mod tests {
         assert!(!super::should_pause(JobPriority::NearViewport, 1));
         assert!(!super::should_pause(JobPriority::Visible, 1));
         assert!(!super::should_pause(JobPriority::IdleLibrary, 4));
+    }
+
+    #[test]
+    fn stale_screen_preview_commit_cannot_evict_write_or_register() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+        let service = AppService::open(config.clone()).unwrap();
+        let (_, stale_selection) = service.select_recent(&first).unwrap();
+        service.select_recent(&second).unwrap();
+        let asset_id = AssetId::from_uuid(uuid::Uuid::new_v4());
+        let spec = DerivativeSpec {
+            asset_id,
+            signature: photo_domain::FileSignature {
+                size_bytes: 10,
+                modified_unix_ns: 20,
+                sidecar_modified_unix_ns: None,
+            },
+            orientation: 1,
+            kind: DerivativeKind::ScreenPreview,
+            decoder_version: "image-0.25-v1".to_owned(),
+            colour_space: "srgb".to_owned(),
+            target: DerivativeTarget::LongEdge(4096),
+        };
+        let generator = ImageDerivativeGenerator::new(config.cache_dir()).unwrap();
+        let result = service.commit_screen_preview_if_active(
+            generator,
+            EncodedScreenPreview {
+                bytes: vec![1, 2, 3],
+                representative_rgb: photo_metadata::RepresentativeRgb {
+                    red: 1,
+                    green: 2,
+                    blue: 3,
+                },
+            },
+            &spec,
+            stale_selection.group_id,
+            CacheBudget::from_total_space(1024 * 1024),
+            &service.protected_groups,
+            stale_selection,
+            &config.catalog_path(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(DerivativeWorkError::WorkerUnavailable)
+        ));
+        assert!(
+            Catalog::open(&config.catalog_path())
+                .unwrap()
+                .all_derivatives()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !std::fs::read_dir(config.cache_dir()).unwrap().any(|entry| {
+                entry
+                    .ok()
+                    .is_some_and(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_screen_preview_commits_respect_exact_budget_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(&source).unwrap();
+        let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+        let service = AppService::open(config.clone()).unwrap();
+        let (_, selection) = service.select_recent(&source).unwrap();
+        let left = AssetId::from_uuid(uuid::Uuid::new_v4());
+        let right = AssetId::from_uuid(uuid::Uuid::new_v4());
+        {
+            let mut state = service.state().unwrap();
+            for (asset_id, name) in [(left, "left.jpg"), (right, "right.jpg")] {
+                let mut asset = NewAsset::minimal(
+                    selection.library_id,
+                    RelativePathKey::from_relative_path(std::path::Path::new(name)).unwrap(),
+                    name,
+                    MediaKind::Jpeg,
+                    1,
+                );
+                asset.id = asset_id;
+                asset.folder_group_id = Some(selection.group_id);
+                state.libraries.catalog_mut().upsert_asset(&asset).unwrap();
+            }
+        }
+        let make_spec = |asset_id| DerivativeSpec {
+            asset_id,
+            signature: FileSignature {
+                size_bytes: 10,
+                modified_unix_ns: 20,
+                sidecar_modified_unix_ns: None,
+            },
+            orientation: 1,
+            kind: DerivativeKind::ScreenPreview,
+            decoder_version: "image-0.25-v1".to_owned(),
+            colour_space: "srgb".to_owned(),
+            target: DerivativeTarget::LongEdge(4096),
+        };
+        let budget = CacheBudget::from_total_space(30);
+        let make_commit = |asset_id| {
+            let service = service.clone();
+            let config = config.clone();
+            let spec = make_spec(asset_id);
+            tokio::task::spawn_blocking(move || {
+                let generator = ImageDerivativeGenerator::new(config.cache_dir()).unwrap();
+                service.commit_screen_preview_if_active(
+                    generator,
+                    EncodedScreenPreview {
+                        bytes: vec![1, 2, 3],
+                        representative_rgb: photo_metadata::RepresentativeRgb {
+                            red: 1,
+                            green: 2,
+                            blue: 3,
+                        },
+                    },
+                    &spec,
+                    selection.group_id,
+                    budget,
+                    &service.protected_groups,
+                    selection,
+                    &config.catalog_path(),
+                )
+            })
+        };
+        let (left_result, right_result) = tokio::join!(make_commit(left), make_commit(right));
+        let outcomes = [left_result.unwrap(), right_result.unwrap()];
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(outcomes.iter().filter(|result| result.is_err()).count(), 1);
+        assert!(outcomes.iter().any(|result| {
+            matches!(
+                result,
+                Err(DerivativeWorkError::Image(
+                    photo_cache::ImageDerivativeError::Cache(
+                        photo_cache::CacheError::BudgetExceeded
+                    )
+                ))
+            )
+        }));
+        assert_eq!(
+            Catalog::open(&config.catalog_path())
+                .unwrap()
+                .non_durable_size_bytes()
+                .unwrap(),
+            3
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

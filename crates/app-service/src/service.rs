@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::watch;
 
 pub(crate) struct ServiceState {
@@ -72,6 +74,14 @@ pub(crate) struct ScanOwner {
     pub(crate) generation: u64,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct DerivativeTestGate {
+    pub(crate) blocked_asset: AssetId,
+    pub(crate) entered: Arc<tokio::sync::Notify>,
+    pub(crate) release: Arc<tokio::sync::Notify>,
+}
+
 trait RecentSourceValidator: Send + Sync {
     fn validate_recent(&self, folder: &Path) -> Result<ValidatedSourceFolder, AddLibraryError>;
 }
@@ -104,6 +114,9 @@ pub struct AppService {
     pub(crate) cache_root: PathBuf,
     pub(crate) cache_budget: CacheBudget,
     pub(crate) protected_groups: ProtectedGroups,
+    pub(crate) screen_preview_commit_lock: Arc<Mutex<()>>,
+    #[cfg(test)]
+    pub(crate) derivative_test_gate: Arc<TokioMutex<Option<DerivativeTestGate>>>,
     pub(crate) derivative_queue: Arc<crate::derivatives::DerivativeQueue>,
     pub(crate) metadata_reader: ReaderAdapter,
     source_validator: Arc<dyn RecentSourceValidator>,
@@ -189,6 +202,9 @@ impl AppService {
             cache_root,
             cache_budget,
             protected_groups: ProtectedGroups::default(),
+            screen_preview_commit_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            derivative_test_gate: Arc::new(TokioMutex::new(None)),
             derivative_queue: Arc::new(crate::derivatives::DerivativeQueue::default()),
             metadata_reader: ReaderAdapter(reader),
             source_validator,
@@ -320,6 +336,10 @@ impl AppService {
             .wrapping_add(1)
             .max(1);
         let validated = self.source_validator.validate_recent(folder)?;
+        let _screen_commit_guard = self
+            .screen_preview_commit_lock
+            .lock()
+            .map_err(|_| AppServiceError::StatePoisoned)?;
         let mut state = self.state()?;
         let prepared = state.libraries.prepare_validated_recent(validated)?;
         self.latest_validated_selection

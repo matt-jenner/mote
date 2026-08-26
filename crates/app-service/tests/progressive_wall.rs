@@ -156,6 +156,27 @@ where
     }
 }
 
+async fn recv_derivatives_until(
+    receiver: &mut tokio::sync::broadcast::Receiver<WallUpdate>,
+    kind: DerivativeClass,
+    expected: usize,
+) -> Vec<DerivativeReference> {
+    let mut references = Vec::new();
+    loop {
+        let event = recv_until(receiver, |event| {
+            matches!(event, WallUpdate::DerivativesReady { derivatives, .. }
+                if derivatives.iter().any(|item| item.kind == kind))
+        })
+        .await;
+        if let WallUpdate::DerivativesReady { derivatives, .. } = event {
+            references.extend(derivatives.into_iter().filter(|item| item.kind == kind));
+        }
+        if references.len() >= expected {
+            return references;
+        }
+    }
+}
+
 fn query(direction: SortDirection) -> WallQueryRequest {
     WallQueryRequest {
         cursor: None,
@@ -699,34 +720,21 @@ async fn one_visible_request_produces_one_ready_batch() {
         .request_derivatives(photo_app_service::DerivativeRequest::visible(ids.clone()))
         .await
         .unwrap();
-    let ready = recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { .. })
-    })
-    .await;
-    match ready {
-        WallUpdate::DerivativesReady { derivatives, .. } => {
-            assert_eq!(derivatives.len(), 8);
-            assert_eq!(
-                derivatives
-                    .iter()
-                    .map(|d| d.asset_id.clone())
-                    .collect::<Vec<_>>(),
-                ids
-            );
-        }
-        _ => unreachable!(),
-    }
+    let ready = recv_derivatives_until(&mut updates, DerivativeClass::WallThumbnail, 8).await;
+    assert_eq!(ready.len(), 8);
+    assert_eq!(
+        ready
+            .iter()
+            .map(|d| d.asset_id.clone())
+            .collect::<std::collections::HashSet<_>>(),
+        ids.iter().cloned().collect()
+    );
     service
         .request_derivatives(photo_app_service::DerivativeRequest::visible(ids))
         .await
         .unwrap();
-    let second = recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { .. })
-    })
-    .await;
-    assert!(
-        matches!(second, WallUpdate::DerivativesReady { ref derivatives, .. } if derivatives.len() == 8)
-    );
+    let second = recv_derivatives_until(&mut updates, DerivativeClass::WallThumbnail, 8).await;
+    assert_eq!(second.len(), 8);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -974,24 +982,15 @@ async fn visible_wall_work_finishes_before_screen_preview_prefetch() {
         .await
         .unwrap();
 
-    let wall = recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { .. })
-    })
-    .await;
-    assert!(
-        matches!(wall, WallUpdate::DerivativesReady { derivatives, .. } if
-        derivatives.len() == 4
-        && derivatives.iter().all(|item| item.kind == DerivativeClass::WallThumbnail))
-    );
-    let screen = recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
-            !derivatives.is_empty()
-            && derivatives.iter().all(|item| item.kind == DerivativeClass::ScreenPreview))
-    })
-    .await;
-    assert!(
-        matches!(screen, WallUpdate::DerivativesReady { derivatives, .. } if
-        derivatives.iter().map(|item| item.asset_id.clone()).collect::<Vec<_>>() == ids)
+    let wall = recv_derivatives_until(&mut updates, DerivativeClass::WallThumbnail, 4).await;
+    assert_eq!(wall.len(), 4);
+    let screen = recv_derivatives_until(&mut updates, DerivativeClass::ScreenPreview, 4).await;
+    assert_eq!(
+        screen
+            .iter()
+            .map(|item| item.asset_id.clone())
+            .collect::<std::collections::HashSet<_>>(),
+        ids.iter().cloned().collect()
     );
 }
 
@@ -1021,11 +1020,7 @@ async fn second_identical_wall_request_reuses_cache_after_the_source_goes_offlin
         .request_derivatives(photo_app_service::DerivativeRequest::visible(ids.clone()))
         .await
         .unwrap();
-    recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
-            derivatives.iter().all(|item| item.kind == DerivativeClass::ScreenPreview))
-    })
-    .await;
+    let _ = recv_derivatives_until(&mut updates, DerivativeClass::ScreenPreview, 2).await;
 
     let unavailable = fixture.temp.path().join("photos-offline");
     std::fs::rename(&fixture.source, &unavailable).unwrap();
@@ -1033,24 +1028,10 @@ async fn second_identical_wall_request_reuses_cache_after_the_source_goes_offlin
         .request_derivatives(photo_app_service::DerivativeRequest::visible(ids))
         .await
         .unwrap();
-    let wall = recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
-            !derivatives.is_empty()
-            && derivatives.iter().all(|item| item.kind == DerivativeClass::WallThumbnail))
-    })
-    .await;
-    let screen = recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
-            !derivatives.is_empty()
-            && derivatives.iter().all(|item| item.kind == DerivativeClass::ScreenPreview))
-    })
-    .await;
-    assert!(
-        matches!(wall, WallUpdate::DerivativesReady { derivatives, .. } if derivatives.len() == 2)
-    );
-    assert!(
-        matches!(screen, WallUpdate::DerivativesReady { derivatives, .. } if derivatives.len() == 2)
-    );
+    let wall = recv_derivatives_until(&mut updates, DerivativeClass::WallThumbnail, 2).await;
+    let screen = recv_derivatives_until(&mut updates, DerivativeClass::ScreenPreview, 2).await;
+    assert_eq!(wall.len(), 2);
+    assert_eq!(screen.len(), 2);
     std::fs::rename(unavailable, &fixture.source).unwrap();
 }
 
@@ -1080,12 +1061,7 @@ async fn offline_reopen_keeps_cached_references() {
         .request_derivatives(photo_app_service::DerivativeRequest::visible(ids))
         .await
         .unwrap();
-    recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
-            derivatives.len() == 4
-            && derivatives.iter().all(|item| item.kind == DerivativeClass::WallThumbnail))
-    })
-    .await;
+    let _ = recv_derivatives_until(&mut updates, DerivativeClass::WallThumbnail, 4).await;
     drop(service);
 
     let unavailable = fixture.temp.path().join("photos-offline");
@@ -1131,12 +1107,7 @@ async fn reconciliation_batches_preserve_cached_wall_and_screen_references_onlin
         .request_derivatives(photo_app_service::DerivativeRequest::visible(ids))
         .await
         .unwrap();
-    recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
-            derivatives.len() == 2
-            && derivatives.iter().all(|item| item.kind == DerivativeClass::ScreenPreview))
-    })
-    .await;
+    let _ = recv_derivatives_until(&mut updates, DerivativeClass::ScreenPreview, 2).await;
     drop(service);
 
     let (reader, release) = BlockingReader::new();
@@ -1230,14 +1201,8 @@ async fn returning_to_idle_resumes_remaining_screen_preview_prefetch() {
     service
         .set_interaction(photo_app_service::InteractionState::Idle)
         .await;
-    let remaining = recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
-            derivatives.iter().all(|item| item.kind == DerivativeClass::ScreenPreview))
-    })
-    .await;
-    assert!(
-        matches!(remaining, WallUpdate::DerivativesReady { derivatives, .. } if derivatives.len() == 3)
-    );
+    let remaining = recv_derivatives_until(&mut updates, DerivativeClass::ScreenPreview, 3).await;
+    assert_eq!(remaining.len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1264,11 +1229,7 @@ async fn screen_preview_prefetch_waits_for_foreground_indexing_to_drain() {
         .request_derivatives(photo_app_service::DerivativeRequest::visible(ids))
         .await
         .unwrap();
-    recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
-            derivatives.iter().all(|item| item.kind == DerivativeClass::WallThumbnail))
-    })
-    .await;
+    let _ = recv_derivatives_until(&mut updates, DerivativeClass::WallThumbnail, 4).await;
     assert!(
         tokio::time::timeout(Duration::from_millis(150), async {
             loop {
@@ -1290,14 +1251,8 @@ async fn screen_preview_prefetch_waits_for_foreground_indexing_to_drain() {
         matches!(event, WallUpdate::MetadataSettled { .. })
     })
     .await;
-    let screen = recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
-            derivatives.iter().all(|item| item.kind == DerivativeClass::ScreenPreview))
-    })
-    .await;
-    assert!(
-        matches!(screen, WallUpdate::DerivativesReady { derivatives, .. } if derivatives.len() == 4)
-    );
+    let screen = recv_derivatives_until(&mut updates, DerivativeClass::ScreenPreview, 4).await;
+    assert_eq!(screen.len(), 4);
 }
 
 #[test]

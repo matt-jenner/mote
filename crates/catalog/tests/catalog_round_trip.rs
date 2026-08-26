@@ -1,9 +1,10 @@
 use std::path::Path;
 
 use photo_catalog::{
-    Catalog, CatalogWarningRecord, NewAsset, NewFolderGroup, NewLibrary, SqliteVersion,
+    Catalog, CatalogWarningRecord, NewAsset, NewDerivative, NewFolderGroup, NewLibrary,
+    SqliteVersion,
 };
-use photo_domain::{Availability, FolderGroupId, MediaKind, RelativePathKey};
+use photo_domain::{Availability, DerivativeId, FolderGroupId, MediaKind, RelativePathKey};
 
 #[test]
 fn opens_with_safe_sqlite_and_round_trips_library_and_asset() {
@@ -107,6 +108,128 @@ fn unavailable_asset_count_tracks_retained_offline_rows() {
     assert_eq!(catalog.unavailable_asset_count(library.id).unwrap(), 0);
     assert_eq!(catalog.mark_root_offline(library.id).unwrap(), 3);
     assert_eq!(catalog.unavailable_asset_count(library.id).unwrap(), 3);
+}
+
+#[test]
+fn aggregate_non_durable_cache_bytes_is_zero_and_sums_only_screen_previews() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured(
+            "Pictures",
+            Path::new("/mounted/Pictures"),
+        ))
+        .unwrap();
+    let group = catalog
+        .upsert_folder_group(&NewFolderGroup {
+            id: FolderGroupId::new(),
+            library_id: library.id,
+            relative_path: RelativePathKey::from_relative_path(Path::new("selected")).unwrap(),
+            display_path: "selected".to_owned(),
+            last_viewed_at: None,
+        })
+        .unwrap();
+
+    assert_eq!(catalog.non_durable_size_bytes().unwrap(), 0);
+    let durable_asset = NewAsset::minimal(
+        library.id,
+        RelativePathKey::from_relative_path(Path::new("selected/durable.jpg")).unwrap(),
+        "selected/durable.jpg",
+        MediaKind::Jpeg,
+        1,
+    );
+    let screen_asset = NewAsset::minimal(
+        library.id,
+        RelativePathKey::from_relative_path(Path::new("selected/screen.jpg")).unwrap(),
+        "selected/screen.jpg",
+        MediaKind::Jpeg,
+        2,
+    );
+    catalog.upsert_asset(&durable_asset).unwrap();
+    catalog.upsert_asset(&screen_asset).unwrap();
+    catalog
+        .insert_derivative(&NewDerivative {
+            id: DerivativeId::new(),
+            asset_id: durable_asset.id,
+            folder_group_id: group,
+            kind: "wall_thumbnail".to_owned(),
+            cache_key: "durable-key".to_owned(),
+            relative_cache_path: Path::new("durable.jpg").to_owned(),
+            size_bytes: 17,
+            durable: true,
+            created_at: 0,
+        })
+        .unwrap();
+    catalog
+        .insert_derivative(&NewDerivative {
+            id: DerivativeId::new(),
+            asset_id: screen_asset.id,
+            folder_group_id: group,
+            kind: "screen_preview".to_owned(),
+            cache_key: "screen-key".to_owned(),
+            relative_cache_path: Path::new("screen.jpg").to_owned(),
+            size_bytes: 25,
+            durable: false,
+            created_at: 0,
+        })
+        .unwrap();
+
+    assert_eq!(catalog.non_durable_size_bytes().unwrap(), 25);
+}
+
+#[test]
+fn aggregate_non_durable_cache_bytes_rejects_sqlite_sum_overflow() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured(
+            "Pictures",
+            Path::new("/mounted/Pictures"),
+        ))
+        .unwrap();
+    let group = catalog
+        .upsert_folder_group(&NewFolderGroup {
+            id: FolderGroupId::new(),
+            library_id: library.id,
+            relative_path: RelativePathKey::from_relative_path(Path::new("selected")).unwrap(),
+            display_path: "selected".to_owned(),
+            last_viewed_at: None,
+        })
+        .unwrap();
+    let left_asset = NewAsset::minimal(
+        library.id,
+        RelativePathKey::from_relative_path(Path::new("selected/left.jpg")).unwrap(),
+        "selected/left.jpg",
+        MediaKind::Jpeg,
+        1,
+    );
+    let right_asset = NewAsset::minimal(
+        library.id,
+        RelativePathKey::from_relative_path(Path::new("selected/right.jpg")).unwrap(),
+        "selected/right.jpg",
+        MediaKind::Jpeg,
+        2,
+    );
+    catalog.upsert_asset(&left_asset).unwrap();
+    catalog.upsert_asset(&right_asset).unwrap();
+    for (key, asset_id) in [("left", left_asset.id), ("right", right_asset.id)] {
+        catalog
+            .insert_derivative(&NewDerivative {
+                id: DerivativeId::new(),
+                asset_id,
+                folder_group_id: group,
+                kind: "screen_preview".to_owned(),
+                cache_key: key.to_owned(),
+                relative_cache_path: Path::new("screen.jpg").to_owned(),
+                size_bytes: i64::MAX as u64,
+                durable: false,
+                created_at: 0,
+            })
+            .unwrap();
+    }
+
+    assert!(matches!(
+        catalog.non_durable_size_bytes(),
+        Err(photo_catalog::CatalogError::ValueOutOfRange)
+    ));
 }
 
 #[test]

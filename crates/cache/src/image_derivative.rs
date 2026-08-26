@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{CacheBudget, ProtectedGroups};
 use image::{DynamicImage, ImageReader, codecs::jpeg::JpegEncoder};
@@ -23,6 +25,12 @@ pub struct GeneratedDerivative {
     pub content_type: &'static str,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedScreenPreview {
+    pub bytes: Vec<u8>,
+    pub representative_rgb: RepresentativeRgb,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ImageDerivativeError {
     #[error("source image could not be read: {0}")]
@@ -44,12 +52,30 @@ pub enum ImageDerivativeError {
 #[derive(Clone, Debug)]
 pub struct ImageDerivativeGenerator {
     writer: CacheWriter,
+    screen_transaction_lock: Arc<Mutex<()>>,
+}
+
+static SCREEN_TRANSACTION_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+    OnceLock::new();
+
+fn transaction_lock(root: &Path) -> Arc<Mutex<()>> {
+    let locks = SCREEN_TRANSACTION_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .expect("screen transaction lock registry must not be poisoned");
+    locks
+        .entry(root.to_owned())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 impl ImageDerivativeGenerator {
     pub fn new(cache_root: &Path) -> Result<Self, ImageDerivativeError> {
+        let writer = CacheWriter::new(cache_root)?;
+        let screen_transaction_lock = transaction_lock(writer.root());
         Ok(Self {
-            writer: CacheWriter::new(cache_root)?,
+            writer,
+            screen_transaction_lock,
         })
     }
 
@@ -88,9 +114,47 @@ impl ImageDerivativeGenerator {
             target: DerivativeTarget::LongEdge(4096),
         };
         validate_spec(&spec)?;
+        let encoded = self.encode_screen_preview(source, &spec)?;
+        self.commit_screen_preview(encoded, &spec, folder_group_id, catalog, budget, protected)
+    }
+
+    pub fn encode_screen_preview(
+        &self,
+        source: &Path,
+        spec: &DerivativeSpec,
+    ) -> Result<EncodedScreenPreview, ImageDerivativeError> {
+        validate_spec(spec)?;
+        if spec.kind != DerivativeKind::ScreenPreview {
+            return Err(ImageDerivativeError::UnsupportedTarget);
+        }
+        let (bytes, representative_rgb) = encode_screen(source, spec)?;
+        Ok(EncodedScreenPreview {
+            bytes,
+            representative_rgb,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_screen_preview(
+        &self,
+        encoded: EncodedScreenPreview,
+        spec: &DerivativeSpec,
+        folder_group_id: FolderGroupId,
+        catalog: &mut Catalog,
+        budget: CacheBudget,
+        protected: &ProtectedGroups,
+    ) -> Result<GeneratedDerivative, ImageDerivativeError> {
+        validate_spec(spec)?;
+        if spec.kind != DerivativeKind::ScreenPreview {
+            return Err(ImageDerivativeError::UnsupportedTarget);
+        }
+        let _transaction = self
+            .screen_transaction_lock
+            .lock()
+            .map_err(|_| ImageDerivativeError::Cache(CacheError::TransactionUnavailable))?;
         let _guard = protected.begin_write(folder_group_id)?;
-        let (encoded, representative_rgb) = encode_screen(source, &spec)?;
-        let estimated = encoded.len() as u64;
+        let estimated = u64::try_from(encoded.bytes.len())
+            .map_err(|_| ImageDerivativeError::Cache(CacheError::SizeOutOfRange))?;
         budget.prepare_write(
             catalog,
             self.writer.root(),
@@ -98,10 +162,10 @@ impl ImageDerivativeGenerator {
             estimated,
             protected,
         )?;
-        let key = DerivativeKey::compute(&spec);
+        let key = DerivativeKey::compute(spec);
         let relative_path = key.sharded_path("jpg");
         let write = self.writer.write_atomic(relative_path.clone(), |file| {
-            std::io::Write::write_all(file, &encoded)
+            std::io::Write::write_all(file, &encoded.bytes)
         })?;
         let generated = GeneratedDerivative {
             key,
@@ -109,12 +173,12 @@ impl ImageDerivativeGenerator {
             size_bytes: write.size_bytes,
             durable: false,
             reused: write.reused,
-            representative_rgb,
+            representative_rgb: encoded.representative_rgb,
             content_type: "image/jpeg",
         };
         catalog.upsert_derivative(&NewDerivative {
             id: DerivativeId::new(),
-            asset_id,
+            asset_id: spec.asset_id,
             folder_group_id,
             kind: "screen_preview".into(),
             cache_key: generated.key.as_str().into(),

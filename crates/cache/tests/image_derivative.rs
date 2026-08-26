@@ -331,3 +331,121 @@ fn managed_screen_budget_authorizes_exact_encoded_bytes_and_reuses_row() {
     assert!(second.reused);
     assert_eq!(catalog.all_derivatives().unwrap().len(), 1);
 }
+
+#[test]
+fn independent_public_generators_serialize_screen_budget_transactions() {
+    let fixture = fixture();
+    let source_before = std::fs::read(fixture.path()).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let catalog_path = temp.path().join("catalog.sqlite");
+    let library = NewLibrary::configured("Photos", &temp.path().join("photos"));
+    let left = photo_catalog::NewAsset::minimal(
+        library.id,
+        RelativePathKey::from_relative_path(std::path::Path::new("left.jpg")).unwrap(),
+        "left.jpg",
+        MediaKind::Jpeg,
+        1,
+    );
+    let right = photo_catalog::NewAsset::minimal(
+        library.id,
+        RelativePathKey::from_relative_path(std::path::Path::new("right.jpg")).unwrap(),
+        "right.jpg",
+        MediaKind::Jpeg,
+        1,
+    );
+    let group = FolderGroupId::new();
+    let mut catalog = Catalog::open(&catalog_path).unwrap();
+    catalog.add_library(&library).unwrap();
+    catalog.upsert_asset(&left).unwrap();
+    catalog.upsert_asset(&right).unwrap();
+    catalog
+        .upsert_folder_group(&NewFolderGroup {
+            id: group,
+            library_id: library.id,
+            relative_path: RelativePathKey::from_relative_path(std::path::Path::new("album"))
+                .unwrap(),
+            display_path: "album".to_owned(),
+            last_viewed_at: Some(1),
+        })
+        .unwrap();
+    let first_generator = ImageDerivativeGenerator::new(cache.path()).unwrap();
+    let encoded_size = first_generator
+        .encode_screen_preview(
+            fixture.path(),
+            &spec_for_asset(left.id, DerivativeKind::ScreenPreview),
+        )
+        .unwrap()
+        .bytes
+        .len() as u64;
+    let budget = CacheBudget::from_total_space(encoded_size.saturating_mul(10));
+    assert_eq!(budget.limit_bytes(), encoded_size);
+    let protected = ProtectedGroups::default();
+    protected.protect(group).unwrap();
+    let signature = FileSignature {
+        size_bytes: std::fs::metadata(fixture.path()).unwrap().len(),
+        modified_unix_ns: 1,
+        sidecar_modified_unix_ns: None,
+    };
+    let run = |asset_id, generator: ImageDerivativeGenerator| {
+        let catalog_path = catalog_path.clone();
+        let source = fixture.path().to_owned();
+        let protected = protected.clone();
+        std::thread::spawn(move || {
+            let mut catalog = Catalog::open(&catalog_path).unwrap();
+            generator.generate_screen_preview(
+                &source,
+                asset_id,
+                signature,
+                1,
+                group,
+                &mut catalog,
+                budget,
+                &protected,
+            )
+        })
+    };
+    let left_thread = run(left.id, first_generator);
+    let right_thread = run(
+        right.id,
+        ImageDerivativeGenerator::new(cache.path()).unwrap(),
+    );
+    let left_result = left_thread.join().unwrap();
+    let right_result = right_thread.join().unwrap();
+    let results = [left_result, right_result];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    assert!(results.iter().any(|result| {
+        matches!(
+            result,
+            Err(ImageDerivativeError::Cache(
+                photo_cache::CacheError::BudgetExceeded
+            ))
+        )
+    }));
+    assert_eq!(
+        Catalog::open(&catalog_path)
+            .unwrap()
+            .all_derivatives()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(std::fs::read(fixture.path()).unwrap(), source_before);
+}
+
+fn spec_for_asset(asset_id: AssetId, kind: DerivativeKind) -> DerivativeSpec {
+    DerivativeSpec {
+        asset_id,
+        signature: FileSignature {
+            size_bytes: 1,
+            modified_unix_ns: 1,
+            sidecar_modified_unix_ns: None,
+        },
+        orientation: 1,
+        kind,
+        decoder_version: "image-0.25-v1".into(),
+        colour_space: "srgb".into(),
+        target: DerivativeTarget::LongEdge(4096),
+    }
+}
