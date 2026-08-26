@@ -2,7 +2,7 @@
 
 ## Status
 
-Complete. The bounded `PhotoTile` repair and focused browser regressions are implemented.
+Complete. Round 1 follow-up is implemented and verified.
 
 ## Confirmed root cause
 
@@ -26,22 +26,28 @@ AssertionError: expected '0' to be '1'
 
 - Added a ref to the current image element.
 - Retained the normal `onLoad` path while accepting only the current image/current URL.
-- After mount and derivative URL replacement, checks the current image on the immediate layout pass and the next animation frame; `complete === true` and `naturalWidth > 0` mark that exact image loaded.
+- Kept the immediate cached-image check, then await the current image's `decode()` promise as a bounded non-polling completion signal. The decode completion is fenced by effect cancellation, current image identity, current derivative URL, and `complete === true` with `naturalWidth > 0`.
 - Keyed the image by derivative URL so stale completions from a previous URL cannot reveal a replacement.
 - Kept error, unavailable-file fallback, warning, colour placeholder, and fade behavior unchanged.
-- Added WebKit browser coverage for cached completion without React `load`, zero-natural-width failure, and replacement reset behavior.
+- Added deterministic WebKit coverage for cached completion without React `load`, delayed completion after the old immediate/one-frame window, zero-natural-width completion with error delivery suppressed, and stale URL-A decode completion after URL-B replacement.
+
+## Fix-round timing evidence
+
+The delayed-completion regression holds `complete === false` and `naturalWidth === 0` for 75 ms while suppressing capture-phase `load` delivery. Opacity remains `0` after the old immediate/one-frame window. After the test resolves the image's decode promise and exposes positive natural width, the fenced decode path changes opacity to `1`.
+
+The zero-width regression exposes `complete === true` with `naturalWidth === 0` while suppressing `error`; the image remains at opacity `0`. The stale-completion regression resolves URL A's decode after URL B has replaced it; URL B remains at opacity `0` until URL B's own decode resolves.
 
 ## Verification
 
 - `npm run test --workspace @photo-viewer/interface`: 4 files, 66 tests passed.
-- `npm run test:browser --workspace @photo-viewer/interface`: 2 files, 47 tests passed.
+- `npm run test:browser --workspace @photo-viewer/interface`: 2 files, 49 tests passed.
 - `npm run typecheck --workspace @photo-viewer/interface`: passed.
 - `npm run check`: 36 files checked, no issues.
 - `npm run build --workspace @photo-viewer/interface`: passed.
 
 ## Commit
 
-`3d729cf` (`fix(interface): reveal cached wall thumbnails`).
+`adf0dc2` (`fix(interface): await fenced thumbnail decode`).
 
 ## Concerns
 
