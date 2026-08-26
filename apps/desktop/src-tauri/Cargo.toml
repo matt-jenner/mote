@@ -6,6 +6,9 @@ rust-version = "1.97.1"
 
 [workspace]
 
+[profile.dev.package."*"]
+opt-level = 3
+
 [lib]
 name = "photo_viewer_desktop_lib"
 crate-type = ["lib", "cdylib", "staticlib"]

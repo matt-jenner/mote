@@ -2,7 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+#[cfg(any(test, debug_assertions))]
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use photo_cache::{
     DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget, ImageDerivativeError,
@@ -24,6 +27,8 @@ const ASSET_DERIVATIVE_WARNING: &str = "derivative_generation_failed";
 const WALL_CACHE_DERIVATIVE_WARNING: &str = "wall_thumbnail_cache_unavailable";
 const SCREEN_CACHE_DERIVATIVE_WARNING: &str = "screen_preview_cache_unavailable";
 const MAX_DERIVATIVE_WORKERS: usize = 2;
+const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(50);
+const PREVIEW_GATE_RETRY: Duration = Duration::from_millis(25);
 
 #[derive(Debug)]
 enum DerivativeWorkError {
@@ -218,17 +223,17 @@ impl AppService {
                 crate::InteractionState::Active => InteractionMode::Active,
             })
             .await;
-        if state == crate::InteractionState::Idle {
+        if state == crate::InteractionState::Idle && !self.derivative_queue.is_empty().await {
             let service = self.clone();
             tokio::spawn(async move {
-                let has_paused_jobs = !service.derivative_queue.is_empty().await;
-                if has_paused_jobs {
-                    service.drive_derivative_queue(true).await;
-                } else {
-                    service.prefetch_screen_previews(Vec::new()).await;
-                }
+                service.drive_derivative_queue(true).await;
             });
         }
+        let recent = self
+            .state()
+            .map(|state| state.recent_derivative_ids.clone())
+            .unwrap_or_default();
+        self.schedule_screen_preview_prefetch(recent);
     }
 
     pub async fn request_derivatives(
@@ -258,19 +263,16 @@ impl AppService {
         if !ready.is_empty() {
             self.publish_derivatives_if_active(selection, ready);
         }
-        let _generated = self.run_derivative_jobs_publishing(pending, priority).await;
-
         if let Ok(mut state) = self.state.lock()
             && state.selection_epoch == selection.epoch
             && state.protected_group == Some(selection.group_id)
         {
-            state.recent_derivative_ids = ids.clone();
+            append_unique(&mut state.recent_derivative_ids, ids.iter().copied());
         }
-
-        let service = self.clone();
-        tokio::spawn(async move {
-            service.prefetch_screen_previews(ids).await;
-        });
+        self.begin_preview_wall_request();
+        let _generated = self.run_derivative_jobs_publishing(pending, priority).await;
+        self.end_preview_wall_request();
+        self.schedule_screen_preview_prefetch(ids);
         Ok(())
     }
 
@@ -474,8 +476,8 @@ impl AppService {
         let group = pending.group;
         let class = pending.class;
         let selection = pending.selection;
-        #[cfg(test)]
-        self.wait_for_test_derivative_gate(id).await;
+        #[cfg(any(test, debug_assertions))]
+        self.wait_for_test_derivative_gate(id, class).await;
         let generated = match class {
             DerivativeClass::WallThumbnail => {
                 let source = pending.source;
@@ -543,13 +545,37 @@ impl AppService {
         Ok(reference(id, class, generated.key.as_str().into()))
     }
 
-    #[cfg(test)]
-    async fn wait_for_test_derivative_gate(&self, asset_id: AssetId) {
+    #[cfg(any(test, debug_assertions))]
+    async fn wait_for_test_derivative_gate(&self, asset_id: AssetId, class: DerivativeClass) {
         let gate = self.derivative_test_gate.lock().await.clone();
-        if let Some(gate) = gate.filter(|gate| gate.blocked_asset == asset_id) {
+        if let Some(gate) = gate.filter(|gate| {
+            gate.blocked_asset == asset_id && gate.class.is_none_or(|blocked| blocked == class)
+        }) {
             gate.entered.notify_one();
             gate.release.notified().await;
         }
+    }
+
+    /// Installs a deterministic derivative boundary for integration tests.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_derivative_test_gate(
+        &self,
+        asset_id: String,
+        class: DerivativeClass,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Result<(), AppServiceError> {
+        let asset_id = uuid::Uuid::parse_str(&asset_id)
+            .map(AssetId::from_uuid)
+            .map_err(|_| AppServiceError::InvalidAssetId)?;
+        *self.derivative_test_gate.lock().await = Some(crate::service::DerivativeTestGate {
+            blocked_asset: asset_id,
+            class: Some(class),
+            entered,
+            release,
+        });
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -578,11 +604,163 @@ impl AppService {
     }
 
     pub(crate) async fn prefetch_screen_previews(&self, recent: Vec<AssetId>) {
-        if self
+        self.schedule_screen_preview_prefetch(recent);
+    }
+
+    fn schedule_screen_preview_prefetch(&self, recent: Vec<AssetId>) {
+        let stable_recent = self
             .state()
-            .map(|state| state.active_scan.is_some())
+            .map(|state| state.recent_derivative_ids.clone())
+            .unwrap_or_default();
+        let should_spawn = {
+            let Ok(mut gate) = self.preview_gate.lock() else {
+                return;
+            };
+            append_unique(&mut gate.recent_ids, stable_recent);
+            append_unique(&mut gate.recent_ids, recent);
+            gate.generation = gate.generation.wrapping_add(1).max(1);
+            if gate.task_running || gate.recent_ids.is_empty() {
+                false
+            } else {
+                gate.task_running = true;
+                true
+            }
+        };
+        self.preview_gate_wake.notify_one();
+        if !should_spawn {
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            if let Ok(mut gate) = self.preview_gate.lock() {
+                gate.task_running = false;
+            }
+            return;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            service.run_preview_gate().await;
+        });
+    }
+
+    pub(crate) fn reset_preview_gate(&self) {
+        if let Ok(mut gate) = self.preview_gate.lock() {
+            gate.recent_ids.clear();
+            gate.generation = gate.generation.wrapping_add(1).max(1);
+        }
+        self.preview_gate_wake.notify_one();
+    }
+
+    fn begin_preview_wall_request(&self) {
+        if let Ok(mut gate) = self.preview_gate.lock() {
+            gate.wall_requests_in_flight = gate.wall_requests_in_flight.saturating_add(1);
+            gate.generation = gate.generation.wrapping_add(1).max(1);
+        }
+        self.preview_gate_wake.notify_one();
+    }
+
+    fn end_preview_wall_request(&self) {
+        if let Ok(mut gate) = self.preview_gate.lock() {
+            gate.wall_requests_in_flight = gate.wall_requests_in_flight.saturating_sub(1);
+            gate.generation = gate.generation.wrapping_add(1).max(1);
+        }
+        self.preview_gate_wake.notify_one();
+    }
+
+    async fn run_preview_gate(&self) {
+        loop {
+            let (generation, recent) = {
+                let Ok(mut gate) = self.preview_gate.lock() else {
+                    return;
+                };
+                if gate.recent_ids.is_empty() {
+                    gate.task_running = false;
+                    return;
+                }
+                (gate.generation, gate.recent_ids.clone())
+            };
+
+            tokio::select! {
+                _ = tokio::time::sleep(PREVIEW_DEBOUNCE) => {}
+                _ = self.preview_gate_wake.notified() => continue,
+            }
+
+            if self
+                .preview_gate
+                .lock()
+                .map(|gate| gate.generation != generation)
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            if self.preview_selection_if_ready(generation).await.is_none() {
+                tokio::select! {
+                    _ = tokio::time::sleep(PREVIEW_GATE_RETRY) => {}
+                    _ = self.preview_gate_wake.notified() => {}
+                }
+                continue;
+            }
+            self.run_screen_preview_prefetch(recent).await;
+
+            let should_continue = {
+                let Ok(mut gate) = self.preview_gate.lock() else {
+                    return;
+                };
+                if gate.generation == generation {
+                    gate.recent_ids.clear();
+                    gate.task_running = false;
+                    false
+                } else {
+                    true
+                }
+            };
+            if !should_continue {
+                return;
+            }
+        }
+    }
+
+    async fn preview_selection_if_ready(&self, generation: u64) -> Option<SelectionToken> {
+        if self
+            .preview_gate
+            .lock()
+            .ok()
+            .is_none_or(|gate| gate.generation != generation)
+        {
+            return None;
+        }
+        let selection = self.active_selection_token().ok()?;
+        if !self.preview_work_can_continue(selection).await {
+            return None;
+        }
+        Some(selection)
+    }
+
+    async fn preview_work_can_continue(&self, selection: SelectionToken) -> bool {
+        if self
+            .preview_gate
+            .lock()
+            .map(|gate| gate.wall_requests_in_flight > 0)
             .unwrap_or(true)
         {
+            return false;
+        }
+        if !self.selection_is_active(selection)
+            || self
+                .state()
+                .map(|state| state.active_scan.is_some())
+                .unwrap_or(true)
+            || self.scheduler.available_background_permits() <= 1
+        {
+            return false;
+        }
+        self.derivative_queue.is_empty().await
+    }
+
+    async fn run_screen_preview_prefetch(&self, recent: Vec<AssetId>) {
+        let Ok(selection) = self.active_selection_token() else {
+            return;
+        };
+        if !self.preview_work_can_continue(selection).await {
             return;
         }
         let Ok((selection, cached, pending)) =
@@ -600,9 +778,7 @@ impl AppService {
         let recent = recent.into_iter().collect::<HashSet<_>>();
         let mut cursor = None;
         loop {
-            if self.scheduler.available_background_permits() <= 1
-                || !self.selection_is_active(selection)
-            {
+            if !self.preview_work_can_continue(selection).await {
                 return;
             }
             let Ok((page_selection, remaining, next)) =
@@ -681,6 +857,26 @@ impl AppService {
                 .collect(),
             page.next,
         ))
+    }
+
+    fn active_selection_token(&self) -> Result<SelectionToken, AppServiceError> {
+        let state = self.state()?;
+        let selection = state
+            .libraries
+            .catalog()
+            .load_app_state()?
+            .active_selection
+            .ok_or(AppServiceError::UnknownAsset)?;
+        let group = state
+            .libraries
+            .catalog()
+            .folder_group_for_path(selection.library_id, &selection.relative_folder)?
+            .ok_or(AppServiceError::UnknownAsset)?;
+        Ok(SelectionToken {
+            library_id: selection.library_id,
+            group_id: group,
+            epoch: state.selection_epoch,
+        })
     }
 
     fn selection_is_active(&self, selection: SelectionToken) -> bool {
@@ -850,6 +1046,17 @@ fn cache_warning_identity(class: DerivativeClass) -> (&'static str, &'static str
             "screenPreviewCacheUnavailable",
             "The preview cache is unavailable. Browsing can continue while the app retries it.",
         ),
+    }
+}
+
+fn append_unique<I>(target: &mut Vec<AssetId>, ids: I)
+where
+    I: IntoIterator<Item = AssetId>,
+{
+    for id in ids {
+        if !target.contains(&id) {
+            target.push(id);
+        }
     }
 }
 
@@ -1101,6 +1308,7 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         *service.derivative_test_gate.lock().await = Some(DerivativeTestGate {
             blocked_asset: AssetId::from_uuid(uuid::Uuid::parse_str(&blocked_id).unwrap()),
+            class: None,
             entered: entered.clone(),
             release: release.clone(),
         });
@@ -1445,7 +1653,7 @@ mod tests {
             .map(|asset| asset.id)
             .collect::<Vec<_>>();
         service
-            .prefetch_screen_previews(
+            .run_screen_preview_prefetch(
                 ids.iter()
                     .map(|id| AssetId::from_uuid(uuid::Uuid::parse_str(id).unwrap()))
                     .collect(),

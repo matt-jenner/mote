@@ -994,6 +994,110 @@ async fn visible_wall_work_finishes_before_screen_preview_prefetch() {
     );
 }
 
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn screen_previews_wait_for_all_overlapping_wall_thumbnail_waves() {
+    let fixture = ProgressiveFixture::new(4);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let ids = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|asset| asset.id)
+        .collect::<Vec<_>>();
+
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    let mut order_updates = service.subscribe_wall_updates();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    service
+        .install_derivative_test_gate(
+            ids[0].clone(),
+            DerivativeClass::ScreenPreview,
+            entered.clone(),
+            release.clone(),
+        )
+        .await
+        .unwrap();
+
+    let first_service = service.clone();
+    let first_ids = ids[..2].to_vec();
+    let first = tokio::spawn(async move {
+        first_service
+            .request_derivatives(DerivativeRequest::visible(first_ids))
+            .await
+    });
+    tokio::task::yield_now().await;
+    let second_service = service.clone();
+    let second_ids = ids[2..].to_vec();
+    let second = tokio::spawn(async move {
+        second_service
+            .request_derivatives(DerivativeRequest {
+                asset_ids: second_ids,
+                priority: photo_app_service::DerivativePriority::NearViewport,
+            })
+            .await
+    });
+
+    first.await.unwrap().unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), entered.notified())
+            .await
+            .is_err(),
+        "screen previews must wait while interaction and overlapping wall work are active"
+    );
+
+    second.await.unwrap().unwrap();
+    service
+        .set_interaction(photo_app_service::InteractionState::Idle)
+        .await;
+    entered.notified().await;
+    release.notify_waiters();
+
+    let mut wall_ids = std::collections::HashSet::new();
+    loop {
+        let event = order_updates.recv().await.unwrap();
+        let WallUpdate::DerivativesReady { derivatives, .. } = event else {
+            continue;
+        };
+        let mut screen_seen = false;
+        for derivative in derivatives {
+            match derivative.kind {
+                DerivativeClass::WallThumbnail => {
+                    wall_ids.insert(derivative.asset_id);
+                    assert!(
+                        !screen_seen,
+                        "a screen preview preceded a wall thumbnail wave"
+                    );
+                }
+                DerivativeClass::ScreenPreview => screen_seen = true,
+            }
+        }
+        if screen_seen {
+            assert_eq!(
+                wall_ids.len(),
+                4,
+                "all wall waves must publish before previews"
+            );
+            break;
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn second_identical_wall_request_reuses_cache_after_the_source_goes_offline() {
     let fixture = ProgressiveFixture::new(2);
@@ -1179,7 +1283,7 @@ async fn returning_to_idle_resumes_remaining_screen_preview_prefetch() {
     recv_until(&mut updates, |event| {
         matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if
             derivatives.len() == 1
-            && derivatives.iter().all(|item| item.kind == DerivativeClass::ScreenPreview))
+            && derivatives.iter().all(|item| item.kind == DerivativeClass::WallThumbnail))
     })
     .await;
     assert!(
@@ -1195,7 +1299,7 @@ async fn returning_to_idle_resumes_remaining_screen_preview_prefetch() {
         })
         .await
         .is_err(),
-        "active interaction should pause the remaining-group prefetch"
+        "active interaction should pause all screen-preview prefetch"
     );
 
     service

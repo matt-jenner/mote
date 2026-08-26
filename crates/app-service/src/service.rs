@@ -13,9 +13,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 use tokio::sync::Mutex as TokioMutex;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 pub(crate) struct ServiceState {
     pub(crate) libraries: LibraryService<RealSourceFs>,
@@ -74,12 +74,21 @@ pub(crate) struct ScanOwner {
     pub(crate) generation: u64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 #[derive(Clone)]
 pub(crate) struct DerivativeTestGate {
     pub(crate) blocked_asset: AssetId,
+    pub(crate) class: Option<DerivativeClass>,
     pub(crate) entered: Arc<tokio::sync::Notify>,
     pub(crate) release: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Default)]
+pub(crate) struct PreviewGateState {
+    pub(crate) recent_ids: Vec<AssetId>,
+    pub(crate) generation: u64,
+    pub(crate) task_running: bool,
+    pub(crate) wall_requests_in_flight: usize,
 }
 
 trait RecentSourceValidator: Send + Sync {
@@ -115,8 +124,10 @@ pub struct AppService {
     pub(crate) cache_budget: CacheBudget,
     pub(crate) protected_groups: ProtectedGroups,
     pub(crate) screen_preview_commit_lock: Arc<Mutex<()>>,
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub(crate) derivative_test_gate: Arc<TokioMutex<Option<DerivativeTestGate>>>,
+    pub(crate) preview_gate: Arc<Mutex<PreviewGateState>>,
+    pub(crate) preview_gate_wake: Arc<Notify>,
     pub(crate) derivative_queue: Arc<crate::derivatives::DerivativeQueue>,
     pub(crate) metadata_reader: ReaderAdapter,
     source_validator: Arc<dyn RecentSourceValidator>,
@@ -203,8 +214,10 @@ impl AppService {
             cache_budget,
             protected_groups: ProtectedGroups::default(),
             screen_preview_commit_lock: Arc::new(Mutex::new(())),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             derivative_test_gate: Arc::new(TokioMutex::new(None)),
+            preview_gate: Arc::new(Mutex::new(PreviewGateState::default())),
+            preview_gate_wake: Arc::new(Notify::new()),
             derivative_queue: Arc::new(crate::derivatives::DerivativeQueue::default()),
             metadata_reader: ReaderAdapter(reader),
             source_validator,
@@ -386,6 +399,7 @@ impl AppService {
         state.active_scan = None;
         state.published_wall_cache_warning = None;
         state.published_screen_cache_warning = None;
+        state.recent_derivative_ids.clear();
         state.selection_epoch = state.selection_epoch.wrapping_add(1).max(1);
         if previous != Some(group) {
             if let Some(previous) = previous {
@@ -400,6 +414,7 @@ impl AppService {
         };
         let bootstrap = Self::bootstrap_locked(&state)?;
         drop(state);
+        self.reset_preview_gate();
         if tokio::runtime::Handle::try_current().is_ok() {
             let queue = self.derivative_queue.clone();
             tokio::spawn(async move {

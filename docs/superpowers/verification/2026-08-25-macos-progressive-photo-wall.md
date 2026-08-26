@@ -22,6 +22,69 @@ and bounded concurrent derivative generation with exact cache-budget
 serialization at the public cache boundary. Independent review and rereview
 reported no remaining findings in each remediation batch.
 
+## Task 2: thumbnail-first preview gate and native development profile
+
+Task 2 is implemented on the `codex/progressive-photo-wall` worktree. The
+service now keeps one shared, selection-fenced preview gate: recent requested
+asset IDs are merged in stable de-duplicated order, a 50 ms quiet period is
+debounced through one generation/task, and the task waits for an idle
+interaction state, settled scan, zero queued or in-flight derivative work, and
+more than the active-interaction background capacity before starting large
+previews. Visible wall requests bump the gate generation before their work is
+queued and remain scheduler-prioritised. Screen previews remain 4096 px and
+non-durable; wall thumbnails remain 1024 px and durable.
+
+The focused RED/GREEN test is
+`screen_previews_wait_for_all_overlapping_wall_thumbnail_waves`. The RED run
+failed at the active/overlapping-wave assertion when the per-request preview
+spawn was restored; the GREEN run passed after the shared gate was installed.
+The app-service progressive-wall integration target passed all 25 tests, and
+the workspace passed 178 tests across its integration and unit targets.
+
+The standalone desktop manifest contains only:
+
+```toml
+[profile.dev.package."*"]
+opt-level = 3
+```
+
+The root workspace and release profiles were not changed. Cargo cannot select
+the `photo-cache` integration target through the standalone desktop manifest
+(`photo-cache` is a path dependency and is not a workspace member there), so
+the profile-specific evidence is the real desktop-manifest AppService
+protocol fixture, which scans a JPEG, generates a wall derivative, and reads
+it through the desktop protocol. Its compile-warm run took 0.62 s wall time
+(test body 0.05 s); the preceding source-rebuild run took 12.24 s wall time
+(11.10 s Cargo build/test setup, 0.05 s test body). For context, the same
+cache integration target took 4.30 s wall time in a warm root debug build
+(4.19 s test body) and 0.46 s in root release (0.26 s test body). These are
+machine observations, not hardware-neutral guarantees.
+
+The final verification commands were all successful:
+
+| Command | Result |
+| --- | ---: |
+| `cargo test -p photo-app-service --test progressive_wall` | 25 passed |
+| `cargo test --workspace --all-features` | 178 passed |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass |
+| `cargo fmt --all -- --check` | pass |
+| `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml` | 9 passed |
+| `cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings` | pass |
+| `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all -- --check` | pass |
+
+The controlled source audit remained clean before and after verification:
+`git diff --quiet -- apps/interface/public/demo-photos` passed, and no source
+fixture path had a status entry. SHA-256 fixture hashes were:
+
+```text
+city.jpg     44faf249868e8d3ae81c0b532c460711526fbf17a66b82ee43ac805b3591cad1
+coast.jpg    ad6ba90e75709487ab6b927dc3f2781042e31312a4b7bc4606cddd4c0c5c4394
+forest.jpg   91c69c673ef96b8afff1c36da486de4dece98fcaeb178310d00b675f2e48a699
+interior.jpg c8cc481a50bc60cdfb34e7e6ff2a0ac2e7350dd8f934afae91f3c19b0a2d3a05
+mountain.jpg 79bcb7af04b68935b29b5e0a80afb17d1823dde94a5fdbc75e3d5adf7a6e62ae
+portrait.jpg d1844a9747c7acfb36b10651ce79acff5c9d35b30a7b54323dbb171aed0bdfd0
+```
+
 ## Fresh verification
 
 All commands below exited 0.
