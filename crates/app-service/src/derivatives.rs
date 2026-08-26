@@ -315,13 +315,12 @@ impl AppService {
         if !ready.is_empty() {
             self.publish_derivatives_if_active(selection, ready);
         }
-        if request.kind == DerivativeClass::WallThumbnail {
-            if let Ok(mut state) = self.state.lock()
-                && state.selection_epoch == selection.epoch
-                && state.protected_group == Some(selection.group_id)
-            {
-                append_unique(&mut state.recent_derivative_ids, ids.iter().copied());
-            }
+        if request.kind == DerivativeClass::WallThumbnail
+            && let Ok(mut state) = self.state.lock()
+            && state.selection_epoch == selection.epoch
+            && state.protected_group == Some(selection.group_id)
+        {
+            append_unique(&mut state.recent_derivative_ids, ids.iter().copied());
         }
         let pending_ids = pending
             .iter()

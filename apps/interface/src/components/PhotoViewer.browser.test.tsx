@@ -10,6 +10,7 @@ import {
 	type InMemoryPhotoService,
 } from "../services/inMemoryPhotoService";
 import type {
+	DerivativeReference,
 	DerivativeRequest,
 	PhotoService,
 	WallAsset,
@@ -87,6 +88,55 @@ function serviceWithReadyPhotos(
 					: undefined,
 		})),
 	});
+}
+
+const cachedPixel =
+	"data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
+
+function cachedOfflineService() {
+	const service = serviceWithReadyPhotos(false, 1, true);
+	const originalDerivativeUrl = service.derivativeUrl.bind(service);
+	const cached = new Map<string, string>();
+	const sentinel = "file:///private/source/secret.jpg";
+	let unavailable = false;
+	const opaqueUrls = new Map<string, string>([
+		["wallThumbnail:coast-wall", `${cachedPixel}#cached-coast-wall`],
+		["screenPreview:coast-screen", `${cachedPixel}#cached-coast-screen`],
+		["wallThumbnail:photo-0-wall", `${cachedPixel}#cached-photo-0-wall`],
+	]);
+	service.derivativeUrl = (reference: DerivativeReference) => {
+		const key = `${reference.kind}:${reference.key}`;
+		if (unavailable) {
+			const ready = cached.get(key);
+			if (ready) return ready;
+			throw new Error(`Source unavailable: ${sentinel}`);
+		}
+		const url = opaqueUrls.get(key) ?? originalDerivativeUrl(reference);
+		cached.set(key, url);
+		return url;
+	};
+	return {
+		service,
+		sentinel,
+		prime: () => {
+			for (const [kind, key] of [
+				["wallThumbnail", "coast-wall"],
+				["screenPreview", "coast-screen"],
+				["wallThumbnail", "photo-0-wall"],
+			] as const)
+				service.derivativeUrl({ assetId: kind, kind, key });
+		},
+		goOffline: () => {
+			unavailable = true;
+			service.emitForTest({
+				kind: "sourceUnavailable",
+				selectionId: "memory-selection-1",
+				sourceId: "memory-source",
+			});
+		},
+		cachedScreenUrl: opaqueUrls.get("screenPreview:coast-screen") ?? "",
+		cachedNeighbourUrl: opaqueUrls.get("wallThumbnail:photo-0-wall") ?? "",
+	};
 }
 
 interface PageGate {
@@ -418,11 +468,21 @@ describe("immersive photo viewer checkpoint", () => {
 			expect(bounds.width).toBeGreaterThanOrEqual(44);
 			expect(bounds.height).toBeGreaterThanOrEqual(44);
 		}
+		await view.getByRole("button", { name: "Photo information" }).click();
+		await expect
+			.element(view.getByRole("complementary", { name: "Photo information" }))
+			.toBeVisible();
+		const close = view
+			.getByRole("button", { name: "Close photo information" })
+			.element();
+		expect(close.getBoundingClientRect().width).toBeGreaterThanOrEqual(44);
+		expect(close.getBoundingClientRect().height).toBeGreaterThanOrEqual(44);
 	});
 
 	it("keeps ready derivative URLs usable after the source becomes unavailable", async () => {
-		const { service, view, tile } = await openAsset("Coast", false, true);
-		(tile.element() as HTMLButtonElement).click();
+		const offline = cachedOfflineService();
+		offline.prime();
+		const { view } = await openAssetWithService(offline.service, "Coast");
 		await expect
 			.element(view.getByRole("dialog", { name: "Photo viewer" }))
 			.toBeVisible();
@@ -430,28 +490,25 @@ describe("immersive photo viewer checkpoint", () => {
 			.getByRole("dialog", { name: "Photo viewer" })
 			.element();
 		await expect
-			.poll(
-				() =>
-					overlay.querySelector<HTMLImageElement>(
-						"[data-viewer-layer='wallThumbnail']",
-					)?.src ?? "",
-			)
-			.toContain("/demo-photos/coast.jpg");
-		await expect
 			.poll(() =>
 				overlay.querySelector<HTMLImageElement>(
 					"[data-viewer-layer='screenPreview'][data-ready='true']",
 				),
 			)
 			.not.toBeNull();
-		const cachedScreenUrl = overlay.querySelector<HTMLImageElement>(
-			"[data-viewer-layer='screenPreview'][data-ready='true']",
-		)?.src;
-		service.emitForTest({
-			kind: "sourceUnavailable",
-			selectionId: "memory-selection-1",
-			sourceId: "memory-source",
-		});
+		expect(
+			overlay.querySelector<HTMLImageElement>(
+				"[data-viewer-layer='screenPreview'][data-ready='true']",
+			)?.src,
+		).toBe(offline.cachedScreenUrl);
+		offline.goOffline();
+		expect(() =>
+			offline.service.derivativeUrl({
+				assetId: "uncached",
+				kind: "screenPreview",
+				key: "uncached-screen",
+			}),
+		).toThrow(offline.sentinel);
 		await expect
 			.element(view.getByTestId("viewer-stage"))
 			.toHaveAttribute("data-current-asset", "coast");
@@ -459,16 +516,21 @@ describe("immersive photo viewer checkpoint", () => {
 			overlay.querySelector<HTMLImageElement>(
 				"[data-viewer-layer='screenPreview'][data-ready='true']",
 			)?.src,
-		).toBe(cachedScreenUrl);
+		).toBe(offline.cachedScreenUrl);
+		expect(document.body.textContent).not.toContain(offline.sentinel);
 		await userEvent.keyboard("{ArrowRight}");
 		await expect
 			.element(view.getByTestId("viewer-stage"))
 			.toHaveAttribute("data-current-asset", "photo-0");
 		const neighbour = overlay.querySelector<HTMLImageElement>(
-			"[data-filmstrip-capacity] button[aria-current='true'] img",
+			"[data-viewer-layer='wallThumbnail']",
 		);
-		expect(neighbour?.src).toContain("/demo-photos/photo-0.jpg");
-		expect(neighbour?.src).not.toContain("memory-source");
+		await expect
+			.poll(() => (neighbour?.complete ? neighbour.naturalWidth : 0))
+			.toBeGreaterThan(0);
+		expect(neighbour?.src).toBe(offline.cachedNeighbourUrl);
+		expect(neighbour?.src).not.toContain(offline.sentinel);
+		expect(document.body.textContent).not.toContain(offline.sentinel);
 	});
 
 	it("marks unavailable larger previews and suppresses reduced-motion transitions", async () => {

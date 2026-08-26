@@ -2,9 +2,8 @@
 
 Date: 2026-08-26
 
-Status: verification complete for the interface and desktop build. The
-workspace-wide Clippy gate remains blocked by an existing warning outside this
-slice. The coordinator-owned `wall-demo` native app was left running and was
+Status: verification complete for the interface, Rust workspace, and desktop
+build. The coordinator-owned `wall-demo` native app was left running and was
 not stopped or replaced.
 
 ## Revision and changed files
@@ -57,7 +56,7 @@ The complete browser suite is GREEN: 3 files, 79 tests passed.
 | `npm run check` | PASS, Biome checked 55 files |
 | `npm run --workspace @photo-viewer/interface build` | PASS, 1882 modules; JS 290.28 kB, CSS 16.89 kB |
 | `cargo test --workspace --all-features` | PASS, 190 passed, 0 failed |
-| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | FAIL, existing `clippy::collapsible-if` at `crates/app-service/src/derivatives.rs:318` |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | PASS |
 | `cargo fmt --all -- --check` | PASS |
 | `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml` | PASS, 11 passed, 0 failed |
 | `cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings` | PASS |
@@ -98,6 +97,24 @@ rename, move, copy, rating, tagging, or delete operation. The viewer reads
 only host-neutral catalog and derivative references. SQLite and managed cache
 locations remain the only intended writable locations. No user-selected path
 was recorded.
+
+## Fix round 1
+
+The workspace Clippy finding was fixed with the prescribed behavior-preserving
+let-chain rewrite in `crates/app-service/src/derivatives.rs`. The controlled
+offline browser harness now primes opaque current and neighbour derivative
+URLs, rejects uncached access after `sourceUnavailable`, and injects the
+internal sentinel `file:///private/source/secret.jpg`; the viewer never renders
+that sentinel. The stage itself remains on the cached screen-preview layer for
+the current photo and a decoded cached wall-thumbnail layer after navigating to
+the neighbour. The phone test also measures the Info drawer close target.
+
+Fresh fix-round results: focused offline/phone browser tests 2 passed; full
+browser suite 3 files and 79 passed; unit suite 10 files and 89 passed; Rust
+workspace 190 passed; workspace Clippy and fmt passed; desktop tests 11 passed,
+desktop Clippy and fmt passed; typecheck, Biome, interface build, desktop app
+build, and `git diff --check` passed. The unsigned bundle remains at
+`apps/desktop/src-tauri/target/release/bundle/macos/Photo Viewer.app`.
 
 ## Native evidence and limits
 
