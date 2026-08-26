@@ -84,6 +84,12 @@ returns to the wall and restores the selected tile. Ready cached derivatives
 remain usable if the selected source becomes unavailable. Zoom and pan are not
 part of this slice.
 
+An unavailable catalog item with no cached derivative does not open in this
+viewer: `PhotoService` has no locate-folder capability yet. Desktop
+locate/reconnect is a named follow-up, and the hosted web interface must not
+offer local folder selection. Until that capability exists, such a desktop
+item has no in-viewer recovery path.
+
 To create an unsigned macOS application bundle:
 
 ```bash

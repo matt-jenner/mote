@@ -31,6 +31,21 @@ export default defineConfig({
 					},
 				},
 			},
+			{
+				plugins: [react()],
+				test: {
+					name: "browser-motion",
+					include: ["src/**/*.motion.test.tsx"],
+					browser: {
+						enabled: true,
+						provider: playwright({
+							contextOptions: { reducedMotion: "no-preference" },
+						}),
+						headless: true,
+						instances: [{ browser: "webkit" }],
+					},
+				},
+			},
 		],
 	},
 });

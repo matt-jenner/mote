@@ -323,6 +323,7 @@ export function JustifiedWall({
 			aria-label="Photos"
 			className={styles.wallRegion}
 			ref={assignRegion}
+			tabIndex={-1}
 		>
 			<div className={styles.wallContent}>
 				{rows.map((row, rowIndex) => (

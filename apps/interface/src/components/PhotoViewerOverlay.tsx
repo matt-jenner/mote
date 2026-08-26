@@ -18,7 +18,8 @@ import { PhotoInfoDrawer } from "./PhotoInfoDrawer";
 import { ViewerFilmstrip } from "./ViewerFilmstrip";
 import { ViewerStage } from "./ViewerStage";
 
-const controlAreaSelector = "[data-viewer-controls], fieldset, aside";
+const controlAreaSelector =
+	"[data-viewer-controls], [data-viewer-chrome], [data-viewer-info], fieldset, aside";
 
 function isTabbable(element: HTMLElement): boolean {
 	if (
@@ -56,6 +57,7 @@ interface PhotoViewerOverlayProps {
 	nextCursor: string | null;
 	onLoadMore: () => void;
 	onRequestNearViewportDerivatives: (assetIds: readonly string[]) => void;
+	onSetWallInteraction?: (active: boolean) => void;
 }
 
 export function PhotoViewerOverlay({
@@ -72,24 +74,65 @@ export function PhotoViewerOverlay({
 	nextCursor,
 	onLoadMore,
 	onRequestNearViewportDerivatives,
+	onSetWallInteraction = () => undefined,
 }: PhotoViewerOverlayProps) {
 	const backRef = useRef<HTMLButtonElement>(null);
 	const dialogRef = useRef<HTMLElement>(null);
-	const [previewFailed, setPreviewFailed] = useState(false);
+	const [previewFailedKey, setPreviewFailedKey] = useState<string | null>(null);
 	const [filmstripRevealed, setFilmstripRevealed] = useState(false);
 	const controlsFocused = useRef(false);
-	const handlePreviewFailure = useCallback(() => setPreviewFailed(true), []);
+	const entryFocusPending = useRef(true);
 	const asset = assets.find((item) => item.id === state.currentAssetId);
-	const previewFailureKey = `${asset?.id ?? ""}:${state.previewGeneration}`;
 	const currentIndex = findViewerIndex(assets, state.currentAssetId ?? "");
 	const preview = useViewerPreview({
 		assets,
 		currentIndex,
 		previewGeneration: state.previewGeneration,
 	});
+	const previewFailureKey = `${asset?.id ?? ""}:${state.previewGeneration}:${preview.currentUrl ?? ""}`;
+	const handlePreviewFailure = useCallback(
+		(failureKey: string) => {
+			if (failureKey === previewFailureKey) setPreviewFailedKey(failureKey);
+		},
+		[previewFailureKey],
+	);
+	const reportInteraction = useCallback(() => {
+		onSetWallInteraction(true);
+		preview.reportInteraction();
+	}, [onSetWallInteraction, preview.reportInteraction]);
+	const handleHideControls = useCallback(() => {
+		const active = document.activeElement;
+		if (
+			controlsFocused.current &&
+			active &&
+			dialogRef.current?.contains(active)
+		)
+			return;
+		if (active?.closest(controlAreaSelector))
+			dialogRef.current?.focus({ preventScroll: true });
+		onHideControls();
+	}, [onHideControls]);
+	const handleSelectAsset = useCallback(
+		(assetId: string) => {
+			reportInteraction();
+			onSelectAsset(assetId);
+		},
+		[onSelectAsset, reportInteraction],
+	);
+	const handleSetInfoOpen = useCallback(
+		(open: boolean) => {
+			reportInteraction();
+			onSetInfoOpen(open);
+		},
+		[onSetInfoOpen, reportInteraction],
+	);
+	const handleClose = useCallback(() => {
+		reportInteraction();
+		onClose();
+	}, [onClose, reportInteraction]);
 	const controls = useViewerControls({
 		controlsVisible: state.controlsVisible,
-		onHide: onHideControls,
+		onHide: handleHideControls,
 		onShow: onShowControls,
 		onToggleTouch: onToggleTouchControls,
 	});
@@ -98,7 +141,7 @@ export function PhotoViewerOverlay({
 		onNavigate: (direction) => {
 			const nextIndex = currentIndex + (direction === "next" ? 1 : -1);
 			const nextAsset = assets[nextIndex];
-			if (nextAsset) onSelectAsset(nextAsset.id);
+			if (nextAsset) handleSelectAsset(nextAsset.id);
 		},
 		onTap: () => controls.toggleTouch(),
 		viewportRevision: viewport.revision,
@@ -107,21 +150,28 @@ export function PhotoViewerOverlay({
 	});
 
 	useEffect(() => {
-		if (!previewFailureKey) return;
-		setPreviewFailed(false);
-	}, [previewFailureKey]);
-
-	useEffect(() => {
 		if (!state.controlsVisible) setFilmstripRevealed(false);
 	}, [state.controlsVisible]);
 
 	useEffect(() => {
+		entryFocusPending.current = true;
 		backRef.current?.focus();
+		entryFocusPending.current = false;
+	}, []);
+
+	const onCloseRef = useRef(onClose);
+	const onSetInfoOpenRef = useRef(onSetInfoOpen);
+	const infoOpenRef = useRef(state.infoOpen);
+	onCloseRef.current = onClose;
+	onSetInfoOpenRef.current = onSetInfoOpen;
+	infoOpenRef.current = state.infoOpen;
+
+	useEffect(() => {
 		const onKeyDown = (event: globalThis.KeyboardEvent) => {
 			if (event.key === "Escape") {
 				event.preventDefault();
-				if (state.infoOpen) onSetInfoOpen(false);
-				else onClose();
+				if (infoOpenRef.current) onSetInfoOpenRef.current(false);
+				else onCloseRef.current();
 			} else if (
 				event.key === "Tab" &&
 				!dialogRef.current?.contains(document.activeElement)
@@ -132,7 +182,7 @@ export function PhotoViewerOverlay({
 		};
 		window.addEventListener("keydown", onKeyDown, true);
 		return () => window.removeEventListener("keydown", onKeyDown, true);
-	}, [onClose, onSetInfoOpen, state.infoOpen]);
+	}, []);
 
 	useEffect(() => {
 		if (
@@ -151,12 +201,14 @@ export function PhotoViewerOverlay({
 	const filmstripVisible =
 		state.controlsVisible && (state.filmstripVisible || filmstripRevealed);
 	const handlePointerMove = (event: React.PointerEvent<HTMLElement>) => {
+		reportInteraction();
 		if (event.pointerType !== "touch" && !controlsFocused.current)
 			controls.showForInput("mouse");
 		const bounds = event.currentTarget.getBoundingClientRect();
 		if (event.clientY >= bounds.bottom - 96) setFilmstripRevealed(true);
 	};
 	const handleKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+		reportInteraction();
 		const target = event.target as HTMLElement;
 		const isEditable =
 			target.isContentEditable ||
@@ -170,7 +222,7 @@ export function PhotoViewerOverlay({
 			event.preventDefault();
 			const nextIndex = currentIndex + (event.key === "ArrowRight" ? 1 : -1);
 			const nextAsset = assets[nextIndex];
-			if (nextAsset) onSelectAsset(nextAsset.id);
+			if (nextAsset) handleSelectAsset(nextAsset.id);
 			return;
 		}
 		trapFocus(event);
@@ -203,6 +255,7 @@ export function PhotoViewerOverlay({
 			focusable.length;
 		focusable[nextIndex]?.focus();
 	};
+	const infoVisible = state.controlsVisible || state.infoOpen;
 	return (
 		<section
 			aria-label="Photo viewer"
@@ -218,6 +271,7 @@ export function PhotoViewerOverlay({
 			onFocusCapture={(event) => {
 				const target = event.target as HTMLElement;
 				if (target.closest(controlAreaSelector)) {
+					if (entryFocusPending.current) return;
 					controlsFocused.current = true;
 					controls.keepVisible();
 				}
@@ -232,23 +286,41 @@ export function PhotoViewerOverlay({
 				}
 			}}
 			onKeyDownCapture={handleKeyDown}
-			onLostPointerCapture={gestures.onLostPointerCapture}
-			onPointerCancel={gestures.onPointerCancel}
-			onPointerDown={gestures.onPointerDown}
+			onLostPointerCapture={(event) => {
+				reportInteraction();
+				gestures.onLostPointerCapture(event);
+			}}
+			onPointerCancel={(event) => {
+				reportInteraction();
+				gestures.onPointerCancel(event);
+			}}
+			onPointerDown={(event) => {
+				reportInteraction();
+				gestures.onPointerDown(event);
+			}}
 			onPointerMove={(event) => {
 				handlePointerMove(event);
 				gestures.onPointerMove(event);
 			}}
-			onPointerUp={gestures.onPointerUp}
+			onPointerUp={(event) => {
+				reportInteraction();
+				gestures.onPointerUp(event);
+			}}
 			ref={dialogRef}
 			role="dialog"
+			tabIndex={-1}
 		>
-			<div className={styles.viewerChrome}>
+			<div
+				aria-hidden={!state.controlsVisible}
+				className={`${styles.viewerChrome} ${!state.controlsVisible ? styles.viewerChromeHidden : ""}`}
+				data-viewer-chrome="true"
+			>
 				<button
 					aria-label="Back to photos"
 					className={styles.viewerBack}
-					onClick={onClose}
+					onClick={handleClose}
 					ref={backRef}
+					tabIndex={state.controlsVisible ? 0 : -1}
 					type="button"
 				>
 					<ChevronLeft aria-hidden="true" size={22} strokeWidth={1.7} />
@@ -276,7 +348,7 @@ export function PhotoViewerOverlay({
 					disabled={currentIndex <= 0}
 					onClick={() => {
 						const previous = assets[currentIndex - 1];
-						if (previous) onSelectAsset(previous.id);
+						if (previous) handleSelectAsset(previous.id);
 					}}
 					tabIndex={state.controlsVisible ? 0 : -1}
 					type="button"
@@ -289,7 +361,7 @@ export function PhotoViewerOverlay({
 					disabled={currentIndex < 0 || currentIndex >= assets.length - 1}
 					onClick={() => {
 						const next = assets[currentIndex + 1];
-						if (next) onSelectAsset(next.id);
+						if (next) handleSelectAsset(next.id);
 					}}
 					tabIndex={state.controlsVisible ? 0 : -1}
 					type="button"
@@ -302,7 +374,7 @@ export function PhotoViewerOverlay({
 					assets={assets}
 					currentIndex={currentIndex}
 					onRequestNearViewportDerivatives={onRequestNearViewportDerivatives}
-					onSelectAsset={onSelectAsset}
+					onSelectAsset={handleSelectAsset}
 					service={service}
 					viewportRevision={viewport.revision}
 					viewportWidth={viewport.width}
@@ -320,8 +392,11 @@ export function PhotoViewerOverlay({
 			<button
 				aria-expanded={state.infoOpen}
 				aria-label="Photo information"
-				className={styles.viewerInfoButton}
-				onClick={() => onSetInfoOpen(true)}
+				aria-hidden={!infoVisible}
+				className={`${styles.viewerInfoButton} ${!infoVisible ? styles.viewerInfoHidden : ""}`}
+				data-viewer-info="true"
+				onClick={() => handleSetInfoOpen(true)}
+				tabIndex={infoVisible ? 0 : -1}
 				type="button"
 			>
 				<Info aria-hidden="true" size={20} strokeWidth={1.7} />
@@ -330,9 +405,10 @@ export function PhotoViewerOverlay({
 				<PhotoInfoDrawer
 					asset={asset}
 					largePreviewUnavailable={
-						preview.largePreviewUnavailable || previewFailed
+						preview.largePreviewUnavailable ||
+						previewFailedKey === previewFailureKey
 					}
-					onClose={() => onSetInfoOpen(false)}
+					onClose={() => handleSetInfoOpen(false)}
 				/>
 			) : null}
 		</section>

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import type { PhotoService, WallAsset } from "../services/photoService";
 import styles from "../styles/photoViewer.module.css";
 import {
@@ -44,9 +44,13 @@ export function ViewerFilmstrip({
 		() => viewerFilmstripWindow(assets, currentIndex, (capacity - 1) / 2),
 		[assets, capacity, currentIndex],
 	);
-	const visibleAssets = assets.slice(windowRange.start, windowRange.end);
+	const visibleAssets = useMemo(
+		() => assets.slice(windowRange.start, windowRange.end),
+		[assets, windowRange.end, windowRange.start],
+	);
 	const scrollRevision = `${currentIndex}:${windowRange.start}:${windowRange.end}:${viewportRevision}`;
 	const currentButtonRef = useRef<HTMLButtonElement>(null);
+	const selectionFocusPending = useRef(false);
 
 	useEffect(() => {
 		const missingIds = visibleAssets
@@ -69,6 +73,12 @@ export function ViewerFilmstrip({
 		});
 	}, [scrollRevision]);
 
+	useLayoutEffect(() => {
+		if (currentIndex < 0 || !selectionFocusPending.current) return;
+		selectionFocusPending.current = false;
+		currentButtonRef.current?.focus({ preventScroll: true });
+	}, [currentIndex]);
+
 	if (visibleAssets.length === 0) return null;
 	return (
 		<fieldset
@@ -87,7 +97,10 @@ export function ViewerFilmstrip({
 							aria-current={isCurrent ? "true" : undefined}
 							aria-label={asset.displayName}
 							className={styles.viewerFilmstripItem}
-							onClick={() => onSelectAsset(asset.id)}
+							onClick={() => {
+								selectionFocusPending.current = true;
+								onSelectAsset(asset.id);
+							}}
 							ref={isCurrent ? currentButtonRef : undefined}
 							type="button"
 						>

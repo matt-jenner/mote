@@ -110,6 +110,27 @@ fn a_second_identical_request_reuses_the_atomic_cache_file_and_source() {
 }
 
 #[test]
+fn controlled_demo_fixture_generation_leaves_source_unchanged() {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../apps/interface/public/demo-photos/city.jpg");
+    let before = std::fs::read(&source).unwrap();
+    let before_modified = std::fs::metadata(&source).unwrap().modified().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let generator = ImageDerivativeGenerator::new(cache.path()).unwrap();
+
+    let generated = generator
+        .generate(&source, &spec(DerivativeKind::WallThumbnail, 1024, 1))
+        .unwrap();
+
+    assert!(cache.path().join(generated.relative_path).is_file());
+    assert_eq!(std::fs::read(&source).unwrap(), before);
+    assert_eq!(
+        std::fs::metadata(&source).unwrap().modified().unwrap(),
+        before_modified
+    );
+}
+
+#[test]
 fn all_exif_orientations_normalize_dimensions() {
     let fixture = fixture();
     let cache = tempfile::tempdir().unwrap();

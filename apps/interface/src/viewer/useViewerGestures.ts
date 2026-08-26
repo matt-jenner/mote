@@ -38,6 +38,7 @@ export function classifyViewerGesture({
 
 interface ActiveGesture {
 	pointerId: number;
+	pointerType: string;
 	startX: number;
 	startY: number;
 	inDrawer: boolean;
@@ -112,6 +113,7 @@ export function useViewerGestures({
 			const target = event.currentTarget;
 			activeGesture.current = {
 				pointerId: event.pointerId,
+				pointerType: event.pointerType,
 				startX: event.clientX,
 				startY: event.clientY,
 				inDrawer:
@@ -163,6 +165,7 @@ export function useViewerGestures({
 			}
 			if (
 				cancelled ||
+				gesture.pointerType !== "touch" ||
 				gesture.startRevision !== revisionRef.current ||
 				gesture.startRevision !== viewportRevision
 			)

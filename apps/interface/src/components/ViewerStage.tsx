@@ -12,7 +12,7 @@ interface ViewerStageProps {
 	baseUrl?: string | null;
 	currentUrl?: string | null;
 	largePreviewUnavailable?: boolean;
-	onPreviewFailure?: () => void;
+	onPreviewFailure?: (failureKey: string) => void;
 	previewGeneration?: number;
 	viewportWidth?: number;
 	viewportHeight?: number;
@@ -21,6 +21,24 @@ interface ViewerStageProps {
 export interface ViewerFrameRect {
 	width: number;
 	height: number;
+}
+
+export interface ViewerInsets {
+	top: number;
+	right: number;
+	bottom: number;
+	left: number;
+}
+
+export function drawableViewerBox(
+	containerWidth: number,
+	containerHeight: number,
+	insets: ViewerInsets,
+): ViewerFrameRect {
+	return {
+		width: Math.max(0, containerWidth - insets.left - insets.right),
+		height: Math.max(0, containerHeight - insets.top - insets.bottom),
+	};
 }
 
 export function fitViewerFrame(
@@ -70,12 +88,15 @@ export function ViewerStage({
 	viewportHeight = 0,
 }: ViewerStageProps) {
 	const stageRef = useRef<HTMLDivElement>(null);
+	const measureRef = useRef<HTMLDivElement>(null);
 	const screenImageRef = useRef<HTMLImageElement>(null);
 	const activeDecodeRef = useRef("");
 	const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
 	const [decodedToken, setDecodedToken] = useState<string | null>(null);
-	const [screenFailed, setScreenFailed] = useState(false);
-	const [baseFailed, setBaseFailed] = useState(false);
+	const [failedScreenToken, setFailedScreenToken] = useState<string | null>(
+		null,
+	);
+	const [failedBaseUrl, setFailedBaseUrl] = useState<string | null>(null);
 	const baseUrl =
 		suppliedBaseUrl === undefined
 			? safeDerivativeUrl(service, asset.wallThumbnail)
@@ -87,23 +108,23 @@ export function ViewerStage({
 	const decodeToken = `${asset.id}:${previewGeneration}:${currentUrl ?? ""}`;
 
 	useLayoutEffect(() => {
-		const stage = stageRef.current;
-		if (!stage) return;
+		const measureNode = measureRef.current;
+		if (!measureNode) return;
 		const measure = () =>
 			setStageSize({
 				width:
 					viewportWidth > 0
-						? Math.min(stage.clientWidth, viewportWidth)
-						: stage.clientWidth,
+						? Math.min(measureNode.clientWidth, viewportWidth)
+						: measureNode.clientWidth,
 				height:
 					viewportHeight > 0
-						? Math.min(stage.clientHeight, viewportHeight)
-						: stage.clientHeight,
+						? Math.min(measureNode.clientHeight, viewportHeight)
+						: measureNode.clientHeight,
 			});
 		measure();
 		if (typeof ResizeObserver !== "undefined") {
 			const observer = new ResizeObserver(measure);
-			observer.observe(stage);
+			observer.observe(measureNode);
 			return () => observer.disconnect();
 		}
 		window.addEventListener("resize", measure);
@@ -113,7 +134,6 @@ export function ViewerStage({
 	useEffect(() => {
 		activeDecodeRef.current = decodeToken;
 		setDecodedToken(null);
-		setScreenFailed(false);
 		if (!currentUrl) return;
 		const image = screenImageRef.current;
 		if (!image) return;
@@ -130,17 +150,11 @@ export function ViewerStage({
 			},
 			() => {
 				if (activeDecodeRef.current !== decodeToken) return;
-				setScreenFailed(true);
-				onPreviewFailure?.();
+				setFailedScreenToken(decodeToken);
+				onPreviewFailure?.(decodeToken);
 			},
 		);
 	}, [currentUrl, decodeToken, onPreviewFailure]);
-
-	// The URL is part of the base-layer identity; reset its error state when it changes.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: baseUrl is the identity being watched.
-	useEffect(() => {
-		setBaseFailed(false);
-	}, [baseUrl]);
 
 	const frame = fitViewerFrame(
 		stageSize.width,
@@ -152,7 +166,8 @@ export function ViewerStage({
 		frame.width > 0
 			? { width: `${frame.width}px`, height: `${frame.height}px` }
 			: undefined;
-	const hasBaseImage = Boolean(baseUrl) && !baseFailed;
+	const screenFailed = Boolean(currentUrl) && failedScreenToken === decodeToken;
+	const hasBaseImage = Boolean(baseUrl) && failedBaseUrl !== baseUrl;
 	const showPreview =
 		Boolean(currentUrl) && decodedToken === decodeToken && !screenFailed;
 
@@ -166,53 +181,55 @@ export function ViewerStage({
 			data-testid="viewer-stage"
 			ref={stageRef}
 		>
-			<div
-				className={styles.viewerFrame}
-				data-testid="viewer-frame"
-				style={frameStyle}
-			>
-				{hasBaseImage ? (
-					<img
-						alt={asset.displayName}
-						className={`${styles.viewerImage} ${styles.viewerBase}`}
-						data-viewer-layer="wallThumbnail"
-						decoding="async"
-						draggable={false}
-						onError={() => setBaseFailed(true)}
-						src={baseUrl ?? undefined}
-					/>
-				) : (
-					<div
-						aria-label={`${asset.displayName} representative colour`}
-						className={`${styles.viewerColour} ${styles.viewerBase}`}
-						data-viewer-layer="representativeColour"
-						role="img"
-						style={{
-							backgroundColor:
-								asset.representativeRgb === null
-									? "var(--canvas-elevated)"
-									: `rgb(${(asset.representativeRgb >> 16) & 255}, ${(asset.representativeRgb >> 8) & 255}, ${asset.representativeRgb & 255})`,
-						}}
-					/>
-				)}
-				{currentUrl ? (
-					<img
-						alt=""
-						className={`${styles.viewerImage} ${styles.viewerPreview}`}
-						data-ready={showPreview ? "true" : "false"}
-						data-viewer-layer="screenPreview"
-						decoding="async"
-						draggable={false}
-						onError={() => {
-							if (activeDecodeRef.current === decodeToken) {
-								setScreenFailed(true);
-								onPreviewFailure?.();
-							}
-						}}
-						ref={screenImageRef}
-						src={currentUrl}
-					/>
-				) : null}
+			<div className={styles.viewerStageMeasure} ref={measureRef}>
+				<div
+					className={styles.viewerFrame}
+					data-testid="viewer-frame"
+					style={frameStyle}
+				>
+					{hasBaseImage ? (
+						<img
+							alt={asset.displayName}
+							className={`${styles.viewerImage} ${styles.viewerBase}`}
+							data-viewer-layer="wallThumbnail"
+							decoding="async"
+							draggable={false}
+							onError={() => setFailedBaseUrl(baseUrl)}
+							src={baseUrl ?? undefined}
+						/>
+					) : (
+						<div
+							aria-label={`${asset.displayName} representative colour`}
+							className={`${styles.viewerColour} ${styles.viewerBase}`}
+							data-viewer-layer="representativeColour"
+							role="img"
+							style={{
+								backgroundColor:
+									asset.representativeRgb === null
+										? "var(--canvas-elevated)"
+										: `rgb(${(asset.representativeRgb >> 16) & 255}, ${(asset.representativeRgb >> 8) & 255}, ${asset.representativeRgb & 255})`,
+							}}
+						/>
+					)}
+					{currentUrl ? (
+						<img
+							alt=""
+							className={`${styles.viewerImage} ${styles.viewerPreview}`}
+							data-ready={showPreview ? "true" : "false"}
+							data-viewer-layer="screenPreview"
+							decoding="async"
+							draggable={false}
+							onError={() => {
+								if (activeDecodeRef.current === decodeToken) {
+									setFailedScreenToken(decodeToken);
+									onPreviewFailure?.(decodeToken);
+								}
+							}}
+							ref={screenImageRef}
+							src={currentUrl}
+						/>
+					) : null}
+				</div>
 			</div>
 		</div>
 	);

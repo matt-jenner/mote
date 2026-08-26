@@ -33,6 +33,7 @@ export interface InMemoryOptions {
 
 export interface InMemoryPhotoService extends PhotoService {
 	readonly derivativeRequests: DerivativeRequest[];
+	readonly interactionCalls: boolean[];
 	startFixtureScan(): Promise<void>;
 	finishFixtureScan(): Promise<void>;
 	emitForTest(update: WallUpdate): void;
@@ -66,6 +67,7 @@ export function createInMemoryPhotoService(
 	let settlementPromise: Promise<void> | null = null;
 	let sourceWarnings: WallWarningState[] = [...(options.sourceWarnings ?? [])];
 	const derivativeRequests: DerivativeRequest[] = [];
+	const interactionCalls: boolean[] = [];
 	let state: BootstrapState = {
 		settings: { appearance: "system" },
 		activeSource: null,
@@ -115,6 +117,7 @@ export function createInMemoryPhotoService(
 	const service: InMemoryPhotoService = {
 		capabilities: { chooseFolder: true, locateFolder: false },
 		derivativeRequests,
+		interactionCalls,
 		async getBootstrapState() {
 			return clone(state);
 		},
@@ -208,7 +211,8 @@ export function createInMemoryPhotoService(
 			});
 			return undefined;
 		},
-		async setWallInteraction(_active: boolean) {
+		async setWallInteraction(active: boolean) {
+			interactionCalls.push(active);
 			return undefined;
 		},
 		watchWallUpdates(listener: WallListener) {

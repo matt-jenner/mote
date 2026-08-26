@@ -21,6 +21,13 @@
 	gap: 8px;
 }
 
+.viewerChromeHidden,
+.viewerInfoHidden {
+	visibility: hidden;
+	opacity: 0;
+	pointer-events: none;
+}
+
 .viewerBack {
 	display: grid;
 	place-items: center;
@@ -46,6 +53,15 @@
 		max(44px, var(--safe-area-left, 0px));
 	background: #08090b;
 	touch-action: pan-y;
+}
+
+.viewerStageMeasure {
+	display: grid;
+	width: 100%;
+	height: 100%;
+	min-width: 0;
+	min-height: 0;
+	place-items: center;
 }
 
 .viewerFrame {
@@ -141,6 +157,10 @@
 	left: calc(max(44px, var(--safe-area-left, 0px)) + 52px);
 }
 
+.viewerInfoButton {
+	transition: opacity 180ms ease;
+}
+
 .viewerInfoClose {
 	font-size: 0.78rem;
 }
@@ -158,13 +178,18 @@
 .viewerInfoDrawer {
 	position: absolute;
 	top: 0;
-	right: 0;
+	right: var(--safe-area-right, 0px);
 	bottom: max(44px, var(--safe-area-bottom, 0px));
 	z-index: 2;
-	width: 320px;
+	width: min(
+		320px,
+		calc(100% - var(--safe-area-left, 0px) - var(--safe-area-right, 0px))
+	);
 	max-width: 100%;
 	overflow-y: auto;
-	padding: calc(var(--safe-area-top) + 20px) 24px 24px;
+	padding: calc(20px + max(0px, var(--safe-area-top, 0px)))
+		calc(24px + max(0px, var(--safe-area-right, 0px))) 24px
+		calc(24px + max(0px, var(--safe-area-left, 0px)));
 	color: #f4f5f6;
 	background: rgb(19 21 25 / 96%);
 	box-shadow: -14px 0 30px rgb(0 0 0 / 24%);
@@ -278,9 +303,12 @@
 
 @media (max-width: 639px) {
 	.viewerInfoDrawer {
-		width: 88%;
-		padding-right: 20px;
-		padding-left: 20px;
+		width: min(
+			88%,
+			calc(100% - var(--safe-area-left, 0px) - var(--safe-area-right, 0px))
+		);
+		padding-right: calc(20px + max(0px, var(--safe-area-right, 0px)));
+		padding-left: calc(20px + max(0px, var(--safe-area-left, 0px)));
 	}
 
 	.viewerControls {

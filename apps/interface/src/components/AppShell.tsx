@@ -32,6 +32,7 @@ export function AppShell() {
 	);
 	const wallRegionRef = useRef<HTMLElement>(null);
 	const closingAnchorRef = useRef(viewer.returnAnchor);
+	const closingFocusFallbackRef = useRef(false);
 	const drawerRef = useRef<HTMLElement>(null);
 	const drawerTriggerRef = useRef<HTMLButtonElement>(null);
 	const drawerCloseRef = useRef<HTMLButtonElement>(null);
@@ -62,9 +63,18 @@ export function AppShell() {
 		[wall.state.items],
 	);
 	const handleCloseViewer = useCallback(() => {
-		closingAnchorRef.current = viewer.returnAnchor;
+		const anchor = viewer.returnAnchor;
+		closingAnchorRef.current = anchor
+			? {
+					...anchor,
+					assetId: viewer.currentAssetId ?? anchor.assetId,
+				}
+			: null;
+		closingFocusFallbackRef.current =
+			!viewer.currentAssetId ||
+			!wall.state.items.some((item) => item.id === viewer.currentAssetId);
 		dispatchViewer({ type: "close" });
-	}, [viewer.returnAnchor]);
+	}, [viewer.currentAssetId, viewer.returnAnchor, wall.state.items]);
 	const handleSelectViewerAsset = useCallback(
 		(assetId: string) => {
 			if (!wall.state.items.some((item) => item.id === assetId)) return;
@@ -82,12 +92,20 @@ export function AppShell() {
 		if (!closingAnchorRef.current) return;
 		const anchor = closingAnchorRef.current;
 		closingAnchorRef.current = null;
+		const focusWall = closingFocusFallbackRef.current;
+		closingFocusFallbackRef.current = false;
 		if (wallRegionRef.current)
 			wallRegionRef.current.scrollTop = anchor.scrollTop;
-		const tile = [
-			...document.querySelectorAll<HTMLElement>("[data-asset-id]"),
-		].find((candidate) => candidate.dataset.assetId === anchor.assetId);
-		tile?.focus({ preventScroll: true });
+		const tile = focusWall
+			? null
+			: [
+					...(wallRegionRef.current?.querySelectorAll<HTMLElement>(
+						"[data-asset-id]",
+					) ?? []),
+				].find((candidate) => candidate.dataset.assetId === anchor.assetId);
+		if (tile && typeof tile.focus === "function")
+			tile.focus({ preventScroll: true });
+		else wallRegionRef.current?.focus({ preventScroll: true });
 		setHighlightedAssetId(anchor.assetId);
 		const timer = window.setTimeout(() => setHighlightedAssetId(null), 600);
 		return () => window.clearTimeout(timer);
@@ -100,7 +118,14 @@ export function AppShell() {
 			wall.state.items.some((item) => item.id === viewer.currentAssetId)
 		)
 			return;
-		closingAnchorRef.current = viewer.returnAnchor;
+		const anchor = viewer.returnAnchor;
+		closingAnchorRef.current = anchor
+			? {
+					...anchor,
+					assetId: viewer.currentAssetId,
+				}
+			: null;
+		closingFocusFallbackRef.current = true;
 		dispatchViewer({ type: "close" });
 	}, [
 		viewer.currentAssetId,
@@ -239,6 +264,7 @@ export function AppShell() {
 					state={viewer}
 					onLoadMore={wall.loadMore}
 					onRequestNearViewportDerivatives={wall.requestNearViewportDerivatives}
+					onSetWallInteraction={wall.setWallInteraction}
 					onSelectAsset={handleSelectViewerAsset}
 					loading={wall.loading}
 					nextCursor={wall.state.cursor}

@@ -135,14 +135,31 @@ export function PhotoTile({
 		</>
 	);
 	const canOpen =
-		asset.availability === "available" ||
-		Boolean(asset.wallThumbnail || asset.screenPreview);
+		asset.mediaKind !== "video" &&
+		(asset.availability === "available" ||
+			Boolean(asset.wallThumbnail || asset.screenPreview));
 	const className = `${styles.tile} ${highlighted ? styles.tileReturnHighlight : ""}`;
 
 	if (!canOpen) {
 		return (
-			<figure className={className} data-asset-id={asset.id} style={style}>
+			<figure
+				aria-label={
+					asset.mediaKind === "video"
+						? `${asset.displayName}; video poster only; playback unavailable`
+						: undefined
+				}
+				className={className}
+				data-asset-id={asset.id}
+				data-media-kind={asset.mediaKind}
+				role={asset.mediaKind === "video" ? "group" : undefined}
+				style={style}
+			>
 				{layers}
+				{asset.mediaKind === "video" ? (
+					<figcaption className={styles.videoCue}>
+						Video · poster only
+					</figcaption>
+				) : null}
 			</figure>
 		);
 	}
@@ -153,6 +170,7 @@ export function PhotoTile({
 			data-asset-id={asset.id}
 			onClick={() => onOpen(asset.id)}
 			style={style}
+			data-media-kind={asset.mediaKind}
 			type="button"
 		>
 			{layers}

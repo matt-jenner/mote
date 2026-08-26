@@ -92,7 +92,15 @@ The wall remains mounted when the viewer opens. The overlay covers it visually a
 
 Opening captures a return anchor containing the selected asset ID and the wall's exact scroll position. Closing removes the overlay, restores that position after the wall has completed any required layout measurement, and briefly highlights the selected tile. The highlight must not move the wall.
 
-An available still-image tile opens the viewer. A catalog entry whose source cannot be confirmed and which has no usable derivative keeps the approved subdued unavailable treatment. Clicking it starts the desktop recovery flow instead. The hosted web interface must never offer a local folder picker for recovery.
+An available still-image tile opens the viewer. A catalog entry whose source cannot be confirmed and which has no usable derivative keeps the approved subdued unavailable treatment and does not open this viewer. Desktop locate/reconnect is a follow-up; the hosted web interface must never offer a local folder picker for recovery.
+
+### Final review ruling (2026-08-26)
+
+An unavailable catalog item with no usable cached derivative does not open this
+viewer because `PhotoService` has no locate-folder capability. Desktop
+locate/reconnect is a named follow-up, and the hosted web interface must not
+offer local folder selection. The cost is explicit: until that capability is
+built, the desktop item has no in-viewer recovery path.
 
 Browser or system Back may close the overlay as a secondary path. It is not the primary mobile return control. A safe-area-aware back chevron appears at the top left whenever viewer controls are visible. Tapping the dark background does not close the viewer.
 
