@@ -773,6 +773,37 @@ async fn explicit_visible_screen_preview_request() {
     assert_eq!(ready[0].asset_id, asset_id);
 }
 
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_visible_screen_preview_does_not_fence_prefetch() {
+    let fixture = ProgressiveFixture::new(1);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let asset_id = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items[0]
+        .id
+        .clone();
+    let before = service.preview_gate_generation_test();
+    service
+        .request_derivatives(DerivativeRequest::visible_screen_preview(vec![asset_id]))
+        .await
+        .unwrap();
+    let after = service.preview_gate_generation_test();
+    assert_eq!(after, before);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn read_derivative_returns_bytes_for_the_active_ready_asset() {
     let fixture = ProgressiveFixture::new(1);

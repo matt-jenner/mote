@@ -274,7 +274,9 @@ impl AppService {
         &self,
         request: DerivativeRequest,
     ) -> Result<(), AppServiceError> {
-        if request.priority == DerivativePriority::Visible {
+        if request.priority == DerivativePriority::Visible
+            && request.kind == DerivativeClass::WallThumbnail
+        {
             self.fence_visible_wall_request();
             #[cfg(debug_assertions)]
             if let Some(hook) = self.derivative_request_test_hook.lock().await.clone() {
@@ -766,6 +768,15 @@ impl AppService {
     #[doc(hidden)]
     pub fn preview_gate_test_checks(&self) -> usize {
         self.preview_gate_checks.load(Ordering::SeqCst)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn preview_gate_generation_test(&self) -> u64 {
+        self.preview_gate
+            .lock()
+            .map(|gate| gate.generation)
+            .unwrap_or_default()
     }
 
     #[allow(clippy::too_many_arguments)]
