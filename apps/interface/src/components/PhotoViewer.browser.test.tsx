@@ -402,6 +402,181 @@ describe("immersive photo viewer checkpoint", () => {
 			await expect
 				.poll(() => controls?.getAttribute("aria-hidden"))
 				.toBe("true");
+			expect(
+				view.getByRole("group", { name: "Photo filmstrip" }).query(),
+			).toBeNull();
+			stage.dispatchEvent(
+				new PointerEvent("pointerup", {
+					bubbles: true,
+					pointerType: "touch",
+				}),
+			);
+			await expect
+				.element(view.getByRole("group", { name: "Photo filmstrip" }))
+				.toBeVisible();
+			await vi.advanceTimersByTimeAsync(3499);
+			expect(controls?.getAttribute("aria-hidden")).toBe("false");
+			await vi.advanceTimersByTimeAsync(1);
+			await expect
+				.poll(() => controls?.getAttribute("aria-hidden"))
+				.toBe("true");
+			stage.dispatchEvent(
+				new PointerEvent("pointerup", {
+					bubbles: true,
+					pointerType: "touch",
+				}),
+			);
+			await expect
+				.element(view.getByRole("group", { name: "Photo filmstrip" }))
+				.toBeVisible();
+			stage.dispatchEvent(
+				new PointerEvent("pointerup", {
+					bubbles: true,
+					pointerType: "touch",
+				}),
+			);
+			await expect
+				.poll(() =>
+					view.getByRole("group", { name: "Photo filmstrip" }).query(),
+				)
+				.toBeNull();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("starts idle hiding on open and resumes after control focus leaves", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const overlay = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		const controls = overlay.querySelector<HTMLElement>(
+			"[data-viewer-controls]",
+		);
+		const next = view.getByRole("button", { name: "Next photo" }).element();
+		vi.useFakeTimers();
+		try {
+			overlay.dispatchEvent(
+				new PointerEvent("pointermove", {
+					bubbles: true,
+					clientY: 100,
+					pointerType: "mouse",
+				}),
+			);
+			await vi.advanceTimersByTimeAsync(2499);
+			expect(controls?.getAttribute("aria-hidden")).toBe("false");
+			await vi.advanceTimersByTimeAsync(1);
+			await expect
+				.poll(() => controls?.getAttribute("aria-hidden"))
+				.toBe("true");
+			overlay.dispatchEvent(
+				new PointerEvent("pointermove", {
+					bubbles: true,
+					clientY: 100,
+					pointerType: "mouse",
+				}),
+			);
+			await expect
+				.poll(() => controls?.getAttribute("aria-hidden"))
+				.toBe("false");
+			next.focus();
+			await vi.advanceTimersByTimeAsync(3000);
+			expect(controls?.getAttribute("aria-hidden")).toBe("false");
+			next.blur();
+			await vi.advanceTimersByTimeAsync(2499);
+			expect(controls?.getAttribute("aria-hidden")).toBe("false");
+			await vi.advanceTimersByTimeAsync(1);
+			await expect
+				.poll(() => controls?.getAttribute("aria-hidden"))
+				.toBe("true");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("cycles only visible controls when primary controls are hidden", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const overlay = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		const back = view.getByRole("button", { name: "Back to photos" }).element();
+		const next = view.getByRole("button", { name: "Next photo" }).element();
+		vi.useFakeTimers();
+		try {
+			overlay.dispatchEvent(
+				new PointerEvent("pointermove", {
+					bubbles: true,
+					clientY: 100,
+					pointerType: "mouse",
+				}),
+			);
+			await vi.advanceTimersByTimeAsync(2500);
+			back.focus();
+			await userEvent.keyboard("{Tab}");
+			expect(document.activeElement).not.toBe(next);
+			expect(document.activeElement).toBe(
+				view.getByRole("button", { name: "Photo information" }).element(),
+			);
+			await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
+			expect(document.activeElement).toBe(back);
+			expect(
+				overlay.querySelector('[data-viewer-controls] [tabindex="-1"]'),
+			).not.toBeNull();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("cycles visible drawer controls while primary controls are hidden", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await view.getByRole("button", { name: "Photo information" }).click();
+		await expect
+			.element(view.getByRole("complementary", { name: "Photo information" }))
+			.toBeVisible();
+		const overlay = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		const back = view.getByRole("button", { name: "Back to photos" }).element();
+		const previous = overlay.querySelector<HTMLButtonElement>(
+			'[data-viewer-controls] button[aria-label="Previous photo"]',
+		);
+		const next = overlay.querySelector<HTMLButtonElement>(
+			'[data-viewer-controls] button[aria-label="Next photo"]',
+		);
+		const close = view
+			.getByRole("button", { name: "Close photo information" })
+			.element();
+		vi.useFakeTimers();
+		try {
+			overlay.dispatchEvent(
+				new PointerEvent("pointermove", {
+					bubbles: true,
+					clientY: 100,
+					pointerType: "mouse",
+				}),
+			);
+			await vi.advanceTimersByTimeAsync(2500);
+			back.focus();
+			await userEvent.keyboard("{Tab}");
+			expect(document.activeElement).not.toBe(previous);
+			await userEvent.keyboard("{Tab}");
+			expect(document.activeElement).not.toBe(next);
+			await userEvent.keyboard("{Tab}");
+			expect(document.activeElement).not.toBe(previous);
+			close.focus();
+			await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
+			expect(document.activeElement).not.toBe(
+				view.getByRole("button", { name: "Next photo" }).element(),
+			);
 		} finally {
 			vi.useRealTimers();
 		}

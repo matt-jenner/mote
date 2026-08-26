@@ -18,6 +18,7 @@ interface ViewerControls {
 	showForInput: (input: ViewerControlInput) => void;
 	toggleTouch: () => void;
 	keepVisible: () => void;
+	resume: () => void;
 	coarsePointer: boolean;
 	prefersReducedMotion: boolean;
 }
@@ -33,6 +34,17 @@ export function useViewerControls({
 	onToggleTouch,
 }: ViewerControlsOptions): ViewerControls {
 	const hideTimer = useRef<number | null>(null);
+	const lastInput = useRef<ViewerControlInput>(
+		mediaMatches("(pointer: coarse)") ? "touch" : "mouse",
+	);
+	const controlsVisibleRef = useRef(controlsVisible);
+	const onHideRef = useRef(onHide);
+	const onShowRef = useRef(onShow);
+	const onToggleTouchRef = useRef(onToggleTouch);
+	controlsVisibleRef.current = controlsVisible;
+	onHideRef.current = onHide;
+	onShowRef.current = onShow;
+	onToggleTouchRef.current = onToggleTouch;
 	const [coarsePointer, setCoarsePointer] = useState(() =>
 		mediaMatches("(pointer: coarse)"),
 	);
@@ -46,32 +58,39 @@ export function useViewerControls({
 			hideTimer.current = null;
 		}
 	}, []);
+	const scheduleHide = useCallback(
+		(input: ViewerControlInput) => {
+			clearHideTimer();
+			lastInput.current = input;
+			hideTimer.current = window.setTimeout(() => {
+				hideTimer.current = null;
+				onHideRef.current();
+			}, controlHideDelay(input));
+		},
+		[clearHideTimer],
+	);
 
 	const showForInput = useCallback(
 		(input: ViewerControlInput) => {
-			clearHideTimer();
-			if (!controlsVisible) onShow();
-			hideTimer.current = window.setTimeout(() => {
-				hideTimer.current = null;
-				onHide();
-			}, controlHideDelay(input));
+			if (!controlsVisibleRef.current) onShowRef.current();
+			scheduleHide(input);
 		},
-		[clearHideTimer, controlsVisible, onHide, onShow],
+		[scheduleHide],
 	);
 
 	const keepVisible = useCallback(() => {
 		clearHideTimer();
-		if (!controlsVisible) onShow();
-	}, [clearHideTimer, controlsVisible, onShow]);
+		if (!controlsVisibleRef.current) onShowRef.current();
+	}, [clearHideTimer]);
+
+	const resume = useCallback(() => {
+		scheduleHide(lastInput.current);
+	}, [scheduleHide]);
 
 	const toggleTouch = useCallback(() => {
-		clearHideTimer();
-		onToggleTouch();
-		hideTimer.current = window.setTimeout(() => {
-			hideTimer.current = null;
-			onHide();
-		}, controlHideDelay("touch"));
-	}, [clearHideTimer, onHide, onToggleTouch]);
+		onToggleTouchRef.current();
+		scheduleHide("touch");
+	}, [scheduleHide]);
 
 	useEffect(() => {
 		const pointerQuery = window.matchMedia("(pointer: coarse)");
@@ -88,13 +107,17 @@ export function useViewerControls({
 		};
 	}, []);
 
-	useEffect(() => clearHideTimer, [clearHideTimer]);
+	useEffect(() => {
+		scheduleHide(lastInput.current);
+		return clearHideTimer;
+	}, [clearHideTimer, scheduleHide]);
 
 	return {
 		controlsVisible,
 		showForInput,
 		toggleTouch,
 		keepVisible,
+		resume,
 		coarsePointer,
 		prefersReducedMotion,
 	};

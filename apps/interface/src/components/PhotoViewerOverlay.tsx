@@ -16,6 +16,30 @@ import { PhotoInfoDrawer } from "./PhotoInfoDrawer";
 import { ViewerFilmstrip } from "./ViewerFilmstrip";
 import { ViewerStage } from "./ViewerStage";
 
+const controlAreaSelector = "[data-viewer-controls], fieldset, aside";
+
+function isTabbable(element: HTMLElement): boolean {
+	if (
+		element.hasAttribute("disabled") ||
+		element.tabIndex < 0 ||
+		element.hidden
+	)
+		return false;
+	let current: HTMLElement | null = element;
+	while (current) {
+		if (
+			current.hidden ||
+			current.inert ||
+			current.getAttribute("aria-hidden") === "true"
+		)
+			return false;
+		const style = window.getComputedStyle(current);
+		if (style.display === "none" || style.visibility === "hidden") return false;
+		current = current.parentElement;
+	}
+	return true;
+}
+
 interface PhotoViewerOverlayProps {
 	state: ViewerState;
 	assets: readonly WallAsset[];
@@ -74,6 +98,10 @@ export function PhotoViewerOverlay({
 	}, [previewFailureKey]);
 
 	useEffect(() => {
+		if (!state.controlsVisible) setFilmstripRevealed(false);
+	}, [state.controlsVisible]);
+
+	useEffect(() => {
 		backRef.current?.focus();
 		const onKeyDown = (event: globalThis.KeyboardEvent) => {
 			if (event.key === "Escape") {
@@ -106,7 +134,8 @@ export function PhotoViewerOverlay({
 
 	if (!asset) return null;
 	const currentPosition = currentIndex >= 0 ? currentIndex + 1 : 0;
-	const filmstripVisible = state.filmstripVisible || filmstripRevealed;
+	const filmstripVisible =
+		state.controlsVisible && (state.filmstripVisible || filmstripRevealed);
 	const handlePointerMove = (event: React.PointerEvent<HTMLElement>) => {
 		if (event.pointerType !== "touch" && !controlsFocused.current)
 			controls.showForInput("mouse");
@@ -142,15 +171,18 @@ export function PhotoViewerOverlay({
 		if (event.key !== "Tab") return;
 		const focusable = [
 			...(dialogRef.current?.querySelectorAll<HTMLElement>(
-				'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+				"button, [href], input, select, textarea, [tabindex]",
 			) ?? []),
-		];
+		].filter(isTabbable);
 		if (focusable.length === 0) return;
 		const first = focusable[0];
 		const last = focusable.at(-1);
 		if (!first || !last) return;
+		const activeElement = event.target as HTMLElement;
 		const activeIndex = focusable.indexOf(
-			document.activeElement as HTMLElement,
+			focusable.includes(activeElement)
+				? activeElement
+				: (document.activeElement as HTMLElement),
 		);
 		if (activeIndex < 0) {
 			event.preventDefault();
@@ -170,17 +202,19 @@ export function PhotoViewerOverlay({
 			className={styles.viewerOverlay}
 			onFocusCapture={(event) => {
 				const target = event.target as HTMLElement;
-				if (target.closest("[data-viewer-controls], fieldset, aside")) {
+				if (target.closest(controlAreaSelector)) {
 					controlsFocused.current = true;
 					controls.keepVisible();
 				}
 			}}
 			onBlurCapture={(event) => {
 				const target = event.target as HTMLElement;
-				if (!target.closest("[data-viewer-controls], fieldset, aside")) return;
+				if (!target.closest(controlAreaSelector)) return;
 				const next = event.relatedTarget as HTMLElement | null;
-				if (!next?.closest("[data-viewer-controls], fieldset, aside"))
+				if (!next?.closest(controlAreaSelector)) {
 					controlsFocused.current = false;
+					controls.resume();
+				}
 			}}
 			onKeyDownCapture={handleKeyDown}
 			onPointerMove={handlePointerMove}
