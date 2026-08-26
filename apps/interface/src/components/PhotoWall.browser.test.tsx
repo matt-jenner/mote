@@ -609,6 +609,88 @@ describe("progressive photo wall", () => {
 		screen.unmount();
 	});
 
+	it("tracks the current provisional viewport for observer promotions", async () => {
+		await page.viewport(1440, 520);
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		const provisional = Array.from({ length: 60 }, (_, index) =>
+			asset(`scroll-provisional-${index}`, `Scroll ${index}`, index + 1),
+		);
+		service.releaseQuery(0, pageOf(provisional, "provisional"));
+		const wall = screen.getByRole("region", { name: "Photos" });
+		await expect
+			.poll(() => wall.element().scrollHeight)
+			.toBeGreaterThan(wall.element().clientHeight);
+		wall.element().scrollTop = wall.element().scrollHeight / 2;
+		wall.element().dispatchEvent(new Event("scroll"));
+		const rows = [
+			...wall
+				.element()
+				.querySelectorAll<HTMLElement>("[data-testid^='photo-row-']"),
+		];
+		const rootRect = wall.element().getBoundingClientRect();
+		const visibleRows = rows
+			.map((row, index) => {
+				const top =
+					row.getBoundingClientRect().top -
+					rootRect.top +
+					wall.element().scrollTop;
+				const bottom = top + row.getBoundingClientRect().height;
+				return top < wall.element().scrollTop + wall.element().clientHeight &&
+					bottom > wall.element().scrollTop
+					? index
+					: -1;
+			})
+			.filter((index) => index >= 0);
+		const lastVisible = visibleRows.at(-1) ?? 0;
+		const nearRows = [lastVisible + 1, lastVisible + 2].filter(
+			(index) => index < rows.length,
+		);
+		const beyondRow = lastVisible + 3;
+		const idsInRows = (indices: readonly number[]) =>
+			indices.flatMap((index) =>
+				[
+					...(rows[index]?.querySelectorAll<HTMLElement>("[data-asset-id]") ??
+						[]),
+				].map((tile) => tile.dataset.assetId ?? ""),
+			);
+		const visibleIds = idsInRows(visibleRows);
+		const nearIds = idsInRows(nearRows);
+		const beyondIds = idsInRows([beyondRow]);
+		expect(visibleIds.length).toBeGreaterThan(0);
+		expect(nearIds.length).toBeGreaterThan(0);
+		expect(beyondIds.length).toBeGreaterThan(0);
+
+		TestIntersectionObserver.trigger("visible", wall.element(), visibleIds);
+		await new Promise((resolve) => window.setTimeout(resolve, 25));
+		expect(
+			service.derivativeRequests.some(
+				(request) =>
+					request.priority === "visible" &&
+					visibleIds.every((id) => request.assetIds.includes(id)),
+			),
+		).toBe(true);
+		TestIntersectionObserver.trigger("near", wall.element(), [
+			...nearIds,
+			...beyondIds,
+		]);
+		await new Promise((resolve) => window.setTimeout(resolve, 25));
+		expect(
+			service.derivativeRequests.some(
+				(request) =>
+					request.priority === "nearViewport" &&
+					nearIds.every((id) => request.assetIds.includes(id)),
+			),
+		).toBe(true);
+		expect(
+			service.derivativeRequests
+				.filter((request) => request.priority === "nearViewport")
+				.flatMap((request) => request.assetIds),
+		).not.toEqual(expect.arrayContaining(beyondIds));
+		screen.unmount();
+	});
+
 	it("does not submit an idle request for a thumbnail that became ready before the flush", async () => {
 		await page.viewport(1440, 520);
 		const idleCallbacks: Array<() => void> = [];

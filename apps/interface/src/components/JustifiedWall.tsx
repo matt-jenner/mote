@@ -29,6 +29,44 @@ interface JustifiedWallProps {
 	regionRef?: RefObject<HTMLElement | null>;
 }
 
+interface ViewportRowPass {
+	visibleIds: string[];
+	nearIds: string[];
+}
+
+function getViewportRowPass(
+	root: HTMLElement,
+	rows: readonly JustifiedRow[],
+): ViewportRowPass {
+	const rowNodes = [
+		...root.querySelectorAll<HTMLElement>("[data-testid^='photo-row-']"),
+	];
+	const rootRect = root.getBoundingClientRect();
+	const viewportTop = root.scrollTop;
+	const viewportBottom = viewportTop + root.clientHeight;
+	const visibleRows: number[] = [];
+	for (let index = 0; index < rows.length; index += 1) {
+		const row = rows[index];
+		const node = rowNodes[index];
+		if (!row) continue;
+		const top = node
+			? node.getBoundingClientRect().top - rootRect.top + root.scrollTop
+			: rows.slice(0, index).reduce((sum, item) => sum + item.height + 4, 16);
+		const bottom = top + (node?.getBoundingClientRect().height || row.height);
+		if (top < viewportBottom && bottom > viewportTop) visibleRows.push(index);
+	}
+	const visible = visibleRows.length > 0 ? visibleRows : [0];
+	const lastVisible = visible.at(-1) ?? 0;
+	const nearRows = [lastVisible + 1, lastVisible + 2].filter(
+		(index) => index < rows.length,
+	);
+	const idsInRows = (indices: readonly number[]) =>
+		indices.flatMap(
+			(index) => rows[index]?.items.map((item) => item.asset.id) ?? [],
+		);
+	return { visibleIds: idsInRows(visible), nearIds: idsInRows(nearRows) };
+}
+
 export function JustifiedWall({
 	rows,
 	assets,
@@ -55,7 +93,6 @@ export function JustifiedWall({
 	);
 	const sentinelRef = useRef<HTMLDivElement>(null);
 	const missingWallIdsRef = useRef<Set<string>>(new Set());
-	const provisionalNearIdsRef = useRef<Set<string>>(new Set());
 	missingWallIdsRef.current = new Set(
 		assets
 			.filter((asset) => asset.wallThumbnail === null)
@@ -64,42 +101,10 @@ export function JustifiedWall({
 
 	useEffect(() => {
 		if (!root || rows.length === 0 || scrollEpoch < 0) return;
-		const rowNodes = [
-			...root.querySelectorAll<HTMLElement>("[data-testid^='photo-row-']"),
-		];
-		const rootRect = root.getBoundingClientRect();
-		const viewportTop = root.scrollTop;
-		const viewportBottom = viewportTop + root.clientHeight;
-		const visibleRows: number[] = [];
-		for (let index = 0; index < rows.length; index += 1) {
-			const row = rows[index];
-			const node = rowNodes[index];
-			if (!row) continue;
-			const top = node
-				? node.getBoundingClientRect().top - rootRect.top + root.scrollTop
-				: rows.slice(0, index).reduce((sum, item) => sum + item.height + 4, 16);
-			const bottom = top + (node?.getBoundingClientRect().height || row.height);
-			if (top < viewportBottom && bottom > viewportTop) visibleRows.push(index);
-		}
-		const visible = visibleRows.length > 0 ? visibleRows : [0];
-		const lastVisible = visible.at(-1) ?? 0;
-		const nearRows = [lastVisible + 1, lastVisible + 2].filter(
-			(index) => index < rows.length,
-		);
-		const visibleIds = visible.flatMap(
-			(index) =>
-				rows[index]?.items
-					.filter((item) => item.asset.wallThumbnail === null)
-					.map((item) => item.asset.id) ?? [],
-		);
-		const nearIds = nearRows.flatMap(
-			(index) =>
-				rows[index]?.items
-					.filter((item) => item.asset.wallThumbnail === null)
-					.map((item) => item.asset.id) ?? [],
-		);
+		const viewportPass = getViewportRowPass(root, rows);
+		const visibleIds = viewportPass.visibleIds;
+		const nearIds = viewportPass.nearIds;
 		const claimed = new Set([...visibleIds, ...nearIds]);
-		provisionalNearIdsRef.current = claimed;
 		const remainingIds = rows
 			.flatMap((row) =>
 				row.items
@@ -207,13 +212,17 @@ export function JustifiedWall({
 		);
 		const nearObserver = new IntersectionObserver(
 			(entries) => {
+				const provisionalNearIds =
+					orderState === "provisional"
+						? new Set(getViewportRowPass(root, rows).nearIds)
+						: null;
 				for (const entry of entries) {
 					if (!entry.isIntersecting) continue;
 					const id = (entry.target as HTMLElement).dataset.assetId;
 					if (
 						id &&
 						missingWallIdsRef.current.has(id) &&
-						(orderState === "settled" || provisionalNearIdsRef.current.has(id))
+						(orderState === "settled" || provisionalNearIds?.has(id))
 					)
 						nearIds.add(id);
 				}
@@ -262,6 +271,7 @@ export function JustifiedWall({
 		requestNearViewportDerivatives,
 		requestVisibleDerivatives,
 		root,
+		rows,
 	]);
 
 	useEffect(() => {
