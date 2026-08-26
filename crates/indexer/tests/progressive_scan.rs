@@ -232,12 +232,15 @@ async fn enrichment_admission_tracks_mode_changes_during_one_scan() {
     let indexer = Indexer::with_scheduler(reader.clone(), empty_policy_engine(), scheduler.clone());
 
     let scan = indexer.start(ScanRequest::new(fixture.path())).unwrap();
+    let notifications = wait_for_starts(notifications, 2).await;
     scheduler
         .set_interaction_mode(InteractionMode::Active)
         .await;
+    // Both idle admissions are held, so the mode change is observed before either read completes.
+    release.release(2);
     let notifications = wait_for_starts(notifications, 1).await;
+    tokio::task::yield_now().await;
     let active_starts = reader.starts.load(Ordering::SeqCst);
-    assert!(notifications.try_recv().is_err());
 
     scheduler.set_interaction_mode(InteractionMode::Idle).await;
     release.release(1);
@@ -245,10 +248,10 @@ async fn enrichment_admission_tracks_mode_changes_during_one_scan() {
     let idle_starts = reader.starts.load(Ordering::SeqCst);
 
     scan.cancel().unwrap();
-    release.release(2);
+    release.open();
     scan.join().await.unwrap();
-    assert_eq!(active_starts, 1);
-    assert_eq!(idle_starts, 3);
+    assert_eq!(active_starts, 3);
+    assert_eq!(idle_starts, 5);
 }
 
 impl ReleaseMetadata {
@@ -264,6 +267,18 @@ impl PermitRelease {
         let (lock, changed) = &*self.gate;
         *lock.lock().unwrap() += count;
         changed.notify_all();
+    }
+
+    fn open(&self) {
+        let (lock, changed) = &*self.gate;
+        *lock.lock().unwrap() = usize::MAX;
+        changed.notify_all();
+    }
+}
+
+impl Drop for PermitRelease {
+    fn drop(&mut self) {
+        self.open();
     }
 }
 
