@@ -82,6 +82,17 @@ struct AdmissionReader {
     gate: Arc<(Mutex<bool>, Condvar)>,
 }
 
+#[derive(Clone)]
+struct PermitMetadataReader {
+    starts: Arc<AtomicUsize>,
+    started: std::sync::mpsc::Sender<()>,
+    gate: Arc<(Mutex<usize>, Condvar)>,
+}
+
+struct PermitRelease {
+    gate: Arc<(Mutex<usize>, Condvar)>,
+}
+
 impl AdmissionReader {
     fn new() -> (Self, std::sync::mpsc::Receiver<()>, ReleaseMetadata) {
         let (started, notifications) = std::sync::mpsc::channel();
@@ -94,6 +105,22 @@ impl AdmissionReader {
             },
             notifications,
             ReleaseMetadata { gate },
+        )
+    }
+}
+
+impl PermitMetadataReader {
+    fn new() -> (Self, std::sync::mpsc::Receiver<()>, PermitRelease) {
+        let (started, notifications) = std::sync::mpsc::channel();
+        let gate = Arc::new((Mutex::new(0), Condvar::new()));
+        (
+            Self {
+                starts: Arc::new(AtomicUsize::new(0)),
+                started,
+                gate: gate.clone(),
+            },
+            notifications,
+            PermitRelease { gate },
         )
     }
 }
@@ -111,6 +138,24 @@ impl MetadataReader for AdmissionReader {
         while !*released {
             released = changed.wait(released).unwrap();
         }
+        Ok(MetadataBundle::default())
+    }
+}
+
+impl MetadataReader for PermitMetadataReader {
+    fn read(
+        &self,
+        _media_path: &Path,
+        _sidecar_path: Option<&Path>,
+    ) -> Result<MetadataBundle, MetadataReadWarning> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        self.started.send(()).unwrap();
+        let (lock, changed) = &*self.gate;
+        let mut permits = lock.lock().unwrap();
+        while *permits == 0 {
+            permits = changed.wait(permits).unwrap();
+        }
+        *permits -= 1;
         Ok(MetadataBundle::default())
     }
 }
@@ -183,38 +228,41 @@ async fn enrichment_admission_tracks_mode_changes_during_one_scan() {
         idle_workers: 2,
         active_workers: 1,
     }));
-    let (reader, notifications, release) = AdmissionReader::new();
+    let (reader, notifications, release) = PermitMetadataReader::new();
     let indexer = Indexer::with_scheduler(reader.clone(), empty_policy_engine(), scheduler.clone());
-    let scan = indexer.start(ScanRequest::new(fixture.path())).unwrap();
-    let notifications = wait_for_starts(notifications, 2).await;
 
+    let scan = indexer.start(ScanRequest::new(fixture.path())).unwrap();
     scheduler
         .set_interaction_mode(InteractionMode::Active)
         .await;
-    release.release();
-    let notifications = tokio::time::timeout(
-        Duration::from_secs(1),
-        tokio::task::spawn_blocking(move || {
-            notifications.recv().unwrap();
-            notifications
-        }),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(reader.starts.load(Ordering::SeqCst), 3);
+    let notifications = wait_for_starts(notifications, 1).await;
+    let active_starts = reader.starts.load(Ordering::SeqCst);
+    assert!(notifications.try_recv().is_err());
 
     scheduler.set_interaction_mode(InteractionMode::Idle).await;
+    release.release(1);
     let _notifications = wait_for_starts(notifications, 2).await;
-    assert!(reader.starts.load(Ordering::SeqCst) >= 5);
+    let idle_starts = reader.starts.load(Ordering::SeqCst);
+
     scan.cancel().unwrap();
+    release.release(2);
     scan.join().await.unwrap();
+    assert_eq!(active_starts, 1);
+    assert_eq!(idle_starts, 3);
 }
 
 impl ReleaseMetadata {
     fn release(self) {
         let (lock, changed) = &*self.gate;
         *lock.lock().unwrap() = true;
+        changed.notify_all();
+    }
+}
+
+impl PermitRelease {
+    fn release(&self, count: usize) {
+        let (lock, changed) = &*self.gate;
+        *lock.lock().unwrap() += count;
         changed.notify_all();
     }
 }
