@@ -202,3 +202,78 @@ This checkpoint still accumulates mounted rows during a session. Row
 virtualization, exact scroll anchoring, continuous row sizing, filename and
 rating controls, multi-folder queries, and the immersive viewer remain
 deferred to later checkpoints.
+
+## Task 3: fresh verification of the thumbnail-first remediation
+
+The verified implementation is `9cad2b0` (`fix: defer large previews behind
+thumbnail work`). The Task 1 and Task 2 implementation range is
+`d63cc9a..9cad2b0`; the Task 2 fix-round range is `a7992b8..9cad2b0`.
+Task 2's warm profile comparison remains above: the desktop-manifest
+AppService workload was 1.12 s with the dependency profile disabled and 0.38
+s with `[profile.dev.package."*"] opt-level = 3`, while root cache context was
+4.38 s debug and 0.41 s release. Those measurements were not rerun or
+reinterpreted here.
+
+The following fresh commands were run from the clean `codex/progressive-photo-wall`
+worktree. `/usr/bin/time -p` `real` values are wall-clock observations on this
+machine:
+
+| Area | Exact command | Fresh result | real |
+| --- | --- | ---: | ---: |
+| Interface unit | `npm test` | 4 files, 64 passed | 0.87 s |
+| Interface WebKit | `npm run test:browser` (local-port permission) | 2 files, 37 passed | 7.98 s |
+| Interface typecheck | `npm run typecheck` | pass | 0.39 s |
+| Biome | `npm run check` | 36 files checked, no fixes | 0.25 s |
+| Interface build | `npm run --workspace @photo-viewer/interface build` | pass, 1,870 modules | 0.54 s |
+| Progressive wall | `cargo test -p photo-app-service --test progressive_wall` | 28 passed, 0 failed | 4.58 s |
+| Workspace | `cargo test --workspace --all-features` | 182 passed, 0 failed | 43.72 s |
+| Root Clippy | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass | 0.45 s |
+| Root format | `cargo fmt --all -- --check` | pass | 0.22 s |
+| Benchmark smoke | `cargo test -p catalog-bench --test benchmark_smoke` | 1 passed, 0 failed | 2.18 s |
+| Desktop tests | `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml` | 9 passed, 0 failed | 11.43 s |
+| Desktop Clippy | `cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --all-features -- -D warnings` | pass | 2.42 s |
+| Desktop format | `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all -- --check` | pass | 0.26 s |
+| macOS bundle | `npm run desktop:build -- --bundles app` | 1 unsigned app bundle created | 23.72 s |
+
+The browser command first attempted inside the restricted sandbox and failed
+before test collection with `listen EPERM: operation not permitted
+::1:63315`; the exact command was then rerun with local ephemeral-port
+permission and produced the 37/37 result above. The bundle is at
+`apps/desktop/src-tauri/target/release/bundle/macos/Photo Viewer.app`. Its
+executable is a Mach-O 64-bit arm64 binary. `codesign -dv --verbose=4`
+reported an ad-hoc/linker signature, `TeamIdentifier=not set`, and
+`Signature=adhoc`; it is not a Developer ID-signed or notarized artifact.
+Strict deep verification reported `code has no resources but signature
+indicates they must be present`, so the bundle is recorded as unsigned for
+distribution purposes despite the linker ad-hoc signature.
+
+## Task 3 source audit and native limitation
+
+The production diff `d63cc9a..9cad2b0` changes only the app-service source,
+desktop manifest, and progressive-wall tests. The filesystem-call scan found
+no production source-path write, rename, move, copy, or delete operation. The
+only `create_dir_all` hits in the changed app-service file are test fixture
+setup under `cfg(test)`. `git diff --quiet -- apps/interface/public/demo-photos`
+returned exit 0 both before and after verification, and the fixture directory
+had no status entries. The before/after SHA-256 values are identical:
+
+```text
+city.jpg      44faf249868e8d3ae81c0b532c460711526fbf17a66b82ee43ac805b3591cad1
+coast.jpg     ad6ba90e75709487ab6b927dc3f2781042e31312a4b7bc4606cddd4c0c5c4394
+forest.jpg    91c69c673ef96b8afff1c36da486de4dece98fcaeb178310d00b675f2e48a699
+interior.jpg c8cc481a50bc60cdfb34e7e6ff2a0ac2e7350dd8f934afae91f3c19b0a2d3a05
+mountain.jpg 79bcb7af04b68935b29b5e0a80afb17d1823dde94a5fdbc75e3d5adf7a6e62ae
+portrait.jpg d1844a9747c7acfb36b10651ce79acff5c9d35b30a7b54323dbb171aed0bdfd0
+```
+
+A fresh named profile, `task3-clean-smoke`, was launched with
+`PHOTO_VIEWER_PROFILE=task3-clean-smoke npm run desktop:dev`. After granting
+local-port permission, Vite and the Tauri binary started successfully. Native
+interaction remained unavailable: `screencapture -x` returned `could not
+create image from display`, and the System Events query returned `osascript is
+not allowed assistive access. (-1728)`. The folder picker could not be
+completed, so no native geometry-paint, first-thumbnail, refined-viewport,
+contact-sheet, preview-gating, pending-sort, or progress-transition timings
+are claimed. The dev process was stopped after the attempt; no desktop app is
+left running. Native interaction remains user-verified rather than
+automation-verified in this environment.
