@@ -304,6 +304,8 @@ export function PhotoViewerOverlay({
 					onRequestNearViewportDerivatives={onRequestNearViewportDerivatives}
 					onSelectAsset={onSelectAsset}
 					service={service}
+					viewportRevision={viewport.revision}
+					viewportWidth={viewport.width}
 				/>
 			) : null}
 			<div

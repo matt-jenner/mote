@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 
 export type ViewerGestureViewState = "fit" | "zoomed";
 export type ViewerGestureResult =
@@ -42,6 +42,7 @@ interface ActiveGesture {
 	startY: number;
 	inDrawer: boolean;
 	viewState: ViewerGestureViewState;
+	startRevision: number;
 	target: HTMLElement;
 }
 
@@ -92,7 +93,7 @@ export function useViewerGestures({
 		activeGesture.current = null;
 	}, []);
 
-	useEffect(() => {
+	useLayoutEffect(() => {
 		if (previousRevision.current !== viewportRevision) cancel();
 		previousRevision.current = viewportRevision;
 	}, [cancel, viewportRevision]);
@@ -118,6 +119,7 @@ export function useViewerGestures({
 						? Boolean(event.target.closest("aside"))
 						: false,
 				viewState,
+				startRevision: revisionRef.current,
 				target,
 			};
 			try {
@@ -159,7 +161,12 @@ export function useViewerGestures({
 			if (gesture.target.hasPointerCapture?.(gesture.pointerId)) {
 				gesture.target.releasePointerCapture(gesture.pointerId);
 			}
-			if (cancelled || revisionRef.current !== viewportRevision) return;
+			if (
+				cancelled ||
+				gesture.startRevision !== revisionRef.current ||
+				gesture.startRevision !== viewportRevision
+			)
+				return;
 			const result = classifyViewerGesture({
 				dx: event.clientX - gesture.startX,
 				dy: event.clientY - gesture.startY,

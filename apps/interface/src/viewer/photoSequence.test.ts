@@ -3,6 +3,7 @@ import type { WallAsset } from "../services/photoService";
 import {
 	findViewerIndex,
 	shouldLoadViewerPage,
+	viewerFilmstripCapacity,
 	viewerFilmstripWindow,
 	viewerNeighbourIds,
 } from "./photoSequence";
@@ -51,6 +52,12 @@ describe("photoSequence", () => {
 			start: 35,
 			end: 66,
 		});
+	});
+
+	it("derives an odd filmstrip capacity from the measured viewport", () => {
+		expect(viewerFilmstripCapacity(390)).toBe(5);
+		expect(viewerFilmstripCapacity(844)).toBe(11);
+		expect(viewerFilmstripCapacity(5000)).toBe(31);
 	});
 
 	it("loads another page within five items of the loaded end", () => {

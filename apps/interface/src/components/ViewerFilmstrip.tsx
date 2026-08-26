@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useRef } from "react";
 import type { PhotoService, WallAsset } from "../services/photoService";
 import styles from "../styles/photoViewer.module.css";
-import { viewerFilmstripWindow } from "../viewer/photoSequence";
+import {
+	viewerFilmstripCapacity,
+	viewerFilmstripWindow,
+} from "../viewer/photoSequence";
 
 interface ViewerFilmstripProps {
 	assets: readonly WallAsset[];
@@ -9,6 +12,8 @@ interface ViewerFilmstripProps {
 	service: PhotoService;
 	onSelectAsset: (assetId: string) => void;
 	onRequestNearViewportDerivatives: (assetIds: readonly string[]) => void;
+	viewportWidth?: number;
+	viewportRevision?: number;
 }
 
 function thumbnailUrl(service: PhotoService, asset: WallAsset): string | null {
@@ -31,13 +36,16 @@ export function ViewerFilmstrip({
 	service,
 	onSelectAsset,
 	onRequestNearViewportDerivatives,
+	viewportWidth = 0,
+	viewportRevision = 0,
 }: ViewerFilmstripProps) {
+	const capacity = viewerFilmstripCapacity(viewportWidth);
 	const windowRange = useMemo(
-		() => viewerFilmstripWindow(assets, currentIndex, 15),
-		[assets, currentIndex],
+		() => viewerFilmstripWindow(assets, currentIndex, (capacity - 1) / 2),
+		[assets, capacity, currentIndex],
 	);
 	const visibleAssets = assets.slice(windowRange.start, windowRange.end);
-	const scrollRevision = `${currentIndex}:${windowRange.start}:${windowRange.end}`;
+	const scrollRevision = `${currentIndex}:${windowRange.start}:${windowRange.end}:${viewportRevision}`;
 	const currentButtonRef = useRef<HTMLButtonElement>(null);
 
 	useEffect(() => {
@@ -63,7 +71,11 @@ export function ViewerFilmstrip({
 
 	if (visibleAssets.length === 0) return null;
 	return (
-		<fieldset aria-label="Photo filmstrip" className={styles.viewerFilmstrip}>
+		<fieldset
+			aria-label="Photo filmstrip"
+			className={styles.viewerFilmstrip}
+			data-filmstrip-capacity={capacity}
+		>
 			<div className={styles.viewerFilmstripTrack}>
 				{visibleAssets.map((asset) => {
 					const assetIndex = assets.findIndex((item) => item.id === asset.id);

@@ -53,4 +53,31 @@ describe("classifyViewerGesture", () => {
 			}),
 		).toBe("tap");
 	});
+
+	it("uses a 48-pixel threshold and strict horizontal dominance", () => {
+		expect(
+			classifyViewerGesture({
+				dx: 47,
+				dy: 0,
+				viewState: "fit",
+				inDrawer: false,
+			}),
+		).toBe("tap");
+		expect(
+			classifyViewerGesture({
+				dx: 48,
+				dy: 38.4,
+				viewState: "fit",
+				inDrawer: false,
+			}),
+		).toBe("none");
+		expect(
+			classifyViewerGesture({
+				dx: 48.01,
+				dy: 38.4,
+				viewState: "fit",
+				inDrawer: false,
+			}),
+		).toBe("previous");
+	});
 });

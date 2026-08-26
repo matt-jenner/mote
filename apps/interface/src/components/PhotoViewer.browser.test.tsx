@@ -49,17 +49,19 @@ function asset(id: string, displayName: string, order: number): WallAsset {
 function serviceWithReadyPhotos(
 	brokenScreenPreview = false,
 	photoCount = 60,
+	readyScreenPreview = false,
 ): InMemoryPhotoService {
 	const assets = [
 		{
 			...asset("coast", "Coast", 1),
-			screenPreview: brokenScreenPreview
-				? {
-						assetId: "coast",
-						kind: "screenPreview" as const,
-						key: "coast-screen",
-					}
-				: null,
+			screenPreview:
+				brokenScreenPreview || readyScreenPreview
+					? {
+							assetId: "coast",
+							kind: "screenPreview" as const,
+							key: "coast-screen",
+						}
+					: null,
 		},
 		...Array.from({ length: photoCount }, (_, index) =>
 			asset(`photo-${index}`, `Photo ${index}`, index + 2),
@@ -75,7 +77,13 @@ function serviceWithReadyPhotos(
 			...item,
 			wallThumbnailUrl: `/demo-photos/${item.id}.jpg`,
 			screenPreviewUrl:
-				item.id === "coast" ? "/demo-photos/missing.jpg" : undefined,
+				item.id === "coast"
+					? brokenScreenPreview
+						? "/demo-photos/missing.jpg"
+						: readyScreenPreview
+							? "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+							: undefined
+					: undefined,
 		})),
 	});
 }
@@ -247,8 +255,16 @@ function PreviewHarness({
 	);
 }
 
-async function openAsset(name: string, brokenScreenPreview = false) {
-	const service = serviceWithReadyPhotos(brokenScreenPreview);
+async function openAsset(
+	name: string,
+	brokenScreenPreview = false,
+	readyScreenPreview = false,
+) {
+	const service = serviceWithReadyPhotos(
+		brokenScreenPreview,
+		60,
+		readyScreenPreview,
+	);
 	const view = await renderViewerWall(service);
 	await view.getByRole("button", { name: "Choose Folder" }).click();
 	await service.finishFixtureScan();
@@ -367,12 +383,36 @@ describe("immersive photo viewer checkpoint", () => {
 
 	it("coalesces visual viewport rotation without resetting the viewer", async () => {
 		const restoreViewport = installVisualViewportDouble(390, 844);
+		const originalScrollIntoView = Element.prototype.scrollIntoView;
+		let scrollCalls = 0;
+		Element.prototype.scrollIntoView = () => {
+			scrollCalls += 1;
+		};
 		try {
-			const { service, view, tile } = await openAsset("Coast");
+			const { service, view, tile } = await openAsset("Coast", false, true);
 			(tile.element() as HTMLButtonElement).click();
 			await expect
 				.element(view.getByRole("dialog", { name: "Photo viewer" }))
 				.toBeVisible();
+			const overlay = view
+				.getByRole("dialog", { name: "Photo viewer" })
+				.element();
+			await expect
+				.poll(() =>
+					overlay.querySelector(
+						"[data-viewer-layer='screenPreview'][data-ready='true']",
+					),
+				)
+				.not.toBeNull();
+			const screenPreview = overlay.querySelector<HTMLImageElement>(
+				"[data-viewer-layer='screenPreview'][data-ready='true']",
+			);
+			const portraitCapacity = Number(
+				overlay
+					.querySelector("[data-filmstrip-capacity]")
+					?.getAttribute("data-filmstrip-capacity"),
+			);
+			const beforeScrollCalls = scrollCalls;
 			await view.getByRole("button", { name: "Photo information" }).click();
 			await expect
 				.element(view.getByRole("complementary", { name: "Photo information" }))
@@ -386,14 +426,7 @@ describe("immersive photo viewer checkpoint", () => {
 					),
 				)
 				.toBe(true);
-			const overlay = view
-				.getByRole("dialog", { name: "Photo viewer" })
-				.element();
 			const beforeRevision = Number(overlay.dataset.viewportRevision);
-			const screen = overlay.querySelector<HTMLImageElement>(
-				"[data-viewer-layer='wallThumbnail']",
-			);
-			const beforeSrc = screen?.src;
 			const viewport = window.visualViewport as VisualViewport & {
 				setSize: (width: number, height: number) => void;
 			};
@@ -408,6 +441,13 @@ describe("immersive photo viewer checkpoint", () => {
 				.poll(() => Number(overlay.dataset.viewportRevision))
 				.toBe(beforeRevision + 1);
 			expect(
+				overlay
+					.querySelector("[data-filmstrip-capacity]")
+					?.getAttribute("data-filmstrip-capacity"),
+			).toBe("11");
+			expect(Number(portraitCapacity)).toBe(5);
+			expect(scrollCalls).toBeGreaterThan(beforeScrollCalls);
+			expect(
 				overlay.querySelector("[data-current-asset='coast']"),
 			).not.toBeNull();
 			expect(
@@ -419,10 +459,107 @@ describe("immersive photo viewer checkpoint", () => {
 					?.getAttribute("aria-label"),
 			).toBe("Coast");
 			expect(
-				overlay.querySelector<HTMLImageElement>(
-					"[data-viewer-layer='wallThumbnail']",
-				)?.src,
-			).toBe(beforeSrc);
+				overlay.querySelector(
+					"[data-viewer-layer='screenPreview'][data-ready='true']",
+				),
+			).toBe(screenPreview);
+		} finally {
+			Element.prototype.scrollIntoView = originalScrollIntoView;
+			restoreViewport();
+		}
+	});
+
+	it("keeps vertical drawer movement scrolling and horizontal drawer swipes navigating once", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await view.getByRole("button", { name: "Photo information" }).click();
+		const drawer = view
+			.getByRole("complementary", { name: "Photo information" })
+			.element();
+		drawer.style.maxHeight = "120px";
+		await expect
+			.poll(() => drawer.scrollHeight > drawer.clientHeight)
+			.toBe(true);
+		const overlay = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		const controls = overlay.querySelector<HTMLElement>(
+			"[data-viewer-controls]",
+		);
+		const controlsBefore = controls?.getAttribute("aria-hidden");
+		const dispatch = (type: string, x: number, y: number) =>
+			drawer.dispatchEvent(
+				new PointerEvent(type, {
+					bubbles: true,
+					clientX: x,
+					clientY: y,
+					isPrimary: true,
+					pointerId: 11,
+					pointerType: "touch",
+				}),
+			);
+		drawer.scrollTop = 80;
+		expect(drawer.scrollTop).toBeGreaterThan(0);
+		dispatch("pointerdown", 500, 300);
+		dispatch("pointerup", 518, 390);
+		expect(controls?.getAttribute("aria-hidden")).toBe(controlsBefore);
+		expect(
+			view.getByTestId("viewer-stage").element().dataset.currentAsset,
+		).toBe("coast");
+		dispatch("pointerdown", 500, 300);
+		dispatch("pointerup", 420, 310);
+		await expect
+			.element(view.getByTestId("viewer-stage"))
+			.toHaveAttribute("data-current-asset", "photo-0");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(
+			view.getByTestId("viewer-stage").element().dataset.currentAsset,
+		).toBe("photo-0");
+	});
+
+	it("cancels an active swipe when the viewport revision changes", async () => {
+		const restoreViewport = installVisualViewportDouble(390, 844);
+		try {
+			const { view, tile } = await openAsset("Coast");
+			(tile.element() as HTMLButtonElement).click();
+			await expect
+				.element(view.getByRole("dialog", { name: "Photo viewer" }))
+				.toBeVisible();
+			const overlay = view
+				.getByRole("dialog", { name: "Photo viewer" })
+				.element();
+			overlay.dispatchEvent(
+				new PointerEvent("pointerdown", {
+					bubbles: true,
+					clientX: 620,
+					clientY: 400,
+					isPrimary: true,
+					pointerId: 13,
+					pointerType: "touch",
+				}),
+			);
+			const viewport = window.visualViewport as VisualViewport & {
+				setSize: (width: number, height: number) => void;
+			};
+			viewport.setSize(844, 390);
+			viewport.dispatchEvent(new Event("resize"));
+			window.dispatchEvent(new Event("orientationchange"));
+			await new Promise<void>((resolve) =>
+				requestAnimationFrame(() => resolve()),
+			);
+			overlay.dispatchEvent(
+				new PointerEvent("pointerup", {
+					bubbles: true,
+					clientX: 520,
+					clientY: 410,
+					isPrimary: true,
+					pointerId: 13,
+					pointerType: "touch",
+				}),
+			);
+			expect(
+				view.getByTestId("viewer-stage").element().dataset.currentAsset,
+			).toBe("coast");
 		} finally {
 			restoreViewport();
 		}

@@ -11,6 +11,18 @@ export interface ViewerFilmstripWindow {
 	end: number;
 }
 
+/** Derive a bounded odd number of filmstrip items from the usable width. */
+export function viewerFilmstripCapacity(
+	viewportWidth: number,
+	itemWidth = viewportWidth <= 639 ? 56 : 64,
+	gap = 8,
+): number {
+	if (!Number.isFinite(viewportWidth) || viewportWidth <= 0) return 1;
+	const measured = Math.floor((viewportWidth + gap) / (itemWidth + gap));
+	const bounded = Math.min(31, Math.max(1, measured));
+	return bounded % 2 === 0 ? Math.max(1, bounded - 1) : bounded;
+}
+
 /** Return the position of an asset in the ordered wall, or -1 when absent. */
 export function findViewerIndex(
 	items: readonly WallAsset[],
