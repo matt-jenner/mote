@@ -1,6 +1,7 @@
 import type {
 	DerivativeReference,
 	OrderState,
+	ScanProgressDto,
 	SortDirection,
 	WallAsset,
 	WallWarningState,
@@ -23,6 +24,9 @@ export interface WallState {
 	activeRequest: PageRequest | null;
 	sourceGeneration: number;
 	error: string | null;
+	scanProgress: ScanProgressDto | null;
+	scanProgressGeneration: number | null;
+	sortPending: boolean;
 }
 
 export type WallRequestId = string | number;
@@ -40,6 +44,7 @@ export type WallAction =
 			orderState: OrderState;
 			selectionId?: string;
 			generation?: number;
+			progress?: ScanProgressDto;
 	  }
 	| {
 			type: "pageLoaded";
@@ -58,6 +63,12 @@ export type WallAction =
 			requestCursor: string | null;
 			requestEpoch: number;
 			sourceGeneration?: number;
+	  }
+	| {
+			type: "progress";
+			selectionId: string;
+			generation: number;
+			progress: ScanProgressDto;
 	  }
 	| {
 			type: "pageRequestFailed";
@@ -120,6 +131,9 @@ export const initialWallState: WallState = {
 	activeRequest: null,
 	sourceGeneration: 0,
 	error: null,
+	scanProgress: null,
+	scanProgressGeneration: null,
+	sortPending: false,
 };
 
 export function isWallLayoutComplete(
@@ -265,6 +279,22 @@ function mergeAssets(
 	return { items: [...byId.values()], changed };
 }
 
+function mergeDerivativeReferences(
+	current: readonly WallAsset[],
+	incoming: readonly WallAsset[],
+): WallAsset[] {
+	const byId = new Map(current.map((asset) => [asset.id, asset]));
+	return incoming.map((asset) => {
+		const previous = byId.get(asset.id);
+		if (!previous) return asset;
+		return {
+			...asset,
+			wallThumbnail: asset.wallThumbnail ?? previous.wallThumbnail,
+			screenPreview: asset.screenPreview ?? previous.screenPreview,
+		};
+	});
+}
+
 interface RememberedWarningsResult {
 	assets: WallAsset[];
 	warnings: Record<string, NonNullable<WallAsset["warning"]>>;
@@ -403,10 +433,16 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			const merged = mergeAssets(state.items, remembered.assets);
 			const orderState =
 				state.settledGeneration !== null ? "settled" : action.orderState;
+			const progressChanged =
+				action.progress !== undefined &&
+				(state.scanProgressGeneration !== action.generation ||
+					JSON.stringify(state.scanProgress) !==
+						JSON.stringify(action.progress));
 			if (
 				!merged.changed &&
 				state.orderState === orderState &&
-				!remembered.changed
+				!remembered.changed &&
+				!progressChanged
 			)
 				return state;
 			const sorted =
@@ -422,6 +458,22 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 					? remembered.warnings
 					: state.assetWarnings,
 				warningTombstones: remembered.tombstones,
+				scanProgress: action.progress ?? state.scanProgress,
+				scanProgressGeneration:
+					action.generation ?? state.scanProgressGeneration,
+			};
+		}
+		case "progress": {
+			if (!matchesSelection(state, action.selectionId)) return state;
+			if (
+				state.scanProgressGeneration !== null &&
+				action.generation < state.scanProgressGeneration
+			)
+				return state;
+			return {
+				...state,
+				scanProgress: action.progress,
+				scanProgressGeneration: action.generation,
 			};
 		}
 		case "pageLoaded": {
@@ -451,8 +503,12 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				requestToken(state.activeRequest),
 				true,
 			);
+			const replacementPage =
+				firstPage && state.sortPending
+					? mergeDerivativeReferences(state.items, remembered.assets)
+					: remembered.assets;
 			const merged = firstPage
-				? mergeAssets([], remembered.assets)
+				? mergeAssets([], replacementPage)
 				: mergeAssets(state.items, remembered.assets);
 			const orderState =
 				state.settledGeneration !== null || settledPage
@@ -496,6 +552,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				sourceWarningTombstones: rememberedSource.tombstones,
 				activeRequest: null,
 				error: null,
+				sortPending: firstPage ? false : state.sortPending,
 			};
 		}
 		case "pageRequestFailed": {
@@ -664,13 +721,14 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			if (state.direction === action.direction) return state;
 			return {
 				...state,
-				items: [],
+				items: state.items,
 				cursor: null,
 				pagesExhausted: false,
 				activeRequest: null,
 				error: null,
 				direction: action.direction,
 				scrollEpoch: state.scrollEpoch + 1,
+				sortPending: true,
 			};
 		}
 	}

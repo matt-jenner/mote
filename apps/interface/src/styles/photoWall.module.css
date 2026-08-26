@@ -27,6 +27,22 @@
 	white-space: nowrap;
 }
 
+.progressTrack {
+	width: 72px;
+	height: 3px;
+	accent-color: var(--progress-accent);
+}
+
+.progressTrack:indeterminate {
+	background: var(--separator);
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.progressTrack:indeterminate {
+		background: var(--separator);
+	}
+}
+
 .retryButton {
 	padding: 0 6px;
 	margin-left: 8px;

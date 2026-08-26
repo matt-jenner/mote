@@ -78,6 +78,8 @@ export function PhotoWallCanvas({
 				service={service}
 				setWallInteraction={wall.setWallInteraction}
 				showEmpty={wall.layoutComplete && !wall.loading && !wall.state.error}
+				scrollEpoch={wall.state.scrollEpoch}
+				busy={wall.progress.busy}
 			/>
 		</main>
 	);

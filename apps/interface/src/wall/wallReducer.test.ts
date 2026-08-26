@@ -34,7 +34,87 @@ function reduce(state: typeof initialWallState, action: WallAction) {
 	return wallReducer(state, action);
 }
 
+function thumbnail(id: string) {
+	return { assetId: id, kind: "wallThumbnail" as const, key: `${id}-thumb` };
+}
+
+function loadedState(items: WallAsset[]) {
+	return {
+		...initialWallState,
+		items,
+		selectionId: "selection-a",
+		sourceGeneration: 1,
+		scanComplete: true,
+		pagesExhausted: true,
+		orderState: "settled" as const,
+	};
+}
+
+function activeState() {
+	return {
+		...initialWallState,
+		selectionId: "selection-a",
+		sourceGeneration: 1,
+	};
+}
+
 describe("wallReducer", () => {
+	it("keeps populated thumbnails visible until the replacement sort page arrives", () => {
+		const populated = loadedState([
+			{ ...wallAsset("old", 1), wallThumbnail: thumbnail("old") },
+			{ ...wallAsset("new", 1), wallThumbnail: thumbnail("new") },
+		]);
+		const pending = wallReducer(populated, {
+			type: "setDirection",
+			direction: "newestFirst",
+		});
+		expect(pending.items.map((item) => item.id)).toEqual(["old", "new"]);
+		expect(pending.items.every((item) => item.wallThumbnail !== null)).toBe(
+			true,
+		);
+		expect(pending.sortPending).toBe(true);
+	});
+
+	it("stores the latest scan counters for the active selection and generation", () => {
+		const next = wallReducer(activeState(), {
+			type: "progress",
+			selectionId: "selection-a",
+			generation: 3,
+			progress: { discovered: 20, shaped: 12, enriched: 4, total: 20 },
+		});
+		expect(next.scanProgress).toEqual({
+			discovered: 20,
+			shaped: 12,
+			enriched: 4,
+			total: 20,
+		});
+	});
+
+	it("stores progress attached to an unchanged catalog batch", () => {
+		const current = reduce(activeState(), {
+			type: "catalogBatch",
+			assets: [wallAsset("same", 1)],
+			orderState: "provisional",
+			selectionId: "selection-a",
+			generation: 2,
+			progress: { discovered: 1, shaped: 1, enriched: 0, total: 1 },
+		});
+		const next = reduce(current, {
+			type: "catalogBatch",
+			assets: [wallAsset("same", 1)],
+			orderState: "provisional",
+			selectionId: "selection-a",
+			generation: 2,
+			progress: { discovered: 1, shaped: 1, enriched: 1, total: 1 },
+		});
+		expect(next.scanProgress).toEqual({
+			discovered: 1,
+			shaped: 1,
+			enriched: 1,
+			total: 1,
+		});
+	});
+
 	it("resets a source and ignores stale failures from the prior source", () => {
 		const request = reduce(initialWallState, {
 			type: "pageRequestStarted",
@@ -181,7 +261,7 @@ describe("wallReducer", () => {
 			direction: "newestFirst",
 		});
 		expect(reversed).toMatchObject({
-			items: [],
+			items: settled.items,
 			cursor: null,
 			scrollEpoch: settled.scrollEpoch + 1,
 			direction: "newestFirst",
@@ -1171,7 +1251,7 @@ describe("wallReducer", () => {
 		expect(reset.scanComplete).toBe(true);
 		expect(reset.pagesExhausted).toBe(false);
 		expect(reset.cursor).toBeNull();
-		expect(reset.items).toEqual([]);
+		expect(reset.items).toEqual(complete.items);
 		expect(isWallLayoutComplete(reset)).toBe(false);
 	});
 

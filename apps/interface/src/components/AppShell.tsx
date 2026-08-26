@@ -103,6 +103,7 @@ export function AppShell() {
 							direction={wall.state.direction}
 							onDirectionChange={wall.setDirection}
 							onRetry={wall.retry}
+							progress={wall.progress}
 							status={wall.status}
 							retryable={Boolean(wall.state.error)}
 						/>
