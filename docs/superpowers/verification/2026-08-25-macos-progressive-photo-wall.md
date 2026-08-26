@@ -34,12 +34,31 @@ previews. Visible wall requests bump the gate generation before their work is
 queued and remain scheduler-prioritised. Screen previews remain 4096 px and
 non-durable; wall thumbnails remain 1024 px and durable.
 
+Round 1 closes four lifecycle races. Wall requests use a
+selection/generation-scoped cancellation-safe RAII guard, visible requests
+fence the preview generation before catalog resolution, and stale queued screen
+jobs are discarded before encoding. The single preview task parks on a shared
+notification rather than polling; scan success, cancellation, unavailable and
+error exits, interaction changes, queue transitions, wall completion, and
+selection changes wake it. The corrected overlap test holds a wall thumbnail in
+the second wave while interaction remains idle.
+
 The focused RED/GREEN test is
 `screen_previews_wait_for_all_overlapping_wall_thumbnail_waves`. The RED run
 failed at the active/overlapping-wave assertion when the per-request preview
 spawn was restored; the GREEN run passed after the shared gate was installed.
-The app-service progressive-wall integration target passed all 25 tests, and
-the workspace passed 178 tests across its integration and unit targets.
+The app-service progressive-wall integration target passed all 28 tests, and
+the workspace passed 182 tests across its integration and unit targets (51
+app-service, 25 cache, 32 catalog, 16 core, 5 domain, 30 indexer, 12 metadata,
+10 server, and 1 catalog-bench).
+
+Fix-round RED evidence against reviewed base `9a6e4f7` was recorded for the
+aborted-wall-request timeout, the queued-preview counter (`3` starts instead
+of `2`), and the parked-gate retry counter (`2` checks instead of `1`). Their
+GREEN runs passed after the RAII guard, generation fence, and notification
+parking changes. The corrected wall-wave test is explicitly wall-gated with
+idle interaction; it was already green on the reviewed base, so it is recorded
+as a characterization rather than a manufactured RED.
 
 The standalone desktop manifest contains only:
 
@@ -51,21 +70,24 @@ opt-level = 3
 The root workspace and release profiles were not changed. Cargo cannot select
 the `photo-cache` integration target through the standalone desktop manifest
 (`photo-cache` is a path dependency and is not a workspace member there), so
-the profile-specific evidence is the real desktop-manifest AppService
-protocol fixture, which scans a JPEG, generates a wall derivative, and reads
-it through the desktop protocol. Its compile-warm run took 0.62 s wall time
-(test body 0.05 s); the preceding source-rebuild run took 12.24 s wall time
-(11.10 s Cargo build/test setup, 0.05 s test body). For context, the same
-cache integration target took 4.30 s wall time in a warm root debug build
-(4.19 s test body) and 0.46 s in root release (0.26 s test body). These are
-machine observations, not hardware-neutral guarantees.
+the profile-specific evidence is a same-workload before/after run of the real
+desktop-manifest AppService protocol fixture, which scans a JPEG, generates a
+wall derivative, and reads it through the desktop protocol. With the standalone
+dependency profile temporarily disabled, the compile-warm command
+took 1.12 s wall time (Cargo/setup 0.34 s, test body 0.73 s; user 0.84 s, sys
+0.12 s). With the exact `opt-level = 3` profile restored, the same compile-warm
+command took 0.38 s wall time (Cargo/setup 0.28 s, test body 0.05 s; user 0.16
+s, sys 0.12 s). The disabled configuration was not committed. For context,
+the same cache integration target took 4.38 s wall time in a warm root debug
+build (4.19 s test body) and 0.41 s in root release (0.26 s test body). These
+are machine observations, not hardware-neutral guarantees.
 
 The final verification commands were all successful:
 
 | Command | Result |
 | --- | ---: |
-| `cargo test -p photo-app-service --test progressive_wall` | 25 passed |
-| `cargo test --workspace --all-features` | 178 passed |
+| `cargo test -p photo-app-service --test progressive_wall` | 28 passed |
+| `cargo test --workspace --all-features` | 182 passed |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass |
 | `cargo fmt --all -- --check` | pass |
 | `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml` | 9 passed |

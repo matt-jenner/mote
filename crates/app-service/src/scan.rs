@@ -66,13 +66,24 @@ impl AppService {
             state.active_scan = Some(owner);
             (root.clone().join(&selected), root, owner)
         };
-        let indexer = Indexer::with_scheduler(
-            self.metadata_reader.clone(),
-            FolderPolicyEngine::new(Vec::new()).map_err(|error| {
-                AppServiceError::LibrarySetup(std::io::Error::other(error.to_string()))
-            })?,
-            self.scheduler.clone(),
-        );
+        self.wake_preview_gate();
+        let policy = match FolderPolicyEngine::new(Vec::new()) {
+            Ok(policy) => policy,
+            Err(error) => {
+                if let Ok(mut state) = self.state.lock()
+                    && state.active_scan == Some(owner)
+                {
+                    state.active_scan = None;
+                    state.active_cancel = None;
+                }
+                self.wake_preview_gate();
+                return Err(AppServiceError::LibrarySetup(std::io::Error::other(
+                    error.to_string(),
+                )));
+            }
+        };
+        let indexer =
+            Indexer::with_scheduler(self.metadata_reader.clone(), policy, self.scheduler.clone());
         let handle = match indexer.start(
             ScanRequest::new(selection_root.clone())
                 .for_library(owner.selection.library_id)
@@ -85,8 +96,15 @@ impl AppService {
                 if state.active_scan != Some(owner) {
                     return Ok(());
                 }
-                mark_unavailable_selection(&mut state, owner)?;
+                if let Err(error) = mark_unavailable_selection(&mut state, owner) {
+                    state.active_scan = None;
+                    state.active_cancel = None;
+                    drop(state);
+                    self.wake_preview_gate();
+                    return Err(error);
+                }
                 state.active_scan = None;
+                state.active_cancel = None;
                 let _ = self.updates.send(WallUpdate::SourceUnavailable {
                     selection_id: owner.selection.selection_id(),
                     source_id: owner
@@ -96,6 +114,8 @@ impl AppService {
                         .hyphenated()
                         .to_string(),
                 });
+                drop(state);
+                self.wake_preview_gate();
                 return Ok(());
             }
             Err(error) => {
@@ -103,7 +123,9 @@ impl AppService {
                     && state.active_scan == Some(owner)
                 {
                     state.active_scan = None;
+                    state.active_cancel = None;
                 }
+                self.wake_preview_gate();
                 return Err(AppServiceError::LibrarySetup(std::io::Error::other(
                     error.to_string(),
                 )));
@@ -173,13 +195,23 @@ impl AppService {
         let Ok((selection_root, library_root, owner)) = details else {
             return;
         };
+        self.wake_preview_gate();
         let indexer = match FolderPolicyEngine::new(Vec::new()) {
             Ok(policy) => Indexer::with_scheduler(
                 self.metadata_reader.clone(),
                 policy,
                 self.scheduler.clone(),
             ),
-            Err(_) => return,
+            Err(_) => {
+                if let Ok(mut state) = self.state.lock()
+                    && state.active_scan == Some(owner)
+                {
+                    state.active_scan = None;
+                    state.active_cancel = None;
+                }
+                self.wake_preview_gate();
+                return;
+            }
         };
         let handle = match indexer.start(
             ScanRequest::new(selection_root.clone())
@@ -195,6 +227,7 @@ impl AppService {
                     }
                     let _ = mark_unavailable_selection(&mut state, owner);
                     state.active_scan = None;
+                    state.active_cancel = None;
                     let _ = self.updates.send(WallUpdate::SourceUnavailable {
                         selection_id: owner.selection.selection_id(),
                         source_id: owner
@@ -204,10 +237,21 @@ impl AppService {
                             .hyphenated()
                             .to_string(),
                     });
+                    drop(state);
+                    self.wake_preview_gate();
                 }
                 return;
             }
-            Err(_) => return,
+            Err(_) => {
+                if let Ok(mut state) = self.state.lock()
+                    && state.active_scan == Some(owner)
+                {
+                    state.active_scan = None;
+                    state.active_cancel = None;
+                }
+                self.wake_preview_gate();
+                return;
+            }
         };
         if let Ok(mut state) = self.state.lock() {
             if state.active_scan != Some(owner) {
@@ -267,6 +311,10 @@ impl AppService {
                 owner.generation,
             );
             if writer.apply_batch(&writer_events).is_err() {
+                state.active_scan = None;
+                state.active_cancel = None;
+                drop(state);
+                self.wake_preview_gate();
                 return;
             }
             if !shaped.is_empty() {
@@ -316,7 +364,7 @@ impl AppService {
             state.active_scan = None;
             state.active_cancel = None;
             if successful {
-                if state
+                let completed = state
                     .libraries
                     .catalog_mut()
                     .complete_generation_for_group(
@@ -324,8 +372,12 @@ impl AppService {
                         owner.selection.group_id,
                         owner.generation,
                     )
-                    .is_err()
-                {
+                    .is_ok();
+                if !completed {
+                    state.active_scan = None;
+                    state.active_cancel = None;
+                    drop(state);
+                    self.wake_preview_gate();
                     return;
                 }
                 let _ = self.updates.send(WallUpdate::MetadataSettled {
@@ -345,6 +397,7 @@ impl AppService {
         } else {
             return;
         };
+        self.wake_preview_gate();
         if let Some(recent) = recent
             && !recent.is_empty()
         {

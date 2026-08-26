@@ -9,8 +9,10 @@ use photo_core::{
 };
 use photo_domain::{Appearance, AssetId, Availability, MediaKind};
 use photo_indexer::{DefaultMetadataReader, IndexScheduler, MetadataReader};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(any(test, debug_assertions))]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(any(test, debug_assertions))]
@@ -77,10 +79,18 @@ pub(crate) struct ScanOwner {
 #[cfg(any(test, debug_assertions))]
 #[derive(Clone)]
 pub(crate) struct DerivativeTestGate {
-    pub(crate) blocked_asset: AssetId,
+    pub(crate) blocked_asset: Option<AssetId>,
     pub(crate) class: Option<DerivativeClass>,
     pub(crate) entered: Arc<tokio::sync::Notify>,
     pub(crate) release: Arc<tokio::sync::Notify>,
+    pub(crate) starts: Option<Arc<AtomicUsize>>,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone)]
+pub(crate) struct DerivativeRequestTestHook {
+    pub(crate) started: Arc<Notify>,
+    pub(crate) release: Option<Arc<Notify>>,
 }
 
 #[derive(Default)]
@@ -89,6 +99,10 @@ pub(crate) struct PreviewGateState {
     pub(crate) generation: u64,
     pub(crate) task_running: bool,
     pub(crate) wall_requests_in_flight: usize,
+    pub(crate) wall_request_selection: Option<SelectionToken>,
+    pub(crate) wall_request_generation: u64,
+    pub(crate) next_wall_request_id: u64,
+    pub(crate) active_wall_request_ids: HashSet<u64>,
 }
 
 trait RecentSourceValidator: Send + Sync {
@@ -126,8 +140,14 @@ pub struct AppService {
     pub(crate) screen_preview_commit_lock: Arc<Mutex<()>>,
     #[cfg(any(test, debug_assertions))]
     pub(crate) derivative_test_gate: Arc<TokioMutex<Option<DerivativeTestGate>>>,
+    #[cfg(debug_assertions)]
+    pub(crate) derivative_request_test_hook: Arc<TokioMutex<Option<DerivativeRequestTestHook>>>,
+    #[cfg(debug_assertions)]
+    pub(crate) derivative_visible_queue_test_hook: Arc<TokioMutex<Option<Arc<Notify>>>>,
     pub(crate) preview_gate: Arc<Mutex<PreviewGateState>>,
     pub(crate) preview_gate_wake: Arc<Notify>,
+    #[cfg(debug_assertions)]
+    pub(crate) preview_gate_checks: Arc<AtomicUsize>,
     pub(crate) derivative_queue: Arc<crate::derivatives::DerivativeQueue>,
     pub(crate) metadata_reader: ReaderAdapter,
     source_validator: Arc<dyn RecentSourceValidator>,
@@ -216,8 +236,14 @@ impl AppService {
             screen_preview_commit_lock: Arc::new(Mutex::new(())),
             #[cfg(any(test, debug_assertions))]
             derivative_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
+            derivative_request_test_hook: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
+            derivative_visible_queue_test_hook: Arc::new(TokioMutex::new(None)),
             preview_gate: Arc::new(Mutex::new(PreviewGateState::default())),
             preview_gate_wake: Arc::new(Notify::new()),
+            #[cfg(debug_assertions)]
+            preview_gate_checks: Arc::new(AtomicUsize::new(0)),
             derivative_queue: Arc::new(crate::derivatives::DerivativeQueue::default()),
             metadata_reader: ReaderAdapter(reader),
             source_validator,
