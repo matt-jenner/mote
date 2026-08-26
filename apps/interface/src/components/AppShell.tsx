@@ -1,16 +1,37 @@
 import { Menu, X } from "lucide-react";
-import { type KeyboardEvent, useEffect, useRef, useState } from "react";
+import {
+	type KeyboardEvent,
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useReducer,
+	useRef,
+	useState,
+} from "react";
+import { usePhotoService } from "../app/PhotoServiceContext";
 import { useAppController } from "../app/useAppController";
 import { usePhotoWall } from "../app/usePhotoWall";
 import styles from "../styles/appShell.module.css";
+import { initialViewerState, viewerReducer } from "../viewer/viewerReducer";
 import { AppearanceMenu } from "./AppearanceMenu";
 import { NavigationRail } from "./NavigationRail";
+import { PhotoViewerOverlay } from "./PhotoViewerOverlay";
 import { SourceCanvas } from "./SourceCanvas";
 import { WallToolbar } from "./WallToolbar";
 
 export function AppShell() {
 	const controller = useAppController();
+	const service = usePhotoService();
 	const [drawerOpen, setDrawerOpen] = useState(false);
+	const [viewer, dispatchViewer] = useReducer(
+		viewerReducer,
+		initialViewerState,
+	);
+	const [highlightedAssetId, setHighlightedAssetId] = useState<string | null>(
+		null,
+	);
+	const wallRegionRef = useRef<HTMLElement>(null);
+	const closingAnchorRef = useRef(viewer.returnAnchor);
 	const drawerRef = useRef<HTMLElement>(null);
 	const drawerTriggerRef = useRef<HTMLButtonElement>(null);
 	const drawerCloseRef = useRef<HTMLButtonElement>(null);
@@ -19,6 +40,51 @@ export function AppShell() {
 	const wall = usePhotoWall(source?.selectionId ?? null);
 	const appearance = controller.state?.settings.appearance ?? "system";
 	const chooseFolder = () => controller.chooseFolder();
+	const handleOpenViewer = useCallback(
+		(assetId: string) => {
+			const asset = wall.state.items.find((item) => item.id === assetId);
+			if (
+				!asset ||
+				(asset.availability !== "available" &&
+					!asset.wallThumbnail &&
+					!asset.screenPreview)
+			)
+				return;
+			dispatchViewer({
+				type: "open",
+				assetId,
+				anchor: {
+					assetId,
+					scrollTop: wallRegionRef.current?.scrollTop ?? 0,
+				},
+			});
+		},
+		[wall.state.items],
+	);
+	const handleCloseViewer = useCallback(() => {
+		closingAnchorRef.current = viewer.returnAnchor;
+		dispatchViewer({ type: "close" });
+	}, [viewer.returnAnchor]);
+
+	useLayoutEffect(() => {
+		if (viewer.open) {
+			if (viewer.returnAnchor && wallRegionRef.current)
+				wallRegionRef.current.scrollTop = viewer.returnAnchor.scrollTop;
+			return;
+		}
+		if (!closingAnchorRef.current) return;
+		const anchor = closingAnchorRef.current;
+		closingAnchorRef.current = null;
+		if (wallRegionRef.current)
+			wallRegionRef.current.scrollTop = anchor.scrollTop;
+		const tile = [
+			...document.querySelectorAll<HTMLElement>("[data-asset-id]"),
+		].find((candidate) => candidate.dataset.assetId === anchor.assetId);
+		tile?.focus({ preventScroll: true });
+		setHighlightedAssetId(anchor.assetId);
+		const timer = window.setTimeout(() => setHighlightedAssetId(null), 600);
+		return () => window.clearTimeout(timer);
+	}, [viewer.open, viewer.returnAnchor]);
 
 	useEffect(() => {
 		if (drawerOpen) {
@@ -80,7 +146,7 @@ export function AppShell() {
 			<section
 				aria-label="Photo workspace"
 				className={styles.workspace}
-				inert={drawerOpen}
+				inert={drawerOpen || viewer.open}
 			>
 				<header className={styles.toolbar}>
 					<button
@@ -128,9 +194,20 @@ export function AppShell() {
 						onChooseFolder={chooseFolder}
 						source={source}
 						wall={wall}
+						regionRef={wallRegionRef}
+						onOpen={handleOpenViewer}
+						highlightedAssetId={highlightedAssetId}
 					/>
 				)}
 			</section>
+			{viewer.open ? (
+				<PhotoViewerOverlay
+					assets={wall.state.items}
+					onClose={handleCloseViewer}
+					service={service}
+					state={viewer}
+				/>
+			) : null}
 			{drawerOpen ? (
 				<div className={styles.drawerBackdrop}>
 					<section

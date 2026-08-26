@@ -27,6 +27,8 @@ interface JustifiedWallProps {
 	scrollEpoch: number;
 	busy: boolean;
 	regionRef?: RefObject<HTMLElement | null>;
+	onOpen: (assetId: string) => void;
+	highlightedAssetId?: string | null;
 }
 
 interface ViewportRowPass {
@@ -80,6 +82,8 @@ export function JustifiedWall({
 	scrollEpoch,
 	busy,
 	regionRef: forwardedRegionRef,
+	onOpen,
+	highlightedAssetId = null,
 }: JustifiedWallProps) {
 	const localRegionRef = useRef<HTMLElement>(null);
 	const [root, setRoot] = useState<HTMLElement | null>(null);
@@ -330,8 +334,10 @@ export function JustifiedWall({
 						{row.items.map((item) => (
 							<PhotoTile
 								key={`${row.items[0]?.asset.id ?? "row"}:${item.asset.id}`}
+								onOpen={onOpen}
 								positioned={item}
 								service={service}
+								highlighted={highlightedAssetId === item.asset.id}
 							/>
 						))}
 					</div>

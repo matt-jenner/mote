@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type RefObject, useEffect, useMemo, useState } from "react";
 import { usePhotoService } from "../app/PhotoServiceContext";
 import type { PhotoWallController } from "../app/usePhotoWall";
 import type { SourceSummary } from "../services/photoService";
@@ -9,14 +9,19 @@ import { JustifiedWall } from "./JustifiedWall";
 interface PhotoWallCanvasProps {
 	source: SourceSummary;
 	wall: PhotoWallController;
+	regionRef: RefObject<HTMLElement | null>;
+	onOpen: (assetId: string) => void;
+	highlightedAssetId?: string | null;
 }
 
 export function PhotoWallCanvas({
 	source: _source,
 	wall,
+	regionRef,
+	onOpen,
+	highlightedAssetId = null,
 }: PhotoWallCanvasProps) {
 	const service = usePhotoService();
-	const regionRef = useRef<HTMLElement>(null);
 	const [containerWidth, setContainerWidth] = useState(0);
 
 	useEffect(() => {
@@ -38,7 +43,7 @@ export function PhotoWallCanvas({
 		}
 		window.addEventListener("resize", measure);
 		return () => window.removeEventListener("resize", measure);
-	}, []);
+	}, [regionRef.current]);
 
 	useEffect(() => {
 		const reportResize = () => wall.setWallInteraction(true);
@@ -49,7 +54,7 @@ export function PhotoWallCanvas({
 	const scrollEpoch = wall.state.scrollEpoch;
 	useEffect(() => {
 		if (scrollEpoch >= 0 && regionRef.current) regionRef.current.scrollTop = 0;
-	}, [scrollEpoch]);
+	}, [regionRef.current, scrollEpoch]);
 
 	const rows = useMemo(() => {
 		if (containerWidth <= 0 || wall.state.items.length === 0) return [];
@@ -67,7 +72,7 @@ export function PhotoWallCanvas({
 	}, [containerWidth, wall.layoutComplete, wall.state.items]);
 
 	return (
-		<main className={styles.wallCanvas}>
+		<main className={styles.wallCanvas} data-testid="photo-wall">
 			<JustifiedWall
 				assets={wall.state.items}
 				loadMore={wall.loadMore}
@@ -81,6 +86,8 @@ export function PhotoWallCanvas({
 				showEmpty={wall.layoutComplete && !wall.loading && !wall.state.error}
 				scrollEpoch={wall.state.scrollEpoch}
 				busy={wall.progress.busy}
+				onOpen={onOpen}
+				highlightedAssetId={highlightedAssetId}
 			/>
 		</main>
 	);

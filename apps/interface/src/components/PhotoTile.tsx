@@ -7,6 +7,8 @@ import type { PositionedWallAsset } from "../wall/layoutJustifiedRows";
 interface PhotoTileProps {
 	positioned: PositionedWallAsset;
 	service: PhotoService;
+	onOpen?: (assetId: string) => void;
+	highlighted?: boolean;
 }
 
 function rgb(value: number | null): string | undefined {
@@ -17,7 +19,12 @@ function rgb(value: number | null): string | undefined {
 	return `rgb(${red}, ${green}, ${blue})`;
 }
 
-export function PhotoTile({ positioned, service }: PhotoTileProps) {
+export function PhotoTile({
+	positioned,
+	service,
+	onOpen = () => undefined,
+	highlighted = false,
+}: PhotoTileProps) {
 	const { asset } = positioned;
 	const [loaded, setLoaded] = useState(false);
 	const [failed, setFailed] = useState(false);
@@ -75,61 +82,80 @@ export function PhotoTile({ positioned, service }: PhotoTileProps) {
 		height: `${positioned.height}px`,
 		"--tile-colour": rgb(asset.representativeRgb),
 	};
+	const layers = failed ? (
+		<div className={styles.fallback} data-testid="photo-fallback">
+			<span aria-hidden="true" className={styles.fallbackMark}>
+				?
+			</span>
+			<span>File unavailable</span>
+		</div>
+	) : (
+		<>
+			<div aria-hidden="true" className={styles.neutralLayer} />
+			<div aria-hidden="true" className={styles.colourLayer} />
+			{url && !previewFailed ? (
+				<img
+					alt={asset.displayName}
+					className={`${styles.imageLayer} ${loaded ? styles.imageLoaded : ""}`}
+					decoding="async"
+					draggable={false}
+					key={url}
+					onError={() => setPreviewFailed(true)}
+					onLoad={(event) => {
+						const image = event.currentTarget;
+						if (
+							image === imageRef.current &&
+							(image.getAttribute("src") === url ||
+								image.src === new URL(url, image.baseURI).href)
+						)
+							setLoaded(true);
+					}}
+					ref={imageRef}
+					src={url}
+				/>
+			) : null}
+			{previewFailed || asset.warning ? (
+				<span
+					aria-label={
+						previewFailed
+							? "Photo preview unavailable"
+							: "Photo preview warning"
+					}
+					className={styles.tileWarning}
+					role="img"
+					title={
+						previewFailed
+							? "Photo preview unavailable"
+							: "Photo preview warning"
+					}
+				>
+					<CircleAlert aria-hidden="true" size={14} strokeWidth={1.7} />
+				</span>
+			) : null}
+		</>
+	);
+	const canOpen =
+		asset.availability === "available" ||
+		Boolean(asset.wallThumbnail || asset.screenPreview);
+	const className = `${styles.tile} ${highlighted ? styles.tileReturnHighlight : ""}`;
 
+	if (!canOpen) {
+		return (
+			<figure className={className} data-asset-id={asset.id} style={style}>
+				{layers}
+			</figure>
+		);
+	}
 	return (
-		<figure className={styles.tile} data-asset-id={asset.id} style={style}>
-			{failed ? (
-				<div className={styles.fallback} data-testid="photo-fallback">
-					<span aria-hidden="true" className={styles.fallbackMark}>
-						?
-					</span>
-					<span>File unavailable</span>
-				</div>
-			) : (
-				<>
-					<div aria-hidden="true" className={styles.neutralLayer} />
-					<div aria-hidden="true" className={styles.colourLayer} />
-					{url && !previewFailed ? (
-						<img
-							alt={asset.displayName}
-							className={`${styles.imageLayer} ${loaded ? styles.imageLoaded : ""}`}
-							decoding="async"
-							draggable={false}
-							key={url}
-							onError={() => setPreviewFailed(true)}
-							onLoad={(event) => {
-								const image = event.currentTarget;
-								if (
-									image === imageRef.current &&
-									(image.getAttribute("src") === url ||
-										image.src === new URL(url, image.baseURI).href)
-								)
-									setLoaded(true);
-							}}
-							ref={imageRef}
-							src={url}
-						/>
-					) : null}
-					{previewFailed || asset.warning ? (
-						<span
-							aria-label={
-								previewFailed
-									? "Photo preview unavailable"
-									: "Photo preview warning"
-							}
-							className={styles.tileWarning}
-							role="img"
-							title={
-								previewFailed
-									? "Photo preview unavailable"
-									: "Photo preview warning"
-							}
-						>
-							<CircleAlert aria-hidden="true" size={14} strokeWidth={1.7} />
-						</span>
-					) : null}
-				</>
-			)}
-		</figure>
+		<button
+			aria-label={`Open ${asset.displayName}`}
+			className={className}
+			data-asset-id={asset.id}
+			onClick={() => onOpen(asset.id)}
+			style={style}
+			type="button"
+		>
+			{layers}
+		</button>
 	);
 }
