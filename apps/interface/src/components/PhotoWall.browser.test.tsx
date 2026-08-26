@@ -622,8 +622,20 @@ describe("progressive photo wall", () => {
 		await expect
 			.poll(() => wall.element().scrollHeight)
 			.toBeGreaterThan(wall.element().clientHeight);
+		const candidates = provisional.slice(30).map((item) => item.id);
+		TestIntersectionObserver.trigger("near", wall.element(), candidates);
+		await new Promise((resolve) => window.setTimeout(resolve, 25));
+		for (const id of candidates)
+			expect(
+				service.derivativeRequests
+					.filter((request) => request.priority === "nearViewport")
+					.flatMap((request) => request.assetIds),
+			).not.toContain(id);
 		wall.element().scrollTop = wall.element().scrollHeight / 2;
 		wall.element().dispatchEvent(new Event("scroll"));
+		await new Promise((resolve) =>
+			window.requestAnimationFrame(() => resolve(undefined)),
+		);
 		const rows = [
 			...wall
 				.element()
@@ -662,32 +674,29 @@ describe("progressive photo wall", () => {
 		expect(nearIds.length).toBeGreaterThan(0);
 		expect(beyondIds.length).toBeGreaterThan(0);
 
-		TestIntersectionObserver.trigger("visible", wall.element(), visibleIds);
-		await new Promise((resolve) => window.setTimeout(resolve, 25));
 		expect(
-			service.derivativeRequests.some(
-				(request) =>
-					request.priority === "visible" &&
-					visibleIds.every((id) => request.assetIds.includes(id)),
-			),
-		).toBe(true);
-		TestIntersectionObserver.trigger("near", wall.element(), [
-			...nearIds,
-			...beyondIds,
-		]);
-		await new Promise((resolve) => window.setTimeout(resolve, 25));
-		expect(
-			service.derivativeRequests.some(
-				(request) =>
-					request.priority === "nearViewport" &&
-					nearIds.every((id) => request.assetIds.includes(id)),
+			visibleIds.every((id) =>
+				service.derivativeRequests.some(
+					(request) =>
+						request.priority === "visible" && request.assetIds.includes(id),
+				),
 			),
 		).toBe(true);
 		expect(
-			service.derivativeRequests
-				.filter((request) => request.priority === "nearViewport")
-				.flatMap((request) => request.assetIds),
-		).not.toEqual(expect.arrayContaining(beyondIds));
+			nearIds.every((id) =>
+				service.derivativeRequests.some(
+					(request) =>
+						request.priority === "nearViewport" &&
+						request.assetIds.includes(id),
+				),
+			),
+		).toBe(true);
+		for (const id of beyondIds)
+			expect(
+				service.derivativeRequests
+					.filter((request) => request.priority === "nearViewport")
+					.flatMap((request) => request.assetIds),
+			).not.toContain(id);
 		screen.unmount();
 	});
 

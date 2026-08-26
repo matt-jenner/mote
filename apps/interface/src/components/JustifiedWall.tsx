@@ -171,6 +171,22 @@ export function JustifiedWall({
 		const visibleIds = new Set<string>();
 		const nearIds = new Set<string>();
 		let frame: number | null = null;
+		let scrollPassFrame: number | null = null;
+		const scheduleScrollPass = () => {
+			if (orderState !== "provisional" || scrollPassFrame !== null) return;
+			scrollPassFrame = window.requestAnimationFrame(() => {
+				scrollPassFrame = null;
+				const viewportPass = getViewportRowPass(root, rows);
+				const visible = viewportPass.visibleIds.filter((id) =>
+					missingWallIdsRef.current.has(id),
+				);
+				const near = viewportPass.nearIds.filter((id) =>
+					missingWallIdsRef.current.has(id),
+				);
+				if (visible.length > 0) requestVisibleDerivatives(visible);
+				if (near.length > 0) requestNearViewportDerivatives(near);
+			});
+		};
 		const flush = () => {
 			frame = null;
 			const visible = [...visibleIds].filter((id) =>
@@ -246,6 +262,7 @@ export function JustifiedWall({
 		};
 		for (const tile of root.querySelectorAll<HTMLElement>("[data-asset-id]"))
 			observeTile(tile);
+		root.addEventListener("scroll", scheduleScrollPass, { passive: true });
 		const mutationObserver =
 			typeof MutationObserver === "undefined"
 				? null
@@ -260,6 +277,9 @@ export function JustifiedWall({
 		mutationObserver?.observe(root, { childList: true, subtree: true });
 		return () => {
 			if (frame !== null) window.cancelAnimationFrame(frame);
+			if (scrollPassFrame !== null)
+				window.cancelAnimationFrame(scrollPassFrame);
+			root.removeEventListener("scroll", scheduleScrollPass);
 			mutationObserver?.disconnect();
 			loadObserver.disconnect();
 			visibleObserver.disconnect();
