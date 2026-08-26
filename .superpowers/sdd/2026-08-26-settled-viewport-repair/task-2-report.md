@@ -41,7 +41,7 @@ AssertionError: expected '0' to be '1'
 
 ## Commit
 
-`c9a1b11` (`fix(interface): reveal cached wall thumbnails`).
+`3d729cf` (`fix(interface): reveal cached wall thumbnails`).
 
 ## Concerns
 
