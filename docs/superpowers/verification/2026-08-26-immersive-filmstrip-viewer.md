@@ -10,6 +10,7 @@ not stopped or replaced.
 
 - Base: `6ce0e798e761d4f70a74ba5046c74c7b3325eb0b`
 - Evidence commit: `2579c94` (`test: verify immersive filmstrip viewer`)
+- Fix commit: `153ed85` (`fix: close viewer verification gaps`)
 - Modified: `README.md`
 - Modified: `apps/interface/src/components/PhotoViewer.browser.test.tsx`
 - Added: this verification document
@@ -21,6 +22,8 @@ consolidated here. The ignored SDD workspace remains in place. Generated
 Vitest screenshots and attachments were not added to Git.
 
 ## RED and GREEN evidence
+
+### Historical initial run
 
 The new browser assertions were written before their focused verification. The
 first focused WebKit run was blocked before test execution by the sandbox
@@ -137,8 +140,8 @@ signing, notarization, and merge/push remain outside this slice.
 ## Self-review
 
 The browser tests use controlled in-memory assets and path-free derivative
-references. Generated screenshots and attachment directories remain untracked.
-README now gives the viewer controls and a clean-profile/native demonstration
-command. The only verification concern is the pre-existing workspace Clippy
-failure listed above. The app state at handoff is the coordinator's running
+references. Generated screenshot and attachment directories were removed after
+the final browser run. Every required automated gate passes, including
+workspace Clippy. README gives the viewer controls and a clean-profile/native
+demonstration command. The app state at handoff is the coordinator's running
 `wall-demo` session, unchanged.
