@@ -1,49 +1,57 @@
 # macOS progressive photo wall verification
 
-Date: 2026-08-25
+Date: 2026-08-26
 
-Implementation commit verified: `44ca7605c1b3f1d37c7e67c82c8289c1b24d1984`
-Evidence/documentation commit: `dafd36f` (documentation only)
+Implementation commit verified: `318635423ee0fbd6399b8b3ce2ef2a7130198429`
+Earlier evidence/documentation commit: `dafd36f` (documentation only)
 
 ## Result
 
-The Rust workspace, interface, desktop tests, and unsigned macOS bundle all
-passed after a fresh run. The six checked-in JPEG fixtures are unchanged. The
-native Tauri app launched with the `wall-demo` profile, but this session could
+The repaired Rust workspace, interface, desktop tests, WebKit suite, full
+million-asset catalog benchmark, and unsigned macOS bundle all passed after a
+fresh run. The six checked-in JPEG fixtures are unchanged. The earlier native
+Tauri attempt launched with the `wall-demo` profile, but this environment could
 not drive the native folder picker or capture the display. The screenshots in
-this record are therefore a fallback render made with headless WebKit from the
-same six real JPEG fixtures. They show the intended states, but they are not
+this record therefore remain fallback renders made with headless WebKit from
+the same six real JPEG fixtures. They show the intended states, but they are not
 evidence that the native picker completed.
 
-The fresh root run also included five small, behavior-preserving fixes required
-by the current Rust toolchain: the benchmark now initializes
-`folder_group_id`, Clippy-compatible forms replace nested conditionals and
-manual arithmetic, and the existing nine-argument preview API has a scoped
-Clippy allowance. These edits are included in the worktree for review.
+The final remediation adds safe legacy-catalog upgrades and folder-scoped
+offline state, selection-scoped client convergence after rescan or channel lag,
+and bounded concurrent derivative generation with exact cache-budget
+serialization at the public cache boundary. Independent review and rereview
+reported no remaining findings in each remediation batch.
 
 ## Fresh verification
 
 All commands below exited 0.
 
-| Area | Command | Result | Wall time |
-| --- | --- | ---: | ---: |
-| Rust | `cargo fmt --all --check` | pass | 0.17 s |
-| Rust | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass | 2.83 s |
-| Rust | `cargo test --workspace --all-features` | 162 tests passed | 41.21 s |
-| Rust | `cargo test -p catalog-bench --test benchmark_smoke` | 1 test passed | 6.61 s |
-| Interface | `npm run check` | 36 files checked | 0.23 s |
-| Interface | `npm run typecheck` | pass | 0.61 s |
-| Interface | `npm test` | 43 tests passed | 0.80 s |
-| Interface | `npm run test:browser` | 24 tests passed in 2 files | 4.14 s |
-| Interface | `npm run --workspace @photo-viewer/interface build` | pass, 1,870 modules | 0.59 s |
-| Desktop | `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all --check` | pass | 0.37 s |
-| Desktop | `cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --all-features -- -D warnings` | pass | 2.86 s |
-| Desktop | `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml` | 7 tests passed | 7.95 s |
-| Desktop | `npm run desktop:build -- --bundles app` | unsigned `.app` created | 66.95 s |
+| Area | Command | Result |
+| --- | --- | ---: |
+| Rust | `cargo fmt --all --check` | pass |
+| Rust | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass |
+| Rust | `cargo test --workspace --all-features` | 177 tests passed |
+| Rust | `cargo test -p catalog-bench --test benchmark_smoke` | 1 test passed |
+| Rust | `cargo run -p catalog-bench --release -- --assets 1000000 --output target/catalog-benchmark.json` | 1,000,000 assets completed |
+| Interface | `npm run check` | 36 files checked |
+| Interface | `npm run typecheck` | pass |
+| Interface | `npm test` | 58 tests passed |
+| Interface | `npm run test:browser` | 29 tests passed in 2 files |
+| Interface | `npm run --workspace @photo-viewer/interface build` | pass, 1,870 modules |
+| Desktop | `cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all --check` | pass |
+| Desktop | `cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --all-features -- -D warnings` | pass |
+| Desktop | `cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml` | 9 tests passed |
+| Desktop | `npm run desktop:build -- --bundles app` | unsigned `.app` created |
 
-The browser suite first hit the sandbox's loopback bind restriction. The same
-command passed in the approved unsandboxed run. The bundle is at the relative
+The browser suite passed in the approved run that permits its loopback test
+server. The bundle is at the relative
 path `apps/desktop/src-tauri/target/release/bundle/macos/Photo Viewer.app`.
+
+The million-asset report used SQLite 3.53.2 and produced a 645,300,224-byte
+database. Insertion took 208,267.27 ms. The first 100-row page took 1.08 ms,
+unavailable-asset counting took 125.52 ms, and whole-group eviction planning
+took 4.48 ms. These are development-machine observations, not hardware-neutral
+guarantees.
 
 ## Fallback visual evidence
 
@@ -76,7 +84,7 @@ The profile catalog inspection was read-only. It reported zero assets and zero
 derivative rows because the picker could not be completed. Consequently,
 `wall_thumbnail` and `screen_preview` rows were not available to report for
 this native profile. The Rust cache tests still cover both tiers: the workspace
-run included 12 cache-policy tests, 5 cache-budget tests, and 7 image-derivative
+run included 12 cache-policy tests, 5 cache-budget tests, and 8 image-derivative
 tests. A native cache-row capture remains an evidence gap for this environment.
 
 First cached-paint and cached screen-preview timings are also not measured for
