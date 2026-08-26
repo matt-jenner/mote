@@ -32,6 +32,7 @@ export interface InMemoryOptions {
 }
 
 export interface InMemoryPhotoService extends PhotoService {
+	readonly derivativeRequests: DerivativeRequest[];
 	startFixtureScan(): Promise<void>;
 	finishFixtureScan(): Promise<void>;
 	emitForTest(update: WallUpdate): void;
@@ -64,6 +65,7 @@ export function createInMemoryPhotoService(
 	let derivativePhasePromise: Promise<void> | null = null;
 	let settlementPromise: Promise<void> | null = null;
 	let sourceWarnings: WallWarningState[] = [...(options.sourceWarnings ?? [])];
+	const derivativeRequests: DerivativeRequest[] = [];
 	let state: BootstrapState = {
 		settings: { appearance: "system" },
 		activeSource: null,
@@ -112,6 +114,7 @@ export function createInMemoryPhotoService(
 
 	const service: InMemoryPhotoService = {
 		capabilities: { chooseFolder: true, locateFolder: false },
+		derivativeRequests,
 		async getBootstrapState() {
 			return clone(state);
 		},
@@ -177,7 +180,32 @@ export function createInMemoryPhotoService(
 				sourceWarnings: clone(sourceWarnings),
 			};
 		},
-		async requestDerivatives(_request: DerivativeRequest) {
+		async requestDerivatives(request: DerivativeRequest) {
+			derivativeRequests.push(
+				clone({ ...request, assetIds: [...request.assetIds] }),
+			);
+			const derivatives = fixtures.flatMap((fixture) => {
+				if (!request.assetIds.includes(fixture.id)) return [];
+				const derivative = fixture[request.kind];
+				return derivative ? [derivative] : [];
+			});
+			if (derivatives.length === 0) return;
+			for (const derivative of derivatives) {
+				const index = assets.findIndex(
+					(asset) => asset.id === derivative.assetId,
+				);
+				const current = assets[index];
+				if (!current) continue;
+				assets[index] = {
+					...current,
+					[request.kind]: clone(derivative),
+				};
+			}
+			publish({
+				kind: "derivativesReady",
+				selectionId,
+				derivatives: clone(derivatives),
+			});
 			return undefined;
 		},
 		async setWallInteraction(_active: boolean) {
@@ -229,7 +257,9 @@ export function createInMemoryPhotoService(
 				});
 				derivativePhasePromise = (async () => {
 					await delay(options.thumbnailDelayMs ?? 0);
-					const derivatives = derivativeReferences();
+					const derivatives = derivativeReferences().filter(
+						(derivative) => derivative.kind === "wallThumbnail",
+					);
 					if (derivatives.length === 0) return;
 					for (const derivative of derivatives) {
 						const index = assets.findIndex(

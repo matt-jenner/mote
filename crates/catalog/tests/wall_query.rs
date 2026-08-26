@@ -107,6 +107,28 @@ fn provisional_pages_paginate_with_stable_order() {
     );
 }
 
+#[test]
+fn wall_page_projects_asset_rating() {
+    let mut fixture = WallFixture::new();
+    let id = fixture.shaped("rated.jpg", ShapeStatus::Ready, 16, 9);
+    fixture
+        .catalog
+        .apply_index_batch(&[CatalogIndexRecord::Metadata(AssetMetadataUpdate {
+            asset_id: id,
+            captured_at_utc: None,
+            rating: Some(4),
+            keywords: vec![],
+            provenance: vec![],
+        })])
+        .unwrap();
+
+    let page = fixture
+        .catalog
+        .wall_page(fixture.group, WallOrder::Provisional, None, 10)
+        .unwrap();
+    assert_eq!(page.items[0].rating, Some(4));
+}
+
 struct WallFixture {
     catalog: Catalog,
     library: photo_domain::LibraryId,

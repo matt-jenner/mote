@@ -50,6 +50,7 @@ const sampleCatalogBatch: WallUpdate = {
 			warning: null,
 			wallThumbnail: null,
 			screenPreview: null,
+			rating: null,
 		},
 	],
 	orderState: "provisional",
@@ -131,7 +132,11 @@ describe("Tauri PhotoService", () => {
 		const service = createTauriPhotoService(invoke);
 
 		const error = await service
-			.requestDerivatives({ assetIds: ["asset-a"], priority: "visible" })
+			.requestDerivatives({
+				assetIds: ["asset-a"],
+				priority: "visible",
+				kind: "screenPreview",
+			})
 			.catch((reason: unknown) => reason);
 
 		expect(error).toBeInstanceOf(PhotoServiceError);
@@ -195,6 +200,7 @@ describe("Tauri PhotoService", () => {
 		await service.requestDerivatives({
 			assetIds: ["asset-a"],
 			priority: "visible",
+			kind: "screenPreview",
 		});
 		await service.setWallInteraction(true);
 
@@ -207,7 +213,13 @@ describe("Tauri PhotoService", () => {
 			],
 			[
 				"request_derivatives",
-				{ request: { assetIds: ["asset-a"], priority: "visible" } },
+				{
+					request: {
+						assetIds: ["asset-a"],
+						priority: "visible",
+						kind: "screenPreview",
+					},
+				},
 			],
 			["set_wall_interaction", { active: true }],
 		]);

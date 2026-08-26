@@ -22,6 +22,7 @@ function assets(aspectRatios: readonly number[]): WallAsset[] {
 		warning: null,
 		wallThumbnail: null,
 		screenPreview: null,
+		rating: null,
 	}));
 }
 

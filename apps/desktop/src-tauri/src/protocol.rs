@@ -410,6 +410,7 @@ mod tests {
                 warning: None,
                 wall_thumbnail: None,
                 screen_preview: None,
+                rating: None,
             }],
             order_state: OrderState::Provisional,
             generation: 1,

@@ -72,6 +72,7 @@ pub struct WallAsset {
     pub warning: Option<WallWarningState>,
     pub wall_thumbnail: Option<DerivativeReference>,
     pub screen_preview: Option<DerivativeReference>,
+    pub rating: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -123,6 +124,7 @@ pub enum DerivativePriority {
 pub struct DerivativeRequest {
     pub asset_ids: Vec<String>,
     pub priority: DerivativePriority,
+    pub kind: DerivativeClass,
 }
 
 impl DerivativeRequest {
@@ -130,6 +132,15 @@ impl DerivativeRequest {
         Self {
             asset_ids,
             priority: DerivativePriority::Visible,
+            kind: DerivativeClass::WallThumbnail,
+        }
+    }
+
+    pub fn visible_screen_preview(asset_ids: Vec<String>) -> Self {
+        Self {
+            asset_ids,
+            priority: DerivativePriority::Visible,
+            kind: DerivativeClass::ScreenPreview,
         }
     }
 }
@@ -246,7 +257,8 @@ pub enum SourceAvailability {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScanProgressDto, WallPage, WallUpdate, WallWarningState};
+    use super::{OrderState, SourceAvailability, WallMediaKind, WallShapeState};
+    use super::{ScanProgressDto, WallAsset, WallPage, WallUpdate, WallWarningState};
 
     #[test]
     fn wall_updates_serialize_selection_identity_and_generation() {
@@ -283,5 +295,29 @@ mod tests {
             "screenPreviewCacheUnavailable"
         );
         assert!(!value.to_string().contains('/'));
+    }
+
+    #[test]
+    fn wall_asset_serializes_rating_without_source_paths() {
+        let value = serde_json::to_value(WallAsset {
+            id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            display_name: "photo.jpg".to_owned(),
+            media_kind: WallMediaKind::Jpeg,
+            provisional_order: 1,
+            captured_at_utc: Some("2026-08-26T12:00:00Z".to_owned()),
+            date_state: OrderState::Settled,
+            width: 2048,
+            height: 1365,
+            representative_rgb: Some(0x334455),
+            shape_state: WallShapeState::Ready,
+            availability: SourceAvailability::Available,
+            warning: None,
+            wall_thumbnail: None,
+            screen_preview: None,
+            rating: Some(4),
+        })
+        .unwrap();
+        assert_eq!(value["rating"], 4);
+        assert!(!value.to_string().contains("/photos/"));
     }
 }

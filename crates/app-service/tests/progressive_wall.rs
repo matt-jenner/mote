@@ -739,6 +739,41 @@ async fn one_visible_request_produces_one_ready_batch() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_visible_screen_preview_request() {
+    let fixture = ProgressiveFixture::new(1);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let asset_id = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items[0]
+        .id
+        .clone();
+
+    service
+        .request_derivatives(DerivativeRequest {
+            asset_ids: vec![asset_id.clone()],
+            priority: photo_app_service::DerivativePriority::Visible,
+            kind: DerivativeClass::ScreenPreview,
+        })
+        .await
+        .unwrap();
+
+    let ready = recv_derivatives_until(&mut updates, DerivativeClass::ScreenPreview, 1).await;
+    assert_eq!(ready[0].asset_id, asset_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn read_derivative_returns_bytes_for_the_active_ready_asset() {
     let fixture = ProgressiveFixture::new(1);
     let service = AppService::open_with_reader(
@@ -1262,6 +1297,7 @@ async fn screen_previews_wait_for_all_overlapping_wall_thumbnail_waves() {
             .request_derivatives(DerivativeRequest {
                 asset_ids: second_ids,
                 priority: photo_app_service::DerivativePriority::NearViewport,
+                kind: DerivativeClass::WallThumbnail,
             })
             .await
     });
@@ -1826,6 +1862,7 @@ fn wall_dtos_never_serialize_native_paths() {
                 key: "opaque-cache-key".to_owned(),
             }),
             screen_preview: None,
+            rating: None,
         }],
         next_cursor: Some("opaque-cursor".to_owned()),
         order_state: OrderState::Settled,

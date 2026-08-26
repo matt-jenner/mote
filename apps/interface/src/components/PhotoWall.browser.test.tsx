@@ -259,6 +259,7 @@ function asset(
 		warning: null,
 		wallThumbnail: null,
 		screenPreview: null,
+		rating: null,
 		...options,
 	};
 }
@@ -530,6 +531,7 @@ describe("progressive photo wall", () => {
 		expect(service.derivativeRequests[0]).toEqual({
 			assetIds: expectedVisibleIds,
 			priority: "visible",
+			kind: "wallThumbnail",
 		});
 		const near = service.derivativeRequests.find(
 			(request) => request.priority === "nearViewport",
@@ -647,10 +649,12 @@ describe("progressive photo wall", () => {
 		expect(service.derivativeRequests[settledStart]).toEqual({
 			assetIds: settledVisibleIds,
 			priority: "visible",
+			kind: "wallThumbnail",
 		});
 		expect(service.derivativeRequests[settledStart + 1]).toEqual({
 			assetIds: settledNearIds,
 			priority: "nearViewport",
+			kind: "wallThumbnail",
 		});
 		const settledIdle = idleCallbacks.splice(0);
 		expect(settledIdle.length).toBeGreaterThan(0);
@@ -906,6 +910,7 @@ describe("progressive photo wall", () => {
 		expect(service.derivativeRequests.at(-1)).toMatchObject({
 			assetIds: ["retry"],
 			priority: "visible",
+			kind: "wallThumbnail",
 		});
 	});
 
@@ -926,6 +931,7 @@ describe("progressive photo wall", () => {
 		expect(service.derivativeRequests.at(-1)).toMatchObject({
 			assetIds: ["retry-visible"],
 			priority: "visible",
+			kind: "wallThumbnail",
 		});
 	});
 
@@ -1376,6 +1382,7 @@ describe("progressive photo wall", () => {
 					...item,
 					wallThumbnail: null,
 					screenPreview: null,
+					rating: null,
 				})),
 				"settled",
 			),

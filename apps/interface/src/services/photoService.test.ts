@@ -20,6 +20,7 @@ const fixtureAsset: WallAsset = {
 	warning: null,
 	wallThumbnail: null,
 	screenPreview: null,
+	rating: null,
 };
 
 const fixtureAssets: readonly InMemoryWallFixture[] = [fixtureAsset];
@@ -273,6 +274,48 @@ describe("PhotoService contract", () => {
 		expect(service.derivativeUrl(thumbnailReference)).toBe(
 			"https://fixtures.invalid/thumb-a.jpg",
 		);
+	});
+
+	it("records derivative class and completes only the requested fixture class", async () => {
+		const screenPreview = {
+			assetId: "asset-a",
+			kind: "screenPreview" as const,
+			key: "screen-a",
+		};
+		const service = createInMemoryPhotoService({
+			wallAssets: [
+				{
+					...fixtureAsset,
+					wallThumbnail: thumbnailReference,
+					screenPreview,
+				},
+			],
+		});
+		const updates: WallUpdate[] = [];
+		service.watchWallUpdates((update) => updates.push(update));
+		const request = {
+			assetIds: ["asset-a"],
+			priority: "visible" as const,
+			kind: "screenPreview" as const,
+		};
+
+		await service.requestDerivatives(request);
+
+		expect(service.derivativeRequests).toEqual([request]);
+		expect(updates).toEqual([
+			{
+				kind: "derivativesReady",
+				selectionId: "memory-selection-1",
+				derivatives: [screenPreview],
+			},
+		]);
+		const page = await service.queryWall({
+			cursor: null,
+			limit: 1,
+			direction: "oldestFirst",
+		});
+		expect(page.items[0]?.wallThumbnail).toBeNull();
+		expect(page.items[0]?.screenPreview).toEqual(screenPreview);
 	});
 
 	it("allows a later reconciliation to settle as a newer generation", async () => {

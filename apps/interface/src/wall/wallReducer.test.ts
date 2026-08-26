@@ -27,6 +27,7 @@ function wallAsset(
 		warning: null,
 		wallThumbnail: null,
 		screenPreview: null,
+		rating: null,
 	};
 }
 
@@ -1257,6 +1258,7 @@ describe("wallReducer", () => {
 			warning: { code: "unreadable", retryable: true },
 			wallThumbnail: { assetId: "a", kind: "wallThumbnail", key: "thumb" },
 			screenPreview: { assetId: "a", kind: "screenPreview", key: "screen" },
+			rating: null,
 		};
 		const state = reduce(initialWallState, {
 			type: "catalogBatch",

@@ -488,7 +488,13 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 			}
 			if (next.length > 0) {
 				void Promise.resolve()
-					.then(() => service.requestDerivatives({ assetIds: next, priority }))
+					.then(() =>
+						service.requestDerivatives({
+							assetIds: next,
+							priority,
+							kind: "wallThumbnail",
+						}),
+					)
 					.catch(() => {
 						let retryDelay = 50;
 						for (const { assetId, record } of attempts) {

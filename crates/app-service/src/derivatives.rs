@@ -299,9 +299,9 @@ impl AppService {
         }
 
         let request_selection = self.active_selection_token()?;
-        let _wall_request = self.begin_preview_wall_request(request_selection);
-        let (selection, ready, pending) =
-            self.resolve_derivatives(&ids, DerivativeClass::WallThumbnail)?;
+        let _wall_request = (request.kind == DerivativeClass::WallThumbnail)
+            .then(|| self.begin_preview_wall_request(request_selection));
+        let (selection, ready, pending) = self.resolve_derivatives(&ids, request.kind)?;
         let priority = match request.priority {
             DerivativePriority::Visible => JobPriority::Visible,
             DerivativePriority::NearViewport => JobPriority::NearViewport,
@@ -313,11 +313,13 @@ impl AppService {
         if !ready.is_empty() {
             self.publish_derivatives_if_active(selection, ready);
         }
-        if let Ok(mut state) = self.state.lock()
-            && state.selection_epoch == selection.epoch
-            && state.protected_group == Some(selection.group_id)
-        {
-            append_unique(&mut state.recent_derivative_ids, ids.iter().copied());
+        if request.kind == DerivativeClass::WallThumbnail {
+            if let Ok(mut state) = self.state.lock()
+                && state.selection_epoch == selection.epoch
+                && state.protected_group == Some(selection.group_id)
+            {
+                append_unique(&mut state.recent_derivative_ids, ids.iter().copied());
+            }
         }
         let pending_ids = pending
             .iter()
@@ -331,7 +333,9 @@ impl AppService {
             .copied()
             .filter(|id| successful_ids.contains(&id.as_uuid().hyphenated().to_string()))
             .collect::<Vec<_>>();
-        self.schedule_screen_preview_prefetch(successful_in_request);
+        if request.kind == DerivativeClass::WallThumbnail {
+            self.schedule_screen_preview_prefetch(successful_in_request);
+        }
         if has_unresolved {
             return Err(AppServiceError::DerivativeUnavailable);
         }

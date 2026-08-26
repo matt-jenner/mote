@@ -699,6 +699,7 @@ pub(crate) fn wall_asset_from_record(
             kind: crate::DerivativeClass::ScreenPreview,
             key: key.to_owned(),
         }),
+        rating: item.rating,
     }
 }
 

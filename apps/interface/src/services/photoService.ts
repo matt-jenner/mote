@@ -73,6 +73,7 @@ export interface WallAsset {
 	warning: WallWarningState | null;
 	wallThumbnail: DerivativeReference | null;
 	screenPreview: DerivativeReference | null;
+	rating: number | null;
 }
 
 export interface WallPage {
@@ -91,6 +92,7 @@ export interface WallQueryRequest {
 export interface DerivativeRequest {
 	assetIds: string[];
 	priority: DerivativePriority;
+	kind: DerivativeClass;
 }
 
 export interface ScanProgressDto {

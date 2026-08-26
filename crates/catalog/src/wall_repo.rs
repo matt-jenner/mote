@@ -68,6 +68,7 @@ pub struct WallCatalogRecord {
     pub has_warning: bool,
     pub warning_code: Option<String>,
     pub shape_status: ShapeStatus,
+    pub rating: Option<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,7 +84,7 @@ impl Catalog {
         assets: &[AssetId],
     ) -> Result<Vec<WallCatalogRecord>, CatalogError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, display_path, media_kind, provisional_order, captured_at_utc, width, height, representative_rgb, availability, shape_status, \
+            "SELECT id, display_path, media_kind, provisional_order, captured_at_utc, width, height, representative_rgb, availability, shape_status, rating, \
                     EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id), \
                     (SELECT code FROM warnings WHERE warnings.asset_id = assets.id ORDER BY CASE code WHEN 'derivative_generation_failed' THEN 0 ELSE 1 END, occurred_at DESC, id DESC LIMIT 1) \
              FROM assets WHERE folder_group_id = ?1 AND id = ?2 \
@@ -124,7 +125,7 @@ impl Catalog {
             return Err(CatalogError::WallCursorOrderMismatch);
         }
         let mut sql = String::from(
-            "SELECT id, display_path, media_kind, provisional_order, captured_at_utc, width, height, representative_rgb, availability, shape_status, \
+            "SELECT id, display_path, media_kind, provisional_order, captured_at_utc, width, height, representative_rgb, availability, shape_status, rating, \
                     EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id), \
                     (SELECT code FROM warnings WHERE warnings.asset_id = assets.id ORDER BY CASE code WHEN 'derivative_generation_failed' THEN 0 ELSE 1 END, occurred_at DESC, id DESC LIMIT 1) \
              FROM assets WHERE folder_group_id = ?1 AND shape_status IN ('ready','fallback') AND width IS NOT NULL AND height IS NOT NULL",
@@ -213,8 +214,20 @@ fn decode_wall_record(row: &rusqlite::Row<'_>) -> Result<WallCatalogRecord, rusq
         representative_rgb: row.get::<_, Option<i64>>(7)?.map(|value| value as u32),
         availability: crate::asset_repo::decode_availability(row.get::<_, String>(8)?.as_str(), 8)?,
         shape_status: ShapeStatus::decode(row.get::<_, String>(9)?.as_str(), 9)?,
-        has_warning: row.get(10)?,
-        warning_code: row.get(11)?,
+        rating: row
+            .get::<_, Option<i64>>(10)?
+            .map(|value| {
+                u8::try_from(value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })
+            })
+            .transpose()?,
+        has_warning: row.get(11)?,
+        warning_code: row.get(12)?,
     })
 }
 
