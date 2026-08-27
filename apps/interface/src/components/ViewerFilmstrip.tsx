@@ -50,7 +50,8 @@ export function ViewerFilmstrip({
 	);
 	const scrollRevision = `${currentIndex}:${windowRange.start}:${windowRange.end}:${viewportRevision}`;
 	const currentButtonRef = useRef<HTMLButtonElement>(null);
-	const selectionFocusPending = useRef(false);
+	const pendingSelectionAssetId = useRef<string | null>(null);
+	const currentAssetId = assets[currentIndex]?.id ?? null;
 
 	useEffect(() => {
 		const missingIds = visibleAssets
@@ -74,10 +75,15 @@ export function ViewerFilmstrip({
 	}, [scrollRevision]);
 
 	useLayoutEffect(() => {
-		if (currentIndex < 0 || !selectionFocusPending.current) return;
-		selectionFocusPending.current = false;
+		if (
+			currentIndex < 0 ||
+			!pendingSelectionAssetId.current ||
+			pendingSelectionAssetId.current !== currentAssetId
+		)
+			return;
+		pendingSelectionAssetId.current = null;
 		currentButtonRef.current?.focus({ preventScroll: true });
-	}, [currentIndex]);
+	}, [currentAssetId, currentIndex]);
 
 	if (visibleAssets.length === 0) return null;
 	return (
@@ -98,7 +104,7 @@ export function ViewerFilmstrip({
 							aria-label={asset.displayName}
 							className={styles.viewerFilmstripItem}
 							onClick={() => {
-								selectionFocusPending.current = true;
+								pendingSelectionAssetId.current = isCurrent ? null : asset.id;
 								onSelectAsset(asset.id);
 							}}
 							ref={isCurrent ? currentButtonRef : undefined}

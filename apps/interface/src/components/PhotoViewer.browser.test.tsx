@@ -320,6 +320,54 @@ function PreviewHarness({
 	);
 }
 
+function RefreshingPreviewHarness({
+	initialAssets,
+	service,
+}: {
+	initialAssets: readonly WallAsset[];
+	service: PhotoService;
+}) {
+	const [assets, setAssets] = useState(initialAssets);
+	const preview = useViewerPreview({
+		assets,
+		currentIndex: 0,
+		previewGeneration: 1,
+	});
+	const current = assets[0];
+	if (!current) return null;
+	return (
+		<>
+			<button
+				data-testid="refresh-preview-assets"
+				onClick={() =>
+					setAssets((previous) =>
+						previous.map((asset) => ({
+							...asset,
+							wallThumbnail: asset.wallThumbnail
+								? { ...asset.wallThumbnail }
+								: null,
+							screenPreview: asset.screenPreview
+								? { ...asset.screenPreview }
+								: null,
+						})),
+					)
+				}
+				type="button"
+			>
+				Refresh assets
+			</button>
+			<ViewerStage
+				asset={current}
+				baseUrl={preview.baseUrl}
+				currentUrl={preview.currentUrl}
+				largePreviewUnavailable={preview.largePreviewUnavailable}
+				previewGeneration={1}
+				service={service}
+			/>
+		</>
+	);
+}
+
 function StageFailureHarness() {
 	const [currentIndex, setCurrentIndex] = useState(0);
 	const assets = [asset("a", "A", 1), asset("b", "B", 2), asset("c", "C", 3)];
@@ -1333,6 +1381,54 @@ describe("immersive photo viewer checkpoint", () => {
 		}
 	});
 
+	it("keeps Tab inside the dialog when all viewer chrome is hidden", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const dialog = view.getByRole("dialog", { name: "Photo viewer" }).element();
+		vi.useFakeTimers();
+		try {
+			dialog.dispatchEvent(
+				new PointerEvent("pointermove", {
+					bubbles: true,
+					clientY: 100,
+					pointerType: "mouse",
+				}),
+			);
+			await vi.advanceTimersByTimeAsync(2500);
+			await expect.poll(() => dialog.getAttribute("aria-hidden")).toBeNull();
+			await expect
+				.poll(() =>
+					dialog
+						.querySelector("[data-viewer-chrome]")
+						?.getAttribute("aria-hidden"),
+				)
+				.toBe("true");
+			dialog.focus();
+			const tab = new KeyboardEvent("keydown", {
+				bubbles: true,
+				cancelable: true,
+				key: "Tab",
+			});
+			dialog.dispatchEvent(tab);
+			expect(tab.defaultPrevented).toBe(true);
+			expect(document.activeElement).toBe(dialog);
+			const reverseTab = new KeyboardEvent("keydown", {
+				bubbles: true,
+				cancelable: true,
+				key: "Tab",
+				shiftKey: true,
+			});
+			dialog.dispatchEvent(reverseTab);
+			expect(reverseTab.defaultPrevented).toBe(true);
+			expect(document.activeElement).toBe(dialog);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("cycles visible drawer controls while primary controls are hidden", async () => {
 		const { view, tile } = await openAsset("Coast");
 		(tile.element() as HTMLButtonElement).click();
@@ -1401,6 +1497,142 @@ describe("immersive photo viewer checkpoint", () => {
 		await expect
 			.poll(() => requests.filter((ids) => ids.includes("a")).length)
 			.toBe(2);
+	});
+
+	it("keeps an in-flight preview rejection alive across an equivalent asset refresh", async () => {
+		const requests: DerivativeRequest[] = [];
+		let rejectCurrent = (_reason?: unknown): void => {
+			throw new Error("Current preview request is not pending");
+		};
+		let rejectionReady = false;
+		let firstRequest = true;
+		const service = previewService((request) => {
+			requests.push({ ...request, assetIds: [...request.assetIds] });
+			if (request.priority === "visible" && request.assetIds.includes("a")) {
+				if (!firstRequest)
+					return Promise.reject(new Error("temporary failure"));
+				firstRequest = false;
+				return new Promise<void>((_resolve, reject) => {
+					rejectCurrent = reject;
+					rejectionReady = true;
+				});
+			}
+			return Promise.resolve();
+		});
+		vi.useFakeTimers();
+		try {
+			const view = await render(
+				<PhotoServiceProvider service={service}>
+					<RefreshingPreviewHarness
+						initialAssets={[asset("a", "A", 1), asset("b", "B", 2)]}
+						service={service}
+					/>
+				</PhotoServiceProvider>,
+			);
+			await vi.advanceTimersByTimeAsync(0);
+			await expect.poll(() => rejectionReady).toBe(true);
+			await view.getByTestId("refresh-preview-assets").click();
+			rejectCurrent(new Error("temporary failure"));
+			await expect
+				.element(view.getByTestId("viewer-stage"))
+				.toHaveAttribute("data-large-preview-unavailable", "true");
+			await vi.advanceTimersByTimeAsync(100);
+			await expect
+				.poll(
+					() =>
+						requests.filter(
+							(request) =>
+								request.priority === "visible" &&
+								request.assetIds.includes("a"),
+						).length,
+				)
+				.toBe(2);
+			await vi.advanceTimersByTimeAsync(250);
+			await expect
+				.poll(
+					() =>
+						requests.filter(
+							(request) =>
+								request.priority === "visible" &&
+								request.assetIds.includes("a"),
+						).length,
+				)
+				.toBe(3);
+			expect(
+				requests.filter(
+					(request) =>
+						request.priority === "visible" && request.assetIds.includes("a"),
+				),
+			).toHaveLength(3);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("retains a scheduled preview retry across an equivalent asset refresh", async () => {
+		const requests: DerivativeRequest[] = [];
+		const service = previewService(async (request) => {
+			requests.push({ ...request, assetIds: [...request.assetIds] });
+			if (request.priority === "visible" && request.assetIds.includes("a"))
+				throw new Error("permanent failure");
+		});
+		vi.useFakeTimers();
+		try {
+			const view = await render(
+				<PhotoServiceProvider service={service}>
+					<RefreshingPreviewHarness
+						initialAssets={[asset("a", "A", 1), asset("b", "B", 2)]}
+						service={service}
+					/>
+				</PhotoServiceProvider>,
+			);
+			await vi.advanceTimersByTimeAsync(0);
+			await expect
+				.poll(
+					() =>
+						requests.filter(
+							(request) =>
+								request.priority === "visible" &&
+								request.assetIds.includes("a"),
+						).length,
+				)
+				.toBe(1);
+			await view.getByTestId("refresh-preview-assets").click();
+			await vi.advanceTimersByTimeAsync(99);
+			expect(
+				requests.filter(
+					(request) =>
+						request.priority === "visible" && request.assetIds.includes("a"),
+				),
+			).toHaveLength(1);
+			await vi.advanceTimersByTimeAsync(1);
+			await expect
+				.poll(
+					() =>
+						requests.filter(
+							(request) =>
+								request.priority === "visible" &&
+								request.assetIds.includes("a"),
+						).length,
+				)
+				.toBe(2);
+			await vi.advanceTimersByTimeAsync(250);
+			await expect
+				.poll(
+					() =>
+						requests.filter(
+							(request) =>
+								request.priority === "visible" &&
+								request.assetIds.includes("a"),
+						).length,
+				)
+				.toBe(3);
+			await expect
+				.element(view.getByTestId("viewer-stage"))
+				.toHaveAttribute("data-large-preview-unavailable", "true");
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("marks a permanently rejected preview unavailable and stops retrying", async () => {
@@ -1725,6 +1957,25 @@ describe("immersive photo viewer checkpoint", () => {
 			.element(view.getByTestId("viewer-stage"))
 			.toHaveAttribute("data-current-asset", "photo-2");
 		await expect.poll(() => document.activeElement).toBe(selected.element());
+	});
+
+	it("does not retain a stale filmstrip focus request after reselecting the current asset", async () => {
+		const { view, tile } = await openAsset("Photo 1");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const filmstrip = view.getByRole("group", { name: "Photo filmstrip" });
+		await filmstrip
+			.getByRole("button", { name: "Photo 1", exact: true })
+			.click();
+		const next = view.getByRole("button", { name: "Next photo" });
+		await next.element().focus();
+		await next.click();
+		await expect
+			.element(view.getByTestId("viewer-stage"))
+			.toHaveAttribute("data-current-asset", "photo-2");
+		await expect.poll(() => document.activeElement).toBe(next.element());
 	});
 
 	it("closes when the current asset disappears during an open viewer", async () => {

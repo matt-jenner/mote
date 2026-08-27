@@ -22,7 +22,8 @@ interface RequestRecord {
 	generation: number;
 	priority: "visible" | "nearViewport";
 	attempt: number;
-	failed: boolean;
+	status: "pending" | "failed" | "completed";
+	retryTimer: number | null;
 }
 
 const MAX_PREVIEW_ATTEMPTS = 3;
@@ -134,8 +135,28 @@ export function useViewerPreview({
 	// Retry tick intentionally re-runs the current plan after a rejected request.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: retryTick is an explicit effect trigger.
 	useEffect(() => {
-		let cancelled = false;
 		const plans = buildViewerPreviewPlan(assets, currentIndex);
+		const activeKeys = new Set<string>();
+		for (const plan of plans) {
+			for (const assetId of plan.assetIds) {
+				const asset = assets.find((candidate) => candidate.id === assetId);
+				if (
+					!asset ||
+					asset.screenPreview ||
+					(asset.warning && !asset.warning.retryable)
+				)
+					continue;
+				activeKeys.add(requestKey(asset, previewGeneration));
+			}
+		}
+		for (const [key, record] of requestRecords.current) {
+			if (activeKeys.has(key)) continue;
+			if (record.retryTimer !== null) {
+				window.clearTimeout(record.retryTimer);
+				retryTimers.current.delete(record.retryTimer);
+			}
+			requestRecords.current.delete(key);
+		}
 
 		const requestPlan = (
 			assetIds: readonly string[],
@@ -156,9 +177,20 @@ export function useViewerPreview({
 					previous.warningCode === warningCode &&
 					previous.retryable === retryable &&
 					previous.generation === previewGeneration &&
-					!(priority === "visible" && previous.priority === "nearViewport")
+					!(priority === "visible" && previous.priority === "nearViewport") &&
+					(previous.status === "pending" ||
+						previous.status === "completed" ||
+						previous.retryTimer !== null ||
+						previous.attempt >= MAX_PREVIEW_ATTEMPTS)
 				)
 					continue;
+				if (
+					previous?.retryTimer !== null &&
+					previous?.retryTimer !== undefined
+				) {
+					window.clearTimeout(previous.retryTimer);
+					retryTimers.current.delete(previous.retryTimer);
+				}
 				const attempt = (attemptCounts.current.get(key) ?? 0) + 1;
 				if (attempt > MAX_PREVIEW_ATTEMPTS) continue;
 				const record: RequestRecord = {
@@ -167,29 +199,41 @@ export function useViewerPreview({
 					generation: previewGeneration,
 					priority,
 					attempt,
-					failed: false,
+					status: "pending",
+					retryTimer: null,
 				};
 				attemptCounts.current.set(key, attempt);
 				requestRecords.current.set(key, record);
 				attempts.set(key, record);
 				ids.push(asset.id);
 			}
-			if (ids.length === 0 || cancelled) return;
+			if (ids.length === 0) return;
 			void service
 				.requestDerivatives({
 					assetIds: ids,
 					priority,
 					kind: "screenPreview",
 				})
+				.then(() => {
+					for (const [key, record] of attempts) {
+						if (requestRecords.current.get(key) !== record) continue;
+						record.status = "completed";
+						setFailedRequestKeys((previous) => {
+							if (!previous.has(key)) return previous;
+							const next = new Set(previous);
+							next.delete(key);
+							return next;
+						});
+					}
+				})
 				.catch(() => {
-					if (cancelled) return;
 					for (const assetId of ids) {
 						const asset = assets.find((candidate) => candidate.id === assetId);
 						if (!asset) continue;
 						const key = requestKey(asset, previewGeneration);
 						const record = attempts.get(key);
 						if (!record || requestRecords.current.get(key) !== record) continue;
-						record.failed = true;
+						record.status = "failed";
 						setFailedRequestKeys((previous) => {
 							if (previous.has(key)) return previous;
 							const next = new Set(previous);
@@ -203,11 +247,12 @@ export function useViewerPreview({
 							viewerIdleFallbackDelayMs;
 						const timer = window.setTimeout(() => {
 							retryTimers.current.delete(timer);
-							if (cancelled) return;
-							if (requestRecords.current.get(key) === record)
-								requestRecords.current.delete(key);
+							if (requestRecords.current.get(key) !== record) return;
+							record.retryTimer = null;
+							requestRecords.current.delete(key);
 							setRetryTick((tick) => tick + 1);
 						}, delay);
+						record.retryTimer = timer;
 						retryTimers.current.add(timer);
 					}
 				});
@@ -223,12 +268,7 @@ export function useViewerPreview({
 				)
 			: null;
 
-		return () => {
-			cancelled = true;
-			scheduled?.cancel();
-			for (const timer of retryTimers.current) window.clearTimeout(timer);
-			retryTimers.current.clear();
-		};
+		return () => scheduled?.cancel();
 	}, [assets, currentIndex, previewGeneration, retryTick, service]);
 
 	useEffect(
@@ -236,6 +276,8 @@ export function useViewerPreview({
 			if (interactionTimer.current !== null)
 				window.clearTimeout(interactionTimer.current);
 			for (const timer of retryTimers.current) window.clearTimeout(timer);
+			requestRecords.current.clear();
+			retryTimers.current.clear();
 		},
 		[],
 	);

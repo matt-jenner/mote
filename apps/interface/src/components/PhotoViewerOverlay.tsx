@@ -234,7 +234,11 @@ export function PhotoViewerOverlay({
 				"button, [href], input, select, textarea, [tabindex]",
 			) ?? []),
 		].filter(isTabbable);
-		if (focusable.length === 0) return;
+		if (focusable.length === 0) {
+			event.preventDefault();
+			dialogRef.current?.focus({ preventScroll: true });
+			return;
+		}
 		const first = focusable[0];
 		const last = focusable.at(-1);
 		if (!first || !last) return;
