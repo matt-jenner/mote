@@ -169,6 +169,24 @@ function installVisualViewportDouble(width: number, height: number) {
 	};
 }
 
+function installPointerModality(coarse: boolean) {
+	const original = window.matchMedia;
+	window.matchMedia = ((query: string) => {
+		const list = original.call(window, query);
+		if (query !== "(pointer: coarse)") return list;
+		return new Proxy(list, {
+			get(target, property, _receiver) {
+				if (property === "matches") return coarse;
+				const value = Reflect.get(target, property, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+	}) as typeof window.matchMedia;
+	return () => {
+		window.matchMedia = original;
+	};
+}
+
 function delayedPaginationService() {
 	const service = serviceWithReadyPhotos(false, 120);
 	const queryRequests: WallQueryRequest[] = [];
@@ -866,30 +884,140 @@ describe("immersive photo viewer checkpoint", () => {
 		expect(drawerNavigator.getBoundingClientRect().right).toBeLessThanOrEqual(
 			drawer.getBoundingClientRect().left,
 		);
+		await view.unmount();
 	});
 
 	it("keeps the touch navigator display-only", async () => {
 		await page.viewport(390, 844);
+		const restorePointer = installPointerModality(true);
+		const { view, tile } = await openAsset("Coast");
+		try {
+			(tile.element() as HTMLButtonElement).click();
+			await view.getByRole("button", { name: "Zoom in" }).click();
+			const navigator = view
+				.getByRole("dialog", { name: "Photo viewer" })
+				.element()
+				.querySelector<HTMLElement>("[data-viewer-navigator]");
+			if (!navigator)
+				throw new Error("navigator was not rendered after zooming");
+			expect(navigator.getAttribute("aria-hidden")).toBe("true");
+			const layer = view.getByTestId("viewer-transform-layer").element();
+			const before = layer.style.transform;
+			navigator.dispatchEvent(
+				new MouseEvent("click", {
+					bubbles: true,
+					clientX: navigator.getBoundingClientRect().right - 8,
+					clientY: navigator.getBoundingClientRect().bottom - 8,
+					detail: 1,
+				}),
+			);
+			expect(layer.style.transform).toBe(before);
+			await view.unmount();
+		} finally {
+			restorePointer();
+		}
+	});
+
+	it("keeps the navigator above controls in rotated landscape and beside the drawer", async () => {
+		await page.viewport(844, 390);
 		const { view, tile } = await openAsset("Coast");
 		(tile.element() as HTMLButtonElement).click();
 		await view.getByRole("button", { name: "Zoom in" }).click();
-		const navigator = view
-			.getByRole("dialog", { name: "Photo viewer" })
-			.element()
-			.querySelector<HTMLElement>("[data-viewer-navigator]");
-		if (!navigator) throw new Error("navigator was not rendered after zooming");
-		expect(navigator.getAttribute("aria-hidden")).toBe("true");
-		const layer = view.getByTestId("viewer-transform-layer").element();
-		const before = layer.style.transform;
-		navigator.dispatchEvent(
-			new MouseEvent("click", {
-				bubbles: true,
-				clientX: navigator.getBoundingClientRect().right - 8,
-				clientY: navigator.getBoundingClientRect().bottom - 8,
-				detail: 1,
-			}),
+		const dialog = view.getByRole("dialog", { name: "Photo viewer" }).element();
+		const navigator = dialog.querySelector<HTMLElement>(
+			"[data-viewer-navigator]",
 		);
-		expect(layer.style.transform).toBe(before);
+		const zoom = dialog.querySelector<HTMLElement>(
+			"[data-viewer-zoom-controls]",
+		);
+		const next = dialog.querySelector<HTMLElement>(
+			"[data-viewer-controls] [aria-label='Next photo']",
+		);
+		if (!navigator || !zoom || !next)
+			throw new Error("landscape navigator controls were not rendered");
+		expect(navigator.getBoundingClientRect().bottom).toBeLessThanOrEqual(
+			zoom.getBoundingClientRect().top,
+		);
+		expect(
+			navigator.getBoundingClientRect().right <=
+				next.getBoundingClientRect().left,
+		).toBe(true);
+		await view.getByRole("button", { name: "Photo information" }).click();
+		const drawer = view
+			.getByRole("complementary", { name: "Photo information" })
+			.element();
+		expect(navigator.getBoundingClientRect().right).toBeLessThanOrEqual(
+			drawer.getBoundingClientRect().left,
+		);
+	});
+
+	it("uses coarse pointer modality for a wide touch viewport", async () => {
+		await page.viewport(844, 390);
+		const restorePointer = installPointerModality(true);
+		try {
+			const { view, tile } = await openAsset("Coast");
+			(tile.element() as HTMLButtonElement).click();
+			await view.getByRole("button", { name: "Zoom in" }).click();
+			const navigator = view
+				.getByRole("dialog", { name: "Photo viewer" })
+				.element()
+				.querySelector<HTMLElement>("[data-viewer-navigator]");
+			if (!navigator)
+				throw new Error("navigator was not rendered after zooming");
+			expect(navigator.getAttribute("aria-hidden")).toBe("true");
+			const layer = view.getByTestId("viewer-transform-layer").element();
+			const before = layer.style.transform;
+			navigator.dispatchEvent(
+				new MouseEvent("click", {
+					bubbles: true,
+					clientX: navigator.getBoundingClientRect().right - 8,
+					clientY: navigator.getBoundingClientRect().bottom - 8,
+					detail: 1,
+				}),
+			);
+			expect(layer.style.transform).toBe(before);
+			await view.unmount();
+		} finally {
+			restorePointer();
+		}
+	});
+
+	it("keeps the thumbnail until the preview decodes and preserves the viewport", async () => {
+		const service = serviceWithReadyPhotos(false, 1, true);
+		const originalDerivativeUrl = service.derivativeUrl.bind(service);
+		service.derivativeUrl = (reference) =>
+			reference.kind === "screenPreview"
+				? "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='2400' height='1600'%3E%3Crect width='100%25' height='100%25' fill='teal'/%3E%3C/svg%3E"
+				: originalDerivativeUrl(reference);
+		const { view } = await openAssetWithService(service, "Coast");
+		await view.getByRole("button", { name: "Zoom in" }).click();
+		const dialog = view.getByRole("dialog", { name: "Photo viewer" }).element();
+		const navigator = dialog.querySelector<HTMLElement>(
+			"[data-viewer-navigator]",
+		);
+		if (!navigator) throw new Error("navigator was not rendered after zooming");
+		const viewport = navigator.querySelector<HTMLElement>(
+			"[data-viewer-navigator-viewport]",
+		);
+		const image = navigator.querySelector<HTMLImageElement>("img");
+		if (!viewport || !image)
+			throw new Error("navigator image was not rendered");
+		const before = {
+			left: viewport.style.left,
+			top: viewport.style.top,
+			width: viewport.style.width,
+			height: viewport.style.height,
+		};
+		await expect
+			.poll(() => navigator.querySelector<HTMLImageElement>("img")?.src ?? "")
+			.toContain("data:image/svg+xml");
+		expect({
+			left: viewport.style.left,
+			top: viewport.style.top,
+			width: viewport.style.width,
+			height: viewport.style.height,
+		}).toEqual(before);
+		await view.unmount();
 	});
 
 	it("ends a zoomed mouse drag exactly once for every lifecycle cancellation", async () => {

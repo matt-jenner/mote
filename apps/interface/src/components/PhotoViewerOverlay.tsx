@@ -89,6 +89,7 @@ export function PhotoViewerOverlay({
 	const entryFocusPending = useRef(true);
 	const drawableSizeRef = useRef({ width: 0, height: 0 });
 	const [panning, setPanning] = useState(false);
+	const [navigatorManipulating, setNavigatorManipulating] = useState(false);
 	const asset = assets.find((item) => item.id === state.currentAssetId);
 	const currentIndex = findViewerIndex(assets, state.currentAssetId ?? "");
 	const preview = useViewerPreview({
@@ -219,10 +220,13 @@ export function PhotoViewerOverlay({
 	const pinchBaseScaleRef = useRef<number | null>(null);
 	const handleViewerPinchStart = useCallback(() => {
 		pinchBaseScaleRef.current = transform.geometry.scale;
+		setPanning(true);
 	}, [transform.geometry.scale]);
 	const handleViewerPinchEnd = useCallback(() => {
 		pinchBaseScaleRef.current = null;
-	}, []);
+		setPanning(false);
+		controls.resume();
+	}, [controls]);
 	const handleViewerPinch = useCallback(
 		(scale: number, midpoint: { x: number; y: number }) => {
 			reportInteraction();
@@ -234,7 +238,8 @@ export function PhotoViewerOverlay({
 	);
 	const handlePanStart = useCallback(() => {
 		setPanning(true);
-	}, []);
+		controls.keepVisible();
+	}, [controls]);
 	const handlePan = useCallback(
 		(delta: { x: number; y: number }) => {
 			reportInteraction();
@@ -244,7 +249,16 @@ export function PhotoViewerOverlay({
 	);
 	const handlePanEnd = useCallback(() => {
 		setPanning(false);
-	}, []);
+		controls.resume();
+	}, [controls]);
+	const handleNavigatorManipulation = useCallback(
+		(active: boolean) => {
+			setNavigatorManipulating(active);
+			if (active) controls.keepVisible();
+			else controls.resume();
+		},
+		[controls],
+	);
 	const viewport = useViewerViewport();
 	const gestures = useViewerGestures({
 		onNavigate: (direction) => {
@@ -269,6 +283,10 @@ export function PhotoViewerOverlay({
 	useEffect(() => {
 		if (!state.controlsVisible) setFilmstripRevealed(false);
 	}, [state.controlsVisible]);
+
+	useEffect(() => {
+		if (transform.mode === "fit") setNavigatorManipulating(false);
+	}, [transform.mode]);
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: rerun when the drawer mounts or the safe-area viewport changes.
 	useLayoutEffect(() => {
@@ -555,19 +573,21 @@ export function PhotoViewerOverlay({
 				onZoomOut={() => transform.step(-1, viewerCenter())}
 				visible={state.controlsVisible}
 			/>
-			<ViewerNavigator
-				assetName={asset.displayName}
-				imageHeight={asset.height}
-				imageUrl={preview.currentUrl ?? preview.baseUrl}
-				imageWidth={asset.width}
-				interactive={viewport.width >= 640}
-				onInteraction={reportInteraction}
-				onRecenter={transform.recenter}
-				visible={
-					transform.mode === "zoomed" && (state.controlsVisible || panning)
-				}
-				visibleRect={transform.geometry.visibleImageRect}
-			/>
+			{transform.mode === "zoomed" ? (
+				<ViewerNavigator
+					assetName={asset.displayName}
+					fallbackUrl={preview.baseUrl}
+					imageHeight={asset.height}
+					imageUrl={preview.currentUrl}
+					imageWidth={asset.width}
+					interactive={!controls.coarsePointer}
+					onInteraction={reportInteraction}
+					onManipulationChange={handleNavigatorManipulation}
+					onRecenter={transform.recenter}
+					visible={state.controlsVisible || panning || navigatorManipulating}
+					visibleRect={transform.geometry.visibleImageRect}
+				/>
+			) : null}
 			<div
 				aria-live="polite"
 				className={styles.viewerStatus}

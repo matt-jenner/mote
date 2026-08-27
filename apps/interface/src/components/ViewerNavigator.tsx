@@ -2,6 +2,7 @@ import {
 	type MouseEvent,
 	type PointerEvent,
 	useEffect,
+	useLayoutEffect,
 	useRef,
 	useState,
 } from "react";
@@ -11,6 +12,7 @@ import type { ViewerPoint } from "../viewer/viewerTransform";
 export interface ViewerNavigatorProps {
 	assetName: string;
 	imageUrl: string | null;
+	fallbackUrl?: string | null;
 	imageWidth: number;
 	imageHeight: number;
 	visibleRect: { x: number; y: number; width: number; height: number };
@@ -18,6 +20,7 @@ export interface ViewerNavigatorProps {
 	interactive: boolean;
 	onRecenter: (focal: ViewerPoint) => void;
 	onInteraction: () => void;
+	onManipulationChange?: (active: boolean) => void;
 }
 
 export interface NavigatorBounds {
@@ -105,6 +108,7 @@ function focalForPointer(
 export function ViewerNavigator({
 	assetName,
 	imageUrl,
+	fallbackUrl = null,
 	imageWidth,
 	imageHeight,
 	visibleRect,
@@ -112,18 +116,52 @@ export function ViewerNavigator({
 	interactive,
 	onRecenter,
 	onInteraction,
+	onManipulationChange,
 }: ViewerNavigatorProps) {
+	const navigatorRef = useRef<HTMLDivElement>(null);
 	const imageRef = useRef<HTMLDivElement>(null);
+	const requestedUrlRef = useRef<string | null>(null);
 	const pointerIdRef = useRef<number | null>(null);
 	const movedRef = useRef(false);
-	const [displayUrl, setDisplayUrl] = useState<string | null>(imageUrl);
+	const [displayUrl, setDisplayUrl] = useState<string | null>(
+		fallbackUrl ?? imageUrl,
+	);
+	const [navigatorSize, setNavigatorSize] = useState({
+		width: 200,
+		height: 120,
+	});
+
+	useLayoutEffect(() => {
+		const node = navigatorRef.current;
+		if (!node) return;
+		const measure = () => {
+			const bounds = node.getBoundingClientRect();
+			const next = { width: bounds.width, height: bounds.height };
+			if (next.width <= 0 || next.height <= 0) return;
+			setNavigatorSize((previous) =>
+				previous.width === next.width && previous.height === next.height
+					? previous
+					: next,
+			);
+		};
+		measure();
+		if (typeof ResizeObserver === "undefined") {
+			window.addEventListener("resize", measure);
+			return () => window.removeEventListener("resize", measure);
+		}
+		const observer = new ResizeObserver(measure);
+		observer.observe(node);
+		return () => observer.disconnect();
+	}, []);
 
 	useEffect(() => {
 		if (!imageUrl) {
-			setDisplayUrl(null);
+			requestedUrlRef.current = null;
+			setDisplayUrl(fallbackUrl);
 			return;
 		}
-		if (displayUrl === imageUrl) return;
+		if (requestedUrlRef.current === imageUrl) return;
+		requestedUrlRef.current = imageUrl;
 		let active = true;
 		const image = new Image();
 		image.src = imageUrl;
@@ -132,15 +170,21 @@ export function ViewerNavigator({
 			() => {
 				if (active) setDisplayUrl(imageUrl);
 			},
-			() => undefined,
+			() => {
+				if (active) setDisplayUrl(fallbackUrl);
+			},
 		);
 		return () => {
 			active = false;
 		};
-	}, [displayUrl, imageUrl]);
+	}, [fallbackUrl, imageUrl]);
 
-	if (!visible) return null;
-	const imageBounds = navigatorImageBounds(200, 120, imageWidth, imageHeight);
+	const imageBounds = navigatorImageBounds(
+		navigatorSize.width,
+		navigatorSize.height,
+		imageWidth,
+		imageHeight,
+	);
 	const viewportStyle = navigatorViewportStyle(visibleRect);
 	const handlePointerDown = (event: PointerEvent<HTMLDivElement>) => {
 		if (!interactive || event.pointerType === "touch" || event.button !== 0)
@@ -151,6 +195,7 @@ export function ViewerNavigator({
 		event.stopPropagation();
 		pointerIdRef.current = event.pointerId;
 		movedRef.current = false;
+		onManipulationChange?.(true);
 		try {
 			target.setPointerCapture?.(event.pointerId);
 		} catch {
@@ -177,6 +222,7 @@ export function ViewerNavigator({
 		if (pointerIdRef.current !== event.pointerId) return;
 		event.stopPropagation();
 		pointerIdRef.current = null;
+		onManipulationChange?.(false);
 		try {
 			imageRef.current?.releasePointerCapture?.(event.pointerId);
 		} catch {
@@ -197,9 +243,9 @@ export function ViewerNavigator({
 
 	return (
 		<div
-			aria-hidden={!interactive}
+			aria-hidden={!interactive || !visible}
 			aria-label={`Navigator for ${assetName}`}
-			className={styles.viewerNavigator}
+			className={`${styles.viewerNavigator} ${!visible ? styles.viewerNavigatorHidden : ""}`}
 			data-viewer-navigator="true"
 			onClick={handleClick}
 			onPointerCancel={endPointer}
@@ -207,6 +253,7 @@ export function ViewerNavigator({
 			onPointerMove={handlePointerMove}
 			onPointerUp={endPointer}
 			role="img"
+			ref={navigatorRef}
 			tabIndex={-1}
 		>
 			<div
@@ -224,6 +271,9 @@ export function ViewerNavigator({
 						alt=""
 						className={styles.viewerNavigatorImageContent}
 						draggable={false}
+						data-viewer-navigator-layer={
+							displayUrl === imageUrl ? "screenPreview" : "wallThumbnail"
+						}
 						src={displayUrl}
 					/>
 				) : null}

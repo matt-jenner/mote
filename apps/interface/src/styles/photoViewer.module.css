@@ -226,7 +226,7 @@
 .viewerNavigator {
 	position: absolute;
 	box-sizing: border-box;
-	top: calc(max(44px, var(--safe-area-top, 0px)) + 56px);
+	top: max(8px, var(--safe-area-top, 0px));
 	right: max(44px, var(--safe-area-right, 0px));
 	z-index: 1;
 	width: 200px;
@@ -252,7 +252,25 @@
 	);
 }
 
+.viewerOverlay:has(.viewerNavigator) .viewerZoomControls {
+	top: calc(max(44px, var(--safe-area-top, 0px)) + 132px);
+	right: calc(max(44px, var(--safe-area-right, 0px)) + 52px);
+}
+
+.viewerOverlay:has(.viewerNavigator):has(.viewerInfoDrawer)
+	.viewerZoomControls {
+	top: calc(max(44px, var(--safe-area-top, 0px)) + 132px);
+	right: auto;
+	left: max(44px, var(--safe-area-left, 0px));
+}
+
 .viewerNavigator[aria-hidden="true"] {
+	pointer-events: none;
+}
+
+.viewerNavigatorHidden {
+	visibility: hidden;
+	opacity: 0;
 	pointer-events: none;
 }
 
@@ -279,13 +297,26 @@
 	pointer-events: none;
 }
 
+@media (prefers-contrast: more), (forced-colors: active) {
+	.viewerNavigatorViewport {
+		border-color: CanvasText;
+		box-shadow: 0 0 0 2px Canvas;
+		forced-color-adjust: none;
+	}
+}
+
 @media (max-width: 639px) {
 	.viewerNavigator {
-		top: auto;
+		top: max(8px, var(--safe-area-top, 0px));
 		right: max(44px, var(--safe-area-right, 0px));
-		bottom: calc(max(44px, var(--safe-area-bottom, 0px)) + 72px);
 		width: 144px;
 		height: 88px;
+	}
+}
+
+@media (orientation: landscape) and (max-height: 500px) {
+	.viewerNavigator {
+		right: calc(max(44px, var(--safe-area-right, 0px)) + 52px);
 	}
 }
 

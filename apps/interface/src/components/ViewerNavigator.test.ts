@@ -34,6 +34,12 @@ describe("viewer navigator geometry", () => {
 			width: 80,
 			height: 120,
 		});
+		expect(navigatorImageBounds(144, 88, 1200, 800)).toEqual({
+			left: 6,
+			top: 0,
+			width: 132,
+			height: 88,
+		});
 	});
 
 	it("maps a normalized visible rectangle to thumbnail percentages", () => {
