@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -108,6 +109,24 @@ struct ProgressiveFixture {
     temp: tempfile::TempDir,
     source: PathBuf,
     config: AppConfig,
+}
+
+fn managed_cache_files(root: &Path) -> BTreeSet<PathBuf> {
+    fn visit(directory: &Path, files: &mut BTreeSet<PathBuf>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                visit(&path, files);
+            } else {
+                files.insert(path);
+            }
+        }
+    }
+
+    let mut files = BTreeSet::new();
+    visit(root, &mut files);
+    files
 }
 
 impl ProgressiveFixture {
@@ -1474,6 +1493,100 @@ async fn full_group_prefetch_completes_all_wall_pages_before_any_screen_preview(
     assert!(observation_after_release.screen_count > 0);
     drop(observation_after_release);
     collector.abort();
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_screen_preview_is_discarded_after_post_encode_invalidation() {
+    let fixture = ProgressiveFixture::new(1);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let asset_id = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap()
+        .id;
+
+    service
+        .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
+        .await
+        .unwrap();
+    let source_before = std::fs::read(fixture.source.join("photo-000.jpg")).unwrap();
+    let source_modified_before = std::fs::metadata(fixture.source.join("photo-000.jpg"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let cache_before = managed_cache_files(&fixture.config.cache_dir());
+    let post_encode_entered = Arc::new(tokio::sync::Notify::new());
+    let post_encode_release = Arc::new(tokio::sync::Notify::new());
+    service
+        .install_screen_preview_post_encode_test_gate(
+            post_encode_entered.clone(),
+            post_encode_release.clone(),
+        )
+        .await;
+
+    service
+        .set_interaction(photo_app_service::InteractionState::Idle)
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), post_encode_entered.notified())
+        .await
+        .expect("screen preview should reach the post-encode boundary");
+
+    service
+        .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
+        .await
+        .unwrap();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    post_encode_release.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let records = Catalog::open(&fixture.config.catalog_path())
+        .unwrap()
+        .all_derivatives()
+        .unwrap();
+    assert!(records.iter().all(|record| record.kind != "screen_preview"));
+    assert_eq!(
+        managed_cache_files(&fixture.config.cache_dir()),
+        cache_before,
+        "stale screen work must not write or evict managed cache files"
+    );
+    assert_eq!(
+        std::fs::read(fixture.source.join("photo-000.jpg")).unwrap(),
+        source_before
+    );
+    assert_eq!(
+        std::fs::metadata(fixture.source.join("photo-000.jpg"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        source_modified_before
+    );
+    while let Ok(event) = updates.try_recv() {
+        assert!(!matches!(
+            event,
+            WallUpdate::DerivativesReady { derivatives, .. }
+                if derivatives.iter().any(|item| item.kind == DerivativeClass::ScreenPreview)
+        ));
+    }
 }
 
 #[derive(Clone)]

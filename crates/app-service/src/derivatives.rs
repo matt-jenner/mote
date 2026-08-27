@@ -677,6 +677,7 @@ impl AppService {
         let group = pending.group;
         let class = pending.class;
         let selection = pending.selection;
+        let preview_generation = pending.preview_generation;
         #[cfg(any(test, debug_assertions))]
         self.wait_for_test_derivative_gate(id, class).await;
         if class == DerivativeClass::ScreenPreview
@@ -755,6 +756,13 @@ impl AppService {
                 })
                 .await
                 .map_err(|_| DerivativeWorkError::WorkerUnavailable)??;
+                #[cfg(any(test, debug_assertions))]
+                self.wait_for_screen_preview_post_encode_test_gate(id).await;
+                if preview_generation
+                    .is_some_and(|generation| !self.preview_generation_is_current(generation))
+                {
+                    return Err(DerivativeWorkError::PreviewSuperseded);
+                }
                 if !self.selection_is_active(selection) {
                     return Err(DerivativeWorkError::WorkerUnavailable);
                 }
@@ -768,6 +776,7 @@ impl AppService {
                         cache_budget,
                         &protected,
                         selection,
+                        preview_generation,
                         &catalog_path,
                     )
                 })
@@ -842,6 +851,25 @@ impl AppService {
         }
     }
 
+    #[cfg(any(test, debug_assertions))]
+    async fn wait_for_screen_preview_post_encode_test_gate(&self, asset_id: AssetId) {
+        let gate = self
+            .screen_preview_post_encode_test_gate
+            .lock()
+            .await
+            .clone();
+        if let Some(gate) = gate
+            .filter(|gate| {
+                gate.class
+                    .is_none_or(|class| class == DerivativeClass::ScreenPreview)
+            })
+            .filter(|gate| gate.blocked_asset.is_none_or(|blocked| blocked == asset_id))
+        {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
     /// Installs a deterministic derivative boundary for integration tests.
     #[cfg(debug_assertions)]
     #[doc(hidden)]
@@ -882,6 +910,24 @@ impl AppService {
             release,
             starts: Some(starts),
         });
+    }
+
+    /// Installs a deterministic screen-preview boundary after encoding and before commit.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_screen_preview_post_encode_test_gate(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.screen_preview_post_encode_test_gate.lock().await =
+            Some(crate::service::DerivativeTestGate {
+                blocked_asset: None,
+                class: Some(DerivativeClass::ScreenPreview),
+                entered,
+                release,
+                starts: None,
+            });
     }
 
     #[cfg(debug_assertions)]
@@ -938,12 +984,18 @@ impl AppService {
         budget: photo_cache::CacheBudget,
         protected: &photo_cache::ProtectedGroups,
         selection: SelectionToken,
+        preview_generation: Option<u64>,
         catalog_path: &std::path::Path,
     ) -> Result<photo_cache::GeneratedDerivative, DerivativeWorkError> {
         let _commit_guard = self
             .screen_preview_commit_lock
             .lock()
             .map_err(|_| DerivativeWorkError::WorkerUnavailable)?;
+        if preview_generation
+            .is_some_and(|generation| !self.preview_generation_is_current(generation))
+        {
+            return Err(DerivativeWorkError::PreviewSuperseded);
+        }
         if !self.selection_is_active(selection) {
             return Err(DerivativeWorkError::WorkerUnavailable);
         }
@@ -2076,6 +2128,7 @@ mod tests {
             CacheBudget::from_total_space(1024 * 1024),
             &service.protected_groups,
             stale_selection,
+            None,
             &config.catalog_path(),
         );
 
@@ -2159,6 +2212,7 @@ mod tests {
                     budget,
                     &service.protected_groups,
                     selection,
+                    None,
                     &config.catalog_path(),
                 )
             })
