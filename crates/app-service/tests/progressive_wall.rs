@@ -1446,16 +1446,17 @@ async fn full_group_prefetch_completes_all_wall_pages_before_any_screen_preview(
         .expect("the late-page wall thumbnail should be reached");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let observation_at_hold = observation.lock().unwrap();
-    assert_eq!(
-        observation_at_hold.screen_count, 0,
-        "screen previews must wait for every wall page while the late page is blocked"
-    );
-    assert!(
-        observation_at_hold.wall_count < total_assets,
-        "the gated late-page wall thumbnail must not be published while blocked"
-    );
-    drop(observation_at_hold);
+    {
+        let observation_at_hold = observation.lock().unwrap();
+        assert_eq!(
+            observation_at_hold.screen_count, 0,
+            "screen previews must wait for every wall page while the late page is blocked"
+        );
+        assert!(
+            observation_at_hold.wall_count < total_assets,
+            "the gated late-page wall thumbnail must not be published while blocked"
+        );
+    }
     let screen_rows = Catalog::open(&fixture.config.catalog_path())
         .unwrap()
         .all_derivatives()
@@ -1532,7 +1533,7 @@ async fn stale_screen_preview_is_discarded_after_post_encode_invalidation() {
         .unwrap()
         .modified()
         .unwrap();
-    let cache_before = managed_cache_files(&fixture.config.cache_dir());
+    let cache_before = managed_cache_files(fixture.config.cache_dir());
     let post_encode_entered = Arc::new(tokio::sync::Notify::new());
     let post_encode_release = Arc::new(tokio::sync::Notify::new());
     service
@@ -1565,7 +1566,7 @@ async fn stale_screen_preview_is_discarded_after_post_encode_invalidation() {
         .unwrap();
     assert!(records.iter().all(|record| record.kind != "screen_preview"));
     assert_eq!(
-        managed_cache_files(&fixture.config.cache_dir()),
+        managed_cache_files(fixture.config.cache_dir()),
         cache_before,
         "stale screen work must not write or evict managed cache files"
     );
