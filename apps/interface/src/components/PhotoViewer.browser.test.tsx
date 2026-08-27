@@ -2188,7 +2188,9 @@ describe("immersive photo viewer checkpoint", () => {
 		const stage = view.getByTestId("viewer-stage").element();
 		const status = view.getByTestId("viewer-status").element();
 		const mutations: MutationRecord[] = [];
-		const observer = new MutationObserver((records) => mutations.push(...records));
+		const observer = new MutationObserver((records) =>
+			mutations.push(...records),
+		);
 		observer.observe(status, {
 			characterData: true,
 			childList: true,
@@ -2205,19 +2207,17 @@ describe("immersive photo viewer checkpoint", () => {
 					clientY: 400,
 				}),
 			);
-			await expect.element(view.getByTestId("viewer-stage")).toHaveAttribute(
-				"data-viewer-mode",
-				"zoomed",
-			);
+			await expect
+				.element(view.getByTestId("viewer-stage"))
+				.toHaveAttribute("data-viewer-mode", "zoomed");
 			await new Promise((resolve) => window.setTimeout(resolve, 0));
 			expect(status.textContent).toContain("Fit");
 			expect(mutations).toHaveLength(0);
 
 			await view.getByRole("button", { name: "Reset zoom" }).click();
-			await expect.element(view.getByTestId("viewer-stage")).toHaveAttribute(
-				"data-viewer-mode",
-				"fit",
-			);
+			await expect
+				.element(view.getByTestId("viewer-stage"))
+				.toHaveAttribute("data-viewer-mode", "fit");
 			await new Promise((resolve) => window.setTimeout(resolve, 0));
 			expect(mutations.length).toBeGreaterThan(0);
 		} finally {

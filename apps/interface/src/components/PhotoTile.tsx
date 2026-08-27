@@ -134,9 +134,7 @@ export function PhotoTile({
 			) : null}
 		</>
 	);
-	const canOpen =
-		asset.mediaKind !== "video" &&
-		Boolean(asset.wallThumbnail);
+	const canOpen = asset.mediaKind !== "video" && Boolean(asset.wallThumbnail);
 	const className = `${styles.tile} ${highlighted ? styles.tileReturnHighlight : ""}`;
 
 	if (!canOpen) {

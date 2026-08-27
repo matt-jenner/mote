@@ -458,7 +458,11 @@ describe("progressive photo wall", () => {
 		await expect
 			.element(screen.getByRole("img", { name: "Coast" }))
 			.toBeVisible();
-		expect(tile.getBoundingClientRect().toJSON()).toEqual(before);
+		const refinedTile = screen
+			.getByTestId("photo-row-0")
+			.element()
+			.querySelector<HTMLElement>("[data-asset-id='coast']");
+		expect(refinedTile?.getBoundingClientRect().toJSON()).toEqual(before);
 	});
 
 	it("requests viewport, next rows, then remaining rows without observer callbacks", async () => {
@@ -1110,7 +1114,9 @@ describe("progressive photo wall", () => {
 		);
 
 		expect(
-			screen.getByRole("button", { name: "Open Screen only", exact: true }).query(),
+			screen
+				.getByRole("button", { name: "Open Screen only", exact: true })
+				.query(),
 		).toBeNull();
 		expect(
 			document.querySelector("[data-asset-id='screen-only']")?.tagName,
@@ -2086,23 +2092,24 @@ describe("progressive photo wall", () => {
 			"broken",
 			"data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==",
 		);
-		const tile = screen
-			.getByRole("region", { name: "Photos" })
-			.element()
-			.querySelector<HTMLElement>('[data-asset-id="broken"]');
+		const tile = () =>
+			screen
+				.getByRole("region", { name: "Photos" })
+				.element()
+				.querySelector<HTMLElement>('[data-asset-id="broken"]');
 		await expect
-			.poll(() => tile?.querySelector<HTMLImageElement>('img[alt="Broken"]'))
+			.poll(() => tile()?.querySelector<HTMLImageElement>('img[alt="Broken"]'))
 			.not.toBeNull();
-		const image = tile?.querySelector<HTMLImageElement>('img[alt="Broken"]');
+		const image = tile()?.querySelector<HTMLImageElement>('img[alt="Broken"]');
 		expect(image).not.toBeNull();
 		image?.dispatchEvent(new Event("error"));
 		await expect
 			.poll(() =>
-				tile?.querySelector('[aria-label="Photo preview unavailable"]'),
+				tile()?.querySelector('[aria-label="Photo preview unavailable"]'),
 			)
 			.not.toBeNull();
-		expect(tile?.querySelector('[data-testid="photo-fallback"]')).toBeNull();
-		expect(tile?.textContent).not.toContain("File unavailable");
-		expect(tile?.textContent).not.toContain("/");
+		expect(tile()?.querySelector('[data-testid="photo-fallback"]')).toBeNull();
+		expect(tile()?.textContent).not.toContain("File unavailable");
+		expect(tile()?.textContent).not.toContain("/");
 	});
 });
