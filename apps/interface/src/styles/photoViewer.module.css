@@ -264,7 +264,7 @@
 	left: max(44px, var(--safe-area-left, 0px));
 }
 
-.viewerNavigator[aria-hidden="true"] {
+.viewerNavigator[data-viewer-navigator-interactive="false"] {
 	pointer-events: none;
 }
 
@@ -503,6 +503,10 @@
 		);
 		padding-right: calc(20px + max(0px, var(--safe-area-right, 0px)));
 		padding-left: calc(20px + max(0px, var(--safe-area-left, 0px)));
+	}
+
+	.viewerOverlay:has(.viewerInfoDrawer) .viewerZoomControls {
+		display: none;
 	}
 
 	.viewerControls {

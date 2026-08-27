@@ -15,7 +15,7 @@ viewer controls, and added two small behavior fixes driven by failing tests:
   - full Axe state matrix for fit, zoomed controls, hidden chrome, navigator,
     Info drawer, and rotated phone layout;
   - native 44px target and disabled-state checks;
-  - polite live-region zoom announcements;
+  - discrete polite live-region zoom announcements;
   - no navigator keyboard trap, forced offline cached zoom, source sentinel
     containment, malformed dimensions, zero-natural derivative, and interaction
     boundary coverage;
@@ -24,10 +24,20 @@ viewer controls, and added two small behavior fixes driven by failing tests:
 - `apps/interface/src/components/PhotoViewer.motion.test.tsx`
   - normal-motion preview crossfade and immediate transform-transition evidence.
 - `apps/interface/src/components/PhotoViewerOverlay.tsx`
-  - includes `Fit` or the native-resolution percentage in the polite viewer
-    status announcement.
+  - keeps discrete `Fit`/native-resolution zoom announcements separate from
+    continuous transform frames.
+- `apps/interface/src/components/ViewerStage.tsx`
+  - gates preview natural dimensions on the successful decode token and restores
+    the wall-thumbnail ceiling after a failed decode.
+- `apps/interface/src/components/ViewerNavigator.tsx`
+  - makes the navigator decorative to assistive technology and cleans up active
+    drag state across capture loss, lifecycle changes, and unmount.
 - `apps/interface/src/viewer/useViewerGestures.ts`
-  - cancels a browser default only when a viewer-owned double-tap is recognized.
+  - tombstones excluded touch IDs through their own release/cancel and protects
+    active stage gestures from excluded pointer cancellation.
+- `apps/interface/src/styles/photoViewer.module.css`
+  - removes the zoom cluster from narrow drawer layouts while preserving its
+    tab order after the drawer closes.
 - `README.md`
   - documents mouse, keyboard, touch, navigator, and cache-only limitations.
 
@@ -85,16 +95,26 @@ undersized 1×1 cached fixture and the old status string. The fixture was change
 to the controlled 1536×1024 derivative and the status expectation was updated;
 the final full run below is green.
 
+## Final review RED/GREEN evidence
+
+The final review regressions were added before their production fixes. The first
+focused run failed the decode-ceiling, excluded-touch, narrow-drawer,
+continuous-live-region, and navigator-lifecycle assertions. The focused unit
+and browser reruns were green after the corresponding fixes, including the
+screen-preview success/failure ceiling transitions, fresh pointer-ID reuse,
+desktop/coarse decorative navigator states, and double-click live-region
+mutations.
+
 ## Interface gates
 
 ```text
 npm test
 Test Files  16 passed (16)
-Tests       126 passed (126)
+Tests       129 passed (129)
 
 npm run test:browser
 Test Files  3 passed (3)
-Tests       123 passed (123)
+Tests       129 passed (129)
 ```
 
 The full browser run emitted one React development warning about an
@@ -103,7 +123,7 @@ clean baseline recorded at feature base
 `14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc`. It remains test-synchronization
 noise and did not produce a failed test. The App and PhotoWall browser files
 were also run alone: 49 tests passed with no warning. The viewer browser file
-passed all 74 tests.
+passed all 80 tests.
 
 ```text
 npm exec --workspace @photo-viewer/interface -- vitest run --project browser-motion
@@ -127,10 +147,14 @@ dist/assets/index-D6LRUogd.js   314.25 kB │ gzip: 96.07 kB
 built in 218ms
 ```
 
-Browser evidence covers viewer-consumed wheel, pinch, zoomed touch pan, and
-double-tap prevention while open; after close, synthetic document wheel and
-double-tap events are not prevented. The malformed-dimension and zero-natural
-cases stay at Fit with native zoom-in disabled and retain navigation.
+Browser evidence covers viewer-consumed wheel, pinch, zoomed touch pan,
+mouse-drag translation and pointer capture, excluded control touches, drawer
+coverage at 390px, decode-ceiling success/failure, navigator lifecycle cleanup,
+decorative navigator semantics in desktop/coarse modes, discrete button and
+keyboard shortcuts, double-click live-region updates, and continuous-route
+mutation suppression. After close, synthetic document wheel and double-tap
+events are not prevented. The malformed-dimension and zero-natural cases stay
+at Fit with native zoom-in disabled and retain navigation.
 
 ## Rust and desktop gates
 
@@ -237,11 +261,18 @@ Self-review confirms:
 
 - zoom controls remain native buttons with 44px targets and native disabled
   state;
-- the live status is polite and includes Fit/native percentage after discrete
-  input;
+- the live status is polite, preserves photo position, and only changes its
+  zoom label for discrete controls, shortcuts, and double-click/tap input;
 - hidden chrome remains out of the tab order while focus stays in the dialog;
-- navigator content is visual-only on coarse pointers, `tabIndex=-1`, and does
-  not add an assistive interaction trap;
+- navigator content is decorative (`aria-hidden="true"`) at every pointer mode,
+  `tabIndex=-1`, and does not add an assistive interaction trap while retaining
+  visible desktop pointer functionality;
+- preview natural dimensions remain at the wall-thumbnail ceiling until the
+  matching screen preview decode succeeds, and return to that ceiling on failure;
+- narrow drawers hide the overlapping zoom cluster and restore its tab order on
+  close;
+- navigator drag cleanup ends manipulation once across capture loss, unmount,
+  asset/viewport revision, and modality changes;
 - cached derivative URLs remain usable after `sourceUnavailable` without the
   sentinel or a native/source URL entering viewer DOM;
 - malformed geometry and zero-natural derivatives fail closed to Fit;
@@ -269,5 +300,6 @@ git status --short
 (clean after commit)
 
 git show -s --format='%h %s' HEAD
-final delivery commit: test: verify viewer zoom and pan
+The exact post-commit SHA and subject are recorded in the companion Task 6 and
+final-fix reports after commit finalization.
 ```

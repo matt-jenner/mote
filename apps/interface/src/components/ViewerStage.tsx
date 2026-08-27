@@ -97,6 +97,10 @@ export function ViewerStage({
 	const stageRef = useRef<HTMLDivElement>(null);
 	const screenImageRef = useRef<HTMLImageElement>(null);
 	const activeDecodeRef = useRef("");
+	const baseNaturalSizeRef = useRef<{
+		token: string;
+		size: ViewerNaturalSize;
+	} | null>(null);
 	const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
 	const [decodedToken, setDecodedToken] = useState<string | null>(null);
 	const [failedScreenToken, setFailedScreenToken] = useState<string | null>(
@@ -112,6 +116,12 @@ export function ViewerStage({
 			? safeDerivativeUrl(service, asset.screenPreview)
 			: suppliedCurrentUrl;
 	const decodeToken = `${asset.id}:${previewGeneration}:${currentUrl ?? ""}`;
+	const baseToken = `${asset.id}:${previewGeneration}:${baseUrl ?? ""}`;
+
+	useEffect(() => {
+		if (baseNaturalSizeRef.current?.token !== baseToken)
+			baseNaturalSizeRef.current = null;
+	}, [baseToken]);
 
 	useLayoutEffect(() => {
 		const measureNode = measureRef.current;
@@ -178,15 +188,40 @@ export function ViewerStage({
 		return () => stage.removeEventListener("dblclick", handleDoubleClick);
 	}, [onDoubleClick]);
 
-	const reportNaturalSize = useCallback(
+	const naturalSizeFor = useCallback(
+		(image: HTMLImageElement): ViewerNaturalSize | null =>
+			image.naturalWidth > 0 && image.naturalHeight > 0
+				? { width: image.naturalWidth, height: image.naturalHeight }
+				: null,
+		[],
+	);
+	const reportBaseNaturalSize = useCallback(
 		(image: HTMLImageElement) => {
-			if (image.naturalWidth > 0 && image.naturalHeight > 0)
-				onNaturalSizeChange?.({
-					width: image.naturalWidth,
-					height: image.naturalHeight,
-				});
+			const size = naturalSizeFor(image);
+			if (!size) return;
+			baseNaturalSizeRef.current = { token: baseToken, size };
+			if (decodedToken !== decodeToken || failedScreenToken === decodeToken)
+				onNaturalSizeChange?.(size);
 		},
-		[onNaturalSizeChange],
+		[
+			baseToken,
+			decodeToken,
+			decodedToken,
+			failedScreenToken,
+			naturalSizeFor,
+			onNaturalSizeChange,
+		],
+	);
+	const restoreBaseNaturalSize = useCallback(() => {
+		const base = baseNaturalSizeRef.current;
+		if (base?.token === baseToken) onNaturalSizeChange?.(base.size);
+	}, [baseToken, onNaturalSizeChange]);
+	const reportDecodedPreviewNaturalSize = useCallback(
+		(image: HTMLImageElement) => {
+			const size = naturalSizeFor(image);
+			if (size) onNaturalSizeChange?.(size);
+		},
+		[naturalSizeFor, onNaturalSizeChange],
 	);
 
 	useEffect(() => {
@@ -205,15 +240,22 @@ export function ViewerStage({
 			() => {
 				if (activeDecodeRef.current !== decodeToken) return;
 				setDecodedToken(decodeToken);
-				reportNaturalSize(image);
+				reportDecodedPreviewNaturalSize(image);
 			},
 			() => {
 				if (activeDecodeRef.current !== decodeToken) return;
 				setFailedScreenToken(decodeToken);
+				restoreBaseNaturalSize();
 				onPreviewFailure?.(decodeToken);
 			},
 		);
-	}, [currentUrl, decodeToken, onPreviewFailure, reportNaturalSize]);
+	}, [
+		currentUrl,
+		decodeToken,
+		onPreviewFailure,
+		reportDecodedPreviewNaturalSize,
+		restoreBaseNaturalSize,
+	]);
 
 	const frame = fitViewerFrame(
 		stageSize.width,
@@ -277,9 +319,7 @@ export function ViewerStage({
 								data-viewer-layer="wallThumbnail"
 								decoding="async"
 								draggable={false}
-								onLoad={(event) => {
-									if (!showPreview) reportNaturalSize(event.currentTarget);
-								}}
+								onLoad={(event) => reportBaseNaturalSize(event.currentTarget)}
 								onError={() => setFailedBaseUrl(baseUrl)}
 								src={baseUrl ?? undefined}
 							/>
@@ -305,10 +345,14 @@ export function ViewerStage({
 								data-viewer-layer="screenPreview"
 								decoding="async"
 								draggable={false}
-								onLoad={(event) => reportNaturalSize(event.currentTarget)}
+								onLoad={(event) => {
+									if (decodedToken === decodeToken && !screenFailed)
+										reportDecodedPreviewNaturalSize(event.currentTarget);
+								}}
 								onError={() => {
 									if (activeDecodeRef.current === decodeToken) {
 										setFailedScreenToken(decodeToken);
+										restoreBaseNaturalSize();
 										onPreviewFailure?.(decodeToken);
 									}
 								}}

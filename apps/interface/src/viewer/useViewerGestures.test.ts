@@ -14,7 +14,7 @@ import {
 class GestureElement {
 	private captures = new Set<number>();
 
-	closest() {
+	closest(): Element | null {
 		return null;
 	}
 
@@ -28,6 +28,12 @@ class GestureElement {
 
 	releasePointerCapture(pointerId: number) {
 		this.captures.delete(pointerId);
+	}
+}
+
+class ControlGestureElement extends GestureElement {
+	closest(): Element | null {
+		return this as unknown as Element;
 	}
 }
 
@@ -385,6 +391,69 @@ nodeDescribe("useViewerGestures mouse panning", () => {
 });
 
 nodeDescribe("useViewerGestures touch arbitration", () => {
+	it("tombstones an excluded touch through an orphan release", () => {
+		const { gestures, stats } = mountTouchGestures("fit");
+		const stage = new GestureElement();
+		const control = new ControlGestureElement();
+		vi.useFakeTimers();
+		try {
+			gestures.onPointerDown(
+				touchPointerEvent(control, "pointerdown", 7, 100, 100),
+			);
+			gestures.onPointerUp(touchPointerEvent(stage, "pointerup", 7, 100, 100));
+			vi.advanceTimersByTime(280);
+			expect(stats.taps).toBe(0);
+			expect(stats.navigations).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("keeps an active stage gesture alive through an excluded cancel", () => {
+		const { gestures, pans, stats } = mountTouchGestures("zoomed");
+		const stage = new GestureElement();
+		const control = new ControlGestureElement();
+		gestures.onPointerDown(
+			touchPointerEvent(stage, "pointerdown", 1, 100, 200),
+		);
+		gestures.onPointerDown(
+			touchPointerEvent(control, "pointerdown", 2, 140, 240),
+		);
+		gestures.onPointerCancel(
+			touchPointerEvent(stage, "pointercancel", 2, 140, 240),
+		);
+		gestures.onPointerMove(
+			touchPointerEvent(stage, "pointermove", 1, 130, 240),
+		);
+		gestures.onPointerUp(touchPointerEvent(stage, "pointerup", 1, 130, 240));
+
+		expect(pans).toEqual([{ x: 30, y: 40 }]);
+		expect(stats.panStarts).toBe(1);
+		expect(stats.panEnds).toBe(1);
+		expect(stats.taps).toBe(0);
+	});
+
+	it("allows an excluded pointer ID to start a fresh stage touch after release", () => {
+		const { gestures, stats } = mountTouchGestures("fit");
+		const stage = new GestureElement();
+		const control = new ControlGestureElement();
+		vi.useFakeTimers();
+		try {
+			gestures.onPointerDown(
+				touchPointerEvent(control, "pointerdown", 9, 100, 100),
+			);
+			gestures.onPointerUp(touchPointerEvent(stage, "pointerup", 9, 100, 100));
+			gestures.onPointerDown(
+				touchPointerEvent(stage, "pointerdown", 9, 100, 100),
+			);
+			gestures.onPointerUp(touchPointerEvent(stage, "pointerup", 9, 100, 100));
+			vi.advanceTimersByTime(280);
+			expect(stats.taps).toBe(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("tracks two distinct pointers for incremental pinch callbacks", () => {
 		const { gestures, pinches, stats } = mountTouchGestures("fit");
 		const element = new GestureElement();

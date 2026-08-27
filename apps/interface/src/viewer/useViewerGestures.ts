@@ -119,7 +119,7 @@ function isViewerControlTarget(target: EventTarget | null): boolean {
 		(isElement(target) &&
 			Boolean(
 				target.closest(
-					"[data-viewer-controls], [data-viewer-chrome], [data-viewer-info], [data-viewer-zoom-controls], aside",
+					"[data-viewer-controls], [data-viewer-chrome], [data-viewer-info], [data-viewer-zoom-controls], [data-viewer-navigator], aside",
 				),
 			))
 	);
@@ -210,7 +210,6 @@ export function useViewerGestures({
 		const touch = touchGesture.current;
 		touchGesture.current = null;
 		touchPoints.current.clear();
-		ignoredTouchPointers.current.clear();
 		if (touch?.panStarted) panEndRef.current?.();
 		if (touch?.pinching) pinchEndRef.current?.();
 		if (touch) releaseTouchCapture(touch);
@@ -232,9 +231,15 @@ export function useViewerGestures({
 
 	const onPointerDown = useCallback(
 		(event: React.PointerEvent<HTMLElement>) => {
-			if (!viewerOpen || isViewerControlTarget(event.target)) return;
+			if (!viewerOpen) return;
+			if (event.pointerType === "touch") {
+				if (ignoredTouchPointers.current.has(event.pointerId)) return;
+				if (isViewerControlTarget(event.target)) {
+					ignoredTouchPointers.current.add(event.pointerId);
+					return;
+				}
+			} else if (isViewerControlTarget(event.target)) return;
 			if (event.pointerType === "mouse") {
-				if (isViewerControlTarget(event.target)) return;
 				if (event.isPrimary === false || event.button !== 0) return;
 				if (activeMouse.current || touchPoints.current.size > 0) return;
 				const target = event.currentTarget;
@@ -253,7 +258,6 @@ export function useViewerGestures({
 				return;
 			}
 			if (event.pointerType !== "touch") return;
-			ignoredTouchPointers.current.delete(event.pointerId);
 			if (touchPoints.current.has(event.pointerId)) return;
 			if (touchPoints.current.size >= 2) {
 				ignoredTouchPointers.current.add(event.pointerId);
@@ -377,13 +381,14 @@ export function useViewerGestures({
 
 	const finishTouch = useCallback(
 		(event: React.PointerEvent<HTMLElement>, cancelled: boolean) => {
+			if (ignoredTouchPointers.current.delete(event.pointerId)) return;
 			const gesture = touchGesture.current;
 			if (!gesture || !touchPoints.current.has(event.pointerId)) {
-				if (ignoredTouchPointers.current.delete(event.pointerId)) return;
+				if (gesture) return;
 				if (cancelled) {
-					touchPoints.current.clear();
 					clearPendingTap();
 					lastTap.current = null;
+					return;
 				}
 				// Preserve compatibility with host integrations that emit a synthetic
 				// touch-up without a preceding down on the stage itself.

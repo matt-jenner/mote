@@ -19,10 +19,7 @@ it("keeps the navigator viewport border visible in forced-colors mode", async ()
 		/>,
 	);
 	const viewport = view
-		.getByRole("img", {
-			name: "Navigator for Contrast photo",
-			includeHidden: true,
-		})
+		.getByTestId("viewer-navigator")
 		.element()
 		.querySelector<HTMLElement>("[data-viewer-navigator-viewport]");
 	if (!viewport) throw new Error("navigator viewport was not rendered");

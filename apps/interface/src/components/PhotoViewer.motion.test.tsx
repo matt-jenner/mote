@@ -120,9 +120,7 @@ it("keeps the navigator mounted and visible while manipulation is active", async
 		);
 	}
 	const view = await render(<Harness />);
-	const navigator = view
-		.getByRole("img", { name: "Navigator for Motion photo" })
-		.element();
+	const navigator = view.getByTestId("viewer-navigator").element();
 	expect(getComputedStyle(navigator).transitionDuration).not.toBe("0s");
 	const hide = setVisible as ((next: boolean) => void) | null;
 	const activate = setActive as ((next: boolean) => void) | null;

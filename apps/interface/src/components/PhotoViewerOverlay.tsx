@@ -26,6 +26,17 @@ import { ViewerZoomControls } from "./ViewerZoomControls";
 const controlAreaSelector =
 	"[data-viewer-controls], [data-viewer-chrome], [data-viewer-info], [data-viewer-zoom-controls], fieldset, aside";
 
+type ViewerZoomAnnouncement = "Fit" | `${number}%`;
+
+function zoomAnnouncement(
+	scale: number,
+	maxScale: number,
+): ViewerZoomAnnouncement {
+	if (!Number.isFinite(scale) || !Number.isFinite(maxScale) || scale <= 1)
+		return "Fit";
+	return `${Math.round((Math.min(scale, maxScale) / maxScale) * 100)}%`;
+}
+
 function isTabbable(element: HTMLElement): boolean {
 	if (
 		element.hasAttribute("disabled") ||
@@ -85,6 +96,10 @@ export function PhotoViewerOverlay({
 	const dialogRef = useRef<HTMLElement>(null);
 	const [previewFailedKey, setPreviewFailedKey] = useState<string | null>(null);
 	const [filmstripRevealed, setFilmstripRevealed] = useState(false);
+	const [announcedZoomLabel, setAnnouncedZoomLabel] =
+		useState<ViewerZoomAnnouncement>("Fit");
+	const announcementResetKey = `${state.currentAssetId ?? ""}:${state.previewGeneration}`;
+	const previousAnnouncementResetKey = useRef<string | null>(null);
 	const controlsFocused = useRef(false);
 	const entryFocusPending = useRef(true);
 	const drawableSizeRef = useRef({ width: 0, height: 0 });
@@ -115,6 +130,11 @@ export function PhotoViewerOverlay({
 		imageHeight: asset?.height ?? 0,
 		onInteraction: reportInteraction,
 	});
+	useEffect(() => {
+		if (previousAnnouncementResetKey.current === announcementResetKey) return;
+		previousAnnouncementResetKey.current = announcementResetKey;
+		setAnnouncedZoomLabel("Fit");
+	}, [announcementResetKey]);
 	const handleDrawableSizeChange = useCallback(
 		(size: { width: number; height: number }) => {
 			drawableSizeRef.current = size;
@@ -136,6 +156,7 @@ export function PhotoViewerOverlay({
 	}, [onHideControls]);
 	const handleSelectAsset = useCallback(
 		(assetId: string) => {
+			setAnnouncedZoomLabel("Fit");
 			reportInteraction();
 			onSelectAsset(assetId);
 		},
@@ -191,8 +212,18 @@ export function PhotoViewerOverlay({
 		(point: { x: number; y: number }) => {
 			reportInteraction();
 			if (!controlsFocused.current) controls.showForInput("mouse");
-			if (transform.mode === "zoomed") transform.reset();
-			else transform.zoomAt(transform.geometry.maxScale, point);
+			if (transform.mode === "zoomed") {
+				setAnnouncedZoomLabel("Fit");
+				transform.reset();
+			} else {
+				setAnnouncedZoomLabel(
+					zoomAnnouncement(
+						transform.geometry.maxScale,
+						transform.geometry.maxScale,
+					),
+				);
+				transform.zoomAt(transform.geometry.maxScale, point);
+			}
 		},
 		[controls, reportInteraction, transform],
 	);
@@ -212,11 +243,38 @@ export function PhotoViewerOverlay({
 		(point: { x: number; y: number }) => {
 			reportInteraction();
 			const drawablePoint = pointInDrawable(point);
-			if (transform.mode === "zoomed") transform.reset();
-			else transform.zoomAt(transform.geometry.maxScale, drawablePoint);
+			if (transform.mode === "zoomed") {
+				setAnnouncedZoomLabel("Fit");
+				transform.reset();
+			} else {
+				setAnnouncedZoomLabel(
+					zoomAnnouncement(
+						transform.geometry.maxScale,
+						transform.geometry.maxScale,
+					),
+				);
+				transform.zoomAt(transform.geometry.maxScale, drawablePoint);
+			}
 		},
 		[pointInDrawable, reportInteraction, transform],
 	);
+	const handleDiscreteStep = useCallback(
+		(direction: 1 | -1, anchor?: { x: number; y: number }) => {
+			const maxScale = transform.geometry.maxScale;
+			const scale = transform.geometry.scale;
+			const nextScale = Math.min(
+				maxScale,
+				Math.max(1, scale * (direction === 1 ? 1.25 : 1 / 1.25)),
+			);
+			setAnnouncedZoomLabel(zoomAnnouncement(nextScale, maxScale));
+			transform.step(direction, anchor);
+		},
+		[transform],
+	);
+	const handleDiscreteReset = useCallback(() => {
+		setAnnouncedZoomLabel("Fit");
+		transform.reset();
+	}, [transform]);
 	const pinchBaseScaleRef = useRef<number | null>(null);
 	const handleViewerPinchStart = useCallback(() => {
 		pinchBaseScaleRef.current = transform.geometry.scale;
@@ -260,6 +318,8 @@ export function PhotoViewerOverlay({
 		[controls],
 	);
 	const viewport = useViewerViewport();
+	const zoomControlsVisible =
+		state.controlsVisible && (!state.infoOpen || viewport.width >= 640);
 	const gestures = useViewerGestures({
 		onNavigate: (direction) => {
 			const nextIndex = currentIndex + (direction === "next" ? 1 : -1);
@@ -376,17 +436,17 @@ export function PhotoViewerOverlay({
 			);
 		if (!isEditable && (event.key === "+" || event.key === "=")) {
 			event.preventDefault();
-			transform.step(1, viewerCenter());
+			handleDiscreteStep(1, viewerCenter());
 			return;
 		}
 		if (!isEditable && event.key === "-") {
 			event.preventDefault();
-			transform.step(-1, viewerCenter());
+			handleDiscreteStep(-1, viewerCenter());
 			return;
 		}
 		if (!isEditable && event.key === "0") {
 			event.preventDefault();
-			transform.reset();
+			handleDiscreteReset();
 			return;
 		}
 		if (
@@ -568,14 +628,15 @@ export function PhotoViewerOverlay({
 				canZoomIn={transform.canZoomIn}
 				canZoomOut={transform.canZoomOut}
 				label={transform.zoomLabel}
-				onReset={transform.reset}
-				onZoomIn={() => transform.step(1, viewerCenter())}
-				onZoomOut={() => transform.step(-1, viewerCenter())}
-				visible={state.controlsVisible}
+				onReset={handleDiscreteReset}
+				onZoomIn={() => handleDiscreteStep(1, viewerCenter())}
+				onZoomOut={() => handleDiscreteStep(-1, viewerCenter())}
+				visible={zoomControlsVisible}
 			/>
 			{transform.mode === "zoomed" ? (
 				<ViewerNavigator
 					assetName={asset.displayName}
+					assetRevision={state.previewGeneration}
 					fallbackUrl={preview.baseUrl}
 					imageHeight={asset.height}
 					imageUrl={preview.currentUrl}
@@ -584,6 +645,7 @@ export function PhotoViewerOverlay({
 					onInteraction={reportInteraction}
 					onManipulationChange={handleNavigatorManipulation}
 					onRecenter={transform.recenter}
+					viewportRevision={viewport.revision}
 					visible={state.controlsVisible || panning || navigatorManipulating}
 					visibleRect={transform.geometry.visibleImageRect}
 				/>
@@ -595,7 +657,7 @@ export function PhotoViewerOverlay({
 				role="status"
 			>
 				{asset.displayName}, photo {currentPosition} of {assets.length}
-				{`, ${transform.zoomLabel}`}
+				{`, ${announcedZoomLabel}`}
 				{nextCursor ? " loaded" : ""}
 			</div>
 			<button

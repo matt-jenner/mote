@@ -1,6 +1,7 @@
 import {
 	type MouseEvent,
 	type PointerEvent,
+	useCallback,
 	useEffect,
 	useLayoutEffect,
 	useRef,
@@ -13,6 +14,7 @@ type CandidateDecodeStatus = "idle" | "pending" | "ready" | "failed";
 
 export interface ViewerNavigatorProps {
 	assetName: string;
+	assetRevision?: number;
 	imageUrl: string | null;
 	fallbackUrl?: string | null;
 	imageWidth: number;
@@ -23,6 +25,7 @@ export interface ViewerNavigatorProps {
 	onRecenter: (focal: ViewerPoint) => void;
 	onInteraction: () => void;
 	onManipulationChange?: (active: boolean) => void;
+	viewportRevision?: number;
 }
 
 export interface NavigatorBounds {
@@ -122,6 +125,7 @@ function focalForPointer(
 
 export function ViewerNavigator({
 	assetName,
+	assetRevision = 0,
 	imageUrl,
 	fallbackUrl = null,
 	imageWidth,
@@ -132,12 +136,15 @@ export function ViewerNavigator({
 	onRecenter,
 	onInteraction,
 	onManipulationChange,
+	viewportRevision = 0,
 }: ViewerNavigatorProps) {
 	const navigatorRef = useRef<HTMLDivElement>(null);
 	const imageRef = useRef<HTMLDivElement>(null);
 	const requestedUrlRef = useRef<string | null>(null);
 	const pointerIdRef = useRef<number | null>(null);
 	const movedRef = useRef(false);
+	const onManipulationChangeRef = useRef(onManipulationChange);
+	onManipulationChangeRef.current = onManipulationChange;
 	const [displayUrl, setDisplayUrl] = useState<string | null>(
 		fallbackUrl ?? imageUrl,
 	);
@@ -218,6 +225,29 @@ export function ViewerNavigator({
 		imageHeight,
 	);
 	const viewportStyle = navigatorViewportStyle(visibleRect);
+	const lifecycleKey = `${assetName}:${assetRevision}:${viewportRevision}:${interactive}:${visible}:${imageUrl ?? ""}:${fallbackUrl ?? ""}:${imageWidth}:${imageHeight}`;
+	const finishNavigatorPointer = useCallback((pointerId?: number) => {
+		const activePointerId = pointerIdRef.current;
+		if (
+			activePointerId === null ||
+			(pointerId !== undefined && activePointerId !== pointerId)
+		)
+			return;
+		const target = imageRef.current;
+		pointerIdRef.current = null;
+		onManipulationChangeRef.current?.(false);
+		try {
+			target?.releasePointerCapture?.(activePointerId);
+		} catch {
+			// The pointer may already have been released by the browser.
+		}
+	}, []);
+
+	useEffect(() => {
+		void lifecycleKey;
+		return () => finishNavigatorPointer();
+	}, [finishNavigatorPointer, lifecycleKey]);
+
 	const handlePointerDown = (event: PointerEvent<HTMLDivElement>) => {
 		if (!interactive || event.pointerType === "touch" || event.button !== 0)
 			return;
@@ -227,7 +257,7 @@ export function ViewerNavigator({
 		event.stopPropagation();
 		pointerIdRef.current = event.pointerId;
 		movedRef.current = false;
-		onManipulationChange?.(true);
+		onManipulationChangeRef.current?.(true);
 		try {
 			target.setPointerCapture?.(event.pointerId);
 		} catch {
@@ -253,13 +283,7 @@ export function ViewerNavigator({
 	const endPointer = (event: PointerEvent<HTMLDivElement>) => {
 		if (pointerIdRef.current !== event.pointerId) return;
 		event.stopPropagation();
-		pointerIdRef.current = null;
-		onManipulationChange?.(false);
-		try {
-			imageRef.current?.releasePointerCapture?.(event.pointerId);
-		} catch {
-			// The pointer may already have been released by the browser.
-		}
+		finishNavigatorPointer(event.pointerId);
 	};
 	const handleClick = (event: MouseEvent<HTMLDivElement>) => {
 		if (!interactive || event.detail === 0 || movedRef.current) {
@@ -275,18 +299,18 @@ export function ViewerNavigator({
 
 	return (
 		<div
-			aria-hidden={!interactive || !visible}
-			aria-label={`Navigator for ${assetName}`}
+			aria-hidden="true"
 			className={`${styles.viewerNavigator} ${!visible ? styles.viewerNavigatorHidden : ""}`}
 			data-viewer-navigator-decode-status={candidateDecodeStatus}
 			data-viewer-navigator="true"
+			data-viewer-navigator-interactive={interactive ? "true" : "false"}
+			data-testid="viewer-navigator"
 			onClick={handleClick}
 			onPointerCancel={endPointer}
 			onPointerDown={handlePointerDown}
 			onPointerMove={handlePointerMove}
 			onPointerUp={endPointer}
 			onLostPointerCapture={endPointer}
-			role="img"
 			ref={navigatorRef}
 			tabIndex={-1}
 		>

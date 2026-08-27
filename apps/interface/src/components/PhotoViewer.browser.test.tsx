@@ -347,6 +347,52 @@ function PreviewHarness({
 const largePreviewFixture =
 	"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4096' height='2731' viewBox='0 0 4096 2731'%3E%3Crect width='4096' height='2731' fill='%23225670'/%3E%3C/svg%3E";
 
+const thumbnailCeilingFixture =
+	"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1536' height='1024' viewBox='0 0 1536 1024'%3E%3Crect width='1536' height='1024' fill='%23225670'/%3E%3C/svg%3E";
+const previewCeilingFixture =
+	"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4096' height='2731' viewBox='0 0 4096 2731'%3E%3Crect width='4096' height='2731' fill='%233a8f68'/%3E%3C/svg%3E#preview-ceiling";
+
+function DecodeCeilingHarness() {
+	const transform = useViewerTransform({
+		assetId: "decode-ceiling",
+		assetRevision: 1,
+		imageWidth: 1200,
+		imageHeight: 800,
+		onInteraction: () => undefined,
+	});
+	return (
+		<>
+			<button
+				data-testid="decode-ceiling-zoom"
+				onClick={() => transform.step(1, { x: 300, y: 200 })}
+				type="button"
+			>
+				Zoom
+			</button>
+			<output data-testid="decode-ceiling-max">
+				{transform.geometry.maxScale}
+			</output>
+			<output data-testid="decode-ceiling-scale">
+				{transform.geometry.scale}
+			</output>
+			<div style={{ width: "600px", height: "400px" }}>
+				<ViewerStage
+					asset={asset("decode-ceiling", "Decode ceiling", 1)}
+					baseUrl={thumbnailCeilingFixture}
+					currentUrl={previewCeilingFixture}
+					onDrawableSizeChange={transform.setDrawableSize}
+					onNaturalSizeChange={transform.setNaturalSize}
+					previewGeneration={1}
+					service={previewService(async () => undefined)}
+					transform={transform.geometry}
+					viewportHeight={400}
+					viewportWidth={600}
+				/>
+			</div>
+		</>
+	);
+}
+
 function TransformHarness() {
 	const [previewReady, setPreviewReady] = useState(false);
 	const [revision, setRevision] = useState(1);
@@ -503,6 +549,66 @@ function RevisionPaintHarness() {
 			<output data-testid="revision-render-modes">
 				{renderModes.current.join(",")}
 			</output>
+		</>
+	);
+}
+
+function NavigatorLifecycleHarness() {
+	const [assetRevision, setAssetRevision] = useState(1);
+	const [viewportRevision, setViewportRevision] = useState(1);
+	const [interactive, setInteractive] = useState(true);
+	const [mounted, setMounted] = useState(true);
+	const [endCount, setEndCount] = useState(0);
+	return (
+		<>
+			{mounted ? (
+				<ViewerNavigator
+					assetName="Lifecycle photo"
+					assetRevision={assetRevision}
+					fallbackUrl={cachedPixel}
+					imageHeight={800}
+					imageUrl={null}
+					imageWidth={1200}
+					interactive={interactive}
+					onInteraction={() => undefined}
+					onManipulationChange={(active) => {
+						if (!active) setEndCount((count) => count + 1);
+					}}
+					onRecenter={() => undefined}
+					viewportRevision={viewportRevision}
+					visible
+					visibleRect={{ x: 0.25, y: 0.25, width: 0.5, height: 0.5 }}
+				/>
+			) : null}
+			<button
+				data-testid="navigator-lifecycle-asset"
+				onClick={() => setAssetRevision((revision) => revision + 1)}
+				type="button"
+			>
+				Asset
+			</button>
+			<button
+				data-testid="navigator-lifecycle-viewport"
+				onClick={() => setViewportRevision((revision) => revision + 1)}
+				type="button"
+			>
+				Viewport
+			</button>
+			<button
+				data-testid="navigator-lifecycle-modality"
+				onClick={() => setInteractive((value) => !value)}
+				type="button"
+			>
+				Modality
+			</button>
+			<button
+				data-testid="navigator-lifecycle-unmount"
+				onClick={() => setMounted(false)}
+				type="button"
+			>
+				Unmount
+			</button>
+			<output data-testid="navigator-lifecycle-end-count">{endCount}</output>
 		</>
 	);
 }
@@ -700,6 +806,107 @@ describe("immersive photo viewer checkpoint", () => {
 		expect(layer.style.transform).toBe(before);
 	});
 
+	it("keeps the thumbnail zoom ceiling until the screen preview decodes", async () => {
+		const originalDecode = HTMLImageElement.prototype.decode;
+		let releaseDecode: (() => void) | null = null;
+		HTMLImageElement.prototype.decode = function () {
+			if (this.src.includes("preview-ceiling"))
+				return new Promise<void>((resolve) => {
+					releaseDecode = resolve;
+				});
+			return originalDecode.call(this);
+		};
+		try {
+			const view = await render(<DecodeCeilingHarness />);
+			const stage = view.getByTestId("viewer-stage").element();
+			const thumbnail = stage.querySelector<HTMLImageElement>(
+				"[data-viewer-layer='wallThumbnail']",
+			);
+			const frame = view.getByTestId("viewer-frame").element();
+			await expect.poll(() => thumbnail?.naturalWidth ?? 0).toBeGreaterThan(0);
+			const thumbnailCeiling = Math.min(
+				(thumbnail?.naturalWidth ?? 0) / frame.getBoundingClientRect().width,
+				(thumbnail?.naturalHeight ?? 0) / frame.getBoundingClientRect().height,
+			);
+			await expect
+				.poll(() =>
+					Number(view.getByTestId("decode-ceiling-max").element().textContent),
+				)
+				.toBeCloseTo(thumbnailCeiling, 2);
+			const release = releaseDecode as (() => void) | null;
+			if (!release) throw new Error("screen preview decode did not start");
+			await view.getByTestId("decode-ceiling-zoom").click();
+			const scaleBefore = Number(
+				view.getByTestId("decode-ceiling-scale").element().textContent,
+			);
+			expect(scaleBefore).toBe(1.25);
+			release();
+			await expect
+				.poll(() =>
+					Number(view.getByTestId("decode-ceiling-max").element().textContent),
+				)
+				.toBeGreaterThan(thumbnailCeiling);
+			expect(
+				Number(view.getByTestId("decode-ceiling-scale").element().textContent),
+			).toBe(scaleBefore);
+			await view.unmount();
+		} finally {
+			HTMLImageElement.prototype.decode = originalDecode;
+		}
+	});
+
+	it("restores the thumbnail zoom ceiling when screen preview decoding fails", async () => {
+		const originalDecode = HTMLImageElement.prototype.decode;
+		let rejectDecode: ((reason?: unknown) => void) | null = null;
+		HTMLImageElement.prototype.decode = function () {
+			if (this.src.includes("preview-ceiling"))
+				return new Promise<void>((_, reject) => {
+					rejectDecode = reject;
+				});
+			return originalDecode.call(this);
+		};
+		try {
+			const view = await render(<DecodeCeilingHarness />);
+			const stage = view.getByTestId("viewer-stage").element();
+			const thumbnail = stage.querySelector<HTMLImageElement>(
+				"[data-viewer-layer='wallThumbnail']",
+			);
+			const frame = view.getByTestId("viewer-frame").element();
+			await expect.poll(() => thumbnail?.naturalWidth ?? 0).toBeGreaterThan(0);
+			const thumbnailCeiling = Math.min(
+				(thumbnail?.naturalWidth ?? 0) / frame.getBoundingClientRect().width,
+				(thumbnail?.naturalHeight ?? 0) / frame.getBoundingClientRect().height,
+			);
+			await expect
+				.poll(() =>
+					Number(view.getByTestId("decode-ceiling-max").element().textContent),
+				)
+				.toBeCloseTo(thumbnailCeiling, 2);
+			const reject = rejectDecode as ((reason?: unknown) => void) | null;
+			if (!reject) throw new Error("screen preview decode did not start");
+			await view.getByTestId("decode-ceiling-zoom").click();
+			const scaleBefore = Number(
+				view.getByTestId("decode-ceiling-scale").element().textContent,
+			);
+			expect(scaleBefore).toBe(1.25);
+			reject(new Error("screen preview unavailable"));
+			await expect
+				.element(view.getByTestId("viewer-stage"))
+				.toHaveAttribute("data-large-preview-unavailable", "true");
+			await expect
+				.poll(() =>
+					Number(view.getByTestId("decode-ceiling-max").element().textContent),
+				)
+				.toBeCloseTo(thumbnailCeiling, 2);
+			expect(
+				Number(view.getByTestId("decode-ceiling-scale").element().textContent),
+			).toBe(scaleBefore);
+			await view.unmount();
+		} finally {
+			HTMLImageElement.prototype.decode = originalDecode;
+		}
+	});
+
 	it("resets on navigation while preserving zoom through rotation", async () => {
 		const view = await render(<TransformHarness />);
 		await view.getByTestId("zoom-programmatically").click();
@@ -775,6 +982,26 @@ describe("immersive photo viewer checkpoint", () => {
 		}
 
 		const overlay = dialog.element();
+		const capturedPointers = new Set<number>();
+		const captured = new Map<number, boolean>();
+		Object.defineProperty(overlay, "setPointerCapture", {
+			configurable: true,
+			value: (pointerId: number) => {
+				capturedPointers.add(pointerId);
+				captured.set(pointerId, true);
+			},
+		});
+		Object.defineProperty(overlay, "hasPointerCapture", {
+			configurable: true,
+			value: (pointerId: number) => captured.has(pointerId),
+		});
+		Object.defineProperty(overlay, "releasePointerCapture", {
+			configurable: true,
+			value: (pointerId: number) => {
+				captured.delete(pointerId);
+			},
+		});
+		const layer = view.getByTestId("viewer-transform-layer").element();
 		const drag = (type: string, x: number, y: number) =>
 			overlay.dispatchEvent(
 				new PointerEvent(type, {
@@ -787,11 +1014,15 @@ describe("immersive photo viewer checkpoint", () => {
 					pointerType: "mouse",
 				}),
 			);
+		const beforeDrag = layer.style.transform;
 		drag("pointerdown", 600, 400);
 		drag("pointermove", 630, 430);
 		await expect.poll(() => getComputedStyle(stage).cursor).toBe("grabbing");
+		await expect.poll(() => layer.style.transform).not.toBe(beforeDrag);
+		expect(capturedPointers.has(88)).toBe(true);
 		drag("pointerup", 630, 430);
 		await expect.poll(() => getComputedStyle(stage).cursor).toBe("grab");
+		expect(captured.has(88)).toBe(false);
 
 		const ordinaryWheel = new WheelEvent("wheel", {
 			bubbles: true,
@@ -825,6 +1056,15 @@ describe("immersive photo viewer checkpoint", () => {
 		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
 		expect(modifiedWheel.defaultPrevented).toBe(true);
 
+		await userEvent.keyboard("0");
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+		overlay.focus();
+		await userEvent.keyboard("+");
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+		await userEvent.keyboard("-");
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+		await userEvent.keyboard("=");
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
 		await userEvent.keyboard("0");
 		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
 		stage.dispatchEvent(
@@ -908,7 +1148,17 @@ describe("immersive photo viewer checkpoint", () => {
 			.closest("[role='dialog']")
 			?.querySelector<HTMLElement>("[data-viewer-navigator]");
 		if (!navigator) throw new Error("navigator was not rendered after zooming");
-		expect(navigator.getAttribute("aria-hidden")).toBe("false");
+		expect(navigator.getAttribute("aria-hidden")).toBe("true");
+		expect(navigator.getAttribute("role")).toBeNull();
+		expect(getComputedStyle(navigator).pointerEvents).toBe("auto");
+		expect(
+			view
+				.getByRole("img", {
+					name: "Navigator for Coast",
+					includeHidden: true,
+				})
+				.query(),
+		).toBeNull();
 		const viewport = navigator.querySelector<HTMLElement>(
 			"[data-viewer-navigator-viewport]",
 		);
@@ -973,6 +1223,7 @@ describe("immersive photo viewer checkpoint", () => {
 			if (!navigator)
 				throw new Error("navigator was not rendered after zooming");
 			expect(navigator.getAttribute("aria-hidden")).toBe("true");
+			expect(getComputedStyle(navigator).pointerEvents).toBe("none");
 			const layer = view.getByTestId("viewer-transform-layer").element();
 			const before = layer.style.transform;
 			navigator.dispatchEvent(
@@ -1174,6 +1425,42 @@ describe("immersive photo viewer checkpoint", () => {
 		await narrow.view.unmount();
 	});
 
+	it("hides the narrow drawer-covered zoom cluster and restores its tab order", async () => {
+		await page.viewport(390, 844);
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await view.getByRole("button", { name: "Zoom in" }).click();
+		const dialog = view.getByRole("dialog", { name: "Photo viewer" }).element();
+		const zoomCluster = dialog.querySelector<HTMLElement>(
+			"[data-viewer-zoom-controls]",
+		);
+		if (!zoomCluster) throw new Error("zoom cluster was not rendered");
+		await view.getByRole("button", { name: "Photo information" }).click();
+		const drawer = view
+			.getByRole("complementary", { name: "Photo information" })
+			.element();
+		expect(getComputedStyle(zoomCluster).display).toBe("none");
+		expect(
+			[...zoomCluster.querySelectorAll<HTMLButtonElement>("button")].every(
+				(button) => button.tabIndex < 0,
+			),
+		).toBe(true);
+		expect(zoomCluster.getBoundingClientRect().right).toBeLessThanOrEqual(
+			drawer.getBoundingClientRect().left,
+		);
+		await view.getByRole("button", { name: "Close photo information" }).click();
+		await expect
+			.poll(() => getComputedStyle(zoomCluster).display)
+			.not.toBe("none");
+		expect(
+			[...zoomCluster.querySelectorAll<HTMLButtonElement>("button")].every(
+				(button) => button.tabIndex === 0,
+			),
+		).toBe(true);
+		expect(zoomCluster.getBoundingClientRect().right).toBeLessThanOrEqual(390);
+		await view.unmount();
+	});
+
 	it("measures phone content bounds before fitting the navigator image", async () => {
 		await page.viewport(390, 844);
 		const restorePointer = installPointerModality(true);
@@ -1298,12 +1585,7 @@ describe("immersive photo viewer checkpoint", () => {
 				/>
 			</>,
 		);
-		const navigator = view
-			.getByRole("img", {
-				name: "Navigator for Motion photo",
-				includeHidden: true,
-			})
-			.element();
+		const navigator = view.getByTestId("viewer-navigator").element();
 		expect(getComputedStyle(navigator).transitionDuration).toBe("0s");
 		expect(getComputedStyle(navigator).opacity).toBe("0");
 		expect(getComputedStyle(navigator).visibility).toBe("hidden");
@@ -1488,6 +1770,59 @@ describe("immersive photo viewer checkpoint", () => {
 		expect(stats.panEnds).toBe(1);
 	});
 
+	it("ends an active navigator drag on every mounted lifecycle boundary", async () => {
+		const view = await render(<NavigatorLifecycleHarness />);
+		const beginDrag = () => {
+			const navigator = view
+				.getByTestId("navigator-lifecycle-end-count")
+				.element()
+				.parentElement?.querySelector<HTMLElement>("[data-viewer-navigator]");
+			if (!navigator) throw new Error("navigator was not mounted");
+			navigator.dispatchEvent(
+				new PointerEvent("pointerdown", {
+					bubbles: true,
+					button: 0,
+					clientX: 100,
+					clientY: 100,
+					isPrimary: true,
+					pointerId: 701,
+					pointerType: "mouse",
+				}),
+			);
+		};
+		for (const action of [
+			"navigator-lifecycle-asset",
+			"navigator-lifecycle-viewport",
+			"navigator-lifecycle-modality",
+		] as const) {
+			beginDrag();
+			const before = Number(
+				view.getByTestId("navigator-lifecycle-end-count").element().textContent,
+			);
+			await view.getByTestId(action).click();
+			await expect
+				.poll(() =>
+					Number(
+						view.getByTestId("navigator-lifecycle-end-count").element()
+							.textContent,
+					),
+				)
+				.toBe(before + 1);
+		}
+		await view.getByTestId("navigator-lifecycle-modality").click();
+		beginDrag();
+		await view.getByTestId("navigator-lifecycle-unmount").click();
+		await expect
+			.poll(() =>
+				Number(
+					view.getByTestId("navigator-lifecycle-end-count").element()
+						.textContent,
+				),
+			)
+			.toBe(4);
+		await view.unmount();
+	});
+
 	it("opens the selected tile above the mounted wall and returns to its exact position", async () => {
 		const { view, tile } = await openAsset("Coast");
 		const wall = view.getByRole("region", { name: "Photos" });
@@ -1643,10 +1978,202 @@ describe("immersive photo viewer checkpoint", () => {
 		const status = view.getByTestId("viewer-status");
 		await expect.element(status).toHaveAttribute("aria-live", "polite");
 		await expect.element(status).toHaveTextContent("Fit");
+		const mutations: MutationRecord[] = [];
+		const observer = new MutationObserver((records) =>
+			mutations.push(...records),
+		);
+		observer.observe(status.element(), {
+			characterData: true,
+			childList: true,
+			subtree: true,
+		});
+		try {
+			await view.getByRole("button", { name: "Zoom in" }).click();
+			await expect.element(status).toHaveTextContent(/\d+%/);
+			await new Promise((resolve) => window.setTimeout(resolve, 0));
+			expect(mutations.length).toBeGreaterThan(0);
+			mutations.splice(0, mutations.length);
+			await view.getByRole("button", { name: "Reset zoom" }).click();
+			await expect.element(status).toHaveTextContent("Fit");
+			await new Promise((resolve) => window.setTimeout(resolve, 0));
+			expect(mutations.length).toBeGreaterThan(0);
+		} finally {
+			observer.disconnect();
+			await view.unmount();
+		}
+	});
+
+	it("keeps continuous zoom and pan frames out of the polite live region", async () => {
+		await page.viewport(800, 600);
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const overlay = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		const stage = view.getByTestId("viewer-stage").element();
 		await view.getByRole("button", { name: "Zoom in" }).click();
-		await expect.element(status).toHaveTextContent(/\d+%/);
 		await view.getByRole("button", { name: "Reset zoom" }).click();
-		await expect.element(status).toHaveTextContent("Fit");
+		const status = view.getByTestId("viewer-status").element();
+		const mutations: MutationRecord[] = [];
+		const observer = new MutationObserver((records) =>
+			mutations.push(...records),
+		);
+		observer.observe(status, {
+			characterData: true,
+			childList: true,
+			subtree: true,
+		});
+		const flush = () =>
+			new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+		const clearMutations = () => {
+			mutations.splice(0, mutations.length);
+		};
+		try {
+			const modifiedWheel = new WheelEvent("wheel", {
+				bubbles: true,
+				cancelable: true,
+				ctrlKey: true,
+				deltaY: -24,
+				clientX: 720,
+				clientY: 400,
+			});
+			stage.dispatchEvent(modifiedWheel);
+			await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+			await flush();
+			expect(mutations).toHaveLength(0);
+
+			await view.getByRole("button", { name: "Reset zoom" }).click();
+			await flush();
+			clearMutations();
+			stage.dispatchEvent(
+				new MouseEvent("dblclick", {
+					bubbles: true,
+					clientX: 400,
+					clientY: 300,
+				}),
+			);
+			await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+			await flush();
+			expect(mutations.length).toBeGreaterThan(0);
+			expect(status.textContent).toMatch(/\d+%/);
+			clearMutations();
+			stage.dispatchEvent(
+				new MouseEvent("dblclick", {
+					bubbles: true,
+					clientX: 400,
+					clientY: 300,
+				}),
+			);
+			await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+			await flush();
+			expect(mutations.length).toBeGreaterThan(0);
+			expect(status.textContent).toContain("Fit");
+
+			await view.getByRole("button", { name: "Reset zoom" }).click();
+			clearMutations();
+			const touch = (type: string, pointerId: number, x: number, y: number) =>
+				overlay.dispatchEvent(
+					new PointerEvent(type, {
+						bubbles: true,
+						cancelable: true,
+						clientX: x,
+						clientY: y,
+						isPrimary: pointerId === 601,
+						pointerId,
+						pointerType: "touch",
+					}),
+				);
+			touch("pointerdown", 601, 560, 400);
+			touch("pointerdown", 602, 680, 400);
+			touch("pointermove", 601, 520, 400);
+			touch("pointermove", 602, 720, 400);
+			touch("pointerup", 601, 520, 400);
+			touch("pointerup", 602, 720, 400);
+			await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+			await flush();
+			expect(mutations).toHaveLength(0);
+
+			clearMutations();
+			touch("pointerdown", 603, 720, 400);
+			touch("pointermove", 603, 760, 430);
+			touch("pointerup", 603, 760, 430);
+			await flush();
+			expect(mutations).toHaveLength(0);
+
+			const navigator = overlay.querySelector<HTMLElement>(
+				"[data-viewer-navigator]",
+			);
+			if (!navigator) throw new Error("navigator was not rendered");
+			clearMutations();
+			navigator.dispatchEvent(
+				new PointerEvent("pointerdown", {
+					bubbles: true,
+					button: 0,
+					clientX: 760,
+					clientY: 120,
+					isPrimary: true,
+					pointerId: 604,
+					pointerType: "mouse",
+				}),
+			);
+			navigator.dispatchEvent(
+				new PointerEvent("pointermove", {
+					bubbles: true,
+					button: 0,
+					clientX: 700,
+					clientY: 150,
+					isPrimary: true,
+					pointerId: 604,
+					pointerType: "mouse",
+				}),
+			);
+			navigator.dispatchEvent(
+				new PointerEvent("pointerup", {
+					bubbles: true,
+					button: 0,
+					clientX: 700,
+					clientY: 150,
+					isPrimary: true,
+					pointerId: 604,
+					pointerType: "mouse",
+				}),
+			);
+			await flush();
+			expect(mutations).toHaveLength(0);
+
+			await view.getByRole("button", { name: "Reset zoom" }).click();
+			await flush();
+			clearMutations();
+			overlay.focus();
+			const discrete = async (key: string, expected: RegExp | string) => {
+				clearMutations();
+				overlay.dispatchEvent(
+					new KeyboardEvent("keydown", {
+						bubbles: true,
+						cancelable: true,
+						key,
+					}),
+				);
+				await flush();
+				expect(
+					mutations.length,
+					`${key} did not mutate status: ${status.textContent}`,
+				).toBeGreaterThan(0);
+				expect(status.textContent).toMatch(
+					typeof expected === "string" ? new RegExp(expected) : expected,
+				);
+			};
+			await discrete("+", /\d+%/);
+			await discrete("=", /\d+%/);
+			await discrete("-", /\d+%/);
+			await discrete("0", /Fit/);
+		} finally {
+			observer.disconnect();
+			await view.unmount();
+		}
 	});
 
 	it("audits every open viewer accessibility state without navigator focus traps", async () => {
@@ -1666,7 +2193,7 @@ describe("immersive photo viewer checkpoint", () => {
 		);
 		if (!navigator) throw new Error("zoomed viewer navigator was not rendered");
 		expect(navigator.tabIndex).toBe(-1);
-		expect(navigator.getAttribute("aria-hidden")).toBe("false");
+		expect(navigator.getAttribute("aria-hidden")).toBe("true");
 		await runAxe();
 
 		vi.useFakeTimers();
@@ -2448,6 +2975,83 @@ describe("immersive photo viewer checkpoint", () => {
 		expect(transform?.style.transform).toBe(before);
 	});
 
+	it("tombstones excluded drawer, filmstrip, and zoom touches through outside release", async () => {
+		const service = serviceWithReadyPhotos(false, 3);
+		const originalDerivativeUrl = service.derivativeUrl.bind(service);
+		service.derivativeUrl = (reference) =>
+			reference.kind === "wallThumbnail"
+				? "/demo-photos/coast.jpg"
+				: originalDerivativeUrl(reference);
+		const { view } = await openAssetWithService(service, "Photo 0");
+		const overlay = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		const stage = view.getByTestId("viewer-stage").element();
+		await view.getByRole("button", { name: "Zoom in" }).click();
+		const controls = overlay.querySelector<HTMLElement>(
+			"[data-viewer-controls]",
+		);
+		const zoomIn = view.getByRole("button", { name: "Zoom in" }).element();
+		const filmstrip = view
+			.getByRole("group", { name: "Photo filmstrip" })
+			.getByRole("button", { name: "Photo 0", exact: true })
+			.element();
+		const dispatch = (
+			target: Element,
+			type: string,
+			pointerId: number,
+			x = 620,
+			y = 400,
+		) =>
+			target.dispatchEvent(
+				new PointerEvent(type, {
+					bubbles: true,
+					cancelable: true,
+					clientX: x,
+					clientY: y,
+					isPrimary: true,
+					pointerId,
+					pointerType: "touch",
+				}),
+			);
+		const assertOutsideReleaseIsIgnored = (
+			target: Element,
+			pointerId: number,
+		) => {
+			dispatch(target, "pointerdown", pointerId);
+			dispatch(overlay, "pointerup", pointerId);
+			expect(controls?.getAttribute("aria-hidden")).toBe("false");
+			expect(stage.dataset.currentAsset).toBe("photo-0");
+		};
+		assertOutsideReleaseIsIgnored(zoomIn, 801);
+		assertOutsideReleaseIsIgnored(filmstrip, 802);
+
+		await view.getByRole("button", { name: "Photo information" }).click();
+		const drawer = view
+			.getByRole("complementary", { name: "Photo information" })
+			.element();
+		assertOutsideReleaseIsIgnored(drawer, 803);
+
+		const before = stage.querySelector<HTMLElement>(
+			"[data-testid='viewer-transform-layer']",
+		)?.style.transform;
+		dispatch(stage, "pointerdown", 804, 520, 400);
+		dispatch(drawer, "pointerdown", 805, 560, 420);
+		dispatch(overlay, "pointercancel", 805, 560, 420);
+		dispatch(stage, "pointermove", 804, 600, 440);
+		dispatch(stage, "pointerup", 804, 600, 440);
+		await expect
+			.poll(
+				() =>
+					stage.querySelector<HTMLElement>(
+						"[data-testid='viewer-transform-layer']",
+					)?.style.transform,
+			)
+			.not.toBe(before);
+		expect(stage.dataset.currentAsset).toBe("photo-0");
+		await view.unmount();
+	});
+
 	it("clears a pending single tap on pointer cancellation and asset revision", async () => {
 		const { view, tile } = await openAsset("Coast");
 		(tile.element() as HTMLButtonElement).click();
@@ -3051,6 +3655,9 @@ describe("immersive photo viewer checkpoint", () => {
 		const controls = overlay.querySelector<HTMLElement>(
 			"[data-viewer-controls]",
 		);
+		const zoomControls = overlay.querySelector<HTMLElement>(
+			"[data-viewer-zoom-controls]",
+		);
 		const next = view.getByRole("button", { name: "Next photo" }).element();
 		vi.useFakeTimers();
 		try {
@@ -3080,7 +3687,11 @@ describe("immersive photo viewer checkpoint", () => {
 			next.focus();
 			await vi.advanceTimersByTimeAsync(3000);
 			expect(controls?.getAttribute("aria-hidden")).toBe("false");
-			next.blur();
+			const zoomIn = view.getByRole("button", { name: "Zoom in" }).element();
+			zoomIn.focus();
+			await vi.advanceTimersByTimeAsync(3000);
+			expect(zoomControls?.getAttribute("aria-hidden")).toBe("false");
+			zoomIn.blur();
 			await vi.advanceTimersByTimeAsync(2499);
 			expect(controls?.getAttribute("aria-hidden")).toBe("false");
 			await vi.advanceTimersByTimeAsync(1);
