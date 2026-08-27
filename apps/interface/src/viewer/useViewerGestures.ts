@@ -44,15 +44,23 @@ interface ActiveGesture {
 	inDrawer: boolean;
 	viewState: ViewerGestureViewState;
 	startRevision: number;
+	startAssetRevision: number;
+	lastX: number;
+	lastY: number;
+	panStarted: boolean;
 	target: HTMLElement;
 }
 
 interface ViewerGesturesOptions {
 	viewerOpen: boolean;
 	viewportRevision: number;
+	assetRevision?: number;
 	viewState?: ViewerGestureViewState;
 	onNavigate: (direction: "next" | "previous") => void;
 	onTap: () => void;
+	onPanStart?: () => void;
+	onPan?: (delta: { x: number; y: number }) => void;
+	onPanEnd?: () => void;
 }
 
 export interface ViewerGestures {
@@ -73,31 +81,47 @@ function isInteractiveTarget(target: EventTarget | null): boolean {
 export function useViewerGestures({
 	viewerOpen,
 	viewportRevision,
+	assetRevision = 0,
 	viewState = "fit",
 	onNavigate,
 	onTap,
+	onPanStart,
+	onPan,
+	onPanEnd,
 }: ViewerGesturesOptions): ViewerGestures {
 	const activeGesture = useRef<ActiveGesture | null>(null);
 	const revisionRef = useRef(viewportRevision);
+	const assetRevisionRef = useRef(assetRevision);
 	const previousRevision = useRef(viewportRevision);
+	const previousAssetRevision = useRef(assetRevision);
 	const navigateRef = useRef(onNavigate);
 	const tapRef = useRef(onTap);
+	const panStartRef = useRef(onPanStart);
+	const panRef = useRef(onPan);
+	const panEndRef = useRef(onPanEnd);
 	revisionRef.current = viewportRevision;
+	assetRevisionRef.current = assetRevision;
 	navigateRef.current = onNavigate;
 	tapRef.current = onTap;
+	panStartRef.current = onPanStart;
+	panRef.current = onPan;
+	panEndRef.current = onPanEnd;
 
 	const cancel = useCallback(() => {
 		const gesture = activeGesture.current;
+		activeGesture.current = null;
+		if (gesture?.panStarted) panEndRef.current?.();
 		if (gesture?.target.hasPointerCapture?.(gesture.pointerId)) {
 			gesture.target.releasePointerCapture(gesture.pointerId);
 		}
-		activeGesture.current = null;
 	}, []);
 
 	useLayoutEffect(() => {
 		if (previousRevision.current !== viewportRevision) cancel();
 		previousRevision.current = viewportRevision;
-	}, [cancel, viewportRevision]);
+		if (previousAssetRevision.current !== assetRevision) cancel();
+		previousAssetRevision.current = assetRevision;
+	}, [assetRevision, cancel, viewportRevision]);
 
 	useEffect(() => {
 		if (!viewerOpen) cancel();
@@ -122,8 +146,16 @@ export function useViewerGestures({
 						: false,
 				viewState,
 				startRevision: revisionRef.current,
+				startAssetRevision: assetRevisionRef.current,
+				lastX: event.clientX,
+				lastY: event.clientY,
+				panStarted:
+					event.pointerType === "mouse" &&
+					viewState === "zoomed" &&
+					!(event.target instanceof Element && event.target.closest("aside")),
 				target,
 			};
+			if (activeGesture.current.panStarted) panStartRef.current?.();
 			try {
 				target.setPointerCapture(event.pointerId);
 			} catch {
@@ -137,6 +169,14 @@ export function useViewerGestures({
 		(event: React.PointerEvent<HTMLElement>) => {
 			const gesture = activeGesture.current;
 			if (!gesture || gesture.pointerId !== event.pointerId) return;
+			if (gesture.panStarted) {
+				panRef.current?.({
+					x: event.clientX - gesture.lastX,
+					y: event.clientY - gesture.lastY,
+				});
+				gesture.lastX = event.clientX;
+				gesture.lastY = event.clientY;
+			}
 			// Keep the gesture alive while the browser decides whether a drawer scroll wins.
 		},
 		[],
@@ -160,6 +200,7 @@ export function useViewerGestures({
 			}
 			if (gesture.pointerId !== event.pointerId) return;
 			activeGesture.current = null;
+			if (gesture.panStarted) panEndRef.current?.();
 			if (gesture.target.hasPointerCapture?.(gesture.pointerId)) {
 				gesture.target.releasePointerCapture(gesture.pointerId);
 			}
@@ -167,7 +208,9 @@ export function useViewerGestures({
 				cancelled ||
 				gesture.pointerType !== "touch" ||
 				gesture.startRevision !== revisionRef.current ||
-				gesture.startRevision !== viewportRevision
+				gesture.startRevision !== viewportRevision ||
+				gesture.startAssetRevision !== assetRevisionRef.current ||
+				gesture.startAssetRevision !== assetRevision
 			)
 				return;
 			const result = classifyViewerGesture({
@@ -180,7 +223,7 @@ export function useViewerGestures({
 				navigateRef.current(result);
 			else if (result === "tap" && !gesture.inDrawer) tapRef.current();
 		},
-		[viewportRevision],
+		[assetRevision, viewportRevision],
 	);
 
 	return {

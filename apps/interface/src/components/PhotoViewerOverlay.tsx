@@ -15,12 +15,14 @@ import { useViewerPreview } from "../viewer/useViewerPreview";
 import { useViewerTransform } from "../viewer/useViewerTransform";
 import type { ViewerState } from "../viewer/viewerReducer";
 import { useViewerViewport } from "../viewer/viewerViewport";
+import { classifyViewerWheel } from "../viewer/viewerZoomInput";
 import { PhotoInfoDrawer } from "./PhotoInfoDrawer";
 import { ViewerFilmstrip } from "./ViewerFilmstrip";
 import { ViewerStage } from "./ViewerStage";
+import { ViewerZoomControls } from "./ViewerZoomControls";
 
 const controlAreaSelector =
-	"[data-viewer-controls], [data-viewer-chrome], [data-viewer-info], fieldset, aside";
+	"[data-viewer-controls], [data-viewer-chrome], [data-viewer-info], [data-viewer-zoom-controls], fieldset, aside";
 
 function isTabbable(element: HTMLElement): boolean {
 	if (
@@ -83,6 +85,8 @@ export function PhotoViewerOverlay({
 	const [filmstripRevealed, setFilmstripRevealed] = useState(false);
 	const controlsFocused = useRef(false);
 	const entryFocusPending = useRef(true);
+	const drawableSizeRef = useRef({ width: 0, height: 0 });
+	const [panning, setPanning] = useState(false);
 	const asset = assets.find((item) => item.id === state.currentAssetId);
 	const currentIndex = findViewerIndex(assets, state.currentAssetId ?? "");
 	const preview = useViewerPreview({
@@ -108,6 +112,13 @@ export function PhotoViewerOverlay({
 		imageHeight: asset?.height ?? 0,
 		onInteraction: reportInteraction,
 	});
+	const handleDrawableSizeChange = useCallback(
+		(size: { width: number; height: number }) => {
+			drawableSizeRef.current = size;
+			transform.setDrawableSize(size);
+		},
+		[transform.setDrawableSize],
+	);
 	const handleHideControls = useCallback(() => {
 		const active = document.activeElement;
 		if (
@@ -144,6 +155,57 @@ export function PhotoViewerOverlay({
 		onShow: onShowControls,
 		onToggleTouch: onToggleTouchControls,
 	});
+	const viewerCenter = useCallback(
+		() => ({
+			x: drawableSizeRef.current.width / 2,
+			y: drawableSizeRef.current.height / 2,
+		}),
+		[],
+	);
+	const handleViewerWheel = useCallback(
+		(event: WheelEvent, point: { x: number; y: number }) => {
+			const intent = classifyViewerWheel({
+				deltaX: event.deltaX,
+				deltaY: event.deltaY,
+				ctrlKey: event.ctrlKey,
+				metaKey: event.metaKey,
+				mode: transform.mode,
+			});
+			if (intent.kind === "none") return false;
+			reportInteraction();
+			if (!controlsFocused.current) controls.showForInput("mouse");
+			if (intent.kind === "zoom")
+				transform.zoomAt(
+					transform.geometry.scale * (intent.zoomFactor ?? 1),
+					point,
+				);
+			else if (intent.delta) transform.panBy(intent.delta);
+			return true;
+		},
+		[controls, reportInteraction, transform],
+	);
+	const handleViewerDoubleClick = useCallback(
+		(point: { x: number; y: number }) => {
+			reportInteraction();
+			if (!controlsFocused.current) controls.showForInput("mouse");
+			if (transform.mode === "zoomed") transform.reset();
+			else transform.zoomAt(transform.geometry.maxScale, point);
+		},
+		[controls, reportInteraction, transform],
+	);
+	const handlePanStart = useCallback(() => {
+		setPanning(true);
+	}, []);
+	const handlePan = useCallback(
+		(delta: { x: number; y: number }) => {
+			reportInteraction();
+			transform.panBy(delta);
+		},
+		[reportInteraction, transform.panBy],
+	);
+	const handlePanEnd = useCallback(() => {
+		setPanning(false);
+	}, []);
 	const viewport = useViewerViewport();
 	const gestures = useViewerGestures({
 		onNavigate: (direction) => {
@@ -153,8 +215,12 @@ export function PhotoViewerOverlay({
 		},
 		onTap: () => controls.toggleTouch(),
 		viewportRevision: viewport.revision,
+		assetRevision: state.previewGeneration,
 		viewerOpen: state.open,
 		viewState: transform.mode,
+		onPanStart: handlePanStart,
+		onPan: handlePan,
+		onPanEnd: handlePanEnd,
 	});
 
 	useEffect(() => {
@@ -223,6 +289,21 @@ export function PhotoViewerOverlay({
 			Boolean(
 				target.closest("input, textarea, select, [contenteditable='true']"),
 			);
+		if (!isEditable && (event.key === "+" || event.key === "=")) {
+			event.preventDefault();
+			transform.step(1, viewerCenter());
+			return;
+		}
+		if (!isEditable && event.key === "-") {
+			event.preventDefault();
+			transform.step(-1, viewerCenter());
+			return;
+		}
+		if (!isEditable && event.key === "0") {
+			event.preventDefault();
+			transform.reset();
+			return;
+		}
 		if (
 			!isEditable &&
 			(event.key === "ArrowLeft" || event.key === "ArrowRight")
@@ -338,6 +419,15 @@ export function PhotoViewerOverlay({
 					<ChevronLeft aria-hidden="true" size={22} strokeWidth={1.7} />
 				</button>
 			</div>
+			<ViewerZoomControls
+				canZoomIn={transform.canZoomIn}
+				canZoomOut={transform.canZoomOut}
+				label={transform.zoomLabel}
+				onReset={transform.reset}
+				onZoomIn={() => transform.step(1, viewerCenter())}
+				onZoomOut={() => transform.step(-1, viewerCenter())}
+				visible={state.controlsVisible}
+			/>
 			<ViewerStage
 				asset={asset}
 				baseUrl={preview.baseUrl}
@@ -347,8 +437,11 @@ export function PhotoViewerOverlay({
 				previewGeneration={state.previewGeneration}
 				service={service}
 				transform={transform.geometry}
-				onDrawableSizeChange={transform.setDrawableSize}
+				onDoubleClick={handleViewerDoubleClick}
+				onDrawableSizeChange={handleDrawableSizeChange}
 				onNaturalSizeChange={transform.setNaturalSize}
+				onWheel={handleViewerWheel}
+				panning={panning}
 				viewportHeight={viewport.height}
 				viewportWidth={viewport.width}
 			/>

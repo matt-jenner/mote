@@ -17,6 +17,7 @@ import type {
 } from "../viewer/useViewerTransform";
 import {
 	fitViewerFrame,
+	type ViewerPoint,
 	type ViewerTransformGeometry,
 } from "../viewer/viewerTransform";
 
@@ -35,6 +36,9 @@ interface ViewerStageProps {
 	transform?: ViewerTransformGeometry;
 	onDrawableSizeChange?: (size: ViewerDrawableSize) => void;
 	onNaturalSizeChange?: (size: ViewerNaturalSize) => void;
+	onWheel?: (event: WheelEvent, point: ViewerPoint) => boolean;
+	onDoubleClick?: (point: ViewerPoint) => void;
+	panning?: boolean;
 }
 
 export interface ViewerFrameRect {
@@ -85,8 +89,12 @@ export function ViewerStage({
 	transform,
 	onDrawableSizeChange,
 	onNaturalSizeChange,
+	onWheel,
+	onDoubleClick,
+	panning = false,
 }: ViewerStageProps) {
 	const measureRef = useRef<HTMLDivElement>(null);
+	const stageRef = useRef<HTMLDivElement>(null);
 	const screenImageRef = useRef<HTMLImageElement>(null);
 	const activeDecodeRef = useRef("");
 	const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
@@ -138,6 +146,37 @@ export function ViewerStage({
 	useEffect(() => {
 		onDrawableSizeChange?.(stageSize);
 	}, [onDrawableSizeChange, stageSize]);
+
+	useEffect(() => {
+		const stage = stageRef.current;
+		if (!stage || !onWheel) return;
+		const handleWheel = (event: WheelEvent) => {
+			const drawable = measureRef.current?.getBoundingClientRect();
+			if (!drawable) return;
+			const consumed = onWheel(event, {
+				x: event.clientX - drawable.left,
+				y: event.clientY - drawable.top,
+			});
+			if (consumed && event.cancelable) event.preventDefault();
+		};
+		stage.addEventListener("wheel", handleWheel, { passive: false });
+		return () => stage.removeEventListener("wheel", handleWheel);
+	}, [onWheel]);
+
+	useEffect(() => {
+		const stage = stageRef.current;
+		if (!stage || !onDoubleClick) return;
+		const handleDoubleClick = (event: MouseEvent) => {
+			const drawable = measureRef.current?.getBoundingClientRect();
+			if (!drawable) return;
+			onDoubleClick({
+				x: event.clientX - drawable.left,
+				y: event.clientY - drawable.top,
+			});
+		};
+		stage.addEventListener("dblclick", handleDoubleClick);
+		return () => stage.removeEventListener("dblclick", handleDoubleClick);
+	}, [onDoubleClick]);
 
 	const reportNaturalSize = useCallback(
 		(image: HTMLImageElement) => {
@@ -211,6 +250,8 @@ export function ViewerStage({
 				largePreviewUnavailable || screenFailed ? "true" : "false"
 			}
 			data-testid="viewer-stage"
+			data-viewer-panning={panning ? "true" : "false"}
+			ref={stageRef}
 		>
 			<div className={styles.viewerStageMeasure} ref={measureRef}>
 				<div

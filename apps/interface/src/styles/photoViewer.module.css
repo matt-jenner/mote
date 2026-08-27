@@ -56,6 +56,14 @@
 	touch-action: pan-y;
 }
 
+.viewerStage[data-viewer-mode="zoomed"] {
+	cursor: grab;
+}
+
+.viewerStage[data-viewer-panning="true"] {
+	cursor: grabbing;
+}
+
 .viewerStageMeasure {
 	display: grid;
 	width: 100%;
@@ -181,6 +189,72 @@
 
 .viewerControls {
 	transition: opacity 180ms ease;
+}
+
+.viewerZoomControls {
+	position: absolute;
+	top: max(44px, var(--safe-area-top, 0px));
+	right: max(44px, var(--safe-area-right, 0px));
+	z-index: 1;
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	padding: 3px;
+	color: #f4f5f6;
+	background: rgb(8 9 11 / 62%);
+	border: 1px solid rgb(255 255 255 / 14%);
+	border-radius: 25px;
+	transition:
+		opacity 180ms ease,
+		left 180ms ease,
+		right 180ms ease;
+}
+
+.viewerZoomControls[aria-hidden="true"] {
+	visibility: hidden;
+	opacity: 0;
+	pointer-events: none;
+}
+
+.viewerZoomControlsHidden {
+	visibility: hidden;
+	opacity: 0;
+	pointer-events: none;
+}
+
+.viewerOverlay:has(.viewerInfoDrawer) .viewerZoomControls {
+	right: auto;
+	left: max(44px, var(--safe-area-left, 0px));
+}
+
+.viewerZoomButton,
+.viewerZoomReset {
+	display: grid;
+	place-items: center;
+	min-width: 44px;
+	height: 44px;
+	padding: 0 10px;
+	color: #f4f5f6;
+	background: transparent;
+	border: 0;
+	border-radius: 22px;
+	cursor: pointer;
+}
+
+.viewerZoomReset {
+	min-width: 64px;
+	font-size: 0.78rem;
+	font-variant-numeric: tabular-nums;
+}
+
+.viewerZoomButton:disabled {
+	opacity: 0.35;
+	cursor: default;
+}
+
+.viewerZoomButton:hover:not(:disabled),
+.viewerZoomReset:hover {
+	background: rgb(255 255 255 / 12%);
 }
 
 .viewerInfoDrawer {
