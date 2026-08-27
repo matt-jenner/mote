@@ -1124,6 +1124,143 @@ describe("progressive photo wall", () => {
 		await screen.unmount();
 	});
 
+	it("keeps a published wall thumbnail inert until its image is decoded", async () => {
+		const service = new ControlledWallService();
+		service.setDerivativeUrl(
+			"screen-only-wall",
+			"/demo-photos/coast.jpg?screen-only-wall=held",
+		);
+		const decodeGate = gate<void>();
+		let complete = false;
+		let naturalWidth = 0;
+		const restoreImageRuntime = overrideImageRuntime({
+			complete: () => complete,
+			naturalWidth: () => naturalWidth,
+			decode: () => decodeGate.promise,
+		});
+		const restoreLoadCapture = suppressCapture("load");
+		function PublicationHarness() {
+			const [published, setPublished] = useState(false);
+			const positioned = {
+				asset: asset("screen-only", "Screen only", 1, {
+					wallThumbnail: published
+						? {
+								assetId: "screen-only",
+								kind: "wallThumbnail" as const,
+								key: "screen-only-wall",
+							}
+						: null,
+					screenPreview: {
+						assetId: "screen-only",
+						kind: "screenPreview" as const,
+						key: "screen-only-preview",
+					},
+				}),
+				left: 0,
+				width: 320,
+				height: 220,
+			};
+			return (
+				<>
+					<button onClick={() => setPublished(true)} type="button">
+						Publish wall thumbnail
+					</button>
+					<PhotoTile positioned={positioned} service={service} />
+				</>
+			);
+		}
+		try {
+			const screen = await render(<PublicationHarness />);
+			expect(
+				screen
+					.getByRole("button", { name: "Open Screen only", exact: true })
+					.query(),
+			).toBeNull();
+			await screen
+				.getByRole("button", { name: "Publish wall thumbnail" })
+				.click();
+			const image = screen.getByRole("img", { name: "Screen only" });
+			await expect
+				.poll(() => image.element().getAttribute("src"))
+				.toContain("screen-only-wall=held");
+			expect(
+				screen
+					.getByRole("button", { name: "Open Screen only", exact: true })
+					.query(),
+			).toBeNull();
+			expect(getComputedStyle(image.element()).opacity).toBe("0");
+
+			complete = true;
+			naturalWidth = 320;
+			decodeGate.resolve();
+			await expect
+				.poll(() => getComputedStyle(image.element()).opacity)
+				.toBe("1");
+			await expect
+				.element(
+					screen.getByRole("button", { name: "Open Screen only", exact: true }),
+				)
+				.toBeVisible();
+			screen.unmount();
+		} finally {
+			restoreLoadCapture();
+			restoreImageRuntime();
+		}
+	});
+
+	it("keeps a wall thumbnail tile inert after its image fails to load", async () => {
+		const service = new ControlledWallService();
+		service.setDerivativeUrl(
+			"screen-only-failure",
+			"/demo-photos/missing-screen-only.jpg?screen-only-failure=1",
+		);
+		function PublicationHarness() {
+			const [published, setPublished] = useState(false);
+			const positioned = {
+				asset: asset("screen-only", "Screen only", 1, {
+					wallThumbnail: published
+						? {
+								assetId: "screen-only",
+								kind: "wallThumbnail" as const,
+								key: "screen-only-failure",
+							}
+						: null,
+				}),
+				left: 0,
+				width: 320,
+				height: 220,
+			};
+			return (
+				<>
+					<button onClick={() => setPublished(true)} type="button">
+						Publish wall thumbnail
+					</button>
+					<PhotoTile positioned={positioned} service={service} />
+				</>
+			);
+		}
+		const screen = await render(<PublicationHarness />);
+		await screen
+			.getByRole("button", { name: "Publish wall thumbnail" })
+			.click();
+		const image = screen.getByRole("img", { name: "Screen only" });
+		await expect
+			.poll(() => image.element().getAttribute("src"))
+			.toContain("screen-only-failure=1");
+		image.element().dispatchEvent(new Event("error"));
+		await expect
+			.poll(() =>
+				screen
+					.getByRole("button", { name: "Open Screen only", exact: true })
+					.query(),
+			)
+			.toBeNull();
+		expect(
+			document.querySelector("[data-asset-id='screen-only']")?.tagName,
+		).toBe("FIGURE");
+		screen.unmount();
+	});
+
 	it("reveals a delayed decode after the image load event is suppressed", async () => {
 		const service = new ControlledWallService();
 		service.setDerivativeUrl(
