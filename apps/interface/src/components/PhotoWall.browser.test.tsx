@@ -1089,6 +1089,35 @@ describe("progressive photo wall", () => {
 		}
 	});
 
+	it("keeps a screen-preview-only tile inert until its wall thumbnail is ready", async () => {
+		const service = new ControlledWallService();
+		const positioned = {
+			asset: asset("screen-only", "Screen only", 1, {
+				wallThumbnail: null,
+				screenPreview: {
+					assetId: "screen-only",
+					kind: "screenPreview" as const,
+					key: "screen-only-preview",
+				},
+			}),
+			left: 0,
+			width: 320,
+			height: 220,
+		};
+
+		const screen = await render(
+			<PhotoTile positioned={positioned} service={service} />,
+		);
+
+		expect(
+			screen.getByRole("button", { name: "Open Screen only", exact: true }).query(),
+		).toBeNull();
+		expect(
+			document.querySelector("[data-asset-id='screen-only']")?.tagName,
+		).toBe("FIGURE");
+		await screen.unmount();
+	});
+
 	it("reveals a delayed decode after the image load event is suppressed", async () => {
 		const service = new ControlledWallService();
 		service.setDerivativeUrl(

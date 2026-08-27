@@ -2176,6 +2176,56 @@ describe("immersive photo viewer checkpoint", () => {
 		}
 	});
 
+	it("announces a discrete reset after continuous zoom even when the label stays Fit", async () => {
+		await page.viewport(800, 600);
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		await view.getByRole("button", { name: "Zoom in" }).click();
+		await view.getByRole("button", { name: "Reset zoom" }).click();
+		const stage = view.getByTestId("viewer-stage").element();
+		const status = view.getByTestId("viewer-status").element();
+		const mutations: MutationRecord[] = [];
+		const observer = new MutationObserver((records) => mutations.push(...records));
+		observer.observe(status, {
+			characterData: true,
+			childList: true,
+			subtree: true,
+		});
+		try {
+			stage.dispatchEvent(
+				new WheelEvent("wheel", {
+					bubbles: true,
+					cancelable: true,
+					ctrlKey: true,
+					deltaY: -24,
+					clientX: 720,
+					clientY: 400,
+				}),
+			);
+			await expect.element(view.getByTestId("viewer-stage")).toHaveAttribute(
+				"data-viewer-mode",
+				"zoomed",
+			);
+			await new Promise((resolve) => window.setTimeout(resolve, 0));
+			expect(status.textContent).toContain("Fit");
+			expect(mutations).toHaveLength(0);
+
+			await view.getByRole("button", { name: "Reset zoom" }).click();
+			await expect.element(view.getByTestId("viewer-stage")).toHaveAttribute(
+				"data-viewer-mode",
+				"fit",
+			);
+			await new Promise((resolve) => window.setTimeout(resolve, 0));
+			expect(mutations.length).toBeGreaterThan(0);
+		} finally {
+			observer.disconnect();
+			await view.unmount();
+		}
+	});
+
 	it("audits every open viewer accessibility state without navigator focus traps", async () => {
 		const { view, tile } = await openAsset("Coast");
 		(tile.element() as HTMLButtonElement).click();
@@ -3533,6 +3583,28 @@ describe("immersive photo viewer checkpoint", () => {
 		expect(
 			view.getByRole("complementary", { name: "Photo information" }).query(),
 		).toBeNull();
+		await userEvent.keyboard("{Escape}");
+		expect(
+			view.getByRole("dialog", { name: "Photo viewer" }).query(),
+		).toBeNull();
+	});
+
+	it("resets zoom on the first Escape and closes the viewer on the second", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const stage = view.getByTestId("viewer-stage");
+		await view.getByRole("button", { name: "Zoom in" }).click();
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+
+		await userEvent.keyboard("{Escape}");
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+
 		await userEvent.keyboard("{Escape}");
 		expect(
 			view.getByRole("dialog", { name: "Photo viewer" }).query(),

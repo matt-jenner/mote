@@ -136,8 +136,7 @@ export function PhotoTile({
 	);
 	const canOpen =
 		asset.mediaKind !== "video" &&
-		(asset.availability === "available" ||
-			Boolean(asset.wallThumbnail || asset.screenPreview));
+		Boolean(asset.wallThumbnail);
 	const className = `${styles.tile} ${highlighted ? styles.tileReturnHighlight : ""}`;
 
 	if (!canOpen) {

@@ -98,6 +98,11 @@ export function PhotoViewerOverlay({
 	const [filmstripRevealed, setFilmstripRevealed] = useState(false);
 	const [announcedZoomLabel, setAnnouncedZoomLabel] =
 		useState<ViewerZoomAnnouncement>("Fit");
+	const [zoomAnnouncementRevision, setZoomAnnouncementRevision] = useState(0);
+	const announceZoomLabel = useCallback((label: ViewerZoomAnnouncement) => {
+		setAnnouncedZoomLabel(label);
+		setZoomAnnouncementRevision((revision) => revision + 1);
+	}, []);
 	const announcementResetKey = `${state.currentAssetId ?? ""}:${state.previewGeneration}`;
 	const previousAnnouncementResetKey = useRef<string | null>(null);
 	const controlsFocused = useRef(false);
@@ -213,10 +218,10 @@ export function PhotoViewerOverlay({
 			reportInteraction();
 			if (!controlsFocused.current) controls.showForInput("mouse");
 			if (transform.mode === "zoomed") {
-				setAnnouncedZoomLabel("Fit");
+				announceZoomLabel("Fit");
 				transform.reset();
 			} else {
-				setAnnouncedZoomLabel(
+				announceZoomLabel(
 					zoomAnnouncement(
 						transform.geometry.maxScale,
 						transform.geometry.maxScale,
@@ -225,7 +230,7 @@ export function PhotoViewerOverlay({
 				transform.zoomAt(transform.geometry.maxScale, point);
 			}
 		},
-		[controls, reportInteraction, transform],
+		[announceZoomLabel, controls, reportInteraction, transform],
 	);
 	const pointInDrawable = useCallback((point: { x: number; y: number }) => {
 		const stage = document.querySelector<HTMLElement>(
@@ -244,10 +249,10 @@ export function PhotoViewerOverlay({
 			reportInteraction();
 			const drawablePoint = pointInDrawable(point);
 			if (transform.mode === "zoomed") {
-				setAnnouncedZoomLabel("Fit");
+				announceZoomLabel("Fit");
 				transform.reset();
 			} else {
-				setAnnouncedZoomLabel(
+				announceZoomLabel(
 					zoomAnnouncement(
 						transform.geometry.maxScale,
 						transform.geometry.maxScale,
@@ -256,7 +261,7 @@ export function PhotoViewerOverlay({
 				transform.zoomAt(transform.geometry.maxScale, drawablePoint);
 			}
 		},
-		[pointInDrawable, reportInteraction, transform],
+		[announceZoomLabel, pointInDrawable, reportInteraction, transform],
 	);
 	const handleDiscreteStep = useCallback(
 		(direction: 1 | -1, anchor?: { x: number; y: number }) => {
@@ -266,15 +271,15 @@ export function PhotoViewerOverlay({
 				maxScale,
 				Math.max(1, scale * (direction === 1 ? 1.25 : 1 / 1.25)),
 			);
-			setAnnouncedZoomLabel(zoomAnnouncement(nextScale, maxScale));
+			announceZoomLabel(zoomAnnouncement(nextScale, maxScale));
 			transform.step(direction, anchor);
 		},
-		[transform],
+		[announceZoomLabel, transform],
 	);
 	const handleDiscreteReset = useCallback(() => {
-		setAnnouncedZoomLabel("Fit");
+		announceZoomLabel("Fit");
 		transform.reset();
-	}, [transform]);
+	}, [announceZoomLabel, transform]);
 	const pinchBaseScaleRef = useRef<number | null>(null);
 	const handleViewerPinchStart = useCallback(() => {
 		pinchBaseScaleRef.current = transform.geometry.scale;
@@ -378,19 +383,24 @@ export function PhotoViewerOverlay({
 		entryFocusPending.current = false;
 	}, []);
 
-	const onCloseRef = useRef(onClose);
-	const onSetInfoOpenRef = useRef(onSetInfoOpen);
 	const infoOpenRef = useRef(state.infoOpen);
-	onCloseRef.current = onClose;
-	onSetInfoOpenRef.current = onSetInfoOpen;
+	const escapeRef = useRef<() => void>(() => undefined);
 	infoOpenRef.current = state.infoOpen;
+	escapeRef.current = () => {
+		if (infoOpenRef.current) {
+			handleSetInfoOpen(false);
+		} else if (transform.mode === "zoomed") {
+			handleDiscreteReset();
+		} else {
+			handleClose();
+		}
+	};
 
 	useEffect(() => {
 		const onKeyDown = (event: globalThis.KeyboardEvent) => {
 			if (event.key === "Escape") {
 				event.preventDefault();
-				if (infoOpenRef.current) onSetInfoOpenRef.current(false);
-				else onCloseRef.current();
+				escapeRef.current();
 			} else if (
 				event.key === "Tab" &&
 				!dialogRef.current?.contains(document.activeElement)
@@ -652,12 +662,14 @@ export function PhotoViewerOverlay({
 			) : null}
 			<div
 				aria-live="polite"
+				aria-atomic="true"
 				className={styles.viewerStatus}
 				data-testid="viewer-status"
 				role="status"
 			>
 				{asset.displayName}, photo {currentPosition} of {assets.length}
-				{`, ${announcedZoomLabel}`}
+				{`, `}
+				<span key={zoomAnnouncementRevision}>{announcedZoomLabel}</span>
 				{nextCursor ? " loaded" : ""}
 			</div>
 			<button
