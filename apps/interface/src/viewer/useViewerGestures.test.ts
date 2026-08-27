@@ -1,4 +1,8 @@
-import { createElement, type PointerEvent as ReactPointerEvent } from "react";
+import {
+	createElement,
+	type PointerEvent as ReactPointerEvent,
+	useState,
+} from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -29,12 +33,84 @@ class GestureElement {
 
 const originalElement = globalThis.Element;
 
-afterEach(() => {
-	Object.defineProperty(globalThis, "Element", {
-		configurable: true,
-		value: originalElement,
+if (typeof document === "undefined")
+	afterEach(() => {
+		Object.defineProperty(globalThis, "Element", {
+			configurable: true,
+			value: originalElement,
+		});
 	});
-});
+
+function nodeDescribe(name: string, factory: () => void) {
+	if (typeof document === "undefined") describe(name, factory);
+}
+
+export function GestureLifecycleHarness({
+	stats,
+}: {
+	stats: { panEnds: number };
+}) {
+	const [assetRevision, setAssetRevision] = useState(1);
+	const [viewportRevision, setViewportRevision] = useState(1);
+	const [viewerOpen, setViewerOpen] = useState(true);
+	const gestures = useViewerGestures({
+		assetRevision,
+		onNavigate: () => undefined,
+		onPan: () => undefined,
+		onPanEnd: () => {
+			stats.panEnds += 1;
+		},
+		onPanStart: () => undefined,
+		onTap: () => undefined,
+		viewportRevision,
+		viewState: "zoomed",
+		viewerOpen,
+	});
+	return createElement(
+		"div",
+		{ "data-testid": "gesture-lifecycle-harness" },
+		createElement("div", {
+			"data-testid": "gesture-lifecycle-target",
+			onLostPointerCapture: gestures.onLostPointerCapture,
+			onPointerCancel: gestures.onPointerCancel,
+			onPointerDown: gestures.onPointerDown,
+			onPointerMove: gestures.onPointerMove,
+			onPointerUp: gestures.onPointerUp,
+		}),
+		createElement(
+			"button",
+			{
+				"data-testid": "gesture-asset-revision",
+				onClick: () => setAssetRevision((value) => value + 1),
+				type: "button",
+			},
+			"Asset revision",
+		),
+		createElement(
+			"button",
+			{
+				"data-testid": "gesture-viewport-revision",
+				onClick: () => setViewportRevision((value) => value + 1),
+				type: "button",
+			},
+			"Viewport revision",
+		),
+		createElement(
+			"button",
+			{
+				"data-testid": "gesture-close",
+				onClick: () => setViewerOpen(false),
+				type: "button",
+			},
+			"Close",
+		),
+		createElement(
+			"output",
+			{ "data-testid": "gesture-pan-ends" },
+			stats.panEnds,
+		),
+	);
+}
 
 function mountGestures(viewState: "fit" | "zoomed") {
 	Object.defineProperty(globalThis, "Element", {
@@ -89,7 +165,7 @@ function pointerEvent(
 	} as unknown as ReactPointerEvent<HTMLElement>;
 }
 
-describe("classifyViewerGesture", () => {
+nodeDescribe("classifyViewerGesture", () => {
 	it("classifies horizontal fit swipes as navigation", () => {
 		expect(
 			classifyViewerGesture({
@@ -170,7 +246,7 @@ describe("classifyViewerGesture", () => {
 	});
 });
 
-describe("useViewerGestures mouse panning", () => {
+nodeDescribe("useViewerGestures mouse panning", () => {
 	it("emits incremental pan deltas without navigating when zoomed", () => {
 		const { gestures, pans, stats } = mountGestures("zoomed");
 		const element = new GestureElement();

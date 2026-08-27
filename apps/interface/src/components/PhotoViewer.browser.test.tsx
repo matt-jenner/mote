@@ -19,6 +19,7 @@ import type {
 } from "../services/photoService";
 import "../styles/tokens.css";
 import "../styles/global.css";
+import { GestureLifecycleHarness } from "../viewer/useViewerGestures.test";
 import { useViewerPreview } from "../viewer/useViewerPreview";
 import { useViewerTransform } from "../viewer/useViewerTransform";
 import { AppShell } from "./AppShell";
@@ -762,8 +763,26 @@ describe("immersive photo viewer checkpoint", () => {
 		const zoomCluster = overlay.querySelector<HTMLElement>(
 			"[data-viewer-zoom-controls]",
 		);
-		expect(zoomCluster?.getBoundingClientRect().right).toBeLessThanOrEqual(
-			drawer.getBoundingClientRect().left,
+		const back = overlay.querySelector<HTMLElement>(
+			"[data-viewer-chrome] button",
+		);
+		const info = overlay.querySelector<HTMLElement>("[data-viewer-info]");
+		const boundsOverlap = (first: DOMRect, second: DOMRect) =>
+			first.left < second.right &&
+			first.right > second.left &&
+			first.top < second.bottom &&
+			first.bottom > second.top;
+		const clusterBounds = zoomCluster?.getBoundingClientRect();
+		if (!clusterBounds || !back || !info)
+			throw new Error("viewer chrome bounds were not rendered");
+		expect(boundsOverlap(clusterBounds, drawer.getBoundingClientRect())).toBe(
+			false,
+		);
+		expect(boundsOverlap(clusterBounds, back.getBoundingClientRect())).toBe(
+			false,
+		);
+		expect(boundsOverlap(clusterBounds, info.getBoundingClientRect())).toBe(
+			false,
 		);
 		const editable = document.createElement("input");
 		drawer.append(editable);
@@ -781,6 +800,61 @@ describe("immersive photo viewer checkpoint", () => {
 			.element(stage)
 			.toHaveAttribute("data-current-asset", "photo-0");
 		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+	});
+
+	it("ends a zoomed mouse drag exactly once for every lifecycle cancellation", async () => {
+		for (const action of [
+			"gesture-asset-revision",
+			"gesture-viewport-revision",
+			"gesture-close",
+		] as const) {
+			const stats = { panEnds: 0 };
+			const view = await render(<GestureLifecycleHarness stats={stats} />);
+			const target = view.getByTestId("gesture-lifecycle-target").element();
+			target.dispatchEvent(
+				new PointerEvent("pointerdown", {
+					bubbles: true,
+					button: 0,
+					clientX: 100,
+					clientY: 200,
+					isPrimary: true,
+					pointerId: 91,
+					pointerType: "mouse",
+				}),
+			);
+			await view.getByTestId(action).click();
+			await expect.poll(() => stats.panEnds).toBe(1);
+			target.dispatchEvent(
+				new PointerEvent("pointerup", {
+					bubbles: true,
+					button: 0,
+					clientX: 120,
+					clientY: 220,
+					isPrimary: true,
+					pointerId: 91,
+					pointerType: "mouse",
+				}),
+			);
+			expect(stats.panEnds).toBe(1);
+			await view.unmount();
+		}
+
+		const stats = { panEnds: 0 };
+		const view = await render(<GestureLifecycleHarness stats={stats} />);
+		const target = view.getByTestId("gesture-lifecycle-target").element();
+		target.dispatchEvent(
+			new PointerEvent("pointerdown", {
+				bubbles: true,
+				button: 0,
+				clientX: 100,
+				clientY: 200,
+				isPrimary: true,
+				pointerId: 92,
+				pointerType: "mouse",
+			}),
+		);
+		await view.unmount();
+		expect(stats.panEnds).toBe(1);
 	});
 
 	it("opens the selected tile above the mounted wall and returns to its exact position", async () => {

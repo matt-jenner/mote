@@ -225,6 +225,7 @@
 .viewerOverlay:has(.viewerInfoDrawer) .viewerZoomControls {
 	right: auto;
 	left: max(44px, var(--safe-area-left, 0px));
+	top: calc(max(44px, var(--safe-area-top, 0px)) + 52px);
 }
 
 .viewerZoomButton,
