@@ -1926,6 +1926,7 @@ describe("immersive photo viewer checkpoint", () => {
 		const overlay = view
 			.getByRole("dialog", { name: "Photo viewer" })
 			.element();
+		const stage = view.getByTestId("viewer-stage");
 		await expect
 			.poll(() =>
 				overlay.querySelector<HTMLImageElement>(
@@ -1976,6 +1977,11 @@ describe("immersive photo viewer checkpoint", () => {
 			.toBeGreaterThan(0);
 		expect(neighbour?.src).toBe(offline.cachedNeighbourUrl);
 		expect(neighbour?.src).not.toContain(offline.sentinel);
+		expect(document.body.textContent).not.toContain(offline.sentinel);
+		expect(overlay.innerHTML).not.toContain(offline.sentinel);
+		await view.getByRole("button", { name: "Zoom in" }).click();
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+		expect(neighbour?.src).toBe(offline.cachedNeighbourUrl);
 		expect(document.body.textContent).not.toContain(offline.sentinel);
 		expect(overlay.innerHTML).not.toContain(offline.sentinel);
 	});
@@ -2250,14 +2256,37 @@ describe("immersive photo viewer checkpoint", () => {
 			await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
 			expect(secondUp.defaultPrevented).toBe(true);
 			await view.getByRole("button", { name: "Back to photos" }).click();
-			const closedDoubleTap = new PointerEvent("pointerup", {
-				bubbles: true,
-				cancelable: true,
-				pointerId: 503,
-				pointerType: "touch",
-			});
-			document.dispatchEvent(closedDoubleTap);
-			expect(closedDoubleTap.defaultPrevented).toBe(false);
+			const dispatchClosedTap = (pointerId: number, x: number, y: number) => {
+				const down = new PointerEvent("pointerdown", {
+					bubbles: true,
+					cancelable: true,
+					clientX: x,
+					clientY: y,
+					isPrimary: true,
+					pointerId,
+					pointerType: "touch",
+				});
+				const up = new PointerEvent("pointerup", {
+					bubbles: true,
+					cancelable: true,
+					clientX: x,
+					clientY: y,
+					isPrimary: true,
+					pointerId,
+					pointerType: "touch",
+				});
+				document.dispatchEvent(down);
+				document.dispatchEvent(up);
+				return [down, up];
+			};
+			const closedFirstTap = dispatchClosedTap(503, 720, 400);
+			await vi.advanceTimersByTimeAsync(60);
+			const closedSecondTap = dispatchClosedTap(504, 728, 408);
+			const closedTapEvents = [...closedFirstTap, ...closedSecondTap];
+			expect(closedTapEvents.every((event) => !event.defaultPrevented)).toBe(
+				true,
+			);
+			expect(document.querySelector("[aria-label='Photo viewer']")).toBeNull();
 		} finally {
 			vi.useRealTimers();
 		}

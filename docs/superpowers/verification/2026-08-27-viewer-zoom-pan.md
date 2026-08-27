@@ -97,10 +97,13 @@ Test Files  3 passed (3)
 Tests       123 passed (123)
 ```
 
-The full browser run emitted one existing React development warning about an
-asynchronous `ViewerStage` update not being wrapped in `act(...)`; it did not
-produce a failed test. The App and PhotoWall browser files were also run alone:
-49 tests passed with no warning. The viewer browser file passed all 74 tests.
+The full browser run emitted one React development warning about an
+asynchronous `ViewerStage` update not being wrapped in `act(...)`, matching the
+clean baseline recorded at feature base
+`14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc`. It remains test-synchronization
+noise and did not produce a failed test. The App and PhotoWall browser files
+were also run alone: 49 tests passed with no warning. The viewer browser file
+passed all 74 tests.
 
 ```text
 npm exec --workspace @photo-viewer/interface -- vitest run --project browser-motion
@@ -247,8 +250,10 @@ Self-review confirms:
 
 Concerns/limitations:
 
-- the full browser project emits one non-failing pre-existing React `act(...)`
-  console warning from asynchronous `ViewerStage` work;
+- the full browser project emits one non-failing React `act(...)` console
+  warning from asynchronous `ViewerStage` work, matching the clean baseline
+  recorded at feature base `14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc`; it is
+  test-synchronization noise;
 - native acceptance observations remain for the controller because the running
   app was intentionally not interrupted;
 - cache-only zoom does not recover an uncached derivative while its source is
