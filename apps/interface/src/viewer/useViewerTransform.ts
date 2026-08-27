@@ -118,6 +118,15 @@ export function reconcileViewerTransform(
 	};
 }
 
+export function viewerTransformStateForRevision(
+	state: ViewerTransformState,
+	assetRevision: number,
+): ViewerTransformState {
+	return state.assetRevision === assetRevision
+		? state
+		: resetViewerTransform(assetRevision);
+}
+
 export interface ViewerTransformController {
 	state: ViewerTransformState;
 	geometry: ViewerTransformGeometry;
@@ -194,7 +203,15 @@ export function useViewerTransform(options: {
 
 	const mutate = useCallback(
 		(action: ViewerTransformTransition) => {
-			setState((previous) => transitionViewerTransform(previous, action));
+			setState((previous) =>
+				transitionViewerTransform(
+					viewerTransformStateForRevision(
+						previous,
+						optionsRef.current.assetRevision,
+					),
+					action,
+				),
+			);
 			interact();
 		},
 		[interact],
@@ -257,8 +274,12 @@ export function useViewerTransform(options: {
 		[updateDimensions],
 	);
 
-	const geometry = deriveViewerTransform(
+	const renderState = viewerTransformStateForRevision(
 		state,
+		options.assetRevision,
+	);
+	const geometry = deriveViewerTransform(
+		renderState,
 		contextFor(
 			dimensions.drawable,
 			dimensions.natural,
@@ -268,7 +289,7 @@ export function useViewerTransform(options: {
 	);
 	const effectiveScale = geometry.scale;
 	return {
-		state,
+		state: renderState,
 		geometry,
 		mode: geometry.mode,
 		zoomLabel:

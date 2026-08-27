@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import axe from "axe-core";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
@@ -391,6 +391,99 @@ function TransformHarness() {
 	);
 }
 
+function LetterboxTransformHarness() {
+	const [zoomed, setZoomed] = useState(false);
+	const transform = useViewerTransform({
+		assetId: "letterbox-harness",
+		assetRevision: 1,
+		imageWidth: 1600,
+		imageHeight: 800,
+		onInteraction: () => undefined,
+	});
+	return (
+		<>
+			<button
+				data-testid="zoom-letterboxed"
+				onClick={() => {
+					transform.setDrawableSize({ width: 712, height: 512 });
+					transform.setNaturalSize({ width: 3200, height: 1600 });
+					transform.zoomAt(1.5, { x: 356, y: 256 });
+					setZoomed(true);
+				}}
+				type="button"
+			>
+				Zoom letterboxed
+			</button>
+			<ViewerStage
+				asset={{
+					...asset("letterbox-harness", "Letterbox", 1),
+					width: 1600,
+					height: 800,
+				}}
+				baseUrl={largePreviewFixture}
+				onDrawableSizeChange={transform.setDrawableSize}
+				onNaturalSizeChange={transform.setNaturalSize}
+				service={previewService(async () => undefined)}
+				transform={transform.geometry}
+				viewportHeight={512}
+				viewportWidth={712}
+			/>
+			<output data-testid="letterbox-zoomed">{String(zoomed)}</output>
+		</>
+	);
+}
+
+function RevisionPaintHarness() {
+	const [revision, setRevision] = useState(1);
+	const renderModes = useRef<string[]>([]);
+	const transform = useViewerTransform({
+		assetId: `revision-${revision}`,
+		assetRevision: revision,
+		imageWidth: 1200,
+		imageHeight: 800,
+		onInteraction: () => undefined,
+	});
+	renderModes.current.push(transform.mode);
+	return (
+		<>
+			<button
+				data-testid="zoom-revision"
+				onClick={() => {
+					transform.setDrawableSize({ width: 600, height: 400 });
+					transform.setNaturalSize({ width: 1200, height: 800 });
+					transform.zoomAt(1.5, { x: 300, y: 200 });
+				}}
+				type="button"
+			>
+				Zoom revision
+			</button>
+			<button
+				data-testid="navigate-revision"
+				onClick={() => {
+					renderModes.current = [];
+					setRevision((value) => value + 1);
+				}}
+				type="button"
+			>
+				Navigate revision
+			</button>
+			<ViewerStage
+				asset={asset(`revision-${revision}`, "Revision", revision)}
+				baseUrl={largePreviewFixture}
+				onDrawableSizeChange={transform.setDrawableSize}
+				onNaturalSizeChange={transform.setNaturalSize}
+				service={previewService(async () => undefined)}
+				transform={transform.geometry}
+				viewportHeight={400}
+				viewportWidth={600}
+			/>
+			<output data-testid="revision-render-modes">
+				{renderModes.current.join(",")}
+			</output>
+		</>
+	);
+}
+
 function RefreshingPreviewHarness({
 	initialAssets,
 	service,
@@ -533,6 +626,29 @@ describe("immersive photo viewer checkpoint", () => {
 		await expect
 			.element(view.getByTestId("viewer-stage"))
 			.toHaveAttribute("data-viewer-mode", "fit");
+	});
+
+	it("lets a letterboxed zoomed layer expand into the drawable stage", async () => {
+		const view = await render(<LetterboxTransformHarness />);
+		await view.getByTestId("zoom-letterboxed").click();
+		const stage = view.getByTestId("viewer-stage").element();
+		const frame = view.getByTestId("viewer-frame").element();
+		const layer = view.getByTestId("viewer-transform-layer").element();
+		expect(getComputedStyle(stage).overflow).toBe("hidden");
+		expect(getComputedStyle(frame).overflow).toBe("visible");
+		expect(layer.getBoundingClientRect().width).toBeGreaterThan(
+			frame.getBoundingClientRect().width,
+		);
+	});
+
+	it("paints a newly selected asset at fit on its first revision render", async () => {
+		const view = await render(<RevisionPaintHarness />);
+		await view.getByTestId("zoom-revision").click();
+		await view.getByTestId("navigate-revision").click();
+		const modes = view
+			.getByTestId("revision-render-modes")
+			.element().textContent;
+		expect(modes?.split(",").every((mode) => mode === "fit")).toBe(true);
 	});
 
 	it("opens the selected tile above the mounted wall and returns to its exact position", async () => {
