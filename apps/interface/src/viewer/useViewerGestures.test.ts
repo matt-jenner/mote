@@ -45,6 +45,38 @@ function nodeDescribe(name: string, factory: () => void) {
 	if (typeof document === "undefined") describe(name, factory);
 }
 
+function GestureLifecycleChild({
+	assetRevision,
+	onPanEnd,
+	onTap,
+	viewportRevision,
+}: {
+	assetRevision: number;
+	onPanEnd: () => void;
+	onTap: () => void;
+	viewportRevision: number;
+}) {
+	const gestures = useViewerGestures({
+		assetRevision,
+		onNavigate: () => undefined,
+		onPan: () => undefined,
+		onPanEnd,
+		onPanStart: () => undefined,
+		onTap,
+		viewportRevision,
+		viewState: "zoomed",
+		viewerOpen: true,
+	});
+	return createElement("div", {
+		"data-testid": "gesture-lifecycle-target",
+		onLostPointerCapture: gestures.onLostPointerCapture,
+		onPointerCancel: gestures.onPointerCancel,
+		onPointerDown: gestures.onPointerDown,
+		onPointerMove: gestures.onPointerMove,
+		onPointerUp: gestures.onPointerUp,
+	});
+}
+
 export function GestureLifecycleHarness({
 	stats,
 }: {
@@ -53,32 +85,23 @@ export function GestureLifecycleHarness({
 	const [assetRevision, setAssetRevision] = useState(1);
 	const [viewportRevision, setViewportRevision] = useState(1);
 	const [viewerOpen, setViewerOpen] = useState(true);
-	const gestures = useViewerGestures({
-		assetRevision,
-		onNavigate: () => undefined,
-		onPan: () => undefined,
-		onPanEnd: () => {
-			stats.panEnds += 1;
-		},
-		onPanStart: () => undefined,
-		onTap: () => {
-			if (stats.taps !== undefined) stats.taps += 1;
-		},
-		viewportRevision,
-		viewState: "zoomed",
-		viewerOpen,
-	});
+	const [tapCount, setTapCount] = useState(0);
 	return createElement(
 		"div",
 		{ "data-testid": "gesture-lifecycle-harness" },
-		createElement("div", {
-			"data-testid": "gesture-lifecycle-target",
-			onLostPointerCapture: gestures.onLostPointerCapture,
-			onPointerCancel: gestures.onPointerCancel,
-			onPointerDown: gestures.onPointerDown,
-			onPointerMove: gestures.onPointerMove,
-			onPointerUp: gestures.onPointerUp,
-		}),
+		viewerOpen
+			? createElement(GestureLifecycleChild, {
+					assetRevision,
+					onPanEnd: () => {
+						stats.panEnds += 1;
+					},
+					onTap: () => {
+						if (stats.taps !== undefined) stats.taps += 1;
+						setTapCount((value) => value + 1);
+					},
+					viewportRevision,
+				})
+			: null,
 		createElement(
 			"button",
 			{
@@ -111,7 +134,7 @@ export function GestureLifecycleHarness({
 			{ "data-testid": "gesture-pan-ends" },
 			stats.panEnds,
 		),
-		createElement("output", { "data-testid": "gesture-taps" }, stats.taps ?? 0),
+		createElement("output", { "data-testid": "gesture-taps" }, tapCount),
 	);
 }
 

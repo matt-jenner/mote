@@ -1447,7 +1447,7 @@ describe("immersive photo viewer checkpoint", () => {
 			reference.kind === "wallThumbnail" || reference.kind === "screenPreview"
 				? "/demo-photos/coast.jpg"
 				: originalDerivativeUrl(reference);
-		const { view } = await openAssetWithService(service, "Photo 0");
+		const { view } = await openAssetWithService(service, "Photo 1");
 		await expect
 			.element(view.getByRole("dialog", { name: "Photo viewer" }))
 			.toBeVisible();
@@ -1455,6 +1455,9 @@ describe("immersive photo viewer checkpoint", () => {
 			.getByRole("dialog", { name: "Photo viewer" })
 			.element();
 		const stage = view.getByTestId("viewer-stage").element();
+		await expect
+			.element(stage)
+			.toHaveAttribute("data-current-asset", "photo-1");
 		const dispatch = (type: string, pointerId: number, x: number) => {
 			const event = new PointerEvent(type, {
 				bubbles: true,
@@ -1474,11 +1477,11 @@ describe("immersive photo viewer checkpoint", () => {
 		dispatch("pointerup", 301, 520);
 		await expect
 			.element(stage)
-			.toHaveAttribute("data-current-asset", "photo-1");
+			.toHaveAttribute("data-current-asset", "photo-2");
 		await view.getByRole("button", { name: "Previous photo" }).click();
 		await expect
 			.element(stage)
-			.toHaveAttribute("data-current-asset", "photo-0");
+			.toHaveAttribute("data-current-asset", "photo-1");
 		await expect
 			.element(view.getByRole("button", { name: "Zoom in" }))
 			.toBeEnabled();
@@ -1490,7 +1493,9 @@ describe("immersive photo viewer checkpoint", () => {
 		dispatch("pointerdown", 302, 620);
 		const move = dispatch("pointermove", 302, 120);
 		dispatch("pointerup", 302, 120);
-		expect(stage.dataset.currentAsset).toBe("photo-0");
+		await expect
+			.element(stage)
+			.toHaveAttribute("data-current-asset", "photo-1");
 		expect(move.defaultPrevented).toBe(true);
 		await expect
 			.poll(
@@ -1693,6 +1698,9 @@ describe("immersive photo viewer checkpoint", () => {
 		tap("pointerdown");
 		tap("pointerup");
 		await view.getByTestId("gesture-close").click();
+		await expect
+			.element(view.getByTestId("gesture-lifecycle-target"))
+			.not.toBeInTheDocument();
 		await new Promise((resolve) => setTimeout(resolve, 320));
 		expect(stats.taps).toBe(0);
 		expect(view.getByTestId("gesture-taps").element().textContent).toBe("0");
