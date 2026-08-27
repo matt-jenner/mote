@@ -5,6 +5,9 @@ import type {
 	WallAsset,
 } from "../services/photoService";
 import styles from "../styles/photoViewer.module.css";
+import { fitViewerFrame } from "../viewer/viewerTransform";
+
+export { fitViewerFrame } from "../viewer/viewerTransform";
 
 interface ViewerStageProps {
 	asset: WallAsset;
@@ -38,29 +41,6 @@ export function drawableViewerBox(
 	return {
 		width: Math.max(0, containerWidth - insets.left - insets.right),
 		height: Math.max(0, containerHeight - insets.top - insets.bottom),
-	};
-}
-
-export function fitViewerFrame(
-	containerWidth: number,
-	containerHeight: number,
-	assetWidth: number,
-	assetHeight: number,
-): ViewerFrameRect {
-	if (
-		containerWidth <= 0 ||
-		containerHeight <= 0 ||
-		assetWidth <= 0 ||
-		assetHeight <= 0
-	)
-		return { width: 0, height: 0 };
-	const scale = Math.min(
-		containerWidth / assetWidth,
-		containerHeight / assetHeight,
-	);
-	return {
-		width: assetWidth * scale,
-		height: assetHeight * scale,
 	};
 }
 
