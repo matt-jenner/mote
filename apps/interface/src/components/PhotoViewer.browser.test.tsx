@@ -802,6 +802,96 @@ describe("immersive photo viewer checkpoint", () => {
 		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
 	});
 
+	it("shows an interactive desktop navigator with the normalized viewport", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		const zoomIn = view.getByRole("button", { name: "Zoom in" });
+		await expect
+			.element(view.getByTestId("viewer-stage"))
+			.toHaveAttribute("data-viewer-mode", "fit");
+		const dialog = view.getByRole("dialog", { name: "Photo viewer" }).element();
+		expect(dialog.querySelector("[data-viewer-navigator]")).toBeNull();
+		await zoomIn.click();
+		const navigator = view
+			.getByTestId("viewer-stage")
+			.element()
+			.closest("[role='dialog']")
+			?.querySelector<HTMLElement>("[data-viewer-navigator]");
+		if (!navigator) throw new Error("navigator was not rendered after zooming");
+		expect(navigator.getAttribute("aria-hidden")).toBe("false");
+		const viewport = navigator.querySelector<HTMLElement>(
+			"[data-viewer-navigator-viewport]",
+		);
+		if (!viewport) throw new Error("navigator viewport was not rendered");
+		expect(viewport.style.width).toMatch(/%$/);
+		expect(viewport.style.height).toMatch(/%$/);
+		const layer = view.getByTestId("viewer-transform-layer").element();
+		const before = layer.style.transform;
+		const bounds = navigator.getBoundingClientRect();
+		navigator.dispatchEvent(
+			new MouseEvent("click", {
+				bubbles: true,
+				clientX: bounds.right - 8,
+				clientY: bounds.bottom - 8,
+				detail: 1,
+			}),
+		);
+		await expect.poll(() => layer.style.transform).not.toBe(before);
+		const beforeDrag = layer.style.transform;
+		const dragEvent = (type: string, x: number, y: number) =>
+			navigator.dispatchEvent(
+				new PointerEvent(type, {
+					bubbles: true,
+					button: 0,
+					clientX: x,
+					clientY: y,
+					isPrimary: true,
+					pointerId: 41,
+					pointerType: "mouse",
+				}),
+			);
+		dragEvent("pointerdown", bounds.right - 24, bounds.bottom - 24);
+		dragEvent("pointermove", bounds.left + 24, bounds.top + 24);
+		await expect.poll(() => layer.style.transform).not.toBe(beforeDrag);
+		dragEvent("pointerup", bounds.right - 24, bounds.bottom - 24);
+		await view.getByRole("button", { name: "Photo information" }).click();
+		const drawer = view
+			.getByRole("complementary", { name: "Photo information" })
+			.element();
+		const drawerNavigator = dialog.querySelector<HTMLElement>(
+			"[data-viewer-navigator]",
+		);
+		if (!drawerNavigator)
+			throw new Error("navigator disappeared beside drawer");
+		expect(drawerNavigator.getBoundingClientRect().right).toBeLessThanOrEqual(
+			drawer.getBoundingClientRect().left,
+		);
+	});
+
+	it("keeps the touch navigator display-only", async () => {
+		await page.viewport(390, 844);
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await view.getByRole("button", { name: "Zoom in" }).click();
+		const navigator = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element()
+			.querySelector<HTMLElement>("[data-viewer-navigator]");
+		if (!navigator) throw new Error("navigator was not rendered after zooming");
+		expect(navigator.getAttribute("aria-hidden")).toBe("true");
+		const layer = view.getByTestId("viewer-transform-layer").element();
+		const before = layer.style.transform;
+		navigator.dispatchEvent(
+			new MouseEvent("click", {
+				bubbles: true,
+				clientX: navigator.getBoundingClientRect().right - 8,
+				clientY: navigator.getBoundingClientRect().bottom - 8,
+				detail: 1,
+			}),
+		);
+		expect(layer.style.transform).toBe(before);
+	});
+
 	it("ends a zoomed mouse drag exactly once for every lifecycle cancellation", async () => {
 		for (const action of [
 			"gesture-asset-revision",

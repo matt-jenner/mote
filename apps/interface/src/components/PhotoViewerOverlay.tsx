@@ -3,6 +3,7 @@ import {
 	type KeyboardEvent as ReactKeyboardEvent,
 	useCallback,
 	useEffect,
+	useLayoutEffect,
 	useRef,
 	useState,
 } from "react";
@@ -18,6 +19,7 @@ import { useViewerViewport } from "../viewer/viewerViewport";
 import { classifyViewerWheel } from "../viewer/viewerZoomInput";
 import { PhotoInfoDrawer } from "./PhotoInfoDrawer";
 import { ViewerFilmstrip } from "./ViewerFilmstrip";
+import { ViewerNavigator } from "./ViewerNavigator";
 import { ViewerStage } from "./ViewerStage";
 import { ViewerZoomControls } from "./ViewerZoomControls";
 
@@ -267,6 +269,30 @@ export function PhotoViewerOverlay({
 	useEffect(() => {
 		if (!state.controlsVisible) setFilmstripRevealed(false);
 	}, [state.controlsVisible]);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: rerun when the drawer mounts or the safe-area viewport changes.
+	useLayoutEffect(() => {
+		const dialog = dialogRef.current;
+		if (!dialog) return;
+		const drawer = dialog.querySelector<HTMLElement>(
+			"[data-testid='photo-info-drawer']",
+		);
+		if (!drawer) {
+			dialog.style.removeProperty("--viewer-info-drawer-width");
+			return;
+		}
+		const updateDrawerWidth = () => {
+			dialog.style.setProperty(
+				"--viewer-info-drawer-width",
+				`${drawer.getBoundingClientRect().width}px`,
+			);
+		};
+		updateDrawerWidth();
+		if (typeof ResizeObserver === "undefined") return;
+		const observer = new ResizeObserver(updateDrawerWidth);
+		observer.observe(drawer);
+		return () => observer.disconnect();
+	}, [state.infoOpen, viewport.revision]);
 
 	useEffect(() => {
 		entryFocusPending.current = true;
@@ -528,6 +554,19 @@ export function PhotoViewerOverlay({
 				onZoomIn={() => transform.step(1, viewerCenter())}
 				onZoomOut={() => transform.step(-1, viewerCenter())}
 				visible={state.controlsVisible}
+			/>
+			<ViewerNavigator
+				assetName={asset.displayName}
+				imageHeight={asset.height}
+				imageUrl={preview.currentUrl ?? preview.baseUrl}
+				imageWidth={asset.width}
+				interactive={viewport.width >= 640}
+				onInteraction={reportInteraction}
+				onRecenter={transform.recenter}
+				visible={
+					transform.mode === "zoomed" && (state.controlsVisible || panning)
+				}
+				visibleRect={transform.geometry.visibleImageRect}
 			/>
 			<div
 				aria-live="polite"

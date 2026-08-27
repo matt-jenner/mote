@@ -223,6 +223,72 @@
 	pointer-events: none;
 }
 
+.viewerNavigator {
+	position: absolute;
+	box-sizing: border-box;
+	top: calc(max(44px, var(--safe-area-top, 0px)) + 56px);
+	right: max(44px, var(--safe-area-right, 0px));
+	z-index: 1;
+	width: 200px;
+	height: 120px;
+	padding: 0;
+	overflow: hidden;
+	background: #08090b;
+	border: 1px solid rgb(255 255 255 / 20%);
+	border-radius: 6px;
+	box-shadow: 0 8px 24px rgb(0 0 0 / 32%);
+	opacity: 1;
+	transition:
+		opacity 180ms ease,
+		right 180ms ease,
+		left 180ms ease;
+}
+
+.viewerOverlay:has(.viewerInfoDrawer) .viewerNavigator {
+	right: calc(
+		max(44px, var(--safe-area-right, 0px)) +
+		var(--viewer-info-drawer-width, 0px) +
+		12px
+	);
+}
+
+.viewerNavigator[aria-hidden="true"] {
+	pointer-events: none;
+}
+
+.viewerNavigatorImage {
+	position: absolute;
+	user-select: none;
+}
+
+.viewerNavigatorImageContent {
+	display: block;
+	width: 100%;
+	height: 100%;
+	object-fit: fill;
+	user-select: none;
+}
+
+.viewerNavigatorViewport {
+	position: absolute;
+	box-sizing: border-box;
+	min-width: 2px;
+	min-height: 2px;
+	border: 2px solid #f4f5f6;
+	box-shadow: 0 0 0 1px rgb(0 0 0 / 78%);
+	pointer-events: none;
+}
+
+@media (max-width: 639px) {
+	.viewerNavigator {
+		top: auto;
+		right: max(44px, var(--safe-area-right, 0px));
+		bottom: calc(max(44px, var(--safe-area-bottom, 0px)) + 72px);
+		width: 144px;
+		height: 88px;
+	}
+}
+
 .viewerOverlay:has(.viewerInfoDrawer) .viewerZoomControls {
 	right: auto;
 	left: max(44px, var(--safe-area-left, 0px));
@@ -413,7 +479,8 @@
 	.viewerInfoButton,
 	.viewerInfoDrawer,
 	.viewerFilmstrip,
-	.viewerFilmstripTrack {
+	.viewerFilmstripTrack,
+	.viewerNavigator {
 		transition-duration: 0s;
 	}
 }
