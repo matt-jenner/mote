@@ -339,7 +339,7 @@ export function panViewerBy(
 	)
 		return resetViewerTransform(safeRevision(state));
 	const geometry = deriveViewerTransform(state, context);
-	if (geometry.scale <= 1) return safeState(state);
+	if (geometry.scale <= 1) return resetViewerTransform(safeRevision(state));
 	const width = geometry.fitWidth * geometry.scale;
 	const height = geometry.fitHeight * geometry.scale;
 	const nextX = clamp(
@@ -362,11 +362,11 @@ export function viewerZoomStep(
 ): ViewerTransformState {
 	if (direction !== 1 && direction !== -1)
 		return resetViewerTransform(safeRevision(state));
-	const safe = safeState(state);
+	const geometry = deriveViewerTransform(state, context);
 	return zoomViewerAt(
-		safe,
+		state,
 		context,
-		safe.scale * (direction === 1 ? 1.25 : 1 / 1.25),
+		geometry.scale * (direction === 1 ? 1.25 : 1 / 1.25),
 		{
 			x: (context?.viewportWidth ?? Number.NaN) / 2,
 			y: (context?.viewportHeight ?? Number.NaN) / 2,

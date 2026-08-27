@@ -4,6 +4,7 @@ import {
 	imagePointAtViewportPoint,
 	panViewerBy,
 	resetViewerTransform,
+	viewerZoomStep,
 	zoomViewerAt,
 } from "./viewerTransform";
 
@@ -49,14 +50,15 @@ describe("viewer transform geometry", () => {
 			x: 600,
 			y: 400,
 		});
-		const moved = panViewerBy(zoomed, landscape, { x: 10000, y: -10000 });
-		const geometry = deriveViewerTransform(moved, landscape);
-		expect(geometry.translateX).toBe(
-			(geometry.fitWidth * geometry.scale - 1200) / 2,
-		);
-		expect(geometry.translateY).toBe(
-			-(geometry.fitHeight * geometry.scale - 800) / 2,
-		);
+		for (const [delta, expectedX, expectedY] of [
+			[{ x: 10000, y: -10000 }, 600, -400],
+			[{ x: -10000, y: 10000 }, -600, 400],
+		] as const) {
+			const moved = panViewerBy(zoomed, landscape, delta);
+			const geometry = deriveViewerTransform(moved, landscape);
+			expect(geometry.translateX).toBe(expectedX);
+			expect(geometry.translateY).toBe(expectedY);
+		}
 	});
 
 	it("preserves the normalized focal point after rotation", () => {
@@ -87,4 +89,111 @@ describe("viewer transform geometry", () => {
 			height: 0.5,
 		});
 	});
+
+	it("steps down from the effective scale after a resize lowers the maximum", () => {
+		const zoomed = zoomViewerAt(resetViewerTransform(4), landscape, 3, {
+			x: 600,
+			y: 400,
+		});
+		const resized = {
+			...landscape,
+			viewportWidth: 2400,
+			viewportHeight: 1600,
+		};
+		const effective = deriveViewerTransform(zoomed, resized);
+		expect(effective.scale).toBeCloseTo(4096 / 2400);
+		const stepped = viewerZoomStep(zoomed, resized, -1);
+		expect(deriveViewerTransform(stepped, resized).scale).toBeCloseTo(
+			4096 / 2400 / 1.25,
+		);
+	});
+
+	it("normalizes stale zoom state to fit when a resize removes zoom room", () => {
+		const zoomed = zoomViewerAt(resetViewerTransform(4), landscape, 2, {
+			x: 600,
+			y: 400,
+		});
+		const resized = {
+			...landscape,
+			viewportWidth: 6000,
+			viewportHeight: 4000,
+		};
+		expect(panViewerBy(zoomed, resized, { x: 10, y: 10 })).toEqual({
+			assetRevision: 4,
+			scale: 1,
+			focal: { x: 0.5, y: 0.5 },
+		});
+	});
+
+	it.each([
+		{
+			name: "reset",
+			run: () => resetViewerTransform(Number.NaN),
+			expectation: { assetRevision: 0, scale: 1, focal: { x: 0.5, y: 0.5 } },
+		},
+		{
+			name: "derive",
+			run: () =>
+				deriveViewerTransform(resetViewerTransform(7), {
+					...landscape,
+					viewportWidth: Number.NaN,
+				}),
+			expectation: {
+				mode: "fit",
+				fitWidth: 0,
+				fitHeight: 0,
+				scale: 1,
+				maxScale: 1,
+				translateX: 0,
+				translateY: 0,
+				focal: { x: 0.5, y: 0.5 },
+				visibleImageRect: { x: 0, y: 0, width: 0, height: 0 },
+			},
+		},
+		{
+			name: "point conversion",
+			run: () =>
+				imagePointAtViewportPoint(resetViewerTransform(7), landscape, {
+					x: Number.POSITIVE_INFINITY,
+					y: 400,
+				}),
+			expectation: { x: 0.5, y: 0.5 },
+		},
+		{
+			name: "zoom",
+			run: () =>
+				zoomViewerAt(resetViewerTransform(7), landscape, Number.NaN, {
+					x: 600,
+					y: 400,
+				}),
+			expectation: { assetRevision: 7, scale: 1, focal: { x: 0.5, y: 0.5 } },
+		},
+		{
+			name: "pan",
+			run: () =>
+				panViewerBy(resetViewerTransform(7), landscape, {
+					x: Number.NEGATIVE_INFINITY,
+					y: 0,
+				}),
+			expectation: { assetRevision: 7, scale: 1, focal: { x: 0.5, y: 0.5 } },
+		},
+		{
+			name: "zoom step",
+			run: () =>
+				viewerZoomStep(
+					resetViewerTransform(7),
+					{
+						...landscape,
+						viewportHeight: Number.POSITIVE_INFINITY,
+					},
+					1,
+				),
+			expectation: { assetRevision: 7, scale: 1, focal: { x: 0.5, y: 0.5 } },
+		},
+	])(
+		"returns a fit-safe result for non-finite $name input",
+		({ run, expectation }) => {
+			expect(run()).toMatchObject(expectation);
+		},
+	);
 });
