@@ -23,6 +23,7 @@ import { GestureLifecycleHarness } from "../viewer/useViewerGestures.test";
 import { useViewerPreview } from "../viewer/useViewerPreview";
 import { useViewerTransform } from "../viewer/useViewerTransform";
 import { AppShell } from "./AppShell";
+import { PhotoViewerOverlay } from "./PhotoViewerOverlay";
 import { ViewerFilmstrip } from "./ViewerFilmstrip";
 import { ViewerNavigator } from "./ViewerNavigator";
 import { ViewerStage } from "./ViewerStage";
@@ -95,6 +96,8 @@ function serviceWithReadyPhotos(
 
 const cachedPixel =
 	"data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
+const cachedZoomFixture =
+	"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1536' height='1024' viewBox='0 0 1536 1024'%3E%3Crect width='100%25' height='100%25' fill='%23225670'/%3E%3C/svg%3E";
 
 function cachedOfflineService() {
 	const service = serviceWithReadyPhotos(false, 1, true);
@@ -103,9 +106,9 @@ function cachedOfflineService() {
 	const sentinel = "file:///private/source/secret.jpg";
 	let unavailable = false;
 	const opaqueUrls = new Map<string, string>([
-		["wallThumbnail:coast-wall", `${cachedPixel}#cached-coast-wall`],
-		["screenPreview:coast-screen", `${cachedPixel}#cached-coast-screen`],
-		["wallThumbnail:photo-0-wall", `${cachedPixel}#cached-photo-0-wall`],
+		["wallThumbnail:coast-wall", `${cachedZoomFixture}#cached-coast-wall`],
+		["screenPreview:coast-screen", `${cachedZoomFixture}#cached-coast-screen`],
+		["wallThumbnail:photo-0-wall", `${cachedZoomFixture}#cached-photo-0-wall`],
 	]);
 	service.derivativeUrl = (reference: DerivativeReference) => {
 		const key = `${reference.kind}:${reference.key}`;
@@ -578,6 +581,71 @@ function StageFailureHarness() {
 	);
 }
 
+const zeroNaturalDerivative =
+	"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='0' height='0'%3E%3C/svg%3E#zero-natural";
+const invalidGeometryService = previewService(async () => undefined);
+invalidGeometryService.derivativeUrl = (reference) =>
+	reference.key === "zero-natural-screen" ? zeroNaturalDerivative : cachedPixel;
+
+function InvalidGeometryViewerHarness() {
+	const [currentIndex, setCurrentIndex] = useState(0);
+	const [revision, setRevision] = useState(1);
+	const assets = [
+		{
+			...asset("malformed", "Malformed", 1),
+			width: 0,
+			height: 0,
+			wallThumbnail: null,
+			screenPreview: null,
+		},
+		{
+			...asset("zero-natural", "Zero natural", 2),
+			wallThumbnail: null,
+			screenPreview: {
+				assetId: "zero-natural",
+				kind: "screenPreview" as const,
+				key: "zero-natural-screen",
+			},
+		},
+	] as const;
+	const current = assets[currentIndex] ?? assets[0];
+	if (!current) return null;
+	return (
+		<PhotoViewerOverlay
+			assets={assets}
+			onClose={() => undefined}
+			onLoadMore={() => undefined}
+			onRequestNearViewportDerivatives={() => undefined}
+			onSelectAsset={(assetId) => {
+				const nextIndex = assets.findIndex(
+					(candidate) => candidate.id === assetId,
+				);
+				if (nextIndex >= 0) {
+					setCurrentIndex(nextIndex);
+					setRevision((value) => value + 1);
+				}
+			}}
+			onSetInfoOpen={() => undefined}
+			onSetWallInteraction={() => undefined}
+			onShowControls={() => undefined}
+			onHideControls={() => undefined}
+			onToggleTouchControls={() => undefined}
+			loading={false}
+			nextCursor={null}
+			service={invalidGeometryService}
+			state={{
+				open: true,
+				currentAssetId: current.id,
+				returnAnchor: null,
+				infoOpen: false,
+				controlsVisible: true,
+				filmstripVisible: true,
+				previewGeneration: revision,
+			}}
+		/>
+	);
+}
+
 async function openAsset(
 	name: string,
 	brokenScreenPreview = false,
@@ -688,10 +756,12 @@ describe("immersive photo viewer checkpoint", () => {
 		while (!(zoomIn.element() as HTMLButtonElement).disabled)
 			await zoomIn.click();
 		await expect.element(zoomIn).toBeDisabled();
+		expect(zoomIn.element().getAttribute("disabled")).not.toBeNull();
 		await expect.element(zoomOut).not.toBeDisabled();
 		while (!(zoomOut.element() as HTMLButtonElement).disabled)
 			await zoomOut.click();
 		await expect.element(zoomOut).toBeDisabled();
+		expect(zoomOut.element().getAttribute("disabled")).not.toBeNull();
 		await zoomIn.click();
 		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
 		for (const button of [
@@ -1208,17 +1278,25 @@ describe("immersive photo viewer checkpoint", () => {
 
 	it("suppresses navigator fade in reduced-motion mode", async () => {
 		const view = await render(
-			<ViewerNavigator
-				assetName="Motion photo"
-				imageHeight={800}
-				imageUrl={null}
-				imageWidth={1200}
-				interactive
-				onInteraction={() => undefined}
-				onRecenter={() => undefined}
-				visible={false}
-				visibleRect={{ x: 0.25, y: 0.25, width: 0.5, height: 0.5 }}
-			/>,
+			<>
+				<ViewerNavigator
+					assetName="Motion photo"
+					imageHeight={800}
+					imageUrl={null}
+					imageWidth={1200}
+					interactive
+					onInteraction={() => undefined}
+					onRecenter={() => undefined}
+					visible={false}
+					visibleRect={{ x: 0.25, y: 0.25, width: 0.5, height: 0.5 }}
+				/>
+				<ViewerStage
+					asset={asset("reduced-motion", "Reduced motion", 1)}
+					service={previewService(async () => undefined)}
+					viewportHeight={400}
+					viewportWidth={600}
+				/>
+			</>,
 		);
 		const navigator = view
 			.getByRole("img", {
@@ -1230,6 +1308,10 @@ describe("immersive photo viewer checkpoint", () => {
 		expect(getComputedStyle(navigator).opacity).toBe("0");
 		expect(getComputedStyle(navigator).visibility).toBe("hidden");
 		expect(getComputedStyle(navigator).pointerEvents).toBe("none");
+		expect(
+			getComputedStyle(view.getByTestId("viewer-transform-layer").element())
+				.transitionDuration,
+		).toBe("0s");
 		await view.unmount();
 	});
 
@@ -1555,6 +1637,145 @@ describe("immersive photo viewer checkpoint", () => {
 		expect(seriousViolations(await axe.run(document))).toEqual([]);
 	});
 
+	it("announces discrete zoom labels through the polite viewer status", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		const status = view.getByTestId("viewer-status");
+		await expect.element(status).toHaveAttribute("aria-live", "polite");
+		await expect.element(status).toHaveTextContent("Fit");
+		await view.getByRole("button", { name: "Zoom in" }).click();
+		await expect.element(status).toHaveTextContent(/\d+%/);
+		await view.getByRole("button", { name: "Reset zoom" }).click();
+		await expect.element(status).toHaveTextContent("Fit");
+	});
+
+	it("audits every open viewer accessibility state without navigator focus traps", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const dialog = view.getByRole("dialog", { name: "Photo viewer" }).element();
+		const runAxe = async () => {
+			expect(seriousViolations(await axe.run(document))).toEqual([]);
+		};
+		await runAxe();
+		await view.getByRole("button", { name: "Zoom in" }).click();
+		const navigator = dialog.querySelector<HTMLElement>(
+			"[data-viewer-navigator]",
+		);
+		if (!navigator) throw new Error("zoomed viewer navigator was not rendered");
+		expect(navigator.tabIndex).toBe(-1);
+		expect(navigator.getAttribute("aria-hidden")).toBe("false");
+		await runAxe();
+
+		vi.useFakeTimers();
+		try {
+			dialog.dispatchEvent(
+				new PointerEvent("pointermove", {
+					bubbles: true,
+					clientY: 100,
+					pointerType: "mouse",
+				}),
+			);
+			await vi.advanceTimersByTimeAsync(2500);
+			await expect
+				.poll(() =>
+					dialog
+						.querySelector("[data-viewer-controls]")
+						?.getAttribute("aria-hidden"),
+				)
+				.toBe("true");
+			vi.useRealTimers();
+			await runAxe();
+			dialog.focus();
+			const tab = new KeyboardEvent("keydown", {
+				bubbles: true,
+				cancelable: true,
+				key: "Tab",
+			});
+			dialog.dispatchEvent(tab);
+			expect(tab.defaultPrevented).toBe(true);
+			expect(document.activeElement).toBe(dialog);
+			dialog.dispatchEvent(
+				new PointerEvent("pointermove", {
+					bubbles: true,
+					clientY: 100,
+					pointerType: "mouse",
+				}),
+			);
+			await expect
+				.poll(() =>
+					dialog
+						.querySelector("[data-viewer-controls]")
+						?.getAttribute("aria-hidden"),
+				)
+				.toBe("false");
+			await view.getByRole("button", { name: "Photo information" }).click();
+			await expect
+				.element(view.getByRole("complementary", { name: "Photo information" }))
+				.toBeVisible();
+			await runAxe();
+		} finally {
+			vi.useRealTimers();
+		}
+		await view.unmount();
+
+		await page.viewport(844, 390);
+		const restorePointer = installPointerModality(true);
+		try {
+			const phone = await openAsset("Coast");
+			(phone.tile.element() as HTMLButtonElement).click();
+			await expect
+				.element(phone.view.getByRole("dialog", { name: "Photo viewer" }))
+				.toBeVisible();
+			await phone.view.getByRole("button", { name: "Zoom in" }).click();
+			const phoneNavigator = phone.view
+				.getByRole("dialog", { name: "Photo viewer" })
+				.element()
+				.querySelector<HTMLElement>("[data-viewer-navigator]");
+			if (!phoneNavigator)
+				throw new Error("rotated phone navigator was not rendered");
+			expect(phoneNavigator.getAttribute("aria-hidden")).toBe("true");
+			expect(phoneNavigator.tabIndex).toBe(-1);
+			await runAxe();
+			await phone.view.unmount();
+		} finally {
+			restorePointer();
+		}
+	});
+
+	it("keeps malformed geometry and zero-natural previews at Fit while navigation works", async () => {
+		const view = await render(
+			<PhotoServiceProvider service={invalidGeometryService}>
+				<InvalidGeometryViewerHarness />
+			</PhotoServiceProvider>,
+		);
+		const stage = view.getByTestId("viewer-stage");
+		const zoomIn = view.getByRole("button", { name: "Zoom in" });
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+		await expect.element(zoomIn).toBeDisabled();
+		await view.getByRole("button", { name: "Next photo" }).click();
+		await expect
+			.element(stage)
+			.toHaveAttribute("data-current-asset", "zero-natural");
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+		await expect.element(zoomIn).toBeDisabled();
+		expect(
+			stage
+				.element()
+				.querySelector<HTMLImageElement>("[data-viewer-layer='screenPreview']")
+				?.naturalWidth ?? 0,
+		).toBe(0);
+		await expect
+			.element(view.getByTestId("viewer-status"))
+			.toHaveTextContent("Zero natural, photo 2 of 2, Fit");
+		await view.getByRole("button", { name: "Previous photo" }).click();
+		await expect
+			.element(stage)
+			.toHaveAttribute("data-current-asset", "malformed");
+	});
+
 	it("exposes current selection and disabled directions at both boundaries", async () => {
 		const { view, tile } = await openAsset("Coast", false, false, 1);
 		(tile.element() as HTMLButtonElement).click();
@@ -1728,12 +1949,21 @@ describe("immersive photo viewer checkpoint", () => {
 		await expect
 			.element(view.getByTestId("viewer-stage"))
 			.toHaveAttribute("data-current-asset", "coast");
+		await view.getByRole("button", { name: "Zoom in" }).click();
+		await expect
+			.element(view.getByTestId("viewer-stage"))
+			.toHaveAttribute("data-viewer-mode", "zoomed");
 		expect(
 			overlay.querySelector<HTMLImageElement>(
 				"[data-viewer-layer='screenPreview'][data-ready='true']",
 			)?.src,
 		).toBe(offline.cachedScreenUrl);
 		expect(document.body.textContent).not.toContain(offline.sentinel);
+		expect(overlay.innerHTML).not.toContain(offline.sentinel);
+		await view.getByRole("button", { name: "Reset zoom" }).click();
+		await expect
+			.element(view.getByTestId("viewer-stage"))
+			.toHaveAttribute("data-viewer-mode", "fit");
 		await userEvent.keyboard("{ArrowRight}");
 		await expect
 			.element(view.getByTestId("viewer-stage"))
@@ -1747,6 +1977,7 @@ describe("immersive photo viewer checkpoint", () => {
 		expect(neighbour?.src).toBe(offline.cachedNeighbourUrl);
 		expect(neighbour?.src).not.toContain(offline.sentinel);
 		expect(document.body.textContent).not.toContain(offline.sentinel);
+		expect(overlay.innerHTML).not.toContain(offline.sentinel);
 	});
 
 	it("marks unavailable larger previews and suppresses reduced-motion transitions", async () => {
@@ -1981,6 +2212,84 @@ describe("immersive photo viewer checkpoint", () => {
 		expect(controls?.getAttribute("aria-hidden")).toBe("true");
 		expect(before).toBe("false");
 		vi.useRealTimers();
+	});
+
+	it("prevents browser double-tap zoom only while the viewer is open", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const overlay = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		const stage = view.getByTestId("viewer-stage").element();
+		vi.useFakeTimers();
+		try {
+			const dispatch = (
+				type: "pointerdown" | "pointerup",
+				pointerId: number,
+			) => {
+				const event = new PointerEvent(type, {
+					bubbles: true,
+					cancelable: true,
+					clientX: 720,
+					clientY: 400,
+					isPrimary: true,
+					pointerId,
+					pointerType: "touch",
+				});
+				overlay.dispatchEvent(event);
+				return event;
+			};
+			dispatch("pointerdown", 501);
+			dispatch("pointerup", 501);
+			await vi.advanceTimersByTimeAsync(60);
+			dispatch("pointerdown", 502);
+			const secondUp = dispatch("pointerup", 502);
+			await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+			expect(secondUp.defaultPrevented).toBe(true);
+			await view.getByRole("button", { name: "Back to photos" }).click();
+			const closedDoubleTap = new PointerEvent("pointerup", {
+				bubbles: true,
+				cancelable: true,
+				pointerId: 503,
+				pointerType: "touch",
+			});
+			document.dispatchEvent(closedDoubleTap);
+			expect(closedDoubleTap.defaultPrevented).toBe(false);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("releases document wheel handling after the viewer closes", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const stage = view.getByTestId("viewer-stage").element();
+		await view.getByRole("button", { name: "Zoom in" }).click();
+		const openWheel = new WheelEvent("wheel", {
+			bubbles: true,
+			cancelable: true,
+			deltaY: 32,
+			clientX: 720,
+			clientY: 400,
+		});
+		stage.dispatchEvent(openWheel);
+		expect(openWheel.defaultPrevented).toBe(true);
+		await view.getByRole("button", { name: "Back to photos" }).click();
+		const closedWheel = new WheelEvent("wheel", {
+			bubbles: true,
+			cancelable: true,
+			deltaY: 32,
+			clientX: 720,
+			clientY: 400,
+		});
+		document.dispatchEvent(closedWheel);
+		expect(closedWheel.defaultPrevented).toBe(false);
 	});
 
 	it("keeps a middle asset while a zoomed drag pans at the edge", async () => {
@@ -2603,7 +2912,7 @@ describe("immersive photo viewer checkpoint", () => {
 		(tile.element() as HTMLButtonElement).click();
 		await expect
 			.element(view.getByTestId("viewer-status"))
-			.toHaveTextContent("Coast, photo 1 of 100 loaded");
+			.toHaveTextContent("Coast, photo 1 of 100, Fit loaded");
 	});
 
 	it("uses quiet mouse timers and toggles touch controls with the stage", async () => {

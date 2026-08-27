@@ -58,6 +58,8 @@ it("crossfades a decoded preview without changing fitted bounds", async () => {
 			</div>,
 		);
 		const frame = view.getByTestId("viewer-frame");
+		const transformLayer = view.getByTestId("viewer-transform-layer").element();
+		expect(getComputedStyle(transformLayer).transitionDuration).toBe("0s");
 		await expect
 			.poll(() => frame.element().getBoundingClientRect().width)
 			.toBeGreaterThan(0);

@@ -444,6 +444,7 @@ export function useViewerGestures({
 			};
 			const previous = lastTap.current;
 			if (previous && isViewerDoubleTap(previous, current)) {
+				if (event.cancelable) event.preventDefault();
 				clearPendingTap();
 				lastTap.current = null;
 				doubleTapRef.current?.(current.point);

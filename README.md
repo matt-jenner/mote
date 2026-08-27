@@ -81,8 +81,19 @@ and Next buttons) to move through the loaded order. Select a filmstrip item for
 a direct jump, or swipe horizontally on a fit-to-window photo. Photo
 information opens the read-only metadata drawer, and Back to photos or Escape
 returns to the wall and restores the selected tile. Ready cached derivatives
-remain usable if the selected source becomes unavailable. Zoom and pan are not
-part of this slice.
+remain usable if the selected source becomes unavailable. In the viewer, use
+Plus/Minus or `+`/`-` to zoom around the viewport centre, `0` or Fit to return
+to the fitted image, and drag a zoomed photo to pan. Double-click or double-tap
+toggles between Fit and the derivative's native 100 percent limit; trackpad
+pinch zooms around its midpoint. A contextual navigator appears for desktop
+pointer input while zoomed, and the filmstrip, keyboard, and navigation buttons
+remain available for photo changes.
+
+Zoom and pan are cache-only. The viewer never reads or enlarges the original
+source file, and it caps zoom at the best decoded derivative's native pixel
+density. If the source becomes unavailable, a cached wall thumbnail or screen
+preview can still be viewed and zoomed; an uncached derivative has no in-viewer
+recovery path until desktop locate/reconnect exists.
 
 An unavailable catalog item with no cached derivative does not open in this
 viewer: `PhotoService` has no locate-folder capability yet. Desktop

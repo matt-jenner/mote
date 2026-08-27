@@ -595,6 +595,7 @@ export function PhotoViewerOverlay({
 				role="status"
 			>
 				{asset.displayName}, photo {currentPosition} of {assets.length}
+				{`, ${transform.zoomLabel}`}
 				{nextCursor ? " loaded" : ""}
 			</div>
 			<button
