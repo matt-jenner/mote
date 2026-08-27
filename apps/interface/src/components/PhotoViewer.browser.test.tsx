@@ -1287,6 +1287,463 @@ describe("immersive photo viewer checkpoint", () => {
 			.not.toBe(before);
 	});
 
+	it("pinches around a midpoint and pans a zoomed image without navigating", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const overlay = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		const stage = view.getByTestId("viewer-stage").element();
+		// Prime natural-size measurement so the pinch starts from a real fit state.
+		await view.getByRole("button", { name: "Zoom in" }).click();
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+		await view.getByRole("button", { name: "Reset zoom" }).click();
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+		expect(getComputedStyle(stage).touchAction).toBe("pan-y");
+		const dispatch = (
+			type: string,
+			pointerId: number,
+			clientX: number,
+			clientY: number,
+		) => {
+			const event = new PointerEvent(type, {
+				bubbles: true,
+				cancelable: true,
+				clientX,
+				clientY,
+				isPrimary: pointerId === 101,
+				pointerId,
+				pointerType: "touch",
+			});
+			overlay.dispatchEvent(event);
+			return event;
+		};
+		dispatch("pointerdown", 101, 520, 400);
+		dispatch("pointerdown", 102, 640, 400);
+		dispatch("pointermove", 101, 517, 400);
+		const pinchMove = dispatch("pointermove", 102, 643, 400);
+		dispatch("pointermove", 101, 514, 400);
+		dispatch("pointermove", 102, 646, 400);
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+		expect(getComputedStyle(stage).touchAction).toBe("none");
+		expect(pinchMove.defaultPrevented).toBe(true);
+		expect(
+			stage.querySelector<HTMLElement>("[data-testid='viewer-transform-layer']")
+				?.style.transform,
+		).toContain("scale(1.1)");
+		expect(
+			stage.querySelector<HTMLElement>("[data-testid='viewer-transform-layer']")
+				?.style.transform,
+		).not.toMatch(/translate3d\(0px, 0px/);
+		expect(
+			stage.querySelector<HTMLElement>("[data-testid='viewer-transform-layer']")
+				?.style.transform,
+		).toContain("translate3d(14.076789px, 8.195122px");
+		const zoomedTransform = stage.querySelector<HTMLElement>(
+			"[data-testid='viewer-transform-layer']",
+		)?.style.transform;
+		dispatch("pointerup", 101, 508, 400);
+		dispatch("pointerup", 102, 652, 400);
+
+		dispatch("pointerdown", 103, 720, 400);
+		dispatch("pointermove", 103, 760, 430);
+		dispatch("pointerup", 103, 760, 430);
+		await expect.element(stage).toHaveAttribute("data-current-asset", "coast");
+		expect(
+			stage.querySelector<HTMLElement>("[data-testid='viewer-transform-layer']")
+				?.style.transform,
+		).not.toBe(zoomedTransform);
+
+		dispatch("pointerdown", 201, 654, 400);
+		dispatch("pointerdown", 202, 786, 400);
+		dispatch("pointermove", 201, 657, 400);
+		dispatch("pointermove", 202, 783, 400);
+		dispatch("pointermove", 201, 660, 400);
+		dispatch("pointermove", 202, 780, 400);
+		dispatch("pointerup", 201, 660, 400);
+		dispatch("pointerup", 202, 780, 400);
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+	});
+
+	it("delays a tap and turns two nearby taps into one zoom without chrome flicker", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const overlay = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		const stage = view.getByTestId("viewer-stage").element();
+		const controls = overlay.querySelector<HTMLElement>(
+			"[data-viewer-controls]",
+		);
+		const before = controls?.getAttribute("aria-hidden");
+		vi.useFakeTimers();
+		overlay.dispatchEvent(
+			new PointerEvent("pointermove", {
+				bubbles: true,
+				clientX: 720,
+				clientY: 400,
+				pointerType: "mouse",
+			}),
+		);
+		await vi.advanceTimersByTimeAsync(2500);
+		await expect.poll(() => controls?.getAttribute("aria-hidden")).toBe("true");
+		const tap = (pointerId: number, x: number, y: number) => {
+			overlay.dispatchEvent(
+				new PointerEvent("pointerdown", {
+					bubbles: true,
+					clientX: x,
+					clientY: y,
+					isPrimary: true,
+					pointerId,
+					pointerType: "touch",
+				}),
+			);
+			overlay.dispatchEvent(
+				new PointerEvent("pointerup", {
+					bubbles: true,
+					clientX: x,
+					clientY: y,
+					isPrimary: true,
+					pointerId,
+					pointerType: "touch",
+				}),
+			);
+		};
+		tap(111, 720, 400);
+		await vi.advanceTimersByTimeAsync(60);
+		expect(controls?.getAttribute("aria-hidden")).toBe("true");
+		tap(112, 730, 408);
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+		expect(controls?.getAttribute("aria-hidden")).toBe("true");
+		expect(before).toBe("false");
+		vi.useRealTimers();
+	});
+
+	it("keeps a middle asset while a zoomed drag pans at the edge", async () => {
+		const service = serviceWithReadyPhotos(false, 3);
+		const originalDerivativeUrl = service.derivativeUrl.bind(service);
+		const originalQueryWall = service.queryWall.bind(service);
+		service.queryWall = async (request) => {
+			const page = await originalQueryWall(request);
+			return {
+				...page,
+				items: page.items.map((item) => ({
+					...item,
+					screenPreview: item.screenPreview ?? {
+						assetId: item.id,
+						kind: "screenPreview" as const,
+						key: `${item.id}-screen`,
+					},
+				})),
+			};
+		};
+		service.derivativeUrl = (reference) =>
+			reference.kind === "wallThumbnail" || reference.kind === "screenPreview"
+				? "/demo-photos/coast.jpg"
+				: originalDerivativeUrl(reference);
+		const { view } = await openAssetWithService(service, "Photo 0");
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const overlay = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		const stage = view.getByTestId("viewer-stage").element();
+		const dispatch = (type: string, pointerId: number, x: number) => {
+			const event = new PointerEvent(type, {
+				bubbles: true,
+				cancelable: true,
+				clientX: x,
+				clientY: 400,
+				isPrimary: true,
+				pointerId,
+				pointerType: "touch",
+			});
+			overlay.dispatchEvent(event);
+			return event;
+		};
+		// This direction navigates while fit, proving the same direction is
+		// deliberately consumed as pan once zoomed.
+		dispatch("pointerdown", 301, 620);
+		dispatch("pointerup", 301, 520);
+		await expect
+			.element(stage)
+			.toHaveAttribute("data-current-asset", "photo-1");
+		await view.getByRole("button", { name: "Previous photo" }).click();
+		await expect
+			.element(stage)
+			.toHaveAttribute("data-current-asset", "photo-0");
+		await expect
+			.element(view.getByRole("button", { name: "Zoom in" }))
+			.toBeEnabled();
+		await view.getByRole("button", { name: "Zoom in" }).click();
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+		const before = stage.querySelector<HTMLElement>(
+			"[data-testid='viewer-transform-layer']",
+		)?.style.transform;
+		dispatch("pointerdown", 302, 620);
+		const move = dispatch("pointermove", 302, 120);
+		dispatch("pointerup", 302, 120);
+		expect(stage.dataset.currentAsset).toBe("photo-0");
+		expect(move.defaultPrevented).toBe(true);
+		await expect
+			.poll(
+				() =>
+					stage.querySelector<HTMLElement>(
+						"[data-testid='viewer-transform-layer']",
+					)?.style.transform,
+			)
+			.not.toBe(before);
+	});
+
+	it("keeps filmstrip and zoom controls out of stage touch routing", async () => {
+		const service = serviceWithReadyPhotos(false, 3);
+		const originalDerivativeUrl = service.derivativeUrl.bind(service);
+		service.derivativeUrl = (reference) =>
+			reference.kind === "wallThumbnail"
+				? "/demo-photos/coast.jpg"
+				: originalDerivativeUrl(reference);
+		const { view } = await openAssetWithService(service, "Photo 0");
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const stage = view.getByTestId("viewer-stage").element();
+		const filmstripButton = view
+			.getByRole("group", { name: "Photo filmstrip" })
+			.getByRole("button", { name: "Photo 0", exact: true })
+			.element();
+		const transform = stage.querySelector<HTMLElement>(
+			"[data-testid='viewer-transform-layer']",
+		);
+		const before = transform?.style.transform;
+		const dispatch = (target: Element, type: string, pointerId: number) =>
+			target.dispatchEvent(
+				new PointerEvent(type, {
+					bubbles: true,
+					clientX: 620,
+					clientY: 400,
+					isPrimary: true,
+					pointerId,
+					pointerType: "touch",
+				}),
+			);
+		dispatch(filmstripButton, "pointerdown", 311);
+		dispatch(filmstripButton, "pointerup", 311);
+		const zoomIn = view.getByRole("button", { name: "Zoom in" }).element();
+		dispatch(zoomIn, "pointerdown", 312);
+		dispatch(zoomIn, "pointerup", 312);
+		const nextButton = view
+			.getByRole("button", { name: "Next photo" })
+			.element();
+		dispatch(nextButton, "pointerdown", 313);
+		dispatch(nextButton, "pointerup", 313);
+		expect(stage.dataset.currentAsset).toBe("photo-0");
+		expect(transform?.style.transform).toBe(before);
+	});
+
+	it("clears a pending single tap on pointer cancellation and asset revision", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const overlay = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		const controls = overlay.querySelector<HTMLElement>(
+			"[data-viewer-controls]",
+		);
+		const stage = view.getByTestId("viewer-stage").element();
+		vi.useFakeTimers();
+		try {
+			const tap = (pointerId: number) => {
+				overlay.dispatchEvent(
+					new PointerEvent("pointerdown", {
+						bubbles: true,
+						clientX: 720,
+						clientY: 400,
+						isPrimary: true,
+						pointerId,
+						pointerType: "touch",
+					}),
+				);
+				overlay.dispatchEvent(
+					new PointerEvent("pointerup", {
+						bubbles: true,
+						clientX: 720,
+						clientY: 400,
+						isPrimary: true,
+						pointerId,
+						pointerType: "touch",
+					}),
+				);
+			};
+			tap(321);
+			overlay.dispatchEvent(
+				new PointerEvent("pointercancel", {
+					bubbles: true,
+					pointerId: 321,
+					pointerType: "touch",
+				}),
+			);
+			await vi.advanceTimersByTimeAsync(280);
+			expect(controls?.getAttribute("aria-hidden")).toBe("false");
+
+			tap(322);
+			await userEvent.keyboard("{ArrowRight}");
+			await expect
+				.element(stage)
+				.toHaveAttribute("data-current-asset", "photo-0");
+			await vi.advanceTimersByTimeAsync(280);
+			expect(controls?.getAttribute("aria-hidden")).toBe("false");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("clears a pending single tap on viewport, rotation, and close", async () => {
+		const restoreViewport = installVisualViewportDouble(390, 844);
+		try {
+			const { view, tile } = await openAsset("Coast");
+			(tile.element() as HTMLButtonElement).click();
+			await expect
+				.element(view.getByRole("dialog", { name: "Photo viewer" }))
+				.toBeVisible();
+			const overlay = view
+				.getByRole("dialog", { name: "Photo viewer" })
+				.element();
+			const controls = overlay.querySelector<HTMLElement>(
+				"[data-viewer-controls]",
+			);
+			const tap = (pointerId: number) => {
+				overlay.dispatchEvent(
+					new PointerEvent("pointerdown", {
+						bubbles: true,
+						clientX: 720,
+						clientY: 400,
+						isPrimary: true,
+						pointerId,
+						pointerType: "touch",
+					}),
+				);
+				overlay.dispatchEvent(
+					new PointerEvent("pointerup", {
+						bubbles: true,
+						clientX: 720,
+						clientY: 400,
+						isPrimary: true,
+						pointerId,
+						pointerType: "touch",
+					}),
+				);
+			};
+			tap(331);
+			const viewport = window.visualViewport as VisualViewport & {
+				setSize: (width: number, height: number) => void;
+			};
+			viewport.setSize(844, 390);
+			viewport.dispatchEvent(new Event("resize"));
+			await new Promise<void>((resolve) =>
+				requestAnimationFrame(() => resolve()),
+			);
+			await new Promise((resolve) => setTimeout(resolve, 320));
+			expect(controls?.getAttribute("aria-hidden")).toBe("false");
+
+			tap(332);
+			viewport.setSize(390, 844);
+			window.dispatchEvent(new Event("orientationchange"));
+			await new Promise<void>((resolve) =>
+				requestAnimationFrame(() => resolve()),
+			);
+			await new Promise((resolve) => setTimeout(resolve, 320));
+			expect(controls?.getAttribute("aria-hidden")).toBe("false");
+
+			tap(333);
+			await view.getByRole("button", { name: "Back to photos" }).click();
+			await expect
+				.element(view.getByRole("dialog", { name: "Photo viewer" }))
+				.not.toBeInTheDocument();
+			await new Promise((resolve) => setTimeout(resolve, 320));
+		} finally {
+			restoreViewport();
+		}
+	});
+
+	it("does not fire a pending tap after the viewer closes", async () => {
+		const stats = { panEnds: 0, taps: 0 };
+		const view = await render(<GestureLifecycleHarness stats={stats} />);
+		const target = view.getByTestId("gesture-lifecycle-target").element();
+		const tap = (type: "pointerdown" | "pointerup") =>
+			target.dispatchEvent(
+				new PointerEvent(type, {
+					bubbles: true,
+					clientX: 320,
+					clientY: 240,
+					isPrimary: true,
+					pointerId: 341,
+					pointerType: "touch",
+				}),
+			);
+		tap("pointerdown");
+		tap("pointerup");
+		await view.getByTestId("gesture-close").click();
+		await new Promise((resolve) => setTimeout(resolve, 320));
+		expect(stats.taps).toBe(0);
+		expect(view.getByTestId("gesture-taps").element().textContent).toBe("0");
+	});
+
+	it("does not lose the first tap when the second tap is too far away", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const overlay = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		const controls = overlay.querySelector<HTMLElement>(
+			"[data-viewer-controls]",
+		);
+		vi.useFakeTimers();
+		try {
+			const tap = (pointerId: number, x: number) => {
+				overlay.dispatchEvent(
+					new PointerEvent("pointerdown", {
+						bubbles: true,
+						clientX: x,
+						clientY: 400,
+						isPrimary: true,
+						pointerId,
+						pointerType: "touch",
+					}),
+				);
+				overlay.dispatchEvent(
+					new PointerEvent("pointerup", {
+						bubbles: true,
+						clientX: x,
+						clientY: 400,
+						isPrimary: true,
+						pointerId,
+						pointerType: "touch",
+					}),
+				);
+			};
+			tap(121, 500);
+			await vi.advanceTimersByTimeAsync(100);
+			tap(122, 700);
+			await vi.advanceTimersByTimeAsync(180);
+			expect(controls?.getAttribute("aria-hidden")).toBe("true");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("reports keyboard, button, filmstrip, and touch activity to the wall", async () => {
 		const { service, view, tile } = await openAsset("Coast");
 		(tile.element() as HTMLButtonElement).click();
@@ -1447,7 +1904,7 @@ describe("immersive photo viewer checkpoint", () => {
 		}
 	});
 
-	it("keeps vertical drawer movement scrolling and horizontal drawer swipes navigating once", async () => {
+	it("keeps drawer movement scrolling without entering stage gestures", async () => {
 		const { view, tile } = await openAsset("Coast");
 		(tile.element() as HTMLButtonElement).click();
 		await view.getByRole("button", { name: "Photo information" }).click();
@@ -1486,13 +1943,9 @@ describe("immersive photo viewer checkpoint", () => {
 		).toBe("coast");
 		dispatch("pointerdown", 500, 300);
 		dispatch("pointerup", 420, 310);
-		await expect
-			.element(view.getByTestId("viewer-stage"))
-			.toHaveAttribute("data-current-asset", "photo-0");
-		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(
 			view.getByTestId("viewer-stage").element().dataset.currentAsset,
-		).toBe("photo-0");
+		).toBe("coast");
 	});
 
 	it("cancels an active swipe when the viewport revision changes", async () => {

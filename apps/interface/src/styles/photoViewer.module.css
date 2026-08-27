@@ -58,6 +58,7 @@
 
 .viewerStage[data-viewer-mode="zoomed"] {
 	cursor: grab;
+	touch-action: none;
 }
 
 .viewerStage[data-viewer-panning="true"] {

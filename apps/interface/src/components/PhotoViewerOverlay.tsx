@@ -193,6 +193,43 @@ export function PhotoViewerOverlay({
 		},
 		[controls, reportInteraction, transform],
 	);
+	const pointInDrawable = useCallback((point: { x: number; y: number }) => {
+		const stage = document.querySelector<HTMLElement>(
+			"[data-testid='viewer-stage']",
+		);
+		if (!stage) return point;
+		const bounds = stage.getBoundingClientRect();
+		const computed = window.getComputedStyle(stage);
+		return {
+			x: point.x - bounds.left - Number.parseFloat(computed.paddingLeft || "0"),
+			y: point.y - bounds.top - Number.parseFloat(computed.paddingTop || "0"),
+		};
+	}, []);
+	const handleViewerDoubleTap = useCallback(
+		(point: { x: number; y: number }) => {
+			reportInteraction();
+			const drawablePoint = pointInDrawable(point);
+			if (transform.mode === "zoomed") transform.reset();
+			else transform.zoomAt(transform.geometry.maxScale, drawablePoint);
+		},
+		[pointInDrawable, reportInteraction, transform],
+	);
+	const pinchBaseScaleRef = useRef<number | null>(null);
+	const handleViewerPinchStart = useCallback(() => {
+		pinchBaseScaleRef.current = transform.geometry.scale;
+	}, [transform.geometry.scale]);
+	const handleViewerPinchEnd = useCallback(() => {
+		pinchBaseScaleRef.current = null;
+	}, []);
+	const handleViewerPinch = useCallback(
+		(scale: number, midpoint: { x: number; y: number }) => {
+			reportInteraction();
+			const baseScale = pinchBaseScaleRef.current ?? transform.geometry.scale;
+			pinchBaseScaleRef.current ??= baseScale;
+			transform.zoomAt(baseScale * scale, pointInDrawable(midpoint));
+		},
+		[pointInDrawable, reportInteraction, transform.geometry, transform.zoomAt],
+	);
 	const handlePanStart = useCallback(() => {
 		setPanning(true);
 	}, []);
@@ -221,6 +258,10 @@ export function PhotoViewerOverlay({
 		onPanStart: handlePanStart,
 		onPan: handlePan,
 		onPanEnd: handlePanEnd,
+		onPinch: handleViewerPinch,
+		onPinchStart: handleViewerPinchStart,
+		onPinchEnd: handleViewerPinchEnd,
+		onDoubleTap: handleViewerDoubleTap,
 	});
 
 	useEffect(() => {

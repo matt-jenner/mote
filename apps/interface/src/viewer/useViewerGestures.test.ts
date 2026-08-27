@@ -4,7 +4,7 @@ import {
 	useState,
 } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	classifyViewerGesture,
 	useViewerGestures,
@@ -48,7 +48,7 @@ function nodeDescribe(name: string, factory: () => void) {
 export function GestureLifecycleHarness({
 	stats,
 }: {
-	stats: { panEnds: number };
+	stats: { panEnds: number; taps?: number };
 }) {
 	const [assetRevision, setAssetRevision] = useState(1);
 	const [viewportRevision, setViewportRevision] = useState(1);
@@ -61,7 +61,9 @@ export function GestureLifecycleHarness({
 			stats.panEnds += 1;
 		},
 		onPanStart: () => undefined,
-		onTap: () => undefined,
+		onTap: () => {
+			if (stats.taps !== undefined) stats.taps += 1;
+		},
 		viewportRevision,
 		viewState: "zoomed",
 		viewerOpen,
@@ -109,6 +111,7 @@ export function GestureLifecycleHarness({
 			{ "data-testid": "gesture-pan-ends" },
 			stats.panEnds,
 		),
+		createElement("output", { "data-testid": "gesture-taps" }, stats.taps ?? 0),
 	);
 }
 
@@ -146,6 +149,52 @@ function mountGestures(viewState: "fit" | "zoomed") {
 	return { gestures, pans, stats };
 }
 
+function mountTouchGestures(viewState: "fit" | "zoomed") {
+	Object.defineProperty(globalThis, "Element", {
+		configurable: true,
+		value: GestureElement,
+	});
+	const pans: Array<{ x: number; y: number }> = [];
+	const pinches: Array<{ scale: number; midpoint: { x: number; y: number } }> =
+		[];
+	const stats = {
+		navigations: 0,
+		panEnds: 0,
+		panStarts: 0,
+		doubleTaps: 0,
+		taps: 0,
+	};
+	let gestures: ViewerGestures | undefined;
+	function Harness() {
+		gestures = useViewerGestures({
+			viewerOpen: true,
+			viewportRevision: 1,
+			viewState,
+			onNavigate: () => {
+				stats.navigations += 1;
+			},
+			onTap: () => {
+				stats.taps += 1;
+			},
+			onPanStart: () => {
+				stats.panStarts += 1;
+			},
+			onPan: (delta) => pans.push(delta),
+			onPanEnd: () => {
+				stats.panEnds += 1;
+			},
+			onPinch: (scale, midpoint) => pinches.push({ scale, midpoint }),
+			onDoubleTap: () => {
+				stats.doubleTaps += 1;
+			},
+		});
+		return null;
+	}
+	renderToStaticMarkup(createElement(Harness));
+	if (!gestures) throw new Error("gesture hook did not mount");
+	return { gestures, pans, pinches, stats };
+}
+
 function pointerEvent(
 	element: GestureElement,
 	type: string,
@@ -160,6 +209,27 @@ function pointerEvent(
 		isPrimary: true,
 		pointerId: 1,
 		pointerType: "mouse",
+		target: element,
+		type,
+	} as unknown as ReactPointerEvent<HTMLElement>;
+}
+
+function touchPointerEvent(
+	element: GestureElement,
+	type: string,
+	pointerId: number,
+	clientX: number,
+	clientY: number,
+): ReactPointerEvent<HTMLElement> {
+	return {
+		button: 0,
+		clientX,
+		clientY,
+		currentTarget: element,
+		isPrimary: pointerId === 1,
+		pointerId,
+		pointerType: "touch",
+		preventDefault: () => undefined,
 		target: element,
 		type,
 	} as unknown as ReactPointerEvent<HTMLElement>;
@@ -288,5 +358,137 @@ nodeDescribe("useViewerGestures mouse panning", () => {
 		expect(pans).toEqual([]);
 		expect(stats.panEnds).toBe(0);
 		expect(stats.navigations).toBe(0);
+	});
+});
+
+nodeDescribe("useViewerGestures touch arbitration", () => {
+	it("tracks two distinct pointers for incremental pinch callbacks", () => {
+		const { gestures, pinches, stats } = mountTouchGestures("fit");
+		const element = new GestureElement();
+		gestures.onPointerDown(
+			touchPointerEvent(element, "pointerdown", 1, 100, 100),
+		);
+		gestures.onPointerDown(
+			touchPointerEvent(element, "pointerdown", 2, 200, 100),
+		);
+		gestures.onPointerMove(
+			touchPointerEvent(element, "pointermove", 1, 50, 100),
+		);
+		gestures.onPointerMove(
+			touchPointerEvent(element, "pointermove", 2, 250, 100),
+		);
+		gestures.onPointerUp(touchPointerEvent(element, "pointerup", 1, 50, 100));
+		gestures.onPointerUp(touchPointerEvent(element, "pointerup", 2, 250, 100));
+
+		expect(pinches).toEqual([
+			{ scale: 1.5, midpoint: { x: 125, y: 100 } },
+			{ scale: 2, midpoint: { x: 150, y: 100 } },
+		]);
+		expect(stats.navigations).toBe(0);
+	});
+
+	it("pans every one-finger drag while zoomed without navigating", () => {
+		const { gestures, pans, stats } = mountTouchGestures("zoomed");
+		const element = new GestureElement();
+		gestures.onPointerDown(
+			touchPointerEvent(element, "pointerdown", 1, 100, 200),
+		);
+		gestures.onPointerMove(
+			touchPointerEvent(element, "pointermove", 1, 130, 240),
+		);
+		gestures.onPointerUp(touchPointerEvent(element, "pointerup", 1, 130, 240));
+
+		expect(pans).toEqual([{ x: 30, y: 40 }]);
+		expect(stats.panStarts).toBe(1);
+		expect(stats.panEnds).toBe(1);
+		expect(stats.navigations).toBe(0);
+	});
+
+	it("ignores an extra pointer up without corrupting a pinch", () => {
+		const { gestures, pinches, stats } = mountTouchGestures("fit");
+		const element = new GestureElement();
+		gestures.onPointerDown(
+			touchPointerEvent(element, "pointerdown", 1, 100, 100),
+		);
+		gestures.onPointerDown(
+			touchPointerEvent(element, "pointerdown", 2, 200, 100),
+		);
+		gestures.onPointerDown(
+			touchPointerEvent(element, "pointerdown", 3, 150, 50),
+		);
+		gestures.onPointerUp(touchPointerEvent(element, "pointerup", 3, 150, 50));
+		gestures.onPointerMove(
+			touchPointerEvent(element, "pointermove", 1, 50, 100),
+		);
+		gestures.onPointerMove(
+			touchPointerEvent(element, "pointermove", 2, 250, 100),
+		);
+		gestures.onPointerUp(touchPointerEvent(element, "pointerup", 1, 50, 100));
+		gestures.onPointerUp(touchPointerEvent(element, "pointerup", 2, 250, 100));
+
+		expect(pinches.length).toBe(2);
+		expect(stats.taps).toBe(0);
+		expect(stats.navigations).toBe(0);
+	});
+
+	it("ignores an extra pointer cancel without corrupting a pinch", () => {
+		const { gestures, pinches, stats } = mountTouchGestures("fit");
+		const element = new GestureElement();
+		gestures.onPointerDown(
+			touchPointerEvent(element, "pointerdown", 1, 100, 100),
+		);
+		gestures.onPointerDown(
+			touchPointerEvent(element, "pointerdown", 2, 200, 100),
+		);
+		gestures.onPointerDown(
+			touchPointerEvent(element, "pointerdown", 3, 150, 50),
+		);
+		gestures.onPointerCancel(
+			touchPointerEvent(element, "pointercancel", 3, 150, 50),
+		);
+		gestures.onPointerMove(
+			touchPointerEvent(element, "pointermove", 1, 50, 100),
+		);
+		gestures.onPointerMove(
+			touchPointerEvent(element, "pointermove", 2, 250, 100),
+		);
+
+		expect(pinches.length).toBe(2);
+		expect(stats.taps).toBe(0);
+		expect(stats.navigations).toBe(0);
+	});
+
+	it("suppresses a late ignored up but accepts a reused pointer ID", () => {
+		const { gestures, stats } = mountTouchGestures("fit");
+		const element = new GestureElement();
+		vi.useFakeTimers();
+		try {
+			gestures.onPointerDown(
+				touchPointerEvent(element, "pointerdown", 1, 100, 100),
+			);
+			gestures.onPointerDown(
+				touchPointerEvent(element, "pointerdown", 2, 200, 100),
+			);
+			gestures.onPointerDown(
+				touchPointerEvent(element, "pointerdown", 3, 150, 50),
+			);
+			gestures.onPointerUp(
+				touchPointerEvent(element, "pointerup", 1, 100, 100),
+			);
+			gestures.onPointerUp(
+				touchPointerEvent(element, "pointerup", 2, 200, 100),
+			);
+			gestures.onPointerUp(touchPointerEvent(element, "pointerup", 3, 150, 50));
+
+			expect(stats.taps).toBe(0);
+			gestures.onPointerDown(
+				touchPointerEvent(element, "pointerdown", 3, 150, 50),
+			);
+			gestures.onPointerUp(touchPointerEvent(element, "pointerup", 3, 150, 50));
+			vi.advanceTimersByTime(280);
+			expect(stats.taps).toBe(1);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
