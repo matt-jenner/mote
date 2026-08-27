@@ -3611,6 +3611,35 @@ describe("immersive photo viewer checkpoint", () => {
 		).toBeNull();
 	});
 
+	it("unwinds the information drawer, zoom, and viewer in Escape order", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		const stage = view.getByTestId("viewer-stage");
+		await view.getByRole("button", { name: "Zoom in" }).click();
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+		await view.getByRole("button", { name: "Photo information" }).click();
+		await expect
+			.element(view.getByRole("complementary", { name: "Photo information" }))
+			.toBeVisible();
+
+		await userEvent.keyboard("{Escape}");
+		expect(
+			view.getByRole("complementary", { name: "Photo information" }).query(),
+		).toBeNull();
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+
+		await userEvent.keyboard("{Escape}");
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+
+		await userEvent.keyboard("{Escape}");
+		expect(
+			view.getByRole("dialog", { name: "Photo viewer" }).query(),
+		).toBeNull();
+	});
+
 	it("announces the current position and loads more when pagination remains", async () => {
 		const { view } = await openManyAsset("Coast");
 		const tile = view.getByRole("button", { name: "Open Coast", exact: true });
