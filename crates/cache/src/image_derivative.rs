@@ -102,6 +102,58 @@ impl ImageDerivativeGenerator {
         self.generate_allowed(source, spec)
     }
 
+    /// Rebuilds the durable wall thumbnail from an already cached screen preview.
+    ///
+    /// Screen previews have already had source orientation applied, so this path only
+    /// downscales and re-encodes the cached pixels. The source media is never opened.
+    pub fn generate_wall_thumbnail_from_cached_preview(
+        &self,
+        cached_relative_path: &Path,
+        spec: &DerivativeSpec,
+    ) -> Result<GeneratedDerivative, ImageDerivativeError> {
+        validate_spec(spec)?;
+        if spec.kind != DerivativeKind::WallThumbnail {
+            return Err(ImageDerivativeError::UnsupportedTarget);
+        }
+        let edge = match spec.target {
+            DerivativeTarget::LongEdge(edge) if edge > 0 => edge,
+            _ => return Err(ImageDerivativeError::UnsupportedTarget),
+        };
+        let read_started = Instant::now();
+        let bytes = self.writer.read_checked(cached_relative_path)?;
+        let image = image::load_from_memory(&bytes)?;
+        record_timing_stage("cached_preview_read_decode", read_started);
+        let transform_started = Instant::now();
+        let representative_rgb = average_rgb(&image.thumbnail(32, 32).to_rgb8());
+        let resized = resize_without_upscale(image, edge).to_rgb8();
+        let mut encoded = Vec::new();
+        JpegEncoder::new_with_quality(&mut encoded, 82).encode(
+            &resized,
+            resized.width(),
+            resized.height(),
+            image::ExtendedColorType::Rgb8,
+        )?;
+        record_timing_stage("cached_preview_transform_encode", transform_started);
+
+        let key = DerivativeKey::compute(spec);
+        let relative_path = key.sharded_path("jpg");
+        let write_started = Instant::now();
+        let write_result = self.writer.write_atomic(relative_path.clone(), |file| {
+            std::io::Write::write_all(file, &encoded)
+        });
+        record_timing_stage("managed_cache_write", write_started);
+        let write = write_result?;
+        Ok(GeneratedDerivative {
+            key,
+            relative_path,
+            size_bytes: write.size_bytes,
+            durable: true,
+            reused: write.reused,
+            representative_rgb,
+            content_type: "image/jpeg",
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn generate_screen_preview(
         &self,

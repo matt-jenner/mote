@@ -773,6 +773,181 @@ async fn explicit_visible_screen_preview_request() {
     assert_eq!(ready[0].asset_id, asset_id);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn screen_preview_request_publishes_wall_thumbnail_before_screen_preview() {
+    let fixture = ProgressiveFixture::new(1);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let asset_id = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items[0]
+        .id
+        .clone();
+
+    service
+        .request_derivatives(DerivativeRequest {
+            asset_ids: vec![asset_id.clone()],
+            priority: photo_app_service::DerivativePriority::Visible,
+            kind: DerivativeClass::ScreenPreview,
+        })
+        .await
+        .unwrap();
+    let mut first_kind = None;
+    let mut screen_seen = false;
+    loop {
+        let event = recv_until(&mut updates, |event| {
+            matches!(event, WallUpdate::DerivativesReady { .. })
+        })
+        .await;
+        let WallUpdate::DerivativesReady { derivatives, .. } = event else {
+            unreachable!();
+        };
+        for derivative in derivatives {
+            if derivative.asset_id != asset_id {
+                continue;
+            }
+            first_kind.get_or_insert(derivative.kind);
+            if derivative.kind == DerivativeClass::ScreenPreview {
+                screen_seen = true;
+            }
+        }
+        if screen_seen {
+            break;
+        }
+    }
+
+    assert_eq!(first_kind, Some(DerivativeClass::WallThumbnail));
+    let page = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    assert!(page.items[0].wall_thumbnail.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_screen_preview_is_repaired_locally_before_prefetching_new_preview_work() {
+    let fixture = ProgressiveFixture::new(1);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let wall_entered = Arc::new(tokio::sync::Notify::new());
+    let wall_release = Arc::new(tokio::sync::Notify::new());
+    service
+        .install_derivative_test_class_gate_with_counter(
+            DerivativeClass::WallThumbnail,
+            wall_entered.clone(),
+            wall_release.clone(),
+            Arc::new(AtomicUsize::new(0)),
+        )
+        .await;
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), wall_entered.notified())
+        .await
+        .expect("background wall thumbnail should be held before legacy repair");
+    let asset_id = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items[0]
+        .id
+        .clone();
+    let asset_id_value = uuid::Uuid::parse_str(&asset_id)
+        .map(photo_domain::AssetId::from_uuid)
+        .unwrap();
+    let mut catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    let stored = catalog.load_app_state().unwrap().active_selection.unwrap();
+    let group = catalog
+        .folder_group_for_path(stored.library_id, &stored.relative_folder)
+        .unwrap()
+        .unwrap();
+    let asset = catalog.find_asset(asset_id_value).unwrap().unwrap();
+    let source_before = std::fs::read(fixture.source.join("photo-000.jpg")).unwrap();
+    let source_mtime = std::fs::metadata(fixture.source.join("photo-000.jpg"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let generator = photo_cache::ImageDerivativeGenerator::new(fixture.config.cache_dir()).unwrap();
+    let protected = photo_cache::ProtectedGroups::default();
+    protected.protect(group).unwrap();
+    generator
+        .generate_screen_preview(
+            &fixture.source.join("photo-000.jpg"),
+            asset.id,
+            asset.signature,
+            asset.orientation.unwrap_or(1),
+            group,
+            &mut catalog,
+            photo_cache::CacheBudget::from_total_space(10_000_000),
+            &protected,
+        )
+        .unwrap();
+    drop(catalog);
+
+    let unavailable = fixture.temp.path().join("photos-offline");
+    std::fs::rename(&fixture.source, &unavailable).unwrap();
+    wall_release.notify_waiters();
+    let mut first_kind = None;
+    let mut screen_seen = false;
+    loop {
+        let event = recv_until(&mut updates, |event| {
+            matches!(event, WallUpdate::DerivativesReady { .. })
+        })
+        .await;
+        let WallUpdate::DerivativesReady { derivatives, .. } = event else {
+            unreachable!();
+        };
+        for derivative in derivatives {
+            if derivative.asset_id != asset_id {
+                continue;
+            }
+            first_kind.get_or_insert(derivative.kind);
+            if derivative.kind == DerivativeClass::ScreenPreview {
+                screen_seen = true;
+            }
+        }
+        if screen_seen {
+            break;
+        }
+    }
+
+    assert_eq!(first_kind, Some(DerivativeClass::WallThumbnail));
+    let page = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    assert!(page.items[0].wall_thumbnail.is_some());
+    std::fs::rename(unavailable, &fixture.source).unwrap();
+    assert_eq!(
+        std::fs::read(fixture.source.join("photo-000.jpg")).unwrap(),
+        source_before
+    );
+    assert_eq!(
+        std::fs::metadata(fixture.source.join("photo-000.jpg"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        source_mtime
+    );
+}
+
 #[cfg(debug_assertions)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_visible_screen_preview_does_not_fence_prefetch() {

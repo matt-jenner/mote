@@ -74,6 +74,28 @@ fn wall_and_screen_outputs_respect_long_edge_and_orientation() {
 }
 
 #[test]
+fn repairs_a_wall_thumbnail_from_a_cached_screen_preview() {
+    let fixture = fixture();
+    let cache = tempfile::tempdir().unwrap();
+    let cached_screen = cache.path().join("legacy-screen.jpg");
+    std::fs::copy(fixture.path(), &cached_screen).unwrap();
+    let generator = ImageDerivativeGenerator::new(cache.path()).unwrap();
+
+    let repaired = generator
+        .generate_wall_thumbnail_from_cached_preview(
+            std::path::Path::new("legacy-screen.jpg"),
+            &spec(DerivativeKind::WallThumbnail, 1024, 1),
+        )
+        .unwrap();
+
+    assert!(repaired.durable);
+    assert_eq!(
+        image::image_dimensions(cache.path().join(repaired.relative_path)).unwrap(),
+        (1024, 683)
+    );
+}
+
+#[test]
 fn a_second_identical_request_reuses_the_atomic_cache_file_and_source() {
     let fixture = fixture();
     let before = std::fs::read(fixture.path()).unwrap();

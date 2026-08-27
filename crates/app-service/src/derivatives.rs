@@ -45,6 +45,7 @@ enum DerivativeWorkError {
     Image(ImageDerivativeError),
     WorkerUnavailable,
     PreviewSuperseded,
+    WallThumbnailRequired,
 }
 
 impl From<ImageDerivativeError> for DerivativeWorkError {
@@ -72,7 +73,8 @@ impl DerivativeWorkError {
             Self::Image(ImageDerivativeError::Cache(_))
             | Self::Image(ImageDerivativeError::Catalog(_))
             | Self::WorkerUnavailable
-            | Self::PreviewSuperseded => DerivativeFailureScope::CacheWide,
+            | Self::PreviewSuperseded
+            | Self::WallThumbnailRequired => DerivativeFailureScope::CacheWide,
         }
     }
 }
@@ -81,6 +83,7 @@ impl DerivativeWorkError {
 pub(crate) struct PendingDerivative {
     id: AssetId,
     source: PathBuf,
+    cached_source: Option<PathBuf>,
     spec: DerivativeSpec,
     group: FolderGroupId,
     class: DerivativeClass,
@@ -303,11 +306,21 @@ impl AppService {
         let request_selection = self.active_selection_token()?;
         let _wall_request = (request.kind == DerivativeClass::WallThumbnail)
             .then(|| self.begin_preview_wall_request(request_selection));
-        let (selection, ready, pending) = self.resolve_derivatives(&ids, request.kind)?;
         let priority = match request.priority {
             DerivativePriority::Visible => JobPriority::Visible,
             DerivativePriority::NearViewport => JobPriority::NearViewport,
         };
+        let derivative_ids = if request.kind == DerivativeClass::ScreenPreview {
+            let (_, wall_ready) = self.ensure_wall_thumbnails(&ids, priority).await?;
+            if wall_ready.len() != ids.len() {
+                return Err(AppServiceError::DerivativeUnavailable);
+            }
+            wall_ready.into_iter().collect::<Vec<_>>()
+        } else {
+            ids.clone()
+        };
+        let (selection, ready, pending) =
+            self.resolve_derivatives(&derivative_ids, request.kind)?;
         let mut successful_ids = ready
             .iter()
             .map(|reference| reference.asset_id.clone())
@@ -329,7 +342,7 @@ impl AppService {
         let generated = self.run_derivative_jobs_publishing(pending, priority).await;
         successful_ids.extend(generated.iter().map(|reference| reference.asset_id.clone()));
         let has_unresolved = pending_ids.difference(&successful_ids).next().is_some();
-        let successful_in_request = ids
+        let successful_in_request = derivative_ids
             .iter()
             .copied()
             .filter(|id| successful_ids.contains(&id.as_uuid().hyphenated().to_string()))
@@ -341,6 +354,32 @@ impl AppService {
             return Err(AppServiceError::DerivativeUnavailable);
         }
         Ok(())
+    }
+
+    async fn ensure_wall_thumbnails(
+        &self,
+        ids: &[AssetId],
+        priority: JobPriority,
+    ) -> Result<(SelectionToken, HashSet<AssetId>), AppServiceError> {
+        let (selection, cached, pending) =
+            self.resolve_derivatives(ids, DerivativeClass::WallThumbnail)?;
+        let mut ready_ids = cached
+            .iter()
+            .map(|reference| reference.asset_id.clone())
+            .filter_map(|id| uuid::Uuid::parse_str(&id).ok())
+            .map(AssetId::from_uuid)
+            .collect::<HashSet<_>>();
+        if !cached.is_empty() {
+            self.publish_derivatives_if_active(selection, cached);
+        }
+        let generated = self.run_derivative_jobs_publishing(pending, priority).await;
+        ready_ids.extend(
+            generated
+                .iter()
+                .filter_map(|reference| uuid::Uuid::parse_str(&reference.asset_id).ok())
+                .map(AssetId::from_uuid),
+        );
+        Ok((selection, ready_ids))
     }
 
     fn resolve_derivatives(
@@ -423,6 +462,16 @@ impl AppService {
             .libraries
             .catalog()
             .derivatives_for_assets(ids, kind)?;
+        let prerequisite_records = match class {
+            DerivativeClass::WallThumbnail => state.libraries.catalog().derivatives_for_assets(
+                ids,
+                derivative_kind_name(DerivativeClass::ScreenPreview),
+            )?,
+            DerivativeClass::ScreenPreview => state.libraries.catalog().derivatives_for_assets(
+                ids,
+                derivative_kind_name(DerivativeClass::WallThumbnail),
+            )?,
+        };
         let mut ready = Vec::new();
         let mut pending = Vec::new();
         for id in ids {
@@ -436,24 +485,55 @@ impl AppService {
             }
             let spec = derivative_spec(&asset, class);
             let key = DerivativeKey::compute(&spec);
-            if let Some(existing) = records
-                .iter()
-                .find(|record| record.asset_id == *id && record.cache_key == key.as_str())
-            {
+            if class == DerivativeClass::ScreenPreview {
+                let wall_spec = derivative_spec(&asset, DerivativeClass::WallThumbnail);
+                let wall_key = DerivativeKey::compute(&wall_spec);
+                let wall_ready = prerequisite_records.iter().any(|record| {
+                    record.asset_id == *id
+                        && record.folder_group_id == group
+                        && record.cache_key == wall_key.as_str()
+                });
+                if !wall_ready {
+                    continue;
+                }
+            }
+            if let Some(existing) = records.iter().find(|record| {
+                record.asset_id == *id
+                    && record.folder_group_id == group
+                    && record.cache_key == key.as_str()
+            }) {
                 ready.push(reference(*id, class, existing.cache_key.clone()));
-            } else if matches!(asset.availability, Availability::Available) {
+            } else {
                 let Some(relative) = asset.relative_path.to_path_buf().ok() else {
                     continue;
                 };
-                pending.push(PendingDerivative {
-                    id: *id,
-                    source: root.join(relative),
-                    spec,
-                    group,
-                    class,
-                    selection: selection_token,
-                    preview_generation,
-                });
+                let cached_source = if class == DerivativeClass::WallThumbnail {
+                    let screen_spec = derivative_spec(&asset, DerivativeClass::ScreenPreview);
+                    let screen_key = DerivativeKey::compute(&screen_spec);
+                    prerequisite_records
+                        .iter()
+                        .find(|record| {
+                            record.asset_id == *id
+                                && record.folder_group_id == group
+                                && record.cache_key == screen_key.as_str()
+                        })
+                        .map(|record| record.relative_cache_path.clone())
+                } else {
+                    None
+                };
+                if matches!(asset.availability, Availability::Available) || cached_source.is_some()
+                {
+                    pending.push(PendingDerivative {
+                        id: *id,
+                        source: root.join(relative),
+                        cached_source,
+                        spec,
+                        group,
+                        class,
+                        selection: selection_token,
+                        preview_generation,
+                    });
+                }
             }
         }
         Ok((selection_token, ready, pending))
@@ -568,6 +648,7 @@ impl AppService {
                         Some(reference)
                     }
                     Err(DerivativeWorkError::PreviewSuperseded) => None,
+                    Err(DerivativeWorkError::WallThumbnailRequired) => None,
                     Err(error) => {
                         match error.scope() {
                             DerivativeFailureScope::Asset => {
@@ -608,14 +689,58 @@ impl AppService {
         if !self.selection_is_active(selection) {
             return Err(DerivativeWorkError::WorkerUnavailable);
         }
+        if class == DerivativeClass::ScreenPreview {
+            let wall_spec = wall_spec_from(&pending.spec);
+            let wall_key = DerivativeKey::compute(&wall_spec);
+            let wall_ready = self
+                .state()
+                .map_err(|_| DerivativeWorkError::WorkerUnavailable)?
+                .libraries
+                .catalog()
+                .find_derivative(
+                    id,
+                    derivative_kind_name(DerivativeClass::WallThumbnail),
+                    wall_key.as_str(),
+                )
+                .map_err(|_| DerivativeWorkError::WorkerUnavailable)?
+                .is_some_and(|record| record.folder_group_id == group);
+            if !wall_ready {
+                return Err(DerivativeWorkError::WallThumbnailRequired);
+            }
+        }
+        let cached_screen_preview = if class == DerivativeClass::WallThumbnail {
+            pending
+                .cached_source
+                .clone()
+                .or(self.cached_screen_preview_for_wall(id, group, &pending.spec)?)
+        } else {
+            None
+        };
         let generator = ImageDerivativeGenerator::new(&self.cache_root)?;
         let generated = match class {
             DerivativeClass::WallThumbnail => {
                 let source = pending.source;
+                let cached_source = cached_screen_preview;
                 let spec = pending.spec;
-                tokio::task::spawn_blocking(move || generator.generate(&source, &spec))
-                    .await
-                    .map_err(|_| DerivativeWorkError::WorkerUnavailable)??
+                tokio::task::spawn_blocking(move || {
+                    if let Some(cached_source) = cached_source {
+                        let repair = generator
+                            .generate_wall_thumbnail_from_cached_preview(&cached_source, &spec);
+                        match repair {
+                            Ok(generated) => Ok(generated),
+                            Err(
+                                ImageDerivativeError::Io(_)
+                                | ImageDerivativeError::Decode(_)
+                                | ImageDerivativeError::Cache(photo_cache::CacheError::Io(_)),
+                            ) => generator.generate(&source, &spec),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        generator.generate(&source, &spec)
+                    }
+                })
+                .await
+                .map_err(|_| DerivativeWorkError::WorkerUnavailable)??
             }
             DerivativeClass::ScreenPreview => {
                 let source = pending.source;
@@ -676,6 +801,31 @@ impl AppService {
             catalog_result.map_err(ImageDerivativeError::from)?;
         }
         Ok(reference(id, class, generated.key.as_str().into()))
+    }
+
+    fn cached_screen_preview_for_wall(
+        &self,
+        asset_id: AssetId,
+        group: FolderGroupId,
+        wall_spec: &DerivativeSpec,
+    ) -> Result<Option<PathBuf>, DerivativeWorkError> {
+        let screen_spec = screen_spec_from(wall_spec);
+        let screen_key = DerivativeKey::compute(&screen_spec);
+        self.state()
+            .map_err(|_| DerivativeWorkError::WorkerUnavailable)?
+            .libraries
+            .catalog()
+            .find_derivative(
+                asset_id,
+                derivative_kind_name(DerivativeClass::ScreenPreview),
+                screen_key.as_str(),
+            )
+            .map_err(|_| DerivativeWorkError::WorkerUnavailable)
+            .map(|record| {
+                record
+                    .filter(|record| record.folder_group_id == group)
+                    .map(|record| record.relative_cache_path)
+            })
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -1040,12 +1190,30 @@ impl AppService {
         if !self.preview_work_can_continue(selection).await {
             return PreviewPrefetchOutcome::Blocked;
         }
-        let Ok((selection, cached, pending)) = self.resolve_screen_previews(&recent, generation)
+        let Ok((selection, wall_ready)) = self
+            .ensure_wall_thumbnails(&recent, JobPriority::NearViewport)
+            .await
         else {
             return PreviewPrefetchOutcome::Terminate;
         };
+        if !self.preview_generation_is_current(generation) {
+            return PreviewPrefetchOutcome::Stale;
+        }
+        let recent_ready = recent
+            .iter()
+            .copied()
+            .filter(|id| wall_ready.contains(id))
+            .collect::<Vec<_>>();
+        let Ok((screen_selection, cached, pending)) =
+            self.resolve_screen_previews(&recent_ready, generation)
+        else {
+            return PreviewPrefetchOutcome::Terminate;
+        };
+        if screen_selection != selection {
+            return PreviewPrefetchOutcome::Stale;
+        }
         if !cached.is_empty() {
-            self.publish_derivatives_if_active(selection, cached);
+            self.publish_derivatives_if_active(screen_selection, cached);
         }
         let _generated = self
             .run_derivative_jobs_publishing(pending, JobPriority::NearViewport)
@@ -1072,13 +1240,33 @@ impl AppService {
                 return PreviewPrefetchOutcome::Stale;
             }
             if !remaining.is_empty() {
-                let Ok((resolved_selection, _cached, pending)) =
-                    self.resolve_screen_previews(&remaining, generation)
+                let Ok((wall_selection, wall_ready)) = self
+                    .ensure_wall_thumbnails(&remaining, JobPriority::IdleLibrary)
+                    .await
+                else {
+                    return PreviewPrefetchOutcome::Terminate;
+                };
+                if wall_selection != selection {
+                    return PreviewPrefetchOutcome::Stale;
+                }
+                if !self.preview_generation_is_current(generation) {
+                    return PreviewPrefetchOutcome::Stale;
+                }
+                let screen_ids = remaining
+                    .iter()
+                    .copied()
+                    .filter(|id| wall_ready.contains(id))
+                    .collect::<Vec<_>>();
+                let Ok((resolved_selection, cached, pending)) =
+                    self.resolve_screen_previews(&screen_ids, generation)
                 else {
                     return PreviewPrefetchOutcome::Terminate;
                 };
                 if resolved_selection != selection {
                     return PreviewPrefetchOutcome::Stale;
+                }
+                if !cached.is_empty() {
+                    self.publish_derivatives_if_active(resolved_selection, cached);
                 }
                 let _generated = self
                     .run_derivative_jobs_publishing(pending, JobPriority::IdleLibrary)
@@ -1384,6 +1572,22 @@ fn derivative_spec(asset: &photo_catalog::AssetRecord, class: DerivativeClass) -
     }
 }
 
+fn wall_spec_from(spec: &DerivativeSpec) -> DerivativeSpec {
+    DerivativeSpec {
+        kind: DerivativeKind::WallThumbnail,
+        target: DerivativeTarget::LongEdge(1024),
+        ..spec.clone()
+    }
+}
+
+fn screen_spec_from(spec: &DerivativeSpec) -> DerivativeSpec {
+    DerivativeSpec {
+        kind: DerivativeKind::ScreenPreview,
+        target: DerivativeTarget::LongEdge(4096),
+        ..spec.clone()
+    }
+}
+
 fn derivative_kind_name(class: DerivativeClass) -> &'static str {
     match class {
         DerivativeClass::WallThumbnail => "wall_thumbnail",
@@ -1464,6 +1668,7 @@ mod tests {
         let pending = PendingDerivative {
             id: asset_id,
             source: PathBuf::from("source.jpg"),
+            cached_source: None,
             spec: spec.clone(),
             group: group_id,
             class: DerivativeClass::ScreenPreview,
@@ -1506,6 +1711,7 @@ mod tests {
         let pending = |asset_id| PendingDerivative {
             id: asset_id,
             source: PathBuf::from("source.jpg"),
+            cached_source: None,
             spec: DerivativeSpec {
                 asset_id,
                 signature: photo_domain::FileSignature {
@@ -1669,6 +1875,7 @@ mod tests {
         let pending = |epoch| PendingDerivative {
             id: asset_id,
             source: PathBuf::from("source.jpg"),
+            cached_source: None,
             spec: spec.clone(),
             group: group_id,
             class: DerivativeClass::ScreenPreview,
@@ -2021,6 +2228,22 @@ mod tests {
         })
         .await
         .unwrap();
+        service.reset_preview_gate();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let task_running = service
+                    .preview_gate
+                    .lock()
+                    .map(|gate| gate.task_running)
+                    .unwrap_or(true);
+                if !task_running && service.derivative_queue.is_empty().await {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(
             photo_catalog::Catalog::open(&config.catalog_path())
                 .unwrap()
@@ -2096,13 +2319,14 @@ mod tests {
                 DerivativeClass::WallThumbnail,
             )
             .unwrap();
-        assert!(cached_wall.is_empty());
+        assert_eq!(cached_wall.len(), 250);
+        assert!(pending_wall.is_empty());
         assert_eq!(
             service
                 .run_derivative_jobs(pending_wall, JobPriority::Visible)
                 .await
                 .len(),
-            250
+            0
         );
         assert_eq!(
             photo_catalog::Catalog::open(&config.catalog_path())
