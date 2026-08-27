@@ -12,6 +12,7 @@ import { findViewerIndex, shouldLoadViewerPage } from "../viewer/photoSequence";
 import { useViewerControls } from "../viewer/useViewerControls";
 import { useViewerGestures } from "../viewer/useViewerGestures";
 import { useViewerPreview } from "../viewer/useViewerPreview";
+import { useViewerTransform } from "../viewer/useViewerTransform";
 import type { ViewerState } from "../viewer/viewerReducer";
 import { useViewerViewport } from "../viewer/viewerViewport";
 import { PhotoInfoDrawer } from "./PhotoInfoDrawer";
@@ -100,6 +101,13 @@ export function PhotoViewerOverlay({
 		onSetWallInteraction(true);
 		preview.reportInteraction();
 	}, [onSetWallInteraction, preview.reportInteraction]);
+	const transform = useViewerTransform({
+		assetId: asset?.id ?? "",
+		assetRevision: state.previewGeneration,
+		imageWidth: asset?.width ?? 0,
+		imageHeight: asset?.height ?? 0,
+		onInteraction: reportInteraction,
+	});
 	const handleHideControls = useCallback(() => {
 		const active = document.activeElement;
 		if (
@@ -146,7 +154,7 @@ export function PhotoViewerOverlay({
 		onTap: () => controls.toggleTouch(),
 		viewportRevision: viewport.revision,
 		viewerOpen: state.open,
-		viewState: "fit",
+		viewState: transform.mode,
 	});
 
 	useEffect(() => {
@@ -338,6 +346,9 @@ export function PhotoViewerOverlay({
 				onPreviewFailure={handlePreviewFailure}
 				previewGeneration={state.previewGeneration}
 				service={service}
+				transform={transform.geometry}
+				onDrawableSizeChange={transform.setDrawableSize}
+				onNaturalSizeChange={transform.setNaturalSize}
 				viewportHeight={viewport.height}
 				viewportWidth={viewport.width}
 			/>

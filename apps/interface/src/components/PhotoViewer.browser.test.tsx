@@ -20,6 +20,7 @@ import type {
 import "../styles/tokens.css";
 import "../styles/global.css";
 import { useViewerPreview } from "../viewer/useViewerPreview";
+import { useViewerTransform } from "../viewer/useViewerTransform";
 import { AppShell } from "./AppShell";
 import { ViewerFilmstrip } from "./ViewerFilmstrip";
 import { ViewerStage } from "./ViewerStage";
@@ -320,6 +321,76 @@ function PreviewHarness({
 	);
 }
 
+const largePreviewFixture =
+	"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4096' height='2731' viewBox='0 0 4096 2731'%3E%3Crect width='4096' height='2731' fill='%23225670'/%3E%3C/svg%3E";
+
+function TransformHarness() {
+	const [previewReady, setPreviewReady] = useState(false);
+	const [revision, setRevision] = useState(1);
+	const [rotated, setRotated] = useState(false);
+	const transform = useViewerTransform({
+		assetId: "transform-harness",
+		assetRevision: revision,
+		imageWidth: 6000,
+		imageHeight: 4000,
+		onInteraction: () => undefined,
+	});
+	const currentWidth = rotated ? 400 : 600;
+	const currentHeight = rotated ? 600 : 400;
+	return (
+		<>
+			<button
+				data-testid="zoom-programmatically"
+				onClick={() => {
+					transform.setDrawableSize({ width: 600, height: 400 });
+					transform.setNaturalSize({ width: 1200, height: 800 });
+					transform.zoomAt(1.5, { x: 450, y: 150 });
+				}}
+				type="button"
+			>
+				Zoom
+			</button>
+			<button
+				data-testid="release-preview-decode"
+				onClick={() => setPreviewReady(true)}
+				type="button"
+			>
+				Release preview
+			</button>
+			<button
+				data-testid="rotate-transform"
+				onClick={() => setRotated(true)}
+				type="button"
+			>
+				Rotate
+			</button>
+			<button
+				data-testid="navigate-transform"
+				onClick={() => setRevision((value) => value + 1)}
+				type="button"
+			>
+				Navigate
+			</button>
+			<div style={{ width: `${currentWidth}px`, height: `${currentHeight}px` }}>
+				<ViewerStage
+					asset={asset("transform-harness", "Transform", 1)}
+					baseUrl={largePreviewFixture}
+					currentUrl={previewReady ? largePreviewFixture : null}
+					onNaturalSizeChange={transform.setNaturalSize}
+					onDrawableSizeChange={transform.setDrawableSize}
+					service={previewService(async () => undefined)}
+					transform={transform.geometry}
+					viewportHeight={currentHeight}
+					viewportWidth={currentWidth}
+				/>
+			</div>
+			<output data-testid="transform-focal">
+				{JSON.stringify(transform.geometry.focal)}
+			</output>
+		</>
+	);
+}
+
 function RefreshingPreviewHarness({
 	initialAssets,
 	service,
@@ -434,6 +505,34 @@ describe("immersive photo viewer checkpoint", () => {
 	afterEach(() => {
 		document.documentElement.dataset.theme = "system";
 		document.documentElement.style.colorScheme = "light dark";
+	});
+
+	it("keeps the same transform when the screen preview replaces the thumbnail", async () => {
+		const view = await render(<TransformHarness />);
+		await view.getByTestId("zoom-programmatically").click();
+		const layer = view.getByTestId("viewer-transform-layer").element();
+		const before = layer.style.transform;
+		await view.getByTestId("release-preview-decode").click();
+		await expect
+			.element(view.getByTestId("viewer-transform-layer"))
+			.toHaveAttribute("data-viewer-mode", "zoomed");
+		expect(layer.style.transform).toBe(before);
+	});
+
+	it("resets on navigation while preserving zoom through rotation", async () => {
+		const view = await render(<TransformHarness />);
+		await view.getByTestId("zoom-programmatically").click();
+		const beforeRotation = view
+			.getByTestId("transform-focal")
+			.element().textContent;
+		await view.getByTestId("rotate-transform").click();
+		await expect
+			.poll(() => view.getByTestId("transform-focal").element().textContent)
+			.toBe(beforeRotation);
+		await view.getByTestId("navigate-transform").click();
+		await expect
+			.element(view.getByTestId("viewer-stage"))
+			.toHaveAttribute("data-viewer-mode", "fit");
 	});
 
 	it("opens the selected tile above the mounted wall and returns to its exact position", async () => {
