@@ -1,9 +1,11 @@
+import { useState } from "react";
 import { expect, it } from "vitest";
 import { page } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import type { PhotoService, WallAsset } from "../services/photoService";
 import "../styles/tokens.css";
 import "../styles/global.css";
+import { ViewerNavigator } from "./ViewerNavigator";
 import { ViewerStage } from "./ViewerStage";
 
 const pixel =
@@ -87,4 +89,49 @@ it("crossfades a decoded preview without changing fitted bounds", async () => {
 	} finally {
 		HTMLImageElement.prototype.decode = originalDecode;
 	}
+});
+
+it("keeps the navigator mounted and visible while manipulation is active", async () => {
+	await page.viewport(800, 600);
+	let active = false;
+	let setActive: ((next: boolean) => void) | null = null;
+	let setVisible: ((next: boolean) => void) | null = null;
+	function Harness() {
+		const [visible, updateVisible] = useState(true);
+		const [manipulating, updateActive] = useState(false);
+		setVisible = updateVisible;
+		setActive = updateActive;
+		active = manipulating;
+		return (
+			<ViewerNavigator
+				assetName="Motion photo"
+				imageHeight={800}
+				imageUrl={null}
+				imageWidth={1200}
+				interactive
+				onInteraction={() => undefined}
+				onManipulationChange={updateActive}
+				onRecenter={() => undefined}
+				visible={visible || manipulating}
+				visibleRect={{ x: 0.25, y: 0, width: 0.5, height: 1 }}
+			/>
+		);
+	}
+	const view = await render(<Harness />);
+	const navigator = view
+		.getByRole("img", { name: "Navigator for Motion photo" })
+		.element();
+	expect(getComputedStyle(navigator).transitionDuration).not.toBe("0s");
+	const hide = setVisible as ((next: boolean) => void) | null;
+	const activate = setActive as ((next: boolean) => void) | null;
+	if (!hide || !activate) throw new Error("harness setters unavailable");
+	hide(false);
+	await expect.poll(() => getComputedStyle(navigator).opacity).toBe("0");
+	expect(getComputedStyle(navigator).visibility).toBe("visible");
+	expect(getComputedStyle(navigator).pointerEvents).toBe("none");
+	activate(true);
+	await expect.poll(() => active).toBe(true);
+	hide(false);
+	await expect.poll(() => getComputedStyle(navigator).opacity).toBe("1");
+	await view.unmount();
 });

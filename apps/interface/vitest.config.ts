@@ -46,6 +46,24 @@ export default defineConfig({
 					},
 				},
 			},
+			{
+				plugins: [react()],
+				test: {
+					name: "browser-contrast",
+					include: ["src/**/*.contrast.test.tsx"],
+					browser: {
+						enabled: true,
+						provider: playwright({
+							contextOptions: {
+								forcedColors: "active",
+								reducedMotion: "reduce",
+							},
+						}),
+						headless: true,
+						instances: [{ browser: "webkit" }],
+					},
+				},
+			},
 		],
 	},
 });

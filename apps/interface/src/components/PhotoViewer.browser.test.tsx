@@ -24,6 +24,7 @@ import { useViewerPreview } from "../viewer/useViewerPreview";
 import { useViewerTransform } from "../viewer/useViewerTransform";
 import { AppShell } from "./AppShell";
 import { ViewerFilmstrip } from "./ViewerFilmstrip";
+import { ViewerNavigator } from "./ViewerNavigator";
 import { ViewerStage } from "./ViewerStage";
 
 function asset(id: string, displayName: string, order: number): WallAsset {
@@ -818,6 +819,7 @@ describe("immersive photo viewer checkpoint", () => {
 			.element(stage)
 			.toHaveAttribute("data-current-asset", "photo-0");
 		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+		expect(overlay.querySelector("[data-viewer-navigator]")).toBeNull();
 	});
 
 	it("shows an interactive desktop navigator with the normalized viewport", async () => {
@@ -920,6 +922,22 @@ describe("immersive photo viewer checkpoint", () => {
 
 	it("keeps the navigator above controls in rotated landscape and beside the drawer", async () => {
 		await page.viewport(844, 390);
+		const root = document.documentElement;
+		const previousSafeAreas = [
+			"--safe-area-top",
+			"--safe-area-right",
+			"--safe-area-bottom",
+			"--safe-area-left",
+		].map(
+			(property) => [property, root.style.getPropertyValue(property)] as const,
+		);
+		for (const [property, value] of [
+			["--safe-area-top", "12px"],
+			["--safe-area-right", "28px"],
+			["--safe-area-bottom", "24px"],
+			["--safe-area-left", "18px"],
+		] as const)
+			root.style.setProperty(property, value);
 		const { view, tile } = await openAsset("Coast");
 		(tile.element() as HTMLButtonElement).click();
 		await view.getByRole("button", { name: "Zoom in" }).click();
@@ -949,6 +967,17 @@ describe("immersive photo viewer checkpoint", () => {
 		expect(navigator.getBoundingClientRect().right).toBeLessThanOrEqual(
 			drawer.getBoundingClientRect().left,
 		);
+		expect(navigator.getBoundingClientRect().bottom).toBeLessThanOrEqual(
+			view
+				.getByRole("dialog", { name: "Photo viewer" })
+				.element()
+				.getBoundingClientRect().bottom - 24,
+		);
+		await view.unmount();
+		for (const [property, value] of previousSafeAreas) {
+			if (value) root.style.setProperty(property, value);
+			else root.style.removeProperty(property);
+		}
 	});
 
 	it("uses coarse pointer modality for a wide touch viewport", async () => {
@@ -1125,62 +1154,148 @@ describe("immersive photo viewer checkpoint", () => {
 		await view.unmount();
 	});
 
+	it("suppresses navigator fade in reduced-motion mode", async () => {
+		const view = await render(
+			<ViewerNavigator
+				assetName="Motion photo"
+				imageHeight={800}
+				imageUrl={null}
+				imageWidth={1200}
+				interactive
+				onInteraction={() => undefined}
+				onRecenter={() => undefined}
+				visible={false}
+				visibleRect={{ x: 0.25, y: 0.25, width: 0.5, height: 0.5 }}
+			/>,
+		);
+		const navigator = view
+			.getByRole("img", {
+				name: "Navigator for Motion photo",
+				includeHidden: true,
+			})
+			.element();
+		expect(getComputedStyle(navigator).transitionDuration).toBe("0s");
+		expect(getComputedStyle(navigator).opacity).toBe("0");
+		expect(getComputedStyle(navigator).visibility).toBe("hidden");
+		expect(getComputedStyle(navigator).pointerEvents).toBe("none");
+		await view.unmount();
+	});
+
 	it("keeps the thumbnail until the preview decodes and preserves the viewport", async () => {
+		const originalDecode = HTMLImageElement.prototype.decode;
+		let releaseDecode: (() => void) | null = null;
+		HTMLImageElement.prototype.decode = function () {
+			if (this.src.includes("data:image/svg+xml"))
+				return new Promise<void>((resolve) => {
+					releaseDecode = resolve;
+				});
+			return originalDecode.call(this);
+		};
 		const service = serviceWithReadyPhotos(false, 1, true);
 		const originalDerivativeUrl = service.derivativeUrl.bind(service);
 		service.derivativeUrl = (reference) =>
 			reference.kind === "screenPreview"
 				? "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='2400' height='1600'%3E%3Crect width='100%25' height='100%25' fill='teal'/%3E%3C/svg%3E"
 				: originalDerivativeUrl(reference);
-		const { view } = await openAssetWithService(service, "Coast");
-		await view.getByRole("button", { name: "Zoom in" }).click();
-		const dialog = view.getByRole("dialog", { name: "Photo viewer" }).element();
-		const navigator = dialog.querySelector<HTMLElement>(
-			"[data-viewer-navigator]",
-		);
-		if (!navigator) throw new Error("navigator was not rendered after zooming");
-		const viewport = navigator.querySelector<HTMLElement>(
-			"[data-viewer-navigator-viewport]",
-		);
-		const image = navigator.querySelector<HTMLImageElement>("img");
-		if (!viewport || !image)
-			throw new Error("navigator image was not rendered");
-		const before = {
-			left: viewport.style.left,
-			top: viewport.style.top,
-			width: viewport.style.width,
-			height: viewport.style.height,
-		};
-		await expect
-			.poll(() => navigator.querySelector<HTMLImageElement>("img")?.src ?? "")
-			.toContain("data:image/svg+xml");
-		expect({
-			left: viewport.style.left,
-			top: viewport.style.top,
-			width: viewport.style.width,
-			height: viewport.style.height,
-		}).toEqual(before);
-		await view.unmount();
+		try {
+			const { view } = await openAssetWithService(service, "Coast");
+			await view.getByRole("button", { name: "Zoom in" }).click();
+			const dialog = view
+				.getByRole("dialog", { name: "Photo viewer" })
+				.element();
+			const navigator = dialog.querySelector<HTMLElement>(
+				"[data-viewer-navigator]",
+			);
+			if (!navigator)
+				throw new Error("navigator was not rendered after zooming");
+			const viewport = navigator.querySelector<HTMLElement>(
+				"[data-viewer-navigator-viewport]",
+			);
+			const image = navigator.querySelector<HTMLImageElement>("img");
+			if (!viewport || !image)
+				throw new Error("navigator image was not rendered");
+			expect(image.dataset.viewerNavigatorLayer).toBe("wallThumbnail");
+			const before = {
+				left: viewport.style.left,
+				top: viewport.style.top,
+				width: viewport.style.width,
+				height: viewport.style.height,
+				bounds: viewport.getBoundingClientRect().toJSON(),
+			};
+			const release = releaseDecode as (() => void) | null;
+			if (!release) throw new Error("preview decode did not start");
+			release();
+			await expect
+				.poll(
+					() =>
+						navigator.querySelector<HTMLImageElement>("img")?.dataset
+							.viewerNavigatorLayer ?? "",
+				)
+				.toBe("screenPreview");
+			expect({
+				left: viewport.style.left,
+				top: viewport.style.top,
+				width: viewport.style.width,
+				height: viewport.style.height,
+				bounds: viewport.getBoundingClientRect().toJSON(),
+			}).toEqual(before);
+			await view.unmount();
+		} finally {
+			HTMLImageElement.prototype.decode = originalDecode;
+		}
 	});
 
 	it("recovers the thumbnail when the navigator preview decode fails", async () => {
-		const { view, tile } = await openAsset("Coast", true);
-		(tile.element() as HTMLButtonElement).click();
-		await view.getByRole("button", { name: "Zoom in" }).click();
-		const navigator = view
-			.getByRole("dialog", { name: "Photo viewer" })
-			.element()
-			.querySelector<HTMLElement>("[data-viewer-navigator]");
-		if (!navigator) throw new Error("navigator was not rendered after zooming");
-		await expect
-			.poll(
-				() =>
-					navigator
-						.querySelector<HTMLImageElement>("img")
-						?.getAttribute("data-viewer-navigator-layer") ?? "",
-			)
-			.toBe("wallThumbnail");
-		await view.unmount();
+		const originalDecode = HTMLImageElement.prototype.decode;
+		let rejectDecode: ((reason?: unknown) => void) | null = null;
+		HTMLImageElement.prototype.decode = function () {
+			if (this.src.includes("missing.jpg"))
+				return new Promise<void>((_, reject) => {
+					rejectDecode = reject;
+				});
+			return originalDecode.call(this);
+		};
+		try {
+			const { view, tile } = await openAsset("Coast", true);
+			(tile.element() as HTMLButtonElement).click();
+			await view.getByRole("button", { name: "Zoom in" }).click();
+			const navigator = view
+				.getByRole("dialog", { name: "Photo viewer" })
+				.element()
+				.querySelector<HTMLElement>("[data-viewer-navigator]");
+			if (!navigator)
+				throw new Error("navigator was not rendered after zooming");
+			const image = navigator.querySelector<HTMLImageElement>("img");
+			const viewport = navigator.querySelector<HTMLElement>(
+				"[data-viewer-navigator-viewport]",
+			);
+			if (!image || !viewport)
+				throw new Error("navigator image was not rendered");
+			expect(image.dataset.viewerNavigatorLayer).toBe("wallThumbnail");
+			const before = {
+				left: viewport.style.left,
+				top: viewport.style.top,
+				width: viewport.style.width,
+				height: viewport.style.height,
+				bounds: viewport.getBoundingClientRect().toJSON(),
+			};
+			const reject = rejectDecode as ((reason?: unknown) => void) | null;
+			if (!reject) throw new Error("preview decode did not start");
+			reject(new Error("preview unavailable"));
+			await expect
+				.poll(() => image.dataset.viewerNavigatorLayer ?? "")
+				.toBe("wallThumbnail");
+			expect({
+				left: viewport.style.left,
+				top: viewport.style.top,
+				width: viewport.style.width,
+				height: viewport.style.height,
+				bounds: viewport.getBoundingClientRect().toJSON(),
+			}).toEqual(before);
+			await view.unmount();
+		} finally {
+			HTMLImageElement.prototype.decode = originalDecode;
+		}
 	});
 
 	it("ends a zoomed mouse drag exactly once for every lifecycle cancellation", async () => {
