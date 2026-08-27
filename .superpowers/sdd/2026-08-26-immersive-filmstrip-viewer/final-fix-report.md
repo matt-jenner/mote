@@ -237,3 +237,84 @@ generation, and URL. The only verification caveat is the expected React act
 diagnostic in the intentional invalid-image browser harness; it is not a test
 failure. Native GUI acceptance and the named desktop locate/reconnect follow-up
 remain outside this slice.
+
+## Authorized residual remediation (2026-08-27)
+
+Status: complete. The coordinator authorized one additional remediation cycle
+from `4d43161e05637688966e431af429865b136a3320`; the resulting code commit is
+`75a40ae6361b23f97687264d687db668a324cb05` (`fix: preserve viewer focus and
+preview retries`). Scope was limited to the three residual findings and the
+one-line reduced-motion selector requested in the authorization.
+
+### Residual results and RED/GREEN evidence
+
+1. Filmstrip stale focus intent: the RED test
+   “does not retain a stale filmstrip focus request after reselecting the
+   current asset” received the current `Photo 2` filmstrip button instead of
+   the focused Next button after reselecting the current item and navigating.
+   `ViewerFilmstrip` now stores a pending asset ID, clears it for same-asset
+   selection, and consumes it only when that asset becomes current. The focused
+   test is GREEN: 1 passed.
+
+2. Preview retry lifecycle: the two RED refresh tests observed unavailable
+   state false after an in-flight rejection and only one visible request after
+   refresh during the retry delay. `useViewerPreview` now owns request and retry
+   state per key, retains live records/timers across equivalent asset-array
+   refreshes, removes obsolete keys on asset/generation/derivative changes, and
+   cleans up on unmount. The 100 ms and 250 ms retry schedule and three-attempt
+   cap remain intact. The focused pair is GREEN: 2 passed, with three visible
+   attempts in each case.
+
+3. Empty modal focus trap: the RED test
+   “keeps Tab inside the dialog when all viewer chrome is hidden” observed
+   `defaultPrevented: false`. The empty-focusable branch now prevents both Tab
+   directions and focuses the dialog. The focused test is GREEN: 1 passed.
+
+The directly related minor is also applied: `.viewerInfoButton` is included in
+the reduced-motion transition suppression selector.
+
+### Exact residual verification commands and results
+
+```text
+npm exec --workspace @photo-viewer/interface -- vitest run --project browser src/components/PhotoViewer.browser.test.tsx -t "does not retain a stale filmstrip focus request|keeps an in-flight preview rejection alive|retains a scheduled preview retry|keeps Tab inside the dialog"
+```
+
+Result: PASS — 1 file, 4 selected tests passed, 41 skipped.
+
+```text
+npm exec --workspace @photo-viewer/interface -- vitest run --project browser src/components/PhotoViewer.browser.test.tsx
+npm test
+npm run test:browser
+npm run check
+npm run typecheck
+npm run --workspace @photo-viewer/interface build
+git diff --check
+```
+
+Results: the full viewer file passed 1 file/45 tests; the unit suite passed 11
+files/91 tests; the full browser suite passed 3 files/94 tests; Biome checked
+57 files with no fixes; TypeScript passed; the interface build passed with
+1882 modules (JS 294.25 kB, gzip 90.44 kB; CSS 17.84 kB, gzip 4.32 kB); and
+`git diff --check` passed. The browser runs emitted the known single React
+`act(...)` diagnostic from the intentional invalid-image harness but no
+unhandled test error or failed assertion.
+
+The final browser-generated directories were removed after the last browser
+run:
+
+```text
+rm -rf apps/interface/.vitest-attachments apps/interface/src/components/__screenshots__
+```
+
+Both paths are absent. The worktree is clean after the documentation update.
+
+### Demo/app state and concerns
+
+The residual pass did not touch Rust, desktop Rust tests, bundle generation, or
+the running app. The coordinator reported that the original `wall-demo`
+process ended externally during this timed pass; I did not stop, restart, or
+replace it. The previously built unsigned bundle remains at
+`apps/desktop/src-tauri/target/release/bundle/macos/Photo Viewer.app`; the
+coordinator will relaunch the demo after this commit. Native GUI interactions
+were not independently observed. The only automated caveat is the expected
+`act(...)` diagnostic described above; no residual test is failing.

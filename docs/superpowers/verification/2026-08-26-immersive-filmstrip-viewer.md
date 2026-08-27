@@ -204,3 +204,49 @@ The final browser run's generated `apps/interface/.vitest-attachments` and
 `apps/interface/src/components/__screenshots__` directories were removed. The
 coordinator-owned `wall-demo` app remained running and was not stopped or
 restarted. Native GUI interactions were not independently observed.
+
+## Authorized residual remediation (2026-08-27)
+
+One additional remediation cycle was authorized from
+`4d43161e05637688966e431af429865b136a3320`. Code is committed as
+`75a40ae6361b23f97687264d687db668a324cb05` (`fix: preserve viewer focus and
+preview retries`). The pass was limited to stale filmstrip focus intent,
+preview retry persistence across equivalent asset refreshes, empty-modal focus
+containment, and the related `.viewerInfoButton` reduced-motion selector.
+
+RED/GREEN evidence:
+
+- The stale-focus regression first received the `Photo 2` filmstrip button
+  instead of the focused Next button; after switching to a pending asset ID it
+  passed 1/1.
+- The two preview-refresh regressions first observed no unavailable state after
+  in-flight rejection and no second request after a scheduled retry; after
+  per-key lifecycle ownership they passed 2/2 with three bounded attempts.
+- The empty-dialog regression first left Tab uncancelled; after the empty-list
+  dialog fallback it passed 1/1 for both Tab directions.
+
+Exact final interface results:
+
+- Focused residual browser run: 1 file, 4 selected tests passed, 41 skipped.
+- Full viewer browser file: 1 file, 45 tests passed.
+- `npm test`: 11 files, 91 tests passed.
+- `npm run test:browser`: 3 files, 94 tests passed.
+- `npm run check`: Biome checked 57 files, no fixes.
+- `npm run typecheck`: passed.
+- Interface build: 1882 modules; JS 294.25 kB (gzip 90.44 kB), CSS 17.84 kB
+  (gzip 4.32 kB).
+- `git diff --check`: passed.
+
+The browser run emitted the known single React `act(...)` diagnostic from the
+intentional invalid-image harness; all assertions passed and there was no
+unhandled test error. Generated browser artifacts were removed with:
+
+```text
+rm -rf apps/interface/.vitest-attachments apps/interface/src/components/__screenshots__
+```
+
+Both directories are absent. Rust/backend code and the previously built
+unsigned macOS bundle were not changed in this timed remediation. The
+coordinator reported that the original `wall-demo` process ended externally;
+this pass did not stop, restart, or replace it, and the coordinator will
+relaunch it after the commit. Native GUI behavior remains unobserved.
