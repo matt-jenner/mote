@@ -1190,8 +1190,10 @@ impl AppService {
         if !self.preview_work_can_continue(selection).await {
             return PreviewPrefetchOutcome::Blocked;
         }
+        let recent_ids = recent.clone();
+        let recent = recent.into_iter().collect::<HashSet<_>>();
         let Ok((selection, wall_ready)) = self
-            .ensure_wall_thumbnails(&recent, JobPriority::NearViewport)
+            .ensure_wall_thumbnails(&recent_ids, JobPriority::NearViewport)
             .await
         else {
             return PreviewPrefetchOutcome::Terminate;
@@ -1199,30 +1201,9 @@ impl AppService {
         if !self.preview_generation_is_current(generation) {
             return PreviewPrefetchOutcome::Stale;
         }
-        let recent_ready = recent
-            .iter()
-            .copied()
-            .filter(|id| wall_ready.contains(id))
-            .collect::<Vec<_>>();
-        let Ok((screen_selection, cached, pending)) =
-            self.resolve_screen_previews(&recent_ready, generation)
-        else {
-            return PreviewPrefetchOutcome::Terminate;
-        };
-        if screen_selection != selection {
-            return PreviewPrefetchOutcome::Stale;
+        if wall_ready.len() != recent.len() {
+            return PreviewPrefetchOutcome::Blocked;
         }
-        if !cached.is_empty() {
-            self.publish_derivatives_if_active(screen_selection, cached);
-        }
-        let _generated = self
-            .run_derivative_jobs_publishing(pending, JobPriority::NearViewport)
-            .await;
-        if !self.preview_generation_is_current(generation) {
-            return PreviewPrefetchOutcome::Stale;
-        }
-
-        let recent = recent.into_iter().collect::<HashSet<_>>();
         let mut cursor = None;
         loop {
             if !self.preview_generation_is_current(generation) {
@@ -1252,13 +1233,60 @@ impl AppService {
                 if !self.preview_generation_is_current(generation) {
                     return PreviewPrefetchOutcome::Stale;
                 }
-                let screen_ids = remaining
-                    .iter()
-                    .copied()
-                    .filter(|id| wall_ready.contains(id))
-                    .collect::<Vec<_>>();
+                if wall_ready.len() != remaining.len() {
+                    return PreviewPrefetchOutcome::Blocked;
+                }
+            }
+            let Some(next) = next else {
+                break;
+            };
+            cursor = Some(next);
+        }
+
+        if !self.preview_generation_is_current(generation) {
+            return PreviewPrefetchOutcome::Stale;
+        }
+        if !self.preview_work_can_continue(selection).await {
+            return PreviewPrefetchOutcome::Blocked;
+        }
+        let recent_ready = recent.iter().copied().collect::<Vec<_>>();
+        let Ok((screen_selection, cached, pending)) =
+            self.resolve_screen_previews(&recent_ready, generation)
+        else {
+            return PreviewPrefetchOutcome::Terminate;
+        };
+        if screen_selection != selection {
+            return PreviewPrefetchOutcome::Stale;
+        }
+        if !cached.is_empty() {
+            self.publish_derivatives_if_active(screen_selection, cached);
+        }
+        let _generated = self
+            .run_derivative_jobs_publishing(pending, JobPriority::NearViewport)
+            .await;
+        if !self.preview_generation_is_current(generation) {
+            return PreviewPrefetchOutcome::Stale;
+        }
+
+        let mut cursor = None;
+        loop {
+            if !self.preview_generation_is_current(generation) {
+                return PreviewPrefetchOutcome::Stale;
+            }
+            if !self.preview_work_can_continue(selection).await {
+                return PreviewPrefetchOutcome::Blocked;
+            }
+            let Ok((page_selection, remaining, next)) =
+                self.remaining_group_ids_page(&recent, cursor)
+            else {
+                return PreviewPrefetchOutcome::Terminate;
+            };
+            if page_selection != selection {
+                return PreviewPrefetchOutcome::Stale;
+            }
+            if !remaining.is_empty() {
                 let Ok((resolved_selection, cached, pending)) =
-                    self.resolve_screen_previews(&screen_ids, generation)
+                    self.resolve_screen_previews(&remaining, generation)
                 else {
                     return PreviewPrefetchOutcome::Terminate;
                 };

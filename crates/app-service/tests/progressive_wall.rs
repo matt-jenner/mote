@@ -1323,6 +1323,159 @@ async fn online_reopen_prefetches_the_full_group_when_only_wall_rows_are_durable
     );
 }
 
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_group_prefetch_completes_all_wall_pages_before_any_screen_preview() {
+    let fixture = ProgressiveFixture::new(301);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    service.start_scan(&fixture.source).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let page = service
+                .query_wall(WallQueryRequest {
+                    cursor: None,
+                    limit: 1,
+                    direction: SortDirection::OldestFirst,
+                })
+                .await
+                .unwrap();
+            if page.order_state == OrderState::Settled {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the large fixture should settle before prefetch assertions");
+    let mut updates = service.subscribe_wall_updates();
+
+    let first_page = service
+        .query_wall(WallQueryRequest {
+            cursor: None,
+            limit: 250,
+            direction: SortDirection::OldestFirst,
+        })
+        .await
+        .unwrap();
+    let second_page = service
+        .query_wall(WallQueryRequest {
+            cursor: first_page.next_cursor.clone(),
+            limit: 250,
+            direction: SortDirection::OldestFirst,
+        })
+        .await
+        .unwrap();
+    let late_asset = second_page.items.first().unwrap().id.clone();
+    let total_assets = first_page.items.len() + second_page.items.len();
+
+    #[derive(Default)]
+    struct PublicationObservation {
+        wall_count: usize,
+        screen_count: usize,
+        wall_count_before_first_screen: Option<usize>,
+    }
+    let observation = Arc::new(Mutex::new(PublicationObservation::default()));
+    let observed = observation.clone();
+    let collector = tokio::spawn(async move {
+        loop {
+            let Ok(event) = updates.recv().await else {
+                return;
+            };
+            let WallUpdate::DerivativesReady { derivatives, .. } = event else {
+                continue;
+            };
+            let mut observation = observed.lock().unwrap();
+            for derivative in derivatives {
+                match derivative.kind {
+                    DerivativeClass::WallThumbnail => observation.wall_count += 1,
+                    DerivativeClass::ScreenPreview => {
+                        if observation.wall_count_before_first_screen.is_none() {
+                            observation.wall_count_before_first_screen =
+                                Some(observation.wall_count);
+                        }
+                        observation.screen_count += 1;
+                    }
+                }
+            }
+        }
+    });
+
+    let wall_entered = Arc::new(tokio::sync::Notify::new());
+    let wall_release = Arc::new(tokio::sync::Notify::new());
+    service
+        .install_derivative_test_gate(
+            late_asset,
+            DerivativeClass::WallThumbnail,
+            wall_entered.clone(),
+            wall_release.clone(),
+        )
+        .await
+        .unwrap();
+
+    service
+        .set_interaction(photo_app_service::InteractionState::Idle)
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), wall_entered.notified())
+        .await
+        .expect("the late-page wall thumbnail should be reached");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let observation_at_hold = observation.lock().unwrap();
+    assert_eq!(
+        observation_at_hold.screen_count, 0,
+        "screen previews must wait for every wall page while the late page is blocked"
+    );
+    assert!(
+        observation_at_hold.wall_count < total_assets,
+        "the gated late-page wall thumbnail must not be published while blocked"
+    );
+    drop(observation_at_hold);
+    let screen_rows = Catalog::open(&fixture.config.catalog_path())
+        .unwrap()
+        .all_derivatives()
+        .unwrap()
+        .into_iter()
+        .filter(|record| record.kind == "screen_preview")
+        .count();
+    assert_eq!(
+        screen_rows, 0,
+        "no screen preview may commit before full wall coverage"
+    );
+
+    wall_release.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if observation
+                .lock()
+                .unwrap()
+                .wall_count_before_first_screen
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("screen previews should resume after full wall coverage");
+    let observation_after_release = observation.lock().unwrap();
+    assert_eq!(
+        observation_after_release.wall_count_before_first_screen,
+        Some(total_assets),
+        "all wall pages must be published before the first screen preview"
+    );
+    assert!(observation_after_release.screen_count > 0);
+    drop(observation_after_release);
+    collector.abort();
+}
+
 #[derive(Clone)]
 struct TimingWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -1645,7 +1798,7 @@ async fn aborted_wall_request_releases_preview_gate_for_later_request() {
 
 #[cfg(debug_assertions)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn visible_request_fences_queued_screen_previews_before_wall_work() {
+async fn visible_request_does_not_allow_screen_prefetch_to_overtake_wall_work() {
     let fixture = ProgressiveFixture::new(5);
     let service = AppService::open_with_reader(
         fixture.config.clone(),
@@ -1653,11 +1806,25 @@ async fn visible_request_fences_queued_screen_previews_before_wall_work() {
     )
     .unwrap();
     let mut updates = service.subscribe_wall_updates();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    let gate_generation_before_scan = service.preview_gate_generation_test();
     service.start_scan(&fixture.source).await.unwrap();
     recv_until(&mut updates, |event| {
         matches!(event, WallUpdate::MetadataSettled { .. })
     })
     .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if service.preview_gate_generation_test() >= gate_generation_before_scan + 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("scan completion should schedule the full-group preview pass");
     let ids = service
         .query_wall(query(SortDirection::OldestFirst))
         .await
@@ -1666,7 +1833,23 @@ async fn visible_request_fences_queued_screen_previews_before_wall_work() {
         .into_iter()
         .map(|asset| asset.id)
         .collect::<Vec<_>>();
-
+    let wall_entered = Arc::new(tokio::sync::Notify::new());
+    let wall_release = Arc::new(tokio::sync::Notify::new());
+    service
+        .install_derivative_test_gate(
+            ids[4].clone(),
+            DerivativeClass::WallThumbnail,
+            wall_entered.clone(),
+            wall_release.clone(),
+        )
+        .await
+        .unwrap();
+    service
+        .set_interaction(photo_app_service::InteractionState::Idle)
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), wall_entered.notified())
+        .await
+        .expect("full-group wall work should reach the held visible asset");
     let screen_entered = Arc::new(tokio::sync::Notify::new());
     let screen_release = Arc::new(tokio::sync::Notify::new());
     let screen_starts = Arc::new(AtomicUsize::new(0));
@@ -1678,20 +1861,11 @@ async fn visible_request_fences_queued_screen_previews_before_wall_work() {
             screen_starts.clone(),
         )
         .await;
-    service
-        .request_derivatives(DerivativeRequest::visible(ids[..4].to_vec()))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if screen_starts.load(Ordering::SeqCst) >= 2 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("both preview workers should reach the deterministic boundary");
+    assert_eq!(
+        screen_starts.load(Ordering::SeqCst),
+        0,
+        "screen previews must not start while a wall prerequisite is held"
+    );
 
     let visible_started = Arc::new(tokio::sync::Notify::new());
     let visible_entry_release = Arc::new(tokio::sync::Notify::new());
@@ -1707,7 +1881,6 @@ async fn visible_request_fences_queued_screen_previews_before_wall_work() {
         .await;
     let visible_service = service.clone();
     let visible_asset = ids[4].clone();
-    let mut visible_updates = service.subscribe_wall_updates();
     let visible = tokio::spawn(async move {
         visible_service
             .request_derivatives(DerivativeRequest::visible(vec![visible_asset]))
@@ -1716,9 +1889,13 @@ async fn visible_request_fences_queued_screen_previews_before_wall_work() {
     visible_started.notified().await;
     visible_entry_release.notify_one();
     visible_queued.notified().await;
-    let starts_when_visible_began = screen_starts.load(Ordering::SeqCst);
-    screen_release.notify_one();
-    recv_until(&mut visible_updates, |event| {
+    assert_eq!(
+        screen_starts.load(Ordering::SeqCst),
+        0,
+        "a visible wall request must not be overtaken by screen work"
+    );
+    wall_release.notify_waiters();
+    recv_until(&mut updates, |event| {
         matches!(event, WallUpdate::DerivativesReady { derivatives, .. }
         if derivatives.iter().any(|item| {
             item.kind == DerivativeClass::WallThumbnail && item.asset_id == ids[4]
@@ -1726,11 +1903,9 @@ async fn visible_request_fences_queued_screen_previews_before_wall_work() {
     })
     .await;
     visible.await.unwrap().unwrap();
-    assert_eq!(
-        screen_starts.load(Ordering::SeqCst),
-        starts_when_visible_began,
-        "queued screen previews must be discarded once visible wall work begins"
-    );
+    tokio::time::timeout(Duration::from_secs(5), screen_entered.notified())
+        .await
+        .expect("screen previews should start only after the wall release");
     screen_release.notify_waiters();
 }
 
