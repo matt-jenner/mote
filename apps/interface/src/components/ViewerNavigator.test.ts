@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+	navigatorContentBounds,
 	navigatorImageBounds,
 	navigatorPointToFocal,
 	navigatorViewportStyle,
@@ -39,6 +40,18 @@ describe("viewer navigator geometry", () => {
 			top: 0,
 			width: 132,
 			height: 88,
+		});
+		expect(navigatorContentBounds(144, 88)).toEqual({
+			left: 1,
+			top: 1,
+			width: 142,
+			height: 86,
+		});
+		expect(navigatorImageBounds(142, 86, 1200, 800)).toEqual({
+			left: 6.5,
+			top: 0,
+			width: 129,
+			height: 86,
 		});
 	});
 

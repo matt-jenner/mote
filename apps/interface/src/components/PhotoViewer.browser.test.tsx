@@ -982,6 +982,149 @@ describe("immersive photo viewer checkpoint", () => {
 		}
 	});
 
+	it("keeps a narrow open drawer layout on-screen or hides an unreadable navigator", async () => {
+		await page.viewport(640, 844);
+		const wide = await openAsset("Coast");
+		(wide.tile.element() as HTMLButtonElement).click();
+		await wide.view.getByRole("button", { name: "Zoom in" }).click();
+		await wide.view.getByRole("button", { name: "Photo information" }).click();
+		const wideDialog = wide.view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		const wideNavigator = wideDialog.querySelector<HTMLElement>(
+			"[data-viewer-navigator]",
+		);
+		const wideDrawer = wide.view
+			.getByRole("complementary", { name: "Photo information" })
+			.element();
+		if (!wideNavigator) throw new Error("640px navigator was not rendered");
+		const wideBounds = wideNavigator.getBoundingClientRect();
+		const dialogBounds = wideDialog.getBoundingClientRect();
+		const drawerBounds = wideDrawer.getBoundingClientRect();
+		expect(wideBounds.left).toBeGreaterThanOrEqual(dialogBounds.left);
+		expect(wideBounds.right).toBeLessThanOrEqual(drawerBounds.left);
+		expect(wideBounds.top).toBeGreaterThanOrEqual(dialogBounds.top);
+		expect(wideBounds.bottom).toBeLessThanOrEqual(dialogBounds.bottom);
+		await wide.view.unmount();
+
+		await page.viewport(639, 844);
+		const narrow = await openAsset("Coast");
+		(narrow.tile.element() as HTMLButtonElement).click();
+		await narrow.view.getByRole("button", { name: "Zoom in" }).click();
+		await narrow.view
+			.getByRole("button", { name: "Photo information" })
+			.click();
+		const narrowNavigator = narrow.view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element()
+			.querySelector<HTMLElement>("[data-viewer-navigator]");
+		if (narrowNavigator)
+			expect(getComputedStyle(narrowNavigator).display).toBe("none");
+		await narrow.view.unmount();
+	});
+
+	it("measures phone content bounds before fitting the navigator image", async () => {
+		await page.viewport(390, 844);
+		const restorePointer = installPointerModality(true);
+		try {
+			const { view, tile } = await openAsset("Coast");
+			(tile.element() as HTMLButtonElement).click();
+			await view.getByRole("button", { name: "Zoom in" }).click();
+			const dialog = view
+				.getByRole("dialog", { name: "Photo viewer" })
+				.element();
+			const navigator = dialog.querySelector<HTMLElement>(
+				"[data-viewer-navigator]",
+			);
+			const imageFrame = navigator?.querySelector<HTMLElement>(
+				"[class*='viewerNavigatorImage']",
+			);
+			const viewport = navigator?.querySelector<HTMLElement>(
+				"[data-viewer-navigator-viewport]",
+			);
+			if (!navigator || !imageFrame || !viewport)
+				throw new Error("phone navigator geometry was not rendered");
+			const navigatorBounds = navigator.getBoundingClientRect();
+			const imageBounds = imageFrame.getBoundingClientRect();
+			expect(navigatorBounds.width).toBe(144);
+			expect(navigatorBounds.height).toBe(88);
+			expect(imageBounds.left - navigatorBounds.left).toBeCloseTo(7.5, 1);
+			expect(imageBounds.top - navigatorBounds.top).toBeCloseTo(1, 1);
+			expect(imageBounds.width).toBeCloseTo(129, 1);
+			expect(imageBounds.height).toBeCloseTo(86, 1);
+			expect(viewport.style.left).toBe("10%");
+			expect(viewport.style.top).toBe("0%");
+			expect(viewport.style.width).toBe("80%");
+			expect(viewport.style.height).toBe("100%");
+			await view.unmount();
+		} finally {
+			restorePointer();
+		}
+	});
+
+	it("fades the mounted navigator after inactivity and restores it for stage manipulation", async () => {
+		await page.viewport(1440, 1024);
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		await view.getByRole("button", { name: "Zoom in" }).click();
+		const dialog = view.getByRole("dialog", { name: "Photo viewer" }).element();
+		const navigator = dialog.querySelector<HTMLElement>(
+			"[data-viewer-navigator]",
+		);
+		const stage = view.getByTestId("viewer-stage").element();
+		if (!navigator) throw new Error("navigator was not rendered after zooming");
+		navigator.dispatchEvent(
+			new PointerEvent("pointerdown", {
+				bubbles: true,
+				button: 0,
+				clientX: 760,
+				clientY: 120,
+				isPrimary: true,
+				pointerId: 78,
+				pointerType: "mouse",
+			}),
+		);
+		navigator.dispatchEvent(
+			new PointerEvent("lostpointercapture", {
+				bubbles: true,
+				pointerId: 78,
+				pointerType: "mouse",
+			}),
+		);
+		await new Promise((resolve) => window.setTimeout(resolve, 2600));
+		expect(getComputedStyle(navigator).opacity).toBe("0");
+		expect(getComputedStyle(navigator).visibility).toBe(
+			window.matchMedia("(prefers-reduced-motion: reduce)").matches
+				? "hidden"
+				: "visible",
+		);
+		expect(getComputedStyle(navigator).pointerEvents).toBe("none");
+		stage.dispatchEvent(
+			new PointerEvent("pointerdown", {
+				bubbles: true,
+				button: 0,
+				clientX: 640,
+				clientY: 480,
+				isPrimary: true,
+				pointerId: 77,
+				pointerType: "mouse",
+			}),
+		);
+		await expect.poll(() => getComputedStyle(navigator).opacity).toBe("1");
+		stage.dispatchEvent(
+			new PointerEvent("pointerup", {
+				bubbles: true,
+				button: 0,
+				clientX: 640,
+				clientY: 480,
+				isPrimary: true,
+				pointerId: 77,
+				pointerType: "mouse",
+			}),
+		);
+		await view.unmount();
+	});
+
 	it("keeps the thumbnail until the preview decodes and preserves the viewport", async () => {
 		const service = serviceWithReadyPhotos(false, 1, true);
 		const originalDerivativeUrl = service.derivativeUrl.bind(service);
@@ -1017,6 +1160,26 @@ describe("immersive photo viewer checkpoint", () => {
 			width: viewport.style.width,
 			height: viewport.style.height,
 		}).toEqual(before);
+		await view.unmount();
+	});
+
+	it("recovers the thumbnail when the navigator preview decode fails", async () => {
+		const { view, tile } = await openAsset("Coast", true);
+		(tile.element() as HTMLButtonElement).click();
+		await view.getByRole("button", { name: "Zoom in" }).click();
+		const navigator = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element()
+			.querySelector<HTMLElement>("[data-viewer-navigator]");
+		if (!navigator) throw new Error("navigator was not rendered after zooming");
+		await expect
+			.poll(
+				() =>
+					navigator
+						.querySelector<HTMLImageElement>("img")
+						?.getAttribute("data-viewer-navigator-layer") ?? "",
+			)
+			.toBe("wallThumbnail");
 		await view.unmount();
 	});
 

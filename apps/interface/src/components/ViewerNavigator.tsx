@@ -79,6 +79,19 @@ export function navigatorImageBounds(
 	};
 }
 
+export function navigatorContentBounds(
+	outerWidth: number,
+	outerHeight: number,
+	borderLeft = 1,
+	borderRight = 1,
+	borderTop = 1,
+	borderBottom = 1,
+): NavigatorBounds {
+	const width = Math.max(0, outerWidth - borderLeft - borderRight);
+	const height = Math.max(0, outerHeight - borderTop - borderBottom);
+	return { left: borderLeft, top: borderTop, width, height };
+}
+
 export function navigatorViewportStyle(rect: {
 	x: number;
 	y: number;
@@ -127,8 +140,8 @@ export function ViewerNavigator({
 		fallbackUrl ?? imageUrl,
 	);
 	const [navigatorSize, setNavigatorSize] = useState({
-		width: 200,
-		height: 120,
+		width: 198,
+		height: 118,
 	});
 
 	useLayoutEffect(() => {
@@ -136,7 +149,16 @@ export function ViewerNavigator({
 		if (!node) return;
 		const measure = () => {
 			const bounds = node.getBoundingClientRect();
-			const next = { width: bounds.width, height: bounds.height };
+			const computed = window.getComputedStyle(node);
+			const content = navigatorContentBounds(
+				bounds.width,
+				bounds.height,
+				Number.parseFloat(computed.borderLeftWidth) || 0,
+				Number.parseFloat(computed.borderRightWidth) || 0,
+				Number.parseFloat(computed.borderTopWidth) || 0,
+				Number.parseFloat(computed.borderBottomWidth) || 0,
+			);
+			const next = { width: content.width, height: content.height };
 			if (next.width <= 0 || next.height <= 0) return;
 			setNavigatorSize((previous) =>
 				previous.width === next.width && previous.height === next.height
@@ -252,6 +274,7 @@ export function ViewerNavigator({
 			onPointerDown={handlePointerDown}
 			onPointerMove={handlePointerMove}
 			onPointerUp={endPointer}
+			onLostPointerCapture={endPointer}
 			role="img"
 			ref={navigatorRef}
 			tabIndex={-1}
