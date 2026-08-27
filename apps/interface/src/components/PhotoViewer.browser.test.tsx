@@ -921,7 +921,6 @@ describe("immersive photo viewer checkpoint", () => {
 	});
 
 	it("keeps the navigator above controls in rotated landscape and beside the drawer", async () => {
-		await page.viewport(844, 390);
 		const root = document.documentElement;
 		const previousSafeAreas = [
 			"--safe-area-top",
@@ -931,52 +930,105 @@ describe("immersive photo viewer checkpoint", () => {
 		].map(
 			(property) => [property, root.style.getPropertyValue(property)] as const,
 		);
-		for (const [property, value] of [
-			["--safe-area-top", "12px"],
-			["--safe-area-right", "28px"],
-			["--safe-area-bottom", "24px"],
-			["--safe-area-left", "18px"],
-		] as const)
-			root.style.setProperty(property, value);
-		const { view, tile } = await openAsset("Coast");
-		(tile.element() as HTMLButtonElement).click();
-		await view.getByRole("button", { name: "Zoom in" }).click();
-		const dialog = view.getByRole("dialog", { name: "Photo viewer" }).element();
-		const navigator = dialog.querySelector<HTMLElement>(
-			"[data-viewer-navigator]",
-		);
-		const zoom = dialog.querySelector<HTMLElement>(
-			"[data-viewer-zoom-controls]",
-		);
-		const next = dialog.querySelector<HTMLElement>(
-			"[data-viewer-controls] [aria-label='Next photo']",
-		);
-		if (!navigator || !zoom || !next)
-			throw new Error("landscape navigator controls were not rendered");
-		expect(navigator.getBoundingClientRect().bottom).toBeLessThanOrEqual(
-			zoom.getBoundingClientRect().top,
-		);
-		expect(
-			navigator.getBoundingClientRect().right <=
-				next.getBoundingClientRect().left,
-		).toBe(true);
-		await view.getByRole("button", { name: "Photo information" }).click();
-		const drawer = view
-			.getByRole("complementary", { name: "Photo information" })
-			.element();
-		expect(navigator.getBoundingClientRect().right).toBeLessThanOrEqual(
-			drawer.getBoundingClientRect().left,
-		);
-		expect(navigator.getBoundingClientRect().bottom).toBeLessThanOrEqual(
-			view
+		const safeArea = { top: 60, right: 68, bottom: 52, left: 72 };
+		let view: Awaited<ReturnType<typeof renderViewerWall>> | null = null;
+		try {
+			await page.viewport(844, 390);
+			for (const [property, value] of [
+				["--safe-area-top", `${safeArea.top}px`],
+				["--safe-area-right", `${safeArea.right}px`],
+				["--safe-area-bottom", `${safeArea.bottom}px`],
+				["--safe-area-left", `${safeArea.left}px`],
+			] as const)
+				root.style.setProperty(property, value);
+			const opened = await openAsset("Coast");
+			view = opened.view;
+			(opened.tile.element() as HTMLButtonElement).click();
+			const activeView = opened.view;
+			await activeView.getByRole("button", { name: "Zoom in" }).click();
+			const dialog = activeView
 				.getByRole("dialog", { name: "Photo viewer" })
-				.element()
-				.getBoundingClientRect().bottom - 24,
-		);
-		await view.unmount();
-		for (const [property, value] of previousSafeAreas) {
-			if (value) root.style.setProperty(property, value);
-			else root.style.removeProperty(property);
+				.element();
+			const navigator = dialog.querySelector<HTMLElement>(
+				"[data-viewer-navigator]",
+			);
+			const previous = dialog.querySelector<HTMLElement>(
+				"[data-viewer-controls] [aria-label='Previous photo']",
+			);
+			const next = dialog.querySelector<HTMLElement>(
+				"[data-viewer-controls] [aria-label='Next photo']",
+			);
+			const back = dialog.querySelector<HTMLElement>(
+				"[data-viewer-chrome] [aria-label='Back to photos']",
+			);
+			const info = dialog.querySelector<HTMLElement>("[data-viewer-info]");
+			const zoom = dialog.querySelector<HTMLElement>(
+				"[data-viewer-zoom-controls]",
+			);
+			const filmstrip = dialog.querySelector<HTMLElement>(
+				"[aria-label='Photo filmstrip']",
+			);
+			if (
+				!navigator ||
+				!previous ||
+				!next ||
+				!back ||
+				!info ||
+				!zoom ||
+				!filmstrip
+			)
+				throw new Error("landscape navigator controls were not rendered");
+			const boundsOverlap = (first: DOMRect, second: DOMRect) =>
+				first.left < second.right &&
+				first.right > second.left &&
+				first.top < second.bottom &&
+				first.bottom > second.top;
+			const assertNavigatorBounds = (drawer?: Element) => {
+				const overlayBounds = dialog.getBoundingClientRect();
+				const navigatorBounds = navigator.getBoundingClientRect();
+				expect(navigatorBounds.left).toBeGreaterThanOrEqual(
+					overlayBounds.left + safeArea.left,
+				);
+				expect(navigatorBounds.right).toBeLessThanOrEqual(
+					overlayBounds.right - safeArea.right,
+				);
+				expect(navigatorBounds.top).toBeGreaterThanOrEqual(
+					overlayBounds.top + safeArea.top,
+				);
+				expect(navigatorBounds.bottom).toBeLessThanOrEqual(
+					overlayBounds.bottom - safeArea.bottom,
+				);
+				for (const [name, element] of [
+					["Previous", previous],
+					["Next", next],
+					["Back", back],
+					["Info", info],
+					["zoom controls", zoom],
+					["filmstrip", filmstrip],
+					["open drawer", drawer],
+				] as const) {
+					if (!element) continue;
+					expect(
+						boundsOverlap(navigatorBounds, element.getBoundingClientRect()),
+						`${name} overlaps the navigator`,
+					).toBe(false);
+				}
+			};
+			assertNavigatorBounds();
+			await activeView
+				.getByRole("button", { name: "Photo information" })
+				.click();
+			const drawer = activeView
+				.getByRole("complementary", { name: "Photo information" })
+				.element();
+			assertNavigatorBounds(drawer);
+		} finally {
+			if (view) await view.unmount();
+			for (const [property, value] of previousSafeAreas) {
+				if (value) root.style.setProperty(property, value);
+				else root.style.removeProperty(property);
+			}
+			await page.viewport(1440, 1024);
 		}
 	});
 
@@ -1283,8 +1335,9 @@ describe("immersive photo viewer checkpoint", () => {
 			if (!reject) throw new Error("preview decode did not start");
 			reject(new Error("preview unavailable"));
 			await expect
-				.poll(() => image.dataset.viewerNavigatorLayer ?? "")
-				.toBe("wallThumbnail");
+				.poll(() => navigator.dataset.viewerNavigatorDecodeStatus ?? "")
+				.toBe("failed");
+			expect(image.dataset.viewerNavigatorLayer).toBe("wallThumbnail");
 			expect({
 				left: viewport.style.left,
 				top: viewport.style.top,
@@ -1563,8 +1616,6 @@ describe("immersive photo viewer checkpoint", () => {
 	});
 
 	it("keeps the information drawer close target inside rotated safe areas", async () => {
-		await page.viewport(390, 844);
-		const restoreViewport = installVisualViewportDouble(390, 844);
 		const root = document.documentElement;
 		const previousSafeAreas = [
 			"--safe-area-top",
@@ -1574,35 +1625,44 @@ describe("immersive photo viewer checkpoint", () => {
 		].map(
 			(property) => [property, root.style.getPropertyValue(property)] as const,
 		);
-		for (const [property, value] of [
-			["--safe-area-top", "12px"],
-			["--safe-area-right", "28px"],
-			["--safe-area-bottom", "24px"],
-			["--safe-area-left", "18px"],
-		] as const)
-			root.style.setProperty(property, value);
+		const safeArea = { top: 60, right: 68, bottom: 52, left: 72 };
+		let restoreViewport: (() => void) | null = null;
+		let view: Awaited<ReturnType<typeof renderViewerWall>> | null = null;
 		try {
-			const { view, tile } = await openAsset("Coast");
-			(tile.element() as HTMLButtonElement).click();
-			await view.getByRole("button", { name: "Photo information" }).click();
-			const overlay = view
+			await page.viewport(390, 844);
+			restoreViewport = installVisualViewportDouble(390, 844);
+			for (const [property, value] of [
+				["--safe-area-top", `${safeArea.top}px`],
+				["--safe-area-right", `${safeArea.right}px`],
+				["--safe-area-bottom", `${safeArea.bottom}px`],
+				["--safe-area-left", `${safeArea.left}px`],
+			] as const)
+				root.style.setProperty(property, value);
+			const opened = await openAsset("Coast");
+			view = opened.view;
+			(opened.tile.element() as HTMLButtonElement).click();
+			const activeView = opened.view;
+			await activeView
+				.getByRole("button", { name: "Photo information" })
+				.click();
+			const overlay = activeView
 				.getByRole("dialog", { name: "Photo viewer" })
 				.element();
-			const drawer = view
+			const drawer = activeView
 				.getByRole("complementary", { name: "Photo information" })
 				.element();
 			const assertDrawerBounds = () => {
 				const overlayBounds = overlay.getBoundingClientRect();
 				const drawerBounds = drawer.getBoundingClientRect();
-				const closeBounds = view
+				const closeBounds = activeView
 					.getByRole("button", { name: "Close photo information" })
 					.element()
 					.getBoundingClientRect();
 				expect(drawerBounds.left).toBeGreaterThanOrEqual(
-					overlayBounds.left + 18 - 1,
+					overlayBounds.left + safeArea.left - 1,
 				);
 				expect(drawerBounds.right).toBeLessThanOrEqual(
-					overlayBounds.right - 28 + 1,
+					overlayBounds.right - safeArea.right + 1,
 				);
 				expect(closeBounds.right).toBeLessThanOrEqual(
 					drawerBounds.right - 8 + 1,
@@ -1625,11 +1685,13 @@ describe("immersive photo viewer checkpoint", () => {
 				.toBeGreaterThan(0);
 			assertDrawerBounds();
 		} finally {
+			if (view) await view.unmount();
 			for (const [property, value] of previousSafeAreas) {
 				if (value) root.style.setProperty(property, value);
 				else root.style.removeProperty(property);
 			}
-			restoreViewport();
+			restoreViewport?.();
+			await page.viewport(1440, 1024);
 		}
 	});
 

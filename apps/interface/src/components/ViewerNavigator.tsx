@@ -9,6 +9,8 @@ import {
 import styles from "../styles/photoViewer.module.css";
 import type { ViewerPoint } from "../viewer/viewerTransform";
 
+type CandidateDecodeStatus = "idle" | "pending" | "ready" | "failed";
+
 export interface ViewerNavigatorProps {
 	assetName: string;
 	imageUrl: string | null;
@@ -139,6 +141,8 @@ export function ViewerNavigator({
 	const [displayUrl, setDisplayUrl] = useState<string | null>(
 		fallbackUrl ?? imageUrl,
 	);
+	const [candidateDecodeStatus, setCandidateDecodeStatus] =
+		useState<CandidateDecodeStatus>(imageUrl ? "pending" : "idle");
 	const [navigatorSize, setNavigatorSize] = useState({
 		width: 198,
 		height: 118,
@@ -180,20 +184,26 @@ export function ViewerNavigator({
 		if (!imageUrl) {
 			requestedUrlRef.current = null;
 			setDisplayUrl(fallbackUrl);
+			setCandidateDecodeStatus("idle");
 			return;
 		}
 		if (requestedUrlRef.current === imageUrl) return;
 		requestedUrlRef.current = imageUrl;
+		setCandidateDecodeStatus("pending");
 		let active = true;
 		const image = new Image();
 		image.src = imageUrl;
 		const ready = image.decode ? image.decode() : Promise.resolve();
 		void ready.then(
 			() => {
-				if (active) setDisplayUrl(imageUrl);
+				if (!active) return;
+				setDisplayUrl(imageUrl);
+				setCandidateDecodeStatus("ready");
 			},
 			() => {
-				if (active) setDisplayUrl(fallbackUrl);
+				if (!active) return;
+				setDisplayUrl(fallbackUrl);
+				setCandidateDecodeStatus("failed");
 			},
 		);
 		return () => {
@@ -268,6 +278,7 @@ export function ViewerNavigator({
 			aria-hidden={!interactive || !visible}
 			aria-label={`Navigator for ${assetName}`}
 			className={`${styles.viewerNavigator} ${!visible ? styles.viewerNavigatorHidden : ""}`}
+			data-viewer-navigator-decode-status={candidateDecodeStatus}
 			data-viewer-navigator="true"
 			onClick={handleClick}
 			onPointerCancel={endPointer}
