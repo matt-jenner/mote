@@ -1427,9 +1427,11 @@ describe("progressive photo wall", () => {
 				)
 				.toBeVisible();
 			await expect
-				.poll(() =>
-					getComputedStyle(screen.getByRole("img", { name: "Coast" }).element())
-						.opacity,
+				.poll(
+					() =>
+						getComputedStyle(
+							screen.getByRole("img", { name: "Coast" }).element(),
+						).opacity,
 				)
 				.toBe("1");
 			tile?.removeEventListener("load", suppressReplacementLoad, true);
