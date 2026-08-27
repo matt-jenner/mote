@@ -48,9 +48,10 @@ export function PhotoTile({
 			(shapeState === "fallback" || asset.availability !== "available") && !url,
 		);
 		let cancelled = false;
-		const image = imageRef.current;
 		const markCachedImageLoaded = () => {
-			if (cancelled || imageRef.current !== image) return;
+			if (cancelled) return;
+			const image = imageRef.current;
+			if (!image) return;
 			if (
 				url &&
 				image &&
@@ -62,6 +63,7 @@ export function PhotoTile({
 				setLoaded(true);
 			}
 		};
+		const image = imageRef.current;
 		markCachedImageLoaded();
 		const frame = window.requestAnimationFrame(markCachedImageLoaded);
 		if (image) {

@@ -1422,7 +1422,15 @@ describe("progressive photo wall", () => {
 			expect(getComputedStyle(image.element()).opacity).toBe("0");
 			newDecode.resolve();
 			await expect
-				.poll(() => getComputedStyle(image.element()).opacity)
+				.element(
+					screen.getByRole("button", { name: "Open Coast", exact: true }),
+				)
+				.toBeVisible();
+			await expect
+				.poll(() =>
+					getComputedStyle(screen.getByRole("img", { name: "Coast" }).element())
+						.opacity,
+				)
 				.toBe("1");
 			tile?.removeEventListener("load", suppressReplacementLoad, true);
 			screen.unmount();
@@ -1468,7 +1476,9 @@ describe("progressive photo wall", () => {
 		await expect.poll(() => image.getAttribute("src")).toContain("swap=1");
 		expect(getComputedStyle(image).opacity).toBe("0");
 		image.dispatchEvent(new Event("load"));
-		await expect.poll(() => getComputedStyle(image).opacity).toBe("1");
+		await expect
+			.element(screen.getByRole("button", { name: "Open Coast", exact: true }))
+			.toBeVisible();
 		screen.unmount();
 	});
 

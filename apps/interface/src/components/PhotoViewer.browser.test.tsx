@@ -57,6 +57,14 @@ function serviceWithReadyPhotos(
 	photoCount = 60,
 	readyScreenPreview = false,
 ): InMemoryPhotoService {
+	const demoWallImages = [
+		"coast",
+		"forest",
+		"city",
+		"mountain",
+		"portrait",
+		"interior",
+	] as const;
 	const assets = [
 		{
 			...asset("coast", "Coast", 1),
@@ -79,9 +87,9 @@ function serviceWithReadyPhotos(
 	}));
 	return createInMemoryPhotoService({
 		selectedFolderName: "Iceland 2025",
-		wallAssets: datedAssets.map((item) => ({
+		wallAssets: datedAssets.map((item, index) => ({
 			...item,
-			wallThumbnailUrl: `/demo-photos/${item.id}.jpg`,
+			wallThumbnailUrl: `/demo-photos/${demoWallImages[index % demoWallImages.length]}.jpg`,
 			screenPreviewUrl:
 				item.id === "coast"
 					? brokenScreenPreview
