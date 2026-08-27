@@ -419,15 +419,6 @@ export function PhotoViewerOverlay({
 					<ChevronLeft aria-hidden="true" size={22} strokeWidth={1.7} />
 				</button>
 			</div>
-			<ViewerZoomControls
-				canZoomIn={transform.canZoomIn}
-				canZoomOut={transform.canZoomOut}
-				label={transform.zoomLabel}
-				onReset={transform.reset}
-				onZoomIn={() => transform.step(1, viewerCenter())}
-				onZoomOut={() => transform.step(-1, viewerCenter())}
-				visible={state.controlsVisible}
-			/>
 			<ViewerStage
 				asset={asset}
 				baseUrl={preview.baseUrl}
@@ -488,6 +479,15 @@ export function PhotoViewerOverlay({
 					viewportWidth={viewport.width}
 				/>
 			) : null}
+			<ViewerZoomControls
+				canZoomIn={transform.canZoomIn}
+				canZoomOut={transform.canZoomOut}
+				label={transform.zoomLabel}
+				onReset={transform.reset}
+				onZoomIn={() => transform.step(1, viewerCenter())}
+				onZoomOut={() => transform.step(-1, viewerCenter())}
+				visible={state.controlsVisible}
+			/>
 			<div
 				aria-live="polite"
 				className={styles.viewerStatus}

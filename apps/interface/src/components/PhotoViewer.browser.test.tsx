@@ -651,6 +651,138 @@ describe("immersive photo viewer checkpoint", () => {
 		expect(modes?.split(",").every((mode) => mode === "fit")).toBe(true);
 	});
 
+	it("supports desktop zoom controls, wheel, double-click, keyboard, and mouse pan", async () => {
+		const { view, tile } = await openAsset("Coast");
+		(tile.element() as HTMLButtonElement).click();
+		const dialog = view.getByRole("dialog", { name: "Photo viewer" });
+		await expect.element(dialog).toBeVisible();
+		const stage = view.getByTestId("viewer-stage").element();
+		const zoomIn = view.getByRole("button", { name: "Zoom in" });
+		const zoomOut = view.getByRole("button", { name: "Zoom out" });
+		const resetZoom = view.getByRole("button", { name: /Reset zoom/ });
+		await expect.element(zoomIn).not.toBeDisabled();
+		await zoomIn.click();
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+		await expect.element(resetZoom).toHaveTextContent(/%/);
+		expect(getComputedStyle(stage).cursor).toBe("grab");
+		while (!(zoomIn.element() as HTMLButtonElement).disabled)
+			await zoomIn.click();
+		await expect.element(zoomIn).toBeDisabled();
+		await expect.element(zoomOut).not.toBeDisabled();
+		while (!(zoomOut.element() as HTMLButtonElement).disabled)
+			await zoomOut.click();
+		await expect.element(zoomOut).toBeDisabled();
+		await zoomIn.click();
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+		for (const button of [
+			zoomIn.element(),
+			zoomOut.element(),
+			resetZoom.element(),
+		]) {
+			const rect = button.getBoundingClientRect();
+			expect(rect.width).toBeGreaterThanOrEqual(44);
+			expect(rect.height).toBeGreaterThanOrEqual(44);
+		}
+
+		const overlay = dialog.element();
+		const drag = (type: string, x: number, y: number) =>
+			overlay.dispatchEvent(
+				new PointerEvent(type, {
+					bubbles: true,
+					button: 0,
+					clientX: x,
+					clientY: y,
+					isPrimary: true,
+					pointerId: 88,
+					pointerType: "mouse",
+				}),
+			);
+		drag("pointerdown", 600, 400);
+		drag("pointermove", 630, 430);
+		await expect.poll(() => getComputedStyle(stage).cursor).toBe("grabbing");
+		drag("pointerup", 630, 430);
+		await expect.poll(() => getComputedStyle(stage).cursor).toBe("grab");
+
+		const ordinaryWheel = new WheelEvent("wheel", {
+			bubbles: true,
+			cancelable: true,
+			deltaY: 30,
+			clientX: 720,
+			clientY: 320,
+		});
+		stage.dispatchEvent(ordinaryWheel);
+		expect(ordinaryWheel.defaultPrevented).toBe(true);
+		await resetZoom.click();
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+		const fitWheel = new WheelEvent("wheel", {
+			bubbles: true,
+			cancelable: true,
+			deltaY: 30,
+			clientX: 720,
+			clientY: 320,
+		});
+		stage.dispatchEvent(fitWheel);
+		expect(fitWheel.defaultPrevented).toBe(false);
+		const modifiedWheel = new WheelEvent("wheel", {
+			bubbles: true,
+			cancelable: true,
+			ctrlKey: true,
+			deltaY: -120,
+			clientX: 720,
+			clientY: 320,
+		});
+		stage.dispatchEvent(modifiedWheel);
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+		expect(modifiedWheel.defaultPrevented).toBe(true);
+
+		await userEvent.keyboard("0");
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+		stage.dispatchEvent(
+			new MouseEvent("dblclick", {
+				bubbles: true,
+				clientX: 800,
+				clientY: 400,
+			}),
+		);
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+		stage.dispatchEvent(
+			new MouseEvent("dblclick", {
+				bubbles: true,
+				clientX: 800,
+				clientY: 400,
+			}),
+		);
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+
+		const infoButton = view.getByRole("button", { name: "Photo information" });
+		await infoButton.click();
+		const drawer = view
+			.getByRole("complementary", { name: "Photo information" })
+			.element();
+		const zoomCluster = overlay.querySelector<HTMLElement>(
+			"[data-viewer-zoom-controls]",
+		);
+		expect(zoomCluster?.getBoundingClientRect().right).toBeLessThanOrEqual(
+			drawer.getBoundingClientRect().left,
+		);
+		const editable = document.createElement("input");
+		drawer.append(editable);
+		editable.focus();
+		editable.dispatchEvent(
+			new KeyboardEvent("keydown", { bubbles: true, key: "=" }),
+		);
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+
+		await view.getByRole("button", { name: "Close photo information" }).click();
+		await zoomIn.click();
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+		await view.getByRole("button", { name: "Next photo" }).click();
+		await expect
+			.element(stage)
+			.toHaveAttribute("data-current-asset", "photo-0");
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+	});
+
 	it("opens the selected tile above the mounted wall and returns to its exact position", async () => {
 		const { view, tile } = await openAsset("Coast");
 		const wall = view.getByRole("region", { name: "Photos" });
