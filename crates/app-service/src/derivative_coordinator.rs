@@ -11,6 +11,7 @@ use photo_indexer::{IndexJob, IndexScheduler, JobPriority};
 use tokio::sync::{Mutex, Notify, oneshot};
 
 pub(crate) const RECENT_CAPACITY: usize = 250;
+const SCHEDULER_OWNER_PREFIX: &str = "photo-derivative-coordinator:";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum WorkLane {
@@ -88,6 +89,7 @@ struct JobState {
     status: JobStatus,
     ticket: Option<WorkTicket>,
     background_generation: u64,
+    commit_background: bool,
     prerequisite_key: Option<String>,
     foreground_waiters: Vec<oneshot::Sender<Option<DerivativeReference>>>,
     background_waiters: Vec<oneshot::Sender<Option<DerivativeReference>>>,
@@ -239,7 +241,7 @@ impl DerivativeCoordinator {
                 } else {
                     let job_id = state.next_job_id;
                     state.next_job_id = state.next_job_id.wrapping_add(1).max(1);
-                    let job_name = format!("photo-derivative-coordinator:{job_id}");
+                    let job_name = format!("{SCHEDULER_OWNER_PREFIX}{job_id}");
                     let (foreground_waiters, background_waiters) = if lane.is_foreground() {
                         (
                             vec![sender.take().expect("waiter was not consumed")],
@@ -261,6 +263,7 @@ impl DerivativeCoordinator {
                             status: JobStatus::Queued,
                             ticket: None,
                             background_generation,
+                            commit_background: false,
                             prerequisite_key,
                             foreground_waiters,
                             background_waiters,
@@ -288,14 +291,8 @@ impl DerivativeCoordinator {
     }
 
     pub(crate) async fn next_work(&self) -> Option<WorkTicket> {
-        let mut foreign = Vec::new();
         loop {
-            let Some(job) = self.scheduler.next().await else {
-                for queued in foreign {
-                    self.scheduler.enqueue(queued).await;
-                }
-                return None;
-            };
+            let job = self.scheduler.next_owned(SCHEDULER_OWNER_PREFIX).await?;
             let result = {
                 let mut state = self.state.lock().await;
                 match state.job_names.get(job.name()).cloned() {
@@ -340,14 +337,8 @@ impl DerivativeCoordinator {
                 }
             };
             if let Some(ticket) = result {
-                for queued in foreign {
-                    self.scheduler.enqueue(queued).await;
-                }
                 self.wake.notify_waiters();
                 return Some(ticket);
-            }
-            if !job.name().starts_with("photo-derivative-coordinator:") {
-                foreign.push(job);
             }
         }
     }
@@ -439,7 +430,7 @@ impl DerivativeCoordinator {
                     .jobs
                     .iter()
                     .filter(|(_, work)| {
-                        work.status == JobStatus::Committing
+                        (work.status == JobStatus::Committing && work.commit_background)
                             || (work.lane.is_background() && work.foreground_waiters.is_empty())
                     })
                     .map(|(key, _)| key.clone())
@@ -499,14 +490,10 @@ impl DerivativeCoordinator {
         if work.status != JobStatus::Running || work.ticket != Some(ticket) {
             return None;
         }
-        if let Some(actual) = prerequisite_key
-            && work
-                .prerequisite_key
-                .as_ref()
-                .is_some_and(|expected| expected != actual)
-        {
+        if work.prerequisite_key.as_deref() != prerequisite_key {
             return None;
         }
+        work.commit_background = work.lane.is_background() && work.foreground_waiters.is_empty();
         work.status = JobStatus::Committing;
         if let Some(ticket_state) = state.tickets.get_mut(&ticket) {
             ticket_state.status = TicketStatus::Committing;
@@ -522,16 +509,18 @@ impl DerivativeCoordinator {
         &self,
         permit: CommitPermit,
         reference: DerivativeReference,
-    ) -> Vec<oneshot::Sender<Option<DerivativeReference>>> {
-        let _ = reference;
-        self.finish_commit(permit).await
+    ) {
+        let waiters = self.finish_commit(permit).await;
+        for waiter in waiters {
+            let _ = waiter.send(Some(reference.clone()));
+        }
     }
 
-    pub(crate) async fn fail_commit(
-        &self,
-        permit: CommitPermit,
-    ) -> Vec<oneshot::Sender<Option<DerivativeReference>>> {
-        self.finish_commit(permit).await
+    pub(crate) async fn fail_commit(&self, permit: CommitPermit) {
+        let waiters = self.finish_commit(permit).await;
+        for waiter in waiters {
+            let _ = waiter.send(None);
+        }
     }
 
     async fn finish_commit(
@@ -636,43 +625,64 @@ impl DerivativeCoordinator {
     }
 
     pub(crate) async fn begin_collection(&self, selection: SelectionToken) {
-        if self.selection().await != Some(selection) {
-            self.reset_selection(selection).await;
-        }
         let mut state = self.state.lock().await;
+        if let Some(current) = state.selection {
+            if current != selection {
+                return;
+            }
+        } else {
+            state.selection = Some(selection);
+        }
         state.collection = CollectionState {
             phase: CollectionPhase::Thumbnails,
             cursor: None,
         };
+        drop(state);
         self.wake.notify_waiters();
     }
 
-    pub(crate) async fn advance_collection(&self, cursor: Option<WallCursorKey>) {
+    pub(crate) async fn advance_collection(
+        &self,
+        selection: SelectionToken,
+        cursor: Option<WallCursorKey>,
+    ) {
         let mut state = self.state.lock().await;
+        if state.selection != Some(selection) {
+            return;
+        }
         if matches!(
             state.collection.phase,
             CollectionPhase::Thumbnails | CollectionPhase::Previews
         ) {
             state.collection.cursor = cursor;
         }
+        drop(state);
         self.wake.notify_waiters();
     }
 
-    pub(crate) async fn finish_thumbnail_phase(&self) {
+    pub(crate) async fn finish_thumbnail_phase(&self, selection: SelectionToken) {
         let mut state = self.state.lock().await;
+        if state.selection != Some(selection) {
+            return;
+        }
         if state.collection.phase == CollectionPhase::Thumbnails {
             state.collection.phase = CollectionPhase::Previews;
             state.collection.cursor = None;
         }
+        drop(state);
         self.wake.notify_waiters();
     }
 
-    pub(crate) async fn finish_preview_phase(&self) {
+    pub(crate) async fn finish_preview_phase(&self, selection: SelectionToken) {
         let mut state = self.state.lock().await;
+        if state.selection != Some(selection) {
+            return;
+        }
         if state.collection.phase == CollectionPhase::Previews {
             state.collection.phase = CollectionPhase::Complete;
             state.collection.cursor = None;
         }
+        drop(state);
         self.wake.notify_waiters();
     }
 
@@ -689,20 +699,27 @@ impl DerivativeCoordinator {
         self.state.lock().await.collection.cursor.clone()
     }
 
-    pub(crate) async fn mark_terminal(&self, key: WorkKey) {
+    pub(crate) async fn mark_terminal(&self, ticket: WorkTicket) -> bool {
         let waiters = {
             let mut state = self.state.lock().await;
-            state.terminal.insert(key.clone());
-            let Some(work) = state.jobs.remove(&key) else {
-                return;
+            let Some(ticket_state) = state.tickets.get(&ticket) else {
+                return false;
             };
+            if ticket_state.status != TicketStatus::Running {
+                return false;
+            }
+            let key = ticket_state.key.clone();
+            let Some(work) = state.jobs.get(&key) else {
+                return false;
+            };
+            if work.ticket != Some(ticket) || work.status != JobStatus::Running {
+                return false;
+            }
+
+            state.terminal.insert(key.clone());
+            let work = state.jobs.remove(&key).expect("job was present");
             state.job_names.remove(&work.job_name);
-            if work.status == JobStatus::Committing {
-                work.completion.notify_waiters();
-            }
-            if let Some(ticket) = work.ticket {
-                state.tickets.remove(&ticket);
-            }
+            state.tickets.remove(&ticket);
             work.foreground_waiters
                 .into_iter()
                 .chain(work.background_waiters)
@@ -712,6 +729,7 @@ impl DerivativeCoordinator {
             let _ = waiter.send(None);
         }
         self.wake.notify_waiters();
+        true
     }
 
     pub(crate) async fn clear_terminal(&self, key: &WorkKey) {
@@ -723,7 +741,12 @@ impl DerivativeCoordinator {
     }
 
     pub(crate) async fn wait_for_change(&self) {
-        self.wake.notified().await;
+        let notified = self.wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.pending_job_count().await == 0 {
+            notified.await;
+        }
     }
 }
 
@@ -740,6 +763,7 @@ pub(crate) fn scheduler_priority(lane: WorkLane) -> JobPriority {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use photo_catalog::WallCursorKey;
     use photo_domain::{AssetId, FolderGroupId, LibraryId};
@@ -859,6 +883,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_attempt_cannot_mark_foreground_replacement_terminal() {
+        let fixture = fixture();
+        let stale = fixture.enqueue(screen_key(), WorkLane::IdlePreview).await;
+        let stale_ticket = fixture.coordinator.next_work().await.unwrap();
+        fixture.coordinator.invalidate_background().await;
+        let foreground = fixture.enqueue(screen_key(), WorkLane::ViewerPreview).await;
+
+        assert!(!fixture.coordinator.mark_terminal(stale_ticket).await);
+        let replacement = fixture.coordinator.next_work().await.unwrap();
+        fixture.coordinator.complete(replacement, reference()).await;
+
+        assert_eq!(stale.await.unwrap(), None);
+        assert_eq!(foreground.await.unwrap(), Some(reference()));
+    }
+
+    #[tokio::test]
+    async fn wait_for_change_observes_enqueue_before_waiter_registration() {
+        let fixture = fixture();
+        assert!(fixture.coordinator.next_work().await.is_none());
+
+        let waiter = fixture.coordinator.wait_for_change();
+        let _queued = fixture.enqueue(screen_key(), WorkLane::IdlePreview).await;
+
+        tokio::time::timeout(Duration::from_millis(50), waiter)
+            .await
+            .expect("enqueue notification was lost before wait registration");
+    }
+
+    #[tokio::test]
     async fn mismatched_attempt_cannot_complete_the_current_job() {
         let fixture = fixture();
         let waiter = fixture.enqueue(screen_key(), WorkLane::VisibleWall).await;
@@ -940,10 +993,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_requires_exact_stored_prerequisite() {
+        let fixture = fixture();
+        let waiter = fixture
+            .coordinator
+            .enqueue_with_prerequisite(
+                screen_key(),
+                WorkLane::VisibleWall,
+                Some("wall-v1".to_owned()),
+            )
+            .await;
+        let ticket = fixture.coordinator.next_work().await.unwrap();
+
+        assert!(
+            fixture
+                .coordinator
+                .admit_commit(ticket, fixture.selection, None)
+                .await
+                .is_none()
+        );
+        assert!(
+            fixture
+                .coordinator
+                .admit_commit(ticket, fixture.selection, Some("wall-v2"))
+                .await
+                .is_none()
+        );
+        assert!(
+            fixture
+                .coordinator
+                .admit_commit(ticket, fixture.selection, Some("wall-v1"))
+                .await
+                .is_some()
+        );
+        drop(waiter);
+    }
+
+    #[tokio::test]
+    async fn foreground_commit_does_not_block_background_invalidation() {
+        let fixture = fixture();
+        let waiter = fixture.enqueue(screen_key(), WorkLane::VisibleWall).await;
+        let ticket = fixture.coordinator.next_work().await.unwrap();
+        let _permit = fixture
+            .coordinator
+            .admit_commit(ticket, fixture.selection, None)
+            .await
+            .unwrap();
+
+        let coordinator = fixture.coordinator.clone();
+        let invalidator = tokio::spawn(async move { coordinator.invalidate_background().await });
+        tokio::time::timeout(Duration::from_millis(50), invalidator)
+            .await
+            .expect("foreground-only commit blocked background invalidation")
+            .expect("background invalidation task panicked");
+        drop(waiter);
+    }
+
+    #[tokio::test]
+    async fn complete_commit_resolves_waiter_without_returned_sender() {
+        let fixture = fixture();
+        let waiter = fixture.enqueue(screen_key(), WorkLane::VisibleWall).await;
+        let ticket = fixture.coordinator.next_work().await.unwrap();
+        let permit = fixture
+            .coordinator
+            .admit_commit(ticket, fixture.selection, None)
+            .await
+            .unwrap();
+
+        fixture
+            .coordinator
+            .complete_commit(permit, reference())
+            .await;
+
+        assert_eq!(waiter.await.unwrap(), Some(reference()));
+    }
+
+    #[tokio::test]
+    async fn fail_commit_resolves_waiter_without_returned_sender() {
+        let fixture = fixture();
+        let waiter = fixture.enqueue(screen_key(), WorkLane::VisibleWall).await;
+        let ticket = fixture.coordinator.next_work().await.unwrap();
+        let permit = fixture
+            .coordinator
+            .admit_commit(ticket, fixture.selection, None)
+            .await
+            .unwrap();
+
+        fixture.coordinator.fail_commit(permit).await;
+
+        assert_eq!(waiter.await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn terminal_work_is_excluded_until_its_full_key_changes_or_is_cleared() {
         let fixture = fixture();
         let key = screen_key();
-        fixture.coordinator.mark_terminal(key.clone()).await;
+        let terminal_waiter = fixture.enqueue(key.clone(), WorkLane::IdlePreview).await;
+        let terminal_ticket = fixture.coordinator.next_work().await.unwrap();
+        assert!(fixture.coordinator.mark_terminal(terminal_ticket).await);
+        assert_eq!(terminal_waiter.await.unwrap(), None);
         let blocked = fixture.enqueue(key.clone(), WorkLane::IdlePreview).await;
         assert!(fixture.coordinator.next_work().await.is_none());
         assert_eq!(blocked.await.unwrap(), None);
@@ -977,13 +1125,16 @@ mod tests {
         };
         fixture
             .coordinator
-            .advance_collection(Some(thumbnail_cursor.clone()))
+            .advance_collection(fixture.selection, Some(thumbnail_cursor.clone()))
             .await;
         assert_eq!(
             fixture.coordinator.collection_state().await,
             (CollectionPhase::Thumbnails, Some(thumbnail_cursor))
         );
-        fixture.coordinator.finish_thumbnail_phase().await;
+        fixture
+            .coordinator
+            .finish_thumbnail_phase(fixture.selection)
+            .await;
         assert_eq!(
             fixture.coordinator.collection_state().await,
             (CollectionPhase::Previews, None)
@@ -996,16 +1147,69 @@ mod tests {
         };
         fixture
             .coordinator
-            .advance_collection(Some(preview_cursor.clone()))
+            .advance_collection(fixture.selection, Some(preview_cursor.clone()))
             .await;
         assert_eq!(
             fixture.coordinator.collection_state().await,
             (CollectionPhase::Previews, Some(preview_cursor))
         );
-        fixture.coordinator.finish_preview_phase().await;
+        fixture
+            .coordinator
+            .finish_preview_phase(fixture.selection)
+            .await;
         assert_eq!(
             fixture.coordinator.collection_state().await,
             (CollectionPhase::Complete, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_collection_selection_cannot_change_new_selection() {
+        let fixture = fixture();
+        let old_selection = fixture.selection;
+        let new_selection = selection(2);
+        fixture.coordinator.begin_collection(old_selection).await;
+        fixture.coordinator.reset_selection(new_selection).await;
+        fixture.coordinator.begin_collection(old_selection).await;
+        assert_eq!(fixture.coordinator.selection().await, Some(new_selection));
+        assert_eq!(
+            fixture.coordinator.collection_state().await,
+            (CollectionPhase::Dormant, None)
+        );
+
+        let stale_cursor = WallCursorKey::Provisional {
+            order: 4,
+            id: fixture_id(4),
+        };
+        fixture
+            .coordinator
+            .advance_collection(old_selection, Some(stale_cursor))
+            .await;
+        fixture
+            .coordinator
+            .finish_thumbnail_phase(old_selection)
+            .await;
+        assert_eq!(
+            fixture.coordinator.collection_state().await,
+            (CollectionPhase::Dormant, None)
+        );
+
+        fixture.coordinator.begin_collection(new_selection).await;
+        fixture
+            .coordinator
+            .finish_thumbnail_phase(old_selection)
+            .await;
+        assert_eq!(
+            fixture.coordinator.collection_state().await,
+            (CollectionPhase::Thumbnails, None)
+        );
+        fixture
+            .coordinator
+            .finish_thumbnail_phase(new_selection)
+            .await;
+        assert_eq!(
+            fixture.coordinator.collection_state().await,
+            (CollectionPhase::Previews, None)
         );
     }
 
@@ -1044,13 +1248,10 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!invalidator.is_finished());
 
-        let waiters = fixture
+        fixture
             .coordinator
             .complete_commit(permit, reference())
             .await;
-        for waiter in waiters {
-            let _ = waiter.send(Some(reference()));
-        }
         invalidator.await.unwrap();
         assert_eq!(waiter.await.unwrap(), Some(reference()));
     }

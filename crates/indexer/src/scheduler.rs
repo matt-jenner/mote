@@ -177,6 +177,29 @@ impl IndexScheduler {
         None
     }
 
+    /// Dequeue the highest-priority job only when it belongs to `owner_prefix`.
+    ///
+    /// A shared scheduler can have several consumers.  Looking at the heap
+    /// before removing anything keeps a consumer from temporarily taking a
+    /// higher-priority job owned by another consumer.
+    pub async fn next_owned(&self, owner_prefix: &str) -> Option<IndexJob> {
+        let mut state = self.state.lock().await;
+        loop {
+            let entry = state.heap.peek()?.clone();
+            if !entry.name.starts_with(owner_prefix) {
+                return None;
+            }
+            let valid = state.queued.get(&entry.name).is_some_and(|current| {
+                current.sequence == entry.sequence && current.job.priority == entry.priority
+            });
+            state.heap.pop();
+            if !valid {
+                continue;
+            }
+            return state.queued.remove(&entry.name).map(|queued| queued.job);
+        }
+    }
+
     pub async fn set_interaction_mode(&self, mode: InteractionMode) {
         let permits = match mode {
             InteractionMode::Idle => self.config.idle_workers,

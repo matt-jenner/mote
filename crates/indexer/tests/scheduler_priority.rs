@@ -65,6 +65,36 @@ async fn visible_work_preempts_queued_idle_work() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn owned_dequeue_does_not_remove_foreign_higher_priority_work() {
+    let scheduler = IndexScheduler::new(SchedulerConfig::default());
+    scheduler
+        .enqueue(job("foreign-visible", JobPriority::Visible))
+        .await;
+    scheduler
+        .enqueue(job(
+            "photo-derivative-coordinator:idle",
+            JobPriority::IdleLibrary,
+        ))
+        .await;
+
+    assert!(
+        scheduler
+            .next_owned("photo-derivative-coordinator:")
+            .await
+            .is_none()
+    );
+    assert_eq!(scheduler.next().await.unwrap().name(), "foreign-visible");
+    assert_eq!(
+        scheduler
+            .next_owned("photo-derivative-coordinator:")
+            .await
+            .unwrap()
+            .name(),
+        "photo-derivative-coordinator:idle"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn equal_priority_jobs_remain_fifo() {
     let scheduler = IndexScheduler::new(SchedulerConfig::default());
     scheduler
