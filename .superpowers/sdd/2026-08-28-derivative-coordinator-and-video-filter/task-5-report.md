@@ -255,3 +255,76 @@ The corrected 10k test schedules the collection's actual first 250-item wall pag
 ### Commit
 
 Fix-round 2 implementation commit: `db56f6e82f8fe625ffa6170fcc9bc8f3c92ca9af` (`fix: guard stale collection admissions`).
+
+## Fix round 3
+
+### Review finding addressed
+
+The 10k bound test now installs a class-wide wall gate before starting the
+real collection driver. Because the first page is loaded with the catalogue's
+250-item keyset limit and all page jobs are admitted before workers start, the
+gate holds every wall attempt from that page. The test waits for a wall attempt
+and asserts an exact 250-job coordinator snapshot, rather than observing only
+one blocked asset while other workers drain the page. It then replaces the
+gate with a separate per-asset wall gate, submits a non-invalidating
+near-viewport request, waits for its queue admission, and asserts exactly 251
+jobs before releasing either gate.
+
+The fixture itself no longer retains a 10,000-element ID vector; records are
+flushed in bounded 500-record batches and the foreground ID is derived from
+its known relative path. The test also reads the catalogue count and asserts
+exactly 10,000 assets. The production snapshot remains path/ID-free and
+reports only recent/page/job counts and phase.
+
+### GREEN evidence
+
+```text
+$ cargo test -p photo-app-service --lib collection_schedules_bounded_missing_work_with_concurrent_foreground_request -- --test-threads=1
+test result: ok. 1 passed; 0 failed
+
+$ focused bound test repeated 20 times
+20/20 bound runs passed
+
+$ cargo test -p photo-app-service --lib -- --test-threads=1
+test result: ok. 62 passed; 0 failed
+
+$ cargo test -p photo-app-service --test progressive_wall -- --test-threads=1
+test result: ok. 54 passed; 0 failed
+
+$ cargo test -p photo-catalog --test wall_query -- --test-threads=1
+test result: ok. 19 passed; 0 failed
+
+$ cargo test -p photo-catalog --test catalog_round_trip -- --test-threads=1
+test result: ok. 12 passed; 0 failed
+
+$ cargo clippy -p photo-app-service -p photo-catalog --all-targets --all-features -- -D warnings
+Finished successfully
+
+$ cargo fmt --all -- --check
+exit=0
+
+$ git diff --check
+exit=0
+
+$ cargo test --workspace --all-targets -- --test-threads=1
+workspace_exit=0
+```
+
+### Boundedness and source safety
+
+The strengthened test proves `largest_loaded_page == 250`,
+`recent_len <= 250`, and `queued_jobs == 250` while every collection wall
+attempt is gated. After the independent near-viewport request is admitted it
+proves `queued_jobs == 251`, accounting for exactly one foreground job. Gates
+are released and the spawned tasks are joined/aborted before the coordinator
+cleanup, so no deterministic work is left running. The fixture checks the
+catalogue's 10,000-asset count while retaining only bounded insertion records;
+collection runtime state still consists of one page and one cursor, with no
+full ID collection exposed or retained by the coordinator snapshot.
+
+No source or cache paths were added to the test hook, snapshot, queue state,
+or report-facing data.
+
+### Commit
+
+Fix-round 3 test-hardening commit: `a8d0eefd5b40a4abd23bf93638ac9baa4e5370ee` (`test: make collection bound gate deterministic`).
