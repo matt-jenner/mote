@@ -141,6 +141,8 @@ pub(crate) struct DerivativeCoordinator {
     scheduler: Arc<IndexScheduler>,
     wake: Notify,
     change_generation: AtomicU64,
+    #[cfg(test)]
+    wait_test_hook: Mutex<Option<Arc<Notify>>>,
 }
 
 impl DerivativeCoordinator {
@@ -150,6 +152,8 @@ impl DerivativeCoordinator {
             scheduler,
             wake: Notify::new(),
             change_generation: AtomicU64::new(0),
+            #[cfg(test)]
+            wait_test_hook: Mutex::new(None),
         }
     }
 
@@ -166,6 +170,8 @@ impl DerivativeCoordinator {
             scheduler,
             wake: Notify::new(),
             change_generation: AtomicU64::new(0),
+            #[cfg(test)]
+            wait_test_hook: Mutex::new(None),
         }
     }
 
@@ -793,10 +799,17 @@ impl DerivativeCoordinator {
     }
 
     pub(crate) async fn wait_for_change_since(&self, observed: u64) {
-        let notified = self.wake.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if self.change_generation() == observed {
+        loop {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.change_generation() != observed {
+                return;
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.wait_test_hook.lock().await.clone() {
+                hook.notify_one();
+            }
             notified.await;
         }
     }
@@ -812,6 +825,11 @@ impl DerivativeCoordinator {
 
     pub(crate) fn wake(&self) {
         self.notify_waiters();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn install_wait_test_hook(&self, entered: Arc<Notify>) {
+        *self.wait_test_hook.lock().await = Some(entered);
     }
 }
 

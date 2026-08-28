@@ -1821,16 +1821,24 @@ mod tests {
 
         let generation = service.coordinator.background_generation().await;
         let change_generation = service.coordinator.change_generation();
+        let wait_entered = Arc::new(tokio::sync::Notify::new());
+        let wait_entered_wait = wait_entered.notified();
+        service
+            .coordinator
+            .install_wait_test_hook(wait_entered.clone())
+            .await;
         let prefetch_service = service.clone();
         let prefetch = tokio::spawn(async move {
             prefetch_service
                 .run_preview_prefetch_until_stable(Vec::new(), true, selection, generation)
                 .await;
         });
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::timeout(Duration::from_secs(2), wait_entered_wait)
+            .await
+            .expect("prefetch did not reach its generation wait barrier");
         assert!(
             !prefetch.is_finished(),
-            "prefetch did not block while the scan was active"
+            "prefetch did not block at the generation wait barrier"
         );
         assert_eq!(service.coordinator.selection().await, Some(selection));
         assert_eq!(
