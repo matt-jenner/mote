@@ -92,6 +92,13 @@ pub(crate) struct DerivativeRequestTestHook {
     pub(crate) release: Option<Arc<Notify>>,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct ScanCompletionWakeTestHook {
+    pub(crate) selection: SelectionToken,
+    pub(crate) marker: Arc<Notify>,
+}
+
 trait RecentSourceValidator: Send + Sync {
     fn validate_recent(&self, folder: &Path) -> Result<ValidatedSourceFolder, AddLibraryError>;
 }
@@ -137,6 +144,8 @@ pub struct AppService {
     pub(crate) derivative_request_test_hook: Arc<TokioMutex<Option<DerivativeRequestTestHook>>>,
     #[cfg(debug_assertions)]
     pub(crate) derivative_visible_queue_test_hook: Arc<TokioMutex<Option<Arc<Notify>>>>,
+    #[cfg(test)]
+    pub(crate) scan_completion_wake_test_hook: Arc<Mutex<Option<ScanCompletionWakeTestHook>>>,
     pub(crate) metadata_reader: ReaderAdapter,
     source_validator: Arc<dyn RecentSourceValidator>,
     selection_request_sequence: Arc<AtomicU64>,
@@ -238,6 +247,8 @@ impl AppService {
             derivative_request_test_hook: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]
             derivative_visible_queue_test_hook: Arc::new(TokioMutex::new(None)),
+            #[cfg(test)]
+            scan_completion_wake_test_hook: Arc::new(Mutex::new(None)),
             metadata_reader: ReaderAdapter(reader),
             source_validator,
             selection_request_sequence: Arc::new(AtomicU64::new(0)),

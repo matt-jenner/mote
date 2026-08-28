@@ -398,8 +398,38 @@ impl AppService {
             return;
         };
         self.wake_derivative_workers();
+        #[cfg(test)]
+        self.notify_scan_completion_wake_test_hook(owner.selection);
         if successful_selection.is_some() {
             self.prefetch_screen_previews(Vec::new()).await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_scan_completion_wake_test_hook(
+        &self,
+        selection: SelectionToken,
+        marker: std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        *self.scan_completion_wake_test_hook.lock().unwrap() =
+            Some(crate::service::ScanCompletionWakeTestHook { selection, marker });
+    }
+
+    #[cfg(test)]
+    fn notify_scan_completion_wake_test_hook(&self, selection: SelectionToken) {
+        let marker = {
+            let mut hook = self.scan_completion_wake_test_hook.lock().unwrap();
+            if hook
+                .as_ref()
+                .is_some_and(|hook| hook.selection == selection)
+            {
+                hook.take().map(|hook| hook.marker)
+            } else {
+                None
+            }
+        };
+        if let Some(marker) = marker {
+            marker.notify_one();
         }
     }
 }

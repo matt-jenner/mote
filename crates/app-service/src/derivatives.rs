@@ -1823,10 +1823,13 @@ mod tests {
         let change_generation = service.coordinator.change_generation();
         let wait_entered = Arc::new(tokio::sync::Notify::new());
         let wait_entered_wait = wait_entered.notified();
+        let scan_wake = Arc::new(tokio::sync::Notify::new());
+        let scan_wake_wait = scan_wake.notified();
         service
             .coordinator
             .install_wait_test_hook(wait_entered.clone())
             .await;
+        service.install_scan_completion_wake_test_hook(selection, scan_wake.clone());
         let prefetch_service = service.clone();
         let prefetch = tokio::spawn(async move {
             prefetch_service
@@ -1861,6 +1864,9 @@ mod tests {
         )
         .await
         .expect("scan did not complete after releasing the metadata reader");
+        tokio::time::timeout(Duration::from_secs(5), scan_wake_wait)
+            .await
+            .expect("scan completion did not reach its post-wake marker");
         assert!(
             service.coordinator.change_generation() > change_generation,
             "scan completion did not record its explicit coordinator wake"
