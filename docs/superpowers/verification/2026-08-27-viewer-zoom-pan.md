@@ -424,7 +424,7 @@ screenshot attachment was produced.
 
 ```text
 cargo test --workspace --all-features
-191 passed; 0 failed; 0 ignored
+269 passed; 0 failed; 0 ignored
 
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 Finished `dev` profile; no warnings or errors

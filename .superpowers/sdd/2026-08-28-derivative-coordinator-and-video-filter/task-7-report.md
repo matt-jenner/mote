@@ -191,7 +191,7 @@ passed after local-network approval.
 
 ```text
 cargo test --workspace --all-features
-192 passed; 0 failed; 0 ignored
+269 passed; 0 failed; 0 ignored
 
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 Finished `dev` profile; no warnings or errors
