@@ -17,7 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(any(test, debug_assertions))]
 use tokio::sync::Mutex as TokioMutex;
-use tokio::sync::{Notify, watch};
+#[cfg(any(test, debug_assertions))]
+use tokio::sync::Notify;
+use tokio::sync::watch;
 
 pub(crate) struct ServiceState {
     pub(crate) libraries: LibraryService<RealSourceFs>,
@@ -83,6 +85,13 @@ pub(crate) struct DerivativeTestGate {
     pub(crate) entered: Arc<tokio::sync::Notify>,
     pub(crate) release: Arc<tokio::sync::Notify>,
     pub(crate) starts: Option<Arc<AtomicUsize>>,
+}
+
+#[cfg(any(test, debug_assertions))]
+#[derive(Clone)]
+pub(crate) struct ManagedCommitTestGate {
+    pub(crate) started: Arc<Notify>,
+    pub(crate) release: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(debug_assertions)]
@@ -155,6 +164,10 @@ pub struct AppService {
     >,
     #[cfg(any(test, debug_assertions))]
     pub(crate) derivative_panic_after_admission_test_hook: Arc<TokioMutex<bool>>,
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) managed_commit_test_gate: Arc<TokioMutex<Option<ManagedCommitTestGate>>>,
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) derivative_panic_in_blocking_commit_test_hook: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(debug_assertions)]
     pub(crate) derivative_request_test_hook: Arc<TokioMutex<Option<DerivativeRequestTestHook>>>,
     #[cfg(debug_assertions)]
@@ -266,6 +279,12 @@ impl AppService {
             derivative_attempt_abort_handle: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]
             derivative_panic_after_admission_test_hook: Arc::new(TokioMutex::new(false)),
+            #[cfg(any(test, debug_assertions))]
+            managed_commit_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(any(test, debug_assertions))]
+            derivative_panic_in_blocking_commit_test_hook: Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
             #[cfg(debug_assertions)]
             derivative_request_test_hook: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]

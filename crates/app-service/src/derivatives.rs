@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicUsize;
+#[cfg(any(test, debug_assertions))]
 use std::sync::atomic::Ordering;
 
 use photo_cache::{
@@ -46,9 +47,8 @@ enum DerivativeWorkError {
     WallThumbnailRequired,
 }
 
-struct GeneratedWork {
-    reference: DerivativeReference,
-    permit: CommitPermit,
+struct AdmittedCommit {
+    completion: tokio::sync::oneshot::Receiver<()>,
 }
 
 struct GenerationFailure {
@@ -103,6 +103,7 @@ pub(crate) struct PendingDerivative {
     group: FolderGroupId,
     class: DerivativeClass,
     selection: SelectionToken,
+    completion_generation: u64,
 }
 
 impl AppService {
@@ -293,6 +294,7 @@ impl AppService {
             group_id: group,
             epoch: state.selection_epoch,
         };
+        let completion_generation = self.coordinator.commit_completion_generation();
         let library = state
             .libraries
             .catalog()
@@ -393,6 +395,7 @@ impl AppService {
                         group,
                         class,
                         selection: selection_token,
+                        completion_generation,
                     });
                 }
             }
@@ -441,11 +444,16 @@ impl AppService {
                     .as_str()
                     .to_owned()
             });
-            receivers.push(
-                self.coordinator
-                    .enqueue_with_prerequisite(key, lane, prerequisite)
-                    .await,
-            );
+            let receiver = self
+                .coordinator
+                .enqueue_with_prerequisite_observed(
+                    key,
+                    lane,
+                    prerequisite,
+                    Some(pending.completion_generation),
+                )
+                .await;
+            receivers.push(receiver);
         }
         if !receivers.is_empty() {
             #[cfg(debug_assertions)]
@@ -550,41 +558,137 @@ impl AppService {
                 permit: None,
             })
         };
-        match outcome {
-            Ok(GeneratedWork { reference, permit }) => {
-                self.clear_derivative_warnings(selection, asset_id, class);
-                self.publish_derivatives_if_active(selection, vec![reference.clone()]);
-                self.coordinator.complete_commit(permit, reference).await;
+        let completed_by_supervisor = match outcome {
+            Ok(AdmittedCommit { completion }) => {
+                let _ = completion.await;
+                true
             }
             Err(GenerationFailure { error, permit }) => {
-                if !matches!(error, DerivativeWorkError::PreviewSuperseded)
-                    && !matches!(error, DerivativeWorkError::WallThumbnailRequired)
-                {
-                    match error.scope() {
-                        DerivativeFailureScope::Asset => {
-                            self.record_asset_derivative_warning(selection, asset_id);
-                        }
-                        DerivativeFailureScope::CacheWide => {
-                            self.record_cache_derivative_warning(selection, class);
-                        }
-                    }
-                }
+                self.record_derivative_failure(selection, asset_id, class, &error);
                 if let Some(permit) = permit {
                     self.coordinator.fail_commit(permit).await;
                 } else {
                     self.coordinator.discard(ticket).await;
                 }
+                false
+            }
+        };
+        #[cfg(not(any(test, debug_assertions)))]
+        let _ = completed_by_supervisor;
+        #[cfg(any(test, debug_assertions))]
+        if !completed_by_supervisor {
+            self.notify_derivative_completion_test_hook().await;
+        }
+    }
+
+    fn record_derivative_failure(
+        &self,
+        selection: SelectionToken,
+        asset_id: AssetId,
+        class: DerivativeClass,
+        error: &DerivativeWorkError,
+    ) {
+        if matches!(error, DerivativeWorkError::PreviewSuperseded)
+            || matches!(error, DerivativeWorkError::WallThumbnailRequired)
+        {
+            return;
+        }
+        match error.scope() {
+            DerivativeFailureScope::Asset => {
+                self.record_asset_derivative_warning(selection, asset_id)
+            }
+            DerivativeFailureScope::CacheWide => {
+                self.record_cache_derivative_warning(selection, class)
             }
         }
-        #[cfg(any(test, debug_assertions))]
-        self.notify_derivative_completion_test_hook().await;
+    }
+
+    async fn resolve_admitted_commit(
+        &self,
+        permit: CommitPermit,
+        selection: SelectionToken,
+        asset_id: AssetId,
+        class: DerivativeClass,
+        result: Result<photo_cache::GeneratedDerivative, DerivativeWorkError>,
+    ) {
+        match result {
+            Ok(generated) => {
+                let reference = reference(asset_id, class, generated.key.as_str().into());
+                self.clear_derivative_warnings(selection, asset_id, class);
+                self.publish_derivatives_if_active(selection, vec![reference.clone()]);
+                self.coordinator.complete_commit(permit, reference).await;
+            }
+            Err(error) => {
+                self.record_derivative_failure(selection, asset_id, class, &error);
+                self.coordinator.fail_commit(permit).await;
+            }
+        }
+    }
+
+    fn spawn_admitted_commit<F>(
+        &self,
+        permit: CommitPermit,
+        selection: SelectionToken,
+        asset_id: AssetId,
+        class: DerivativeClass,
+        operation: F,
+    ) -> AdmittedCommit
+    where
+        F: FnOnce() -> Result<photo_cache::GeneratedDerivative, DerivativeWorkError>
+            + Send
+            + 'static,
+    {
+        let (completion_sender, completion) = tokio::sync::oneshot::channel();
+        if !permit.claim_supervisor() {
+            let fallback_service = self.clone();
+            tokio::spawn(async move {
+                fallback_service.coordinator.fail_commit(permit).await;
+                #[cfg(any(test, debug_assertions))]
+                fallback_service
+                    .notify_derivative_completion_test_hook()
+                    .await;
+                let _ = completion_sender.send(());
+            });
+            return AdmittedCommit { completion };
+        }
+        let operation_service = self.clone();
+        let fallback_permit = permit.clone();
+        let operation_task = tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(operation)
+                .await
+                .map_err(|_| DerivativeWorkError::WorkerUnavailable)
+                .and_then(|result| result);
+            operation_service
+                .resolve_admitted_commit(permit, selection, asset_id, class, result)
+                .await;
+        });
+        let monitor_service = self.clone();
+        tokio::spawn(async move {
+            if operation_task.await.is_err() {
+                monitor_service
+                    .resolve_admitted_commit(
+                        fallback_permit,
+                        selection,
+                        asset_id,
+                        class,
+                        Err(DerivativeWorkError::WorkerUnavailable),
+                    )
+                    .await;
+            }
+            #[cfg(any(test, debug_assertions))]
+            monitor_service
+                .notify_derivative_completion_test_hook()
+                .await;
+            let _ = completion_sender.send(());
+        });
+        AdmittedCommit { completion }
     }
 
     async fn generate_derivative(
         &self,
         ticket: WorkTicket,
         key: WorkKey,
-    ) -> Result<GeneratedWork, GenerationFailure> {
+    ) -> Result<AdmittedCommit, GenerationFailure> {
         let pending = self
             .pending_for_key(&key)
             .map_err(|error| GenerationFailure {
@@ -607,13 +711,16 @@ impl AppService {
                 permit: None,
             });
         }
-        let generator =
-            ImageDerivativeGenerator::new(&self.cache_root).map_err(|error| GenerationFailure {
-                error: error.into(),
-                permit: None,
-            })?;
         match class {
             DerivativeClass::WallThumbnail => {
+                let source = pending.source;
+                let cached_source = pending.cached_source.clone().or(self
+                    .cached_screen_preview_for_wall(id, group, &pending.spec)
+                    .map_err(|error| GenerationFailure {
+                        error,
+                        permit: None,
+                    })?);
+                let spec = pending.spec;
                 let permit = self
                     .coordinator
                     .admit_commit(ticket, selection, None)
@@ -622,71 +729,75 @@ impl AppService {
                         error: DerivativeWorkError::PreviewSuperseded,
                         permit: None,
                     })?;
-                let source = pending.source;
-                let cached_source = pending.cached_source.clone().or(self
-                    .cached_screen_preview_for_wall(id, group, &pending.spec)
-                    .map_err(|error| GenerationFailure {
-                        error,
-                        permit: Some(permit),
-                    })?);
-                let spec = pending.spec;
-                let generated = tokio::task::spawn_blocking(move || {
-                    if let Some(cached_source) = cached_source {
-                        let repair = generator
-                            .generate_wall_thumbnail_from_cached_preview(&cached_source, &spec);
-                        match repair {
-                            Ok(generated) => Ok(generated),
-                            Err(
-                                ImageDerivativeError::Io(_)
-                                | ImageDerivativeError::Decode(_)
-                                | ImageDerivativeError::Cache(photo_cache::CacheError::Io(_)),
-                            ) => generator.generate(&source, &spec),
-                            Err(error) => Err(error),
+                let cache_root = self.cache_root.clone();
+                let catalog_path = self.catalog_path.clone();
+                #[cfg(any(test, debug_assertions))]
+                let managed_gate = self.take_managed_commit_test_gate().await;
+                #[cfg(any(test, debug_assertions))]
+                let panic_hook = self.derivative_panic_in_blocking_commit_test_hook.clone();
+                Ok(
+                    self.spawn_admitted_commit(permit, selection, id, class, move || {
+                        #[cfg(any(test, debug_assertions))]
+                        {
+                            if let Some(gate) = managed_gate {
+                                gate.started.notify_one();
+                                while !gate.release.load(Ordering::Acquire) {
+                                    std::thread::yield_now();
+                                }
+                            }
+                            if panic_hook.swap(false, Ordering::AcqRel) {
+                                panic!("injected blocking derivative commit panic");
+                            }
                         }
-                    } else {
-                        generator.generate(&source, &spec)
-                    }
-                })
-                .await
-                .map_err(|_| GenerationFailure {
-                    error: DerivativeWorkError::WorkerUnavailable,
-                    permit: Some(permit),
-                })?
-                .map_err(|error| GenerationFailure {
-                    error: error.into(),
-                    permit: Some(permit),
-                })?;
-                let mut state = self.state().map_err(|_| GenerationFailure {
-                    error: DerivativeWorkError::WorkerUnavailable,
-                    permit: Some(permit),
-                })?;
-                let catalog_started = std::time::Instant::now();
-                let catalog_result =
-                    state
-                        .libraries
-                        .catalog_mut()
-                        .upsert_derivative(&NewDerivative {
-                            id: DerivativeId::new(),
-                            asset_id: id,
-                            folder_group_id: group,
-                            kind: derivative_kind_name(class).into(),
-                            cache_key: generated.key.as_str().into(),
-                            relative_cache_path: generated.relative_path,
-                            size_bytes: generated.size_bytes,
-                            durable: true,
-                            created_at: 0,
-                        });
-                record_timing_stage("catalog_commit", catalog_started);
-                catalog_result.map_err(|error| GenerationFailure {
-                    error: ImageDerivativeError::Catalog(error).into(),
-                    permit: Some(permit),
-                })?;
-                Ok(GeneratedWork {
-                    reference: reference(id, class, generated.key.as_str().into()),
-                    permit,
-                })
+                        let generator = ImageDerivativeGenerator::new(&cache_root)
+                            .map_err(DerivativeWorkError::from)?;
+                        let generated = if let Some(cached_source) = cached_source {
+                            let repair = generator
+                                .generate_wall_thumbnail_from_cached_preview(&cached_source, &spec);
+                            match repair {
+                                Ok(generated) => Ok(generated),
+                                Err(
+                                    ImageDerivativeError::Io(_)
+                                    | ImageDerivativeError::Decode(_)
+                                    | ImageDerivativeError::Cache(photo_cache::CacheError::Io(_)),
+                                ) => generator.generate(&source, &spec),
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            generator.generate(&source, &spec)
+                        }
+                        .map_err(DerivativeWorkError::from)?;
+                        let mut catalog = Catalog::open(&catalog_path)
+                            .map_err(ImageDerivativeError::from)
+                            .map_err(DerivativeWorkError::from)?;
+                        let catalog_started = std::time::Instant::now();
+                        catalog
+                            .upsert_derivative(&NewDerivative {
+                                id: DerivativeId::new(),
+                                asset_id: id,
+                                folder_group_id: group,
+                                kind: derivative_kind_name(class).into(),
+                                cache_key: generated.key.as_str().into(),
+                                relative_cache_path: generated.relative_path.clone(),
+                                size_bytes: generated.size_bytes,
+                                durable: true,
+                                created_at: 0,
+                            })
+                            .map_err(ImageDerivativeError::from)
+                            .map_err(DerivativeWorkError::from)?;
+                        record_timing_stage("catalog_commit", catalog_started);
+                        Ok(generated)
+                    }),
+                )
             }
             DerivativeClass::ScreenPreview => {
+                let generator =
+                    ImageDerivativeGenerator::new(&self.cache_root).map_err(|error| {
+                        GenerationFailure {
+                            error: error.into(),
+                            permit: None,
+                        }
+                    })?;
                 let wall_spec = wall_spec_from(&pending.spec);
                 let wall_key = DerivativeKey::compute(&wall_spec);
                 let wall_ready = self
@@ -761,35 +872,45 @@ impl AppService {
                 let catalog_path = self.catalog_path.clone();
                 #[cfg(any(test, debug_assertions))]
                 let commit_counter = self.screen_preview_commit_test_counter.lock().await.clone();
-                let generated = tokio::task::spawn_blocking(move || {
-                    let generator = ImageDerivativeGenerator::new(&cache_root)?;
-                    let mut catalog = Catalog::open(&catalog_path)?;
-                    #[cfg(any(test, debug_assertions))]
-                    if let Some(counter) = commit_counter {
-                        counter.fetch_add(1, Ordering::SeqCst);
-                    }
-                    generator.commit_screen_preview(
-                        encoded,
-                        &spec,
-                        group,
-                        &mut catalog,
-                        cache_budget,
-                        &protected,
-                    )
-                })
-                .await
-                .map_err(|_| GenerationFailure {
-                    error: DerivativeWorkError::WorkerUnavailable,
-                    permit: Some(permit),
-                })?
-                .map_err(|error| GenerationFailure {
-                    error: error.into(),
-                    permit: Some(permit),
-                })?;
-                Ok(GeneratedWork {
-                    reference: reference(id, class, generated.key.as_str().into()),
-                    permit,
-                })
+                #[cfg(any(test, debug_assertions))]
+                let managed_gate = self.take_managed_commit_test_gate().await;
+                #[cfg(any(test, debug_assertions))]
+                let panic_hook = self.derivative_panic_in_blocking_commit_test_hook.clone();
+                Ok(
+                    self.spawn_admitted_commit(permit, selection, id, class, move || {
+                        #[cfg(any(test, debug_assertions))]
+                        {
+                            if let Some(gate) = managed_gate {
+                                gate.started.notify_one();
+                                while !gate.release.load(Ordering::Acquire) {
+                                    std::thread::yield_now();
+                                }
+                            }
+                            if panic_hook.swap(false, Ordering::AcqRel) {
+                                panic!("injected blocking derivative commit panic");
+                            }
+                        }
+                        let generator = ImageDerivativeGenerator::new(&cache_root)
+                            .map_err(DerivativeWorkError::from)?;
+                        let mut catalog = Catalog::open(&catalog_path)
+                            .map_err(ImageDerivativeError::from)
+                            .map_err(DerivativeWorkError::from)?;
+                        #[cfg(any(test, debug_assertions))]
+                        if let Some(counter) = commit_counter {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                        }
+                        generator
+                            .commit_screen_preview(
+                                encoded,
+                                &spec,
+                                group,
+                                &mut catalog,
+                                cache_budget,
+                                &protected,
+                            )
+                            .map_err(DerivativeWorkError::from)
+                    }),
+                )
             }
         }
     }
@@ -879,6 +1000,7 @@ impl AppService {
             group,
             class: key.class,
             selection: key.selection,
+            completion_generation: self.coordinator.commit_completion_generation(),
         }))
     }
 
@@ -994,6 +1116,11 @@ impl AppService {
         panic
     }
 
+    #[cfg(any(test, debug_assertions))]
+    async fn take_managed_commit_test_gate(&self) -> Option<crate::service::ManagedCommitTestGate> {
+        self.managed_commit_test_gate.lock().await.take()
+    }
+
     /// Installs a deterministic derivative boundary for integration tests.
     #[cfg(debug_assertions)]
     #[doc(hidden)]
@@ -1100,6 +1227,26 @@ impl AppService {
     #[doc(hidden)]
     pub async fn install_derivative_panic_after_admission_test_hook(&self) {
         *self.derivative_panic_after_admission_test_hook.lock().await = true;
+    }
+
+    /// Installs a deterministic gate at the start of admitted blocking commit work.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_managed_commit_started_test_gate(
+        &self,
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        *self.managed_commit_test_gate.lock().await =
+            Some(crate::service::ManagedCommitTestGate { started, release });
+    }
+
+    /// Injects a panic from the admitted blocking commit operation.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_derivative_panic_in_blocking_commit_test_hook(&self) {
+        self.derivative_panic_in_blocking_commit_test_hook
+            .store(true, Ordering::Release);
     }
 
     /// Holds commit completion after waiter delivery and before invalidation is released.

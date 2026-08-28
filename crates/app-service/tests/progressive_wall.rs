@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use std::{io, sync::Once};
@@ -1163,6 +1163,39 @@ async fn prepare_wall_ready_fixture() -> (ProgressiveFixture, AppService, String
     (fixture, service, asset_id)
 }
 
+async fn prepare_managed_cache_wall_ready_fixture() -> (ProgressiveFixture, AppService, String) {
+    let fixture = ProgressiveFixture::new(1);
+    let mut service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    service.set_derivative_cache_budget_for_test(CacheBudget::from_total_space(1_000_000));
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    let asset_id = scanned_asset(&fixture, &service).await;
+    service
+        .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
+        .await
+        .unwrap();
+    (fixture, service, asset_id)
+}
+
+async fn prepare_unready_fixture() -> (ProgressiveFixture, AppService, String) {
+    let fixture = ProgressiveFixture::new(1);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    let asset_id = scanned_asset(&fixture, &service).await;
+    (fixture, service, asset_id)
+}
+
 async fn begin_blocked_background_preview(
     service: &AppService,
     asset_id: &str,
@@ -2151,7 +2184,7 @@ async fn invalidation_before_commit_admission_has_no_side_effects() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admitted_commit_finishes_before_later_invalidation() {
     for _ in 0..20 {
-        let (fixture, mut service, asset_id) = prepare_wall_ready_fixture().await;
+        let (fixture, mut service, asset_id) = prepare_managed_cache_wall_ready_fixture().await;
         seed_evictable_screen_preview_and_warning(&fixture, &asset_id);
         service.set_derivative_cache_budget_for_test(CacheBudget::from_total_space(1_000_000));
         let expected_selection_id = service.active_selection_id().unwrap();
@@ -2459,6 +2492,245 @@ async fn admitted_preview_panic_fails_waiters_and_releases_invalidation() {
             tokio::time::timeout(Duration::from_secs(5), visible)
                 .await
                 .expect("invalidation should be released after panic")
+                .expect("visible request task panicked")
+                .is_ok()
+        );
+        assert_eq!(
+            Catalog::open(&fixture.config.catalog_path())
+                .unwrap()
+                .all_derivatives()
+                .unwrap()
+                .into_iter()
+                .filter(|record| record.kind == "screen_preview")
+                .count(),
+            0
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_screen_commit_waits_for_started_blocking_work() {
+    for _ in 0..20 {
+        let (fixture, service, asset_id) = prepare_wall_ready_fixture().await;
+        let commit_started = Arc::new(tokio::sync::Notify::new());
+        let commit_release = Arc::new(AtomicBool::new(false));
+        service
+            .install_managed_commit_started_test_gate(
+                commit_started.clone(),
+                commit_release.clone(),
+            )
+            .await;
+        let invalidation_waiting = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_background_invalidation_wait_test_hook(invalidation_waiting.clone())
+            .await;
+
+        service
+            .set_interaction(photo_app_service::InteractionState::Idle)
+            .await;
+        let background_service = service.clone();
+        let background_asset = asset_id.clone();
+        let mut background = tokio::spawn(async move {
+            background_service
+                .request_derivatives(DerivativeRequest {
+                    asset_ids: vec![background_asset],
+                    priority: photo_app_service::DerivativePriority::NearViewport,
+                    kind: DerivativeClass::ScreenPreview,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), commit_started.notified())
+            .await
+            .expect("screen commit should enter the blocking-work gate");
+
+        service
+            .set_interaction(photo_app_service::InteractionState::Active)
+            .await;
+        let visible_service = service.clone();
+        let visible_asset = asset_id.clone();
+        let visible = tokio::spawn(async move {
+            visible_service
+                .request_derivatives(DerivativeRequest::visible(vec![visible_asset]))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), invalidation_waiting.notified())
+            .await
+            .expect("visible invalidation should wait for started screen work");
+
+        service.abort_derivative_attempt_for_test().await;
+        tokio::task::yield_now().await;
+        assert!(!background.is_finished());
+        assert!(!visible.is_finished());
+        commit_release.store(true, Ordering::Release);
+        let background_result = tokio::time::timeout(Duration::from_secs(5), &mut background)
+            .await
+            .expect("supervised screen work should finish after release")
+            .expect("background request task panicked");
+        assert!(background_result.is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), visible)
+                .await
+                .expect("screen invalidation should complete after release")
+                .expect("visible request task panicked")
+                .is_ok()
+        );
+        assert_eq!(
+            Catalog::open(&fixture.config.catalog_path())
+                .unwrap()
+                .all_derivatives()
+                .unwrap()
+                .into_iter()
+                .filter(|record| record.kind == "screen_preview")
+                .count(),
+            1
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_wall_commit_waits_for_started_blocking_work() {
+    for _ in 0..20 {
+        let (fixture, service, asset_id) = prepare_unready_fixture().await;
+        let commit_started = Arc::new(tokio::sync::Notify::new());
+        let commit_release = Arc::new(AtomicBool::new(false));
+        service
+            .install_managed_commit_started_test_gate(
+                commit_started.clone(),
+                commit_release.clone(),
+            )
+            .await;
+        let visible_queued = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_visible_derivative_queue_test_hook(visible_queued.clone())
+            .await;
+
+        service
+            .set_interaction(photo_app_service::InteractionState::Idle)
+            .await;
+        let background_service = service.clone();
+        let background_asset = asset_id.clone();
+        let mut background = tokio::spawn(async move {
+            background_service
+                .request_derivatives(DerivativeRequest {
+                    asset_ids: vec![background_asset],
+                    priority: photo_app_service::DerivativePriority::NearViewport,
+                    kind: DerivativeClass::WallThumbnail,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), commit_started.notified())
+            .await
+            .expect("wall commit should enter the blocking-work gate");
+
+        service
+            .set_interaction(photo_app_service::InteractionState::Active)
+            .await;
+        let visible_service = service.clone();
+        let visible_asset = asset_id.clone();
+        let visible = tokio::spawn(async move {
+            visible_service
+                .request_derivatives(DerivativeRequest::visible(vec![visible_asset]))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), visible_queued.notified())
+            .await
+            .expect("visible invalidation should enqueue behind started wall work");
+
+        service.abort_derivative_attempt_for_test().await;
+        tokio::task::yield_now().await;
+        assert!(!background.is_finished());
+        assert!(!visible.is_finished());
+        commit_release.store(true, Ordering::Release);
+        let background_result = tokio::time::timeout(Duration::from_secs(5), &mut background)
+            .await
+            .expect("supervised wall work should finish after release")
+            .expect("background request task panicked");
+        assert!(background_result.is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), visible)
+                .await
+                .expect("wall invalidation should complete after release")
+                .expect("visible request task panicked")
+                .is_ok()
+        );
+        assert_eq!(
+            Catalog::open(&fixture.config.catalog_path())
+                .unwrap()
+                .all_derivatives()
+                .unwrap()
+                .into_iter()
+                .filter(|record| record.kind == "wall_thumbnail")
+                .count(),
+            1
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blocking_screen_commit_panic_fails_only_after_work_finishes() {
+    for _ in 0..20 {
+        let (fixture, service, asset_id) = prepare_wall_ready_fixture().await;
+        let commit_started = Arc::new(tokio::sync::Notify::new());
+        let commit_release = Arc::new(AtomicBool::new(false));
+        service
+            .install_managed_commit_started_test_gate(
+                commit_started.clone(),
+                commit_release.clone(),
+            )
+            .await;
+        let invalidation_waiting = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_background_invalidation_wait_test_hook(invalidation_waiting.clone())
+            .await;
+
+        service
+            .set_interaction(photo_app_service::InteractionState::Idle)
+            .await;
+        let background_service = service.clone();
+        let background_asset = asset_id.clone();
+        let mut background = tokio::spawn(async move {
+            background_service
+                .request_derivatives(DerivativeRequest {
+                    asset_ids: vec![background_asset],
+                    priority: photo_app_service::DerivativePriority::NearViewport,
+                    kind: DerivativeClass::ScreenPreview,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), commit_started.notified())
+            .await
+            .expect("screen commit should enter the blocking-work gate");
+
+        service
+            .set_interaction(photo_app_service::InteractionState::Active)
+            .await;
+        let visible_service = service.clone();
+        let visible_asset = asset_id.clone();
+        let visible = tokio::spawn(async move {
+            visible_service
+                .request_derivatives(DerivativeRequest::visible(vec![visible_asset]))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), invalidation_waiting.notified())
+            .await
+            .expect("visible invalidation should wait for started screen work");
+
+        service
+            .install_derivative_panic_in_blocking_commit_test_hook()
+            .await;
+        commit_release.store(true, Ordering::Release);
+        let background_result = tokio::time::timeout(Duration::from_secs(5), &mut background)
+            .await
+            .expect("blocking panic should resolve the background waiter")
+            .expect("background request task panicked");
+        assert!(background_result.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), visible)
+                .await
+                .expect("invalidation should complete after blocking panic")
                 .expect("visible request task panicked")
                 .is_ok()
         );
