@@ -401,3 +401,79 @@ retains no full ID vector.
 ### Commit
 
 Fix-round 4 test-hardening commit: `e7f134c183c319a9f3be9f54689ae2fbfc6671c7` (`test: await derivative worker quiescence`).
+
+## Fix round 5
+
+### Review findings addressed
+
+- Every deterministic derivative gate now creates, pins, and enables its
+  release notification future before incrementing or signaling entry. This
+  closes the entry-signal/release-registration gap for class-wide and
+  foreground derivative gates, collection publish/enqueue gates, post-encode
+  and post-admission gates, visible-request hooks, and commit-delivery hooks.
+- Debug/test-only derivative quiescence now registers each waiter before its
+  active-count check and broadcasts the transition to zero with
+  `notify_waiters`. A deterministic regression starts two simultaneous
+  `wait_for_zero` callers behind one active guard and proves both complete
+  after the guard drops; the waiter count returns to zero.
+
+### GREEN evidence
+
+```text
+$ cargo test -p photo-app-service --lib derivative_task_tracker_broadcasts_quiescence_to_all_waiters -- --test-threads=1
+test result: ok; 1 passed; 0 failed
+
+$ cargo test -p photo-app-service --lib collection_schedules_bounded_missing_work_with_concurrent_foreground_request -- --test-threads=1
+test result: ok; 1 passed; 0 failed
+
+$ focused tracker and bound tests repeated 100 times each (8 concurrent processes)
+tracker_rc=0 bound_rc=0
+
+$ cargo test -p photo-app-service --lib -- --test-threads=1
+test result: ok; 63 passed; 0 failed
+
+$ cargo test -p photo-app-service --test progressive_wall -- --test-threads=1
+test result: ok; 54 passed; 0 failed
+
+$ cargo test -p photo-catalog --test wall_query -- --test-threads=1
+test result: ok; 19 passed; 0 failed
+
+$ cargo test -p photo-catalog --test catalog_round_trip -- --test-threads=1
+test result: ok; 12 passed; 0 failed
+
+$ cargo clippy -p photo-app-service -p photo-catalog --all-targets --all-features -- -D warnings
+Finished successfully
+
+$ cargo fmt --all -- --check
+exit=0
+
+$ git diff --check
+exit=0
+
+$ cargo check --workspace --release
+Finished successfully
+
+$ cargo test -p photo-app-service --lib --release -- --test-threads=1
+test result: ok; 53 passed; 0 failed
+
+$ cargo test --workspace --all-targets -- --test-threads=1
+workspace_exit=0
+```
+
+### Liveness, boundedness, and source safety
+
+The gate changes are test/debug harness synchronization only; they do not
+change production scheduling. Notification futures are armed before any
+entry signal, so a release cannot be lost in the deterministic harness.
+Quiescence completion is broadcast to all registered waiters, and the
+two-waiter regression proves no caller remains stranded. The bound test still
+holds all configured wall workers, admits the independent foreground request,
+and proves `largest_loaded_page == 250`, `recent_len <= 250`, and exactly
+`queued_jobs == 251` before release. Cleanup waits for tracked derivative
+quiescence and zero coordinator jobs without an arbitrary sleep. Counters and
+test snapshots expose only bounded counts; no asset IDs, source paths, or
+cache paths are retained or reported.
+
+### Commit
+
+Fix-round 5 implementation commit: `6bcc9797c33e688e3592a91fb7bca5837e020b58` (`test: close derivative gate wakeup races`).
