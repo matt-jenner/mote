@@ -716,9 +716,15 @@ impl AppService {
                 let protected = self.protected_groups.clone();
                 let cache_root = self.cache_root.clone();
                 let catalog_path = self.catalog_path.clone();
+                #[cfg(any(test, debug_assertions))]
+                let commit_counter = self.screen_preview_commit_test_counter.lock().await.clone();
                 let generated = tokio::task::spawn_blocking(move || {
                     let generator = ImageDerivativeGenerator::new(&cache_root)?;
                     let mut catalog = Catalog::open(&catalog_path)?;
+                    #[cfg(any(test, debug_assertions))]
+                    if let Some(counter) = commit_counter {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
                     generator.commit_screen_preview(
                         encoded,
                         &spec,
@@ -912,6 +918,13 @@ impl AppService {
             starts: None,
         });
         Ok(())
+    }
+
+    /// Installs a deterministic counter at the managed screen-preview commit call.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_screen_preview_commit_test_counter(&self, counter: Arc<AtomicUsize>) {
+        *self.screen_preview_commit_test_counter.lock().await = Some(counter);
     }
 
     /// Installs a class-wide deterministic derivative boundary for integration tests.

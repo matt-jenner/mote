@@ -115,6 +115,14 @@ struct CoordinatorState {
     collection: CollectionState,
 }
 
+#[derive(Clone, Copy)]
+struct WaitSnapshot {
+    selection: Option<SelectionToken>,
+    background_generation: u64,
+    pending_jobs: usize,
+    background_permits: usize,
+}
+
 impl Default for CoordinatorState {
     fn default() -> Self {
         Self {
@@ -623,14 +631,18 @@ impl DerivativeCoordinator {
     }
 
     pub(crate) async fn ensure_selection(&self, selection: SelectionToken) {
-        if self.selection().await != Some(selection) {
-            self.reset_selection(selection).await;
-        }
+        self.reset_selection(selection).await;
     }
 
     pub(crate) async fn reset_selection(&self, selection: SelectionToken) {
         let waiters = {
             let mut state = self.state.lock().await;
+            if state
+                .selection
+                .is_some_and(|current| current.epoch >= selection.epoch)
+            {
+                return;
+            }
             state.selection = Some(selection);
             state.background_generation = state.background_generation.wrapping_add(1);
             state.recent.clear();
@@ -780,12 +792,43 @@ impl DerivativeCoordinator {
     }
 
     pub(crate) async fn wait_for_change(&self) {
-        let notified = self.wake.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if self.pending_job_count().await == 0 {
+        let mut baseline = None;
+        loop {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let current = self.wait_snapshot().await;
+            let baseline = baseline.get_or_insert(current);
+            if self.has_actionable_queued_work(current).await
+                || current.selection != baseline.selection
+                || current.background_generation != baseline.background_generation
+                || current.background_permits != baseline.background_permits
+                || (baseline.pending_jobs > 0 && current.pending_jobs == 0)
+            {
+                return;
+            }
             notified.await;
         }
+    }
+
+    async fn wait_snapshot(&self) -> WaitSnapshot {
+        let state = self.state.lock().await;
+        WaitSnapshot {
+            selection: state.selection,
+            background_generation: state.background_generation,
+            pending_jobs: state.jobs.len(),
+            background_permits: self.scheduler.available_background_permits(),
+        }
+    }
+
+    async fn has_actionable_queued_work(&self, snapshot: WaitSnapshot) -> bool {
+        let state = self.state.lock().await;
+        state.jobs.values().any(|work| {
+            work.status == JobStatus::Queued
+                && (!work.lane.is_background()
+                    || work.background_generation == snapshot.background_generation)
+                && !(work.lane.is_background() && snapshot.background_permits <= 1)
+        })
     }
 
     pub(crate) fn wake(&self) {
@@ -820,6 +863,7 @@ mod tests {
 
     struct Fixture {
         coordinator: Arc<DerivativeCoordinator>,
+        scheduler: Arc<IndexScheduler>,
         selection: SelectionToken,
     }
 
@@ -833,7 +877,8 @@ mod tests {
         let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig::default()));
         let selection = selection(1);
         Fixture {
-            coordinator: Arc::new(DerivativeCoordinator::new(scheduler)),
+            coordinator: Arc::new(DerivativeCoordinator::new(scheduler.clone())),
+            scheduler,
             selection,
         }
     }
@@ -868,10 +913,14 @@ mod tests {
     }
 
     fn reference() -> DerivativeReference {
+        reference_for(fixture_id(1), DerivativeClass::ScreenPreview, "screen-v1")
+    }
+
+    fn reference_for(asset_id: AssetId, kind: DerivativeClass, key: &str) -> DerivativeReference {
         DerivativeReference {
-            asset_id: fixture_id(1).as_uuid().hyphenated().to_string(),
-            kind: DerivativeClass::ScreenPreview,
-            key: "screen-v1".to_owned(),
+            asset_id: asset_id.as_uuid().hyphenated().to_string(),
+            kind,
+            key: key.to_owned(),
         }
     }
 
@@ -955,6 +1004,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_for_change_waits_on_a_paused_idle_job_until_interaction_ends() {
+        let fixture = fixture();
+        fixture
+            .scheduler
+            .set_interaction_mode(photo_indexer::InteractionMode::Active)
+            .await;
+        let waiter = fixture.enqueue(screen_key(), WorkLane::IdlePreview).await;
+        let coordinator = fixture.coordinator.clone();
+        let waiting = tokio::spawn(async move {
+            coordinator.wait_for_change().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !waiting.is_finished(),
+            "paused idle work caused a busy spin"
+        );
+
+        fixture
+            .scheduler
+            .set_interaction_mode(photo_indexer::InteractionMode::Idle)
+            .await;
+        fixture.coordinator.wake();
+        tokio::time::timeout(Duration::from_millis(100), waiting)
+            .await
+            .expect("interaction transition did not wake the wait")
+            .expect("wait task panicked");
+
+        let ticket = fixture.coordinator.next_work().await.unwrap();
+        fixture.coordinator.discard(ticket).await;
+        assert_eq!(waiter.await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn wait_for_change_wakes_when_paused_idle_work_is_promoted() {
+        let fixture = fixture();
+        fixture
+            .scheduler
+            .set_interaction_mode(photo_indexer::InteractionMode::Active)
+            .await;
+        let waiter = fixture.enqueue(screen_key(), WorkLane::IdlePreview).await;
+        let coordinator = fixture.coordinator.clone();
+        let waiting = tokio::spawn(async move {
+            coordinator.wait_for_change().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !waiting.is_finished(),
+            "paused idle work caused a busy spin"
+        );
+
+        let promoted = fixture.enqueue(screen_key(), WorkLane::ViewerPreview).await;
+        tokio::time::timeout(Duration::from_millis(100), waiting)
+            .await
+            .expect("promotion did not wake the wait")
+            .expect("wait task panicked");
+
+        let ticket = fixture.coordinator.next_work().await.unwrap();
+        fixture.coordinator.complete(ticket, reference()).await;
+        assert_eq!(waiter.await.unwrap(), Some(reference()));
+        assert_eq!(promoted.await.unwrap(), Some(reference()));
+    }
+
+    #[tokio::test]
     async fn mismatched_attempt_cannot_complete_the_current_job() {
         let fixture = fixture();
         let waiter = fixture.enqueue(screen_key(), WorkLane::VisibleWall).await;
@@ -998,6 +1112,56 @@ mod tests {
         assert!(fixture.coordinator.next_work().await.is_some());
         assert_eq!(fixture.coordinator.selection().await, Some(selection(2)));
         drop(waiter);
+    }
+
+    #[tokio::test]
+    async fn duplicate_selection_reset_is_idempotent_for_current_foreground_work() {
+        let fixture = fixture();
+        let current = selection(2);
+        fixture.coordinator.reset_selection(current).await;
+        let key = screen_key_for(current, fixture_id(2), "screen-v2");
+        let waiter = fixture.enqueue(key, WorkLane::ViewerPreview).await;
+        let ticket = fixture.coordinator.next_work().await.unwrap();
+
+        fixture.coordinator.reset_selection(current).await;
+
+        assert_eq!(fixture.coordinator.selection().await, Some(current));
+        let expected = reference_for(fixture_id(2), DerivativeClass::ScreenPreview, "screen-v2");
+        fixture.coordinator.complete(ticket, expected.clone()).await;
+        assert_eq!(waiter.await.unwrap(), Some(expected));
+    }
+
+    #[tokio::test]
+    async fn out_of_order_selection_reset_cannot_regress_newer_foreground_work() {
+        let fixture = fixture();
+        let older = selection(2);
+        let newer = selection(3);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let older_barrier = barrier.clone();
+        let older_coordinator = fixture.coordinator.clone();
+        let older_reset = tokio::spawn(async move {
+            older_barrier.wait().await;
+            older_coordinator.reset_selection(older).await;
+        });
+        let newer_barrier = barrier.clone();
+        let newer_coordinator = fixture.coordinator.clone();
+        let newer_reset = tokio::spawn(async move {
+            newer_barrier.wait().await;
+            newer_coordinator.reset_selection(newer).await;
+        });
+        older_reset.await.unwrap();
+        newer_reset.await.unwrap();
+
+        let key = screen_key_for(newer, fixture_id(3), "screen-v3");
+        let waiter = fixture.enqueue(key, WorkLane::ViewerPreview).await;
+        let ticket = fixture.coordinator.next_work().await.unwrap();
+        fixture.coordinator.reset_selection(older).await;
+
+        assert_eq!(fixture.coordinator.selection().await, Some(newer));
+        let expected = reference_for(fixture_id(3), DerivativeClass::ScreenPreview, "screen-v3");
+        fixture.coordinator.complete(ticket, expected.clone()).await;
+        assert_eq!(waiter.await.unwrap(), Some(expected));
     }
 
     #[tokio::test]

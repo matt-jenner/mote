@@ -130,6 +130,8 @@ pub struct AppService {
     #[cfg(any(test, debug_assertions))]
     pub(crate) derivative_test_gate: Arc<TokioMutex<Option<DerivativeTestGate>>>,
     #[cfg(any(test, debug_assertions))]
+    pub(crate) screen_preview_commit_test_counter: Arc<TokioMutex<Option<Arc<AtomicUsize>>>>,
+    #[cfg(any(test, debug_assertions))]
     pub(crate) screen_preview_post_encode_test_gate: Arc<TokioMutex<Option<DerivativeTestGate>>>,
     #[cfg(debug_assertions)]
     pub(crate) derivative_request_test_hook: Arc<TokioMutex<Option<DerivativeRequestTestHook>>>,
@@ -228,6 +230,8 @@ impl AppService {
             derivative_driver: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(any(test, debug_assertions))]
             derivative_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(any(test, debug_assertions))]
+            screen_preview_commit_test_counter: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]
             screen_preview_post_encode_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]

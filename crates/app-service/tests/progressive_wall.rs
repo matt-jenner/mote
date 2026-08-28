@@ -868,35 +868,31 @@ async fn screen_preview_request_publishes_wall_thumbnail_before_screen_preview()
     assert!(page.items[0].wall_thumbnail.is_some());
 }
 
-async fn next_derivative_kind(
+async fn published_derivative_kinds(
     receiver: &mut tokio::sync::broadcast::Receiver<WallUpdate>,
-) -> DerivativeClass {
-    loop {
+) -> Vec<DerivativeClass> {
+    let mut kinds = Vec::new();
+    while kinds.len() < 2 {
         let event = recv_until(receiver, |event| {
             matches!(event, WallUpdate::DerivativesReady { derivatives, .. }
                 if !derivatives.is_empty())
         })
         .await;
         if let WallUpdate::DerivativesReady { derivatives, .. } = event {
-            return derivatives[0].kind;
+            kinds.extend(derivatives.into_iter().map(|derivative| derivative.kind));
         }
     }
+    kinds
 }
 
 fn catalog_derivative_kinds(config: &AppConfig) -> Vec<String> {
-    let mut kinds = Catalog::open(&config.catalog_path())
+    Catalog::open(&config.catalog_path())
         .unwrap()
         .all_derivatives()
         .unwrap()
         .into_iter()
         .map(|record| record.kind)
-        .collect::<Vec<_>>();
-    kinds.sort_by_key(|kind| match kind.as_str() {
-        "wall_thumbnail" => 0,
-        "screen_preview" => 1,
-        _ => 2,
-    });
-    kinds
+        .collect()
 }
 
 async fn scanned_asset(fixture: &ProgressiveFixture, service: &AppService) -> String {
@@ -937,17 +933,16 @@ async fn explicit_preview_generates_and_publishes_thumbnail_before_preview() {
         .unwrap();
 
     assert_eq!(
-        next_derivative_kind(&mut updates).await,
-        DerivativeClass::WallThumbnail
+        published_derivative_kinds(&mut updates).await,
+        vec![
+            DerivativeClass::WallThumbnail,
+            DerivativeClass::ScreenPreview
+        ]
     );
-    assert_eq!(
-        next_derivative_kind(&mut updates).await,
-        DerivativeClass::ScreenPreview
-    );
-    assert_eq!(
-        catalog_derivative_kinds(&fixture.config),
-        vec!["wall_thumbnail", "screen_preview"]
-    );
+    let catalog_kinds = catalog_derivative_kinds(&fixture.config);
+    assert_eq!(catalog_kinds.len(), 2);
+    assert!(catalog_kinds.iter().any(|kind| kind == "wall_thumbnail"));
+    assert!(catalog_kinds.iter().any(|kind| kind == "screen_preview"));
 }
 
 async fn prepare_wall_ready_fixture() -> (ProgressiveFixture, AppService, String) {
@@ -1011,6 +1006,10 @@ async fn viewer_request_restarts_once_after_colliding_background_was_invalidated
         .set_interaction(photo_app_service::InteractionState::Idle)
         .await;
     let starts = Arc::new(AtomicUsize::new(0));
+    let commits = Arc::new(AtomicUsize::new(0));
+    service
+        .install_screen_preview_commit_test_counter(commits.clone())
+        .await;
     let (background, _entered, release) =
         begin_blocked_background_preview(&service, &asset_id, starts.clone()).await;
 
@@ -1043,6 +1042,7 @@ async fn viewer_request_restarts_once_after_colliding_background_was_invalidated
     assert!(foreground.await.unwrap().is_ok());
     assert!(background.await.unwrap().is_err());
     assert_eq!(starts.load(Ordering::SeqCst), 2);
+    assert_eq!(commits.load(Ordering::SeqCst), 1);
     assert_eq!(
         Catalog::open(&fixture.config.catalog_path())
             .unwrap()
@@ -1062,6 +1062,10 @@ async fn viewer_request_promotes_current_background_encode() {
         .set_interaction(photo_app_service::InteractionState::Idle)
         .await;
     let starts = Arc::new(AtomicUsize::new(0));
+    let commits = Arc::new(AtomicUsize::new(0));
+    service
+        .install_screen_preview_commit_test_counter(commits.clone())
+        .await;
     let (background, _entered, release) =
         begin_blocked_background_preview(&service, &asset_id, starts.clone()).await;
     let foreground_service = service.clone();
@@ -1078,6 +1082,7 @@ async fn viewer_request_promotes_current_background_encode() {
     assert!(foreground.await.unwrap().is_ok());
     assert!(background.await.unwrap().is_ok());
     assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(commits.load(Ordering::SeqCst), 1);
     assert_eq!(
         Catalog::open(&fixture.config.catalog_path())
             .unwrap()
