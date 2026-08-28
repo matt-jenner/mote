@@ -314,6 +314,46 @@ impl DerivativeCoordinator {
         prerequisite_key: Option<String>,
         observed_completion_generation: Option<u64>,
     ) -> WorkResultReceiver {
+        self.enqueue_with_prerequisite_observed_guarded(
+            key,
+            lane,
+            prerequisite_key,
+            observed_completion_generation,
+            None,
+        )
+        .await
+    }
+
+    /// Enqueues collection-owned background work only when the caller still
+    /// owns the exact collection position it resolved.  The token check and
+    /// job insertion share one coordinator lock, so invalidation cannot slip
+    /// between the check and the generation stamp on a queued job.
+    pub(crate) async fn enqueue_collection_with_prerequisite_observed(
+        &self,
+        token: &CollectionProgressToken,
+        key: WorkKey,
+        lane: WorkLane,
+        prerequisite_key: Option<String>,
+        observed_completion_generation: Option<u64>,
+    ) -> WorkResultReceiver {
+        self.enqueue_with_prerequisite_observed_guarded(
+            key,
+            lane,
+            prerequisite_key,
+            observed_completion_generation,
+            Some(token),
+        )
+        .await
+    }
+
+    async fn enqueue_with_prerequisite_observed_guarded(
+        &self,
+        key: WorkKey,
+        lane: WorkLane,
+        prerequisite_key: Option<String>,
+        observed_completion_generation: Option<u64>,
+        collection_token: Option<&CollectionProgressToken>,
+    ) -> WorkResultReceiver {
         let (sender, receiver) = oneshot::channel();
         let mut sender = Some(sender);
         let mut schedule = None;
@@ -321,12 +361,19 @@ impl DerivativeCoordinator {
         let mut immediate_result = None;
         {
             let mut state = self.state.lock().await;
-            if let Some(selection) = state.selection {
-                if selection != key.selection {
-                    immediate_none = true;
+            if collection_token.is_some_and(|token| {
+                token.selection != key.selection || !Self::collection_token_matches(&state, token)
+            }) {
+                immediate_none = true;
+            }
+            if !immediate_none {
+                if let Some(selection) = state.selection {
+                    if selection != key.selection {
+                        immediate_none = true;
+                    }
+                } else {
+                    state.selection = Some(key.selection);
                 }
-            } else {
-                state.selection = Some(key.selection);
             }
 
             if !immediate_none {
@@ -965,6 +1012,19 @@ impl DerivativeCoordinator {
             .retain(|asset_id| !consumed.contains(asset_id));
     }
 
+    pub(crate) async fn remove_recent_if_collection_current(
+        &self,
+        token: &CollectionProgressToken,
+        consumed: &HashSet<AssetId>,
+    ) -> bool {
+        let mut state = self.state.lock().await;
+        if !Self::collection_token_matches(&state, token) {
+            return false;
+        }
+        state.recent.retain(|asset_id| !consumed.contains(asset_id));
+        true
+    }
+
     pub(crate) async fn selection(&self) -> Option<SelectionToken> {
         self.state.lock().await.selection
     }
@@ -1073,6 +1133,30 @@ impl DerivativeCoordinator {
             cursor: state.collection.cursor.clone(),
             background_generation: state.background_generation,
         })
+    }
+
+    pub(crate) async fn collection_progress_token_is_current(
+        &self,
+        token: &CollectionProgressToken,
+    ) -> bool {
+        let state = self.state.lock().await;
+        Self::collection_token_matches(&state, token)
+    }
+
+    /// Runs a small synchronous collection side effect under the same
+    /// linearization boundary as invalidation and cursor transitions.  Once
+    /// admitted, invalidation is ordered after the side effect; if the token
+    /// is already stale, the closure is never called.
+    pub(crate) async fn collection_side_effect_if_current<T>(
+        &self,
+        token: &CollectionProgressToken,
+        effect: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let state = self.state.lock().await;
+        if !Self::collection_token_matches(&state, token) {
+            return None;
+        }
+        Some(effect())
     }
 
     fn collection_token_matches(state: &CoordinatorState, token: &CollectionProgressToken) -> bool {

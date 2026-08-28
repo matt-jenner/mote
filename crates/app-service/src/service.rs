@@ -89,6 +89,13 @@ pub(crate) struct DerivativeTestGate {
 
 #[cfg(any(test, debug_assertions))]
 #[derive(Clone)]
+pub(crate) struct CollectionTestGate {
+    pub(crate) entered: Arc<Notify>,
+    pub(crate) release: Arc<Notify>,
+}
+
+#[cfg(any(test, debug_assertions))]
+#[derive(Clone)]
 pub(crate) struct ManagedCommitTestGate {
     pub(crate) started: Arc<Notify>,
     pub(crate) release: Arc<std::sync::atomic::AtomicBool>,
@@ -146,6 +153,10 @@ pub struct AppService {
     pub(crate) collection_driver: Arc<tokio::sync::Mutex<()>>,
     #[cfg(any(test, debug_assertions))]
     pub(crate) derivative_test_gate: Arc<TokioMutex<Option<DerivativeTestGate>>>,
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) collection_publish_test_gate: Arc<TokioMutex<Option<CollectionTestGate>>>,
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) collection_enqueue_test_gate: Arc<TokioMutex<Option<CollectionTestGate>>>,
     #[cfg(any(test, debug_assertions))]
     pub(crate) screen_preview_commit_test_counter: Arc<TokioMutex<Option<Arc<AtomicUsize>>>>,
     #[cfg(any(test, debug_assertions))]
@@ -271,6 +282,10 @@ impl AppService {
             collection_driver: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(any(test, debug_assertions))]
             derivative_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(any(test, debug_assertions))]
+            collection_publish_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(any(test, debug_assertions))]
+            collection_enqueue_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]
             screen_preview_commit_test_counter: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]

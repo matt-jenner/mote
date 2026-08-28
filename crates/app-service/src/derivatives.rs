@@ -17,7 +17,9 @@ use photo_catalog::{Catalog, NewDerivative, TerminalDerivativeFailure, WallOrder
 use photo_domain::{AssetId, Availability, DerivativeId, FolderGroupId, MediaKind};
 use photo_indexer::{InteractionMode, JobPriority};
 
-use crate::derivative_coordinator::{CommitPermit, RECENT_CAPACITY, WorkKey, WorkTicket};
+use crate::derivative_coordinator::{
+    CollectionProgressToken, CommitPermit, RECENT_CAPACITY, WorkKey, WorkTicket,
+};
 use crate::service::SelectionToken;
 use crate::{
     AppService, AppServiceError, DerivativeClass, DerivativePriority, DerivativeReference,
@@ -206,8 +208,16 @@ impl AppService {
             for id in successful_in_request.iter().copied() {
                 self.coordinator.note_recent(id).await;
             }
-            self.schedule_screen_preview_prefetch(successful_in_request)
-                .await;
+            if request.priority == DerivativePriority::Visible {
+                // A visible wall request rewinds collection progress.  Start
+                // the full-group driver again so cached screens are replayed
+                // only after the rewound thumbnail phase drains; an ordinary
+                // near-viewport request remains a recent-only driver.
+                self.prefetch_screen_previews(successful_in_request).await;
+            } else {
+                self.schedule_screen_preview_prefetch(successful_in_request)
+                    .await;
+            }
         }
         if has_unresolved {
             return Err(AppServiceError::DerivativeUnavailable);
@@ -434,7 +444,7 @@ impl AppService {
             .first()
             .map(|work| lane_for_priority(work.class, priority))
             .unwrap_or(crate::derivative_coordinator::WorkLane::IdlePreview);
-        self.run_derivative_jobs_with_publication(pending, lane)
+        self.run_derivative_jobs_with_publication(pending, lane, None)
             .await
     }
 
@@ -443,7 +453,17 @@ impl AppService {
         pending: Vec<PendingDerivative>,
         lane: crate::derivative_coordinator::WorkLane,
     ) -> Vec<DerivativeReference> {
-        self.run_derivative_jobs_with_publication(pending, lane)
+        self.run_derivative_jobs_with_publication(pending, lane, None)
+            .await
+    }
+
+    async fn run_collection_derivative_jobs_publishing(
+        &self,
+        pending: Vec<PendingDerivative>,
+        lane: crate::derivative_coordinator::WorkLane,
+        token: &CollectionProgressToken,
+    ) -> Vec<DerivativeReference> {
+        self.run_derivative_jobs_with_publication(pending, lane, Some(token))
             .await
     }
 
@@ -451,6 +471,7 @@ impl AppService {
         &self,
         pending: Vec<PendingDerivative>,
         lane: crate::derivative_coordinator::WorkLane,
+        collection_token: Option<&CollectionProgressToken>,
     ) -> Vec<DerivativeReference> {
         let mut receivers = Vec::with_capacity(pending.len());
         for pending in pending {
@@ -467,28 +488,49 @@ impl AppService {
             // Availability is part of the persisted terminal identity even
             // though it is not part of the derivative key.  A pending item
             // therefore proves that the source state changed and must clear
-            // any in-memory terminal result for the old availability.
-            self.coordinator.clear_terminal(&key).await;
+            // any in-memory terminal result for the old availability.  A
+            // collection token is checked by the enqueue CAS below; avoid
+            // mutating terminal state before that admission boundary.
+            if collection_token.is_none() {
+                self.coordinator.clear_terminal(&key).await;
+            }
             let prerequisite = (pending.class == DerivativeClass::ScreenPreview).then(|| {
                 DerivativeKey::compute(&wall_spec_from(&pending.spec))
                     .as_str()
                     .to_owned()
             });
-            let receiver = self
-                .coordinator
-                .enqueue_with_prerequisite_observed(
-                    key,
-                    lane,
-                    prerequisite,
-                    Some(pending.completion_generation),
-                )
-                .await;
+            let receiver = if let Some(token) = collection_token {
+                #[cfg(any(test, debug_assertions))]
+                self.wait_for_collection_enqueue_test_gate().await;
+                self.coordinator
+                    .enqueue_collection_with_prerequisite_observed(
+                        token,
+                        key,
+                        lane,
+                        prerequisite,
+                        Some(pending.completion_generation),
+                    )
+                    .await
+            } else {
+                self.coordinator
+                    .enqueue_with_prerequisite_observed(
+                        key,
+                        lane,
+                        prerequisite,
+                        Some(pending.completion_generation),
+                    )
+                    .await
+            };
             receivers.push(receiver);
         }
         if !receivers.is_empty() {
             #[cfg(debug_assertions)]
-            if lane == crate::derivative_coordinator::WorkLane::VisibleWall
-                && let Some(hook) = self.derivative_visible_queue_test_hook.lock().await.clone()
+            if matches!(
+                lane,
+                crate::derivative_coordinator::WorkLane::NearWall
+                    | crate::derivative_coordinator::WorkLane::ViewerPreview
+                    | crate::derivative_coordinator::WorkLane::VisibleWall
+            ) && let Some(hook) = self.derivative_visible_queue_test_hook.lock().await.clone()
             {
                 hook.notify_one();
             }
@@ -1198,6 +1240,22 @@ impl AppService {
     }
 
     #[cfg(any(test, debug_assertions))]
+    async fn wait_for_collection_publish_test_gate(&self) {
+        if let Some(gate) = self.collection_publish_test_gate.lock().await.take() {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    async fn wait_for_collection_enqueue_test_gate(&self) {
+        if let Some(gate) = self.collection_enqueue_test_gate.lock().await.take() {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    #[cfg(any(test, debug_assertions))]
     async fn wait_for_screen_preview_post_encode_test_gate(&self, asset_id: AssetId) {
         let gate = self
             .screen_preview_post_encode_test_gate
@@ -1296,6 +1354,32 @@ impl AppService {
             starts: None,
         });
         Ok(())
+    }
+
+    /// Installs a deterministic boundary immediately before a collection
+    /// driver's cached publication admission.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_collection_publish_test_gate(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.collection_publish_test_gate.lock().await =
+            Some(crate::service::CollectionTestGate { entered, release });
+    }
+
+    /// Installs a deterministic boundary immediately before a collection
+    /// driver's background enqueue admission.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_collection_enqueue_test_gate(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.collection_enqueue_test_gate.lock().await =
+            Some(crate::service::CollectionTestGate { entered, release });
     }
 
     /// Installs a deterministic counter at the managed screen-preview commit call.
@@ -1643,7 +1727,11 @@ impl AppService {
         };
         let recent_set = recent_ids.iter().copied().collect::<HashSet<_>>();
 
-        let phase = self.coordinator.collection_phase().await;
+        let Some(collection_token) = self.coordinator.collection_progress_token(selection).await
+        else {
+            return PreviewPrefetchOutcome::Stale;
+        };
+        let phase = collection_token.phase;
         if !full_group {
             // Recent background work is a preview-only phase.  A recent
             // driver can acquire the collection mutex before the full-group
@@ -1657,13 +1745,21 @@ impl AppService {
             ) {
                 return PreviewPrefetchOutcome::Complete;
             }
-            let Ok((wall_selection, _wall_ready, blocked)) = self
+            let wall_result = self
                 .ensure_wall_thumbnails_lane(
                     &recent_ids,
                     crate::derivative_coordinator::WorkLane::NearWall,
+                    Some(&collection_token),
                 )
+                .await;
+            if !self
+                .coordinator
+                .collection_progress_token_is_current(&collection_token)
                 .await
-            else {
+            {
+                return PreviewPrefetchOutcome::Stale;
+            }
+            let Ok((wall_selection, _wall_ready, blocked)) = wall_result else {
                 return PreviewPrefetchOutcome::Terminate;
             };
             if wall_selection != selection {
@@ -1673,20 +1769,40 @@ impl AppService {
                 return PreviewPrefetchOutcome::Blocked;
             }
             let outcome = self
-                .run_screen_preview_batch(&recent_ids, selection, generation)
+                .run_screen_preview_batch(
+                    &recent_ids,
+                    selection,
+                    generation,
+                    Some(&collection_token),
+                )
                 .await;
-            if matches!(outcome, PreviewPrefetchOutcome::Complete) {
-                self.coordinator.remove_recent(&recent_set).await;
+            if matches!(outcome, PreviewPrefetchOutcome::Complete)
+                && !self
+                    .coordinator
+                    .remove_recent_if_collection_current(&collection_token, &recent_set)
+                    .await
+            {
+                return PreviewPrefetchOutcome::Stale;
             }
             return outcome;
         }
 
         if phase == crate::derivative_coordinator::CollectionPhase::Complete {
             let outcome = self
-                .run_screen_preview_batch(&recent_ids, selection, generation)
+                .run_screen_preview_batch(
+                    &recent_ids,
+                    selection,
+                    generation,
+                    Some(&collection_token),
+                )
                 .await;
-            if matches!(outcome, PreviewPrefetchOutcome::Complete) {
-                self.coordinator.remove_recent(&recent_set).await;
+            if matches!(outcome, PreviewPrefetchOutcome::Complete)
+                && !self
+                    .coordinator
+                    .remove_recent_if_collection_current(&collection_token, &recent_set)
+                    .await
+            {
+                return PreviewPrefetchOutcome::Stale;
             }
             return outcome;
         }
@@ -1714,13 +1830,21 @@ impl AppService {
                     return PreviewPrefetchOutcome::Stale;
                 }
                 if !page_ids.is_empty() {
-                    let Ok((wall_selection, _wall_ready, blocked)) = self
+                    let wall_result = self
                         .ensure_wall_thumbnails_lane(
                             &page_ids,
                             crate::derivative_coordinator::WorkLane::IdleWall,
+                            Some(&token),
                         )
+                        .await;
+                    if !self
+                        .coordinator
+                        .collection_progress_token_is_current(&token)
                         .await
-                    else {
+                    {
+                        return PreviewPrefetchOutcome::Stale;
+                    }
+                    let Ok((wall_selection, _wall_ready, blocked)) = wall_result else {
                         return PreviewPrefetchOutcome::Terminate;
                     };
                     if wall_selection != selection {
@@ -1751,8 +1875,18 @@ impl AppService {
             }
         }
 
+        let recent_token = self
+            .coordinator
+            .collection_progress_token(selection)
+            .await
+            .filter(|token| {
+                token.phase == crate::derivative_coordinator::CollectionPhase::Previews
+            });
+        let Some(recent_token) = recent_token else {
+            return PreviewPrefetchOutcome::Stale;
+        };
         let recent_outcome = self
-            .run_screen_preview_batch(&recent_ids, selection, generation)
+            .run_screen_preview_batch(&recent_ids, selection, generation, Some(&recent_token))
             .await;
         if !matches!(recent_outcome, PreviewPrefetchOutcome::Complete) {
             return recent_outcome;
@@ -1790,16 +1924,29 @@ impl AppService {
             if resolved_selection != selection {
                 return PreviewPrefetchOutcome::Stale;
             }
-            if !cached.is_empty() {
-                self.publish_derivatives_if_active(resolved_selection, cached);
+            if !cached.is_empty()
+                && self
+                    .publish_collection_derivatives_if_current(&token, resolved_selection, cached)
+                    .await
+                    .is_none()
+            {
+                return PreviewPrefetchOutcome::Stale;
             }
             let pending_for_outcome = pending.clone();
             let _generated = self
-                .run_derivative_jobs_publishing(
+                .run_collection_derivative_jobs_publishing(
                     pending,
                     crate::derivative_coordinator::WorkLane::IdlePreview,
+                    &token,
                 )
                 .await;
+            if !self
+                .coordinator
+                .collection_progress_token_is_current(&token)
+                .await
+            {
+                return PreviewPrefetchOutcome::Stale;
+            }
             if !self
                 .screen_pending_complete(&pending_for_outcome)
                 .unwrap_or(false)
@@ -1825,7 +1972,18 @@ impl AppService {
                 None => return PreviewPrefetchOutcome::Stale,
             };
         }
-        self.coordinator.remove_recent(&recent_set).await;
+        let Some(completed_token) = self.coordinator.collection_progress_token(selection).await
+        else {
+            return PreviewPrefetchOutcome::Stale;
+        };
+        if completed_token.phase != crate::derivative_coordinator::CollectionPhase::Complete
+            || !self
+                .coordinator
+                .remove_recent_if_collection_current(&completed_token, &recent_set)
+                .await
+        {
+            return PreviewPrefetchOutcome::Stale;
+        }
         PreviewPrefetchOutcome::Complete
     }
 
@@ -1834,6 +1992,7 @@ impl AppService {
         ids: &[AssetId],
         selection: SelectionToken,
         generation: u64,
+        collection_token: Option<&CollectionProgressToken>,
     ) -> PreviewPrefetchOutcome {
         if ids.is_empty() {
             return PreviewPrefetchOutcome::Complete;
@@ -1847,15 +2006,41 @@ impl AppService {
             return PreviewPrefetchOutcome::Stale;
         }
         if !cached.is_empty() {
-            self.publish_derivatives_if_active(screen_selection, cached);
+            if let Some(token) = collection_token {
+                if self
+                    .publish_collection_derivatives_if_current(token, screen_selection, cached)
+                    .await
+                    .is_none()
+                {
+                    return PreviewPrefetchOutcome::Stale;
+                }
+            } else {
+                self.publish_derivatives_if_active(screen_selection, cached);
+            }
         }
         let pending_for_outcome = pending.clone();
-        let _generated = self
-            .run_derivative_jobs_publishing(
+        let _generated = if let Some(token) = collection_token {
+            self.run_collection_derivative_jobs_publishing(
+                pending,
+                crate::derivative_coordinator::WorkLane::IdlePreview,
+                token,
+            )
+            .await
+        } else {
+            self.run_derivative_jobs_publishing(
                 pending,
                 crate::derivative_coordinator::WorkLane::IdlePreview,
             )
-            .await;
+            .await
+        };
+        if let Some(token) = collection_token
+            && !self
+                .coordinator
+                .collection_progress_token_is_current(token)
+                .await
+        {
+            return PreviewPrefetchOutcome::Stale;
+        }
         if self
             .screen_pending_complete(&pending_for_outcome)
             .unwrap_or(false)
@@ -2086,6 +2271,7 @@ impl AppService {
         &self,
         ids: &[AssetId],
         lane: crate::derivative_coordinator::WorkLane,
+        collection_token: Option<&CollectionProgressToken>,
     ) -> Result<(SelectionToken, HashSet<AssetId>, bool), AppServiceError> {
         let (selection, cached, pending) =
             self.resolve_derivatives(ids, DerivativeClass::WallThumbnail)?;
@@ -2096,9 +2282,32 @@ impl AppService {
             .map(AssetId::from_uuid)
             .collect::<HashSet<_>>();
         if !cached.is_empty() {
-            self.publish_derivatives_if_active(selection, cached);
+            if let Some(token) = collection_token {
+                if self
+                    .publish_collection_derivatives_if_current(token, selection, cached)
+                    .await
+                    .is_none()
+                {
+                    return Err(AppServiceError::DerivativeUnavailable);
+                }
+            } else {
+                self.publish_derivatives_if_active(selection, cached);
+            }
         }
-        let generated = self.run_derivative_jobs_publishing(pending, lane).await;
+        let generated = if let Some(token) = collection_token {
+            self.run_collection_derivative_jobs_publishing(pending, lane, token)
+                .await
+        } else {
+            self.run_derivative_jobs_publishing(pending, lane).await
+        };
+        if let Some(token) = collection_token
+            && !self
+                .coordinator
+                .collection_progress_token_is_current(token)
+                .await
+        {
+            return Err(AppServiceError::DerivativeUnavailable);
+        }
         ready_ids.extend(
             generated
                 .iter()
@@ -2224,6 +2433,26 @@ impl AppService {
         });
         record_timing_stage("derivative_publication", publication_started);
         result.is_ok()
+    }
+
+    async fn publish_collection_derivatives_if_current(
+        &self,
+        token: &CollectionProgressToken,
+        selection: SelectionToken,
+        derivatives: Vec<DerivativeReference>,
+    ) -> Option<bool> {
+        #[cfg(any(test, debug_assertions))]
+        if derivatives
+            .iter()
+            .any(|derivative| derivative.kind == DerivativeClass::ScreenPreview)
+        {
+            self.wait_for_collection_publish_test_gate().await;
+        }
+        self.coordinator
+            .collection_side_effect_if_current(token, || {
+                self.publish_derivatives_if_active(selection, derivatives)
+            })
+            .await
     }
 
     fn record_asset_derivative_warning(&self, selection: SelectionToken, asset_id: AssetId) {
@@ -2564,6 +2793,8 @@ fn reference(id: AssetId, kind: DerivativeClass, key: String) -> DerivativeRefer
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    #[cfg(debug_assertions)]
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
 
@@ -2575,6 +2806,8 @@ mod tests {
         ImageDerivativeGenerator,
     };
     #[cfg(debug_assertions)]
+    use photo_catalog::NewDerivative;
+    #[cfg(debug_assertions)]
     use photo_catalog::{
         AssetShapeUpdate, CatalogIndexRecord, CatalogWarningRecord, ShapeStatus,
         TerminalDerivativeFailure,
@@ -2585,9 +2818,13 @@ mod tests {
     use photo_metadata::{MetadataBundle, MetadataReadWarning};
 
     use crate::service::DerivativeTestGate;
+    #[cfg(debug_assertions)]
+    use crate::service::SelectionToken;
     use crate::{AppConfig, AppService, DerivativeClass, WallUpdate};
 
     use super::DerivativeWorkError;
+    #[cfg(debug_assertions)]
+    use super::PreviewPrefetchOutcome;
 
     struct BlockingReader {
         gate: Arc<(Mutex<bool>, Condvar)>,
@@ -2780,6 +3017,212 @@ mod tests {
             .await
             .expect("prefetch was not woken by scan completion")
             .expect("prefetch task panicked");
+    }
+
+    #[cfg(debug_assertions)]
+    async fn collection_gap_fixture(
+        with_screen: bool,
+    ) -> (
+        tempfile::TempDir,
+        AppService,
+        SelectionToken,
+        AssetId,
+        usize,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(&source).unwrap();
+        let image_path = source.join("photo.jpg");
+        ImageBuffer::from_pixel(8, 8, Rgb([20_u8, 40, 60]))
+            .save(&image_path)
+            .unwrap();
+        let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+        let service = AppService::open(config).unwrap();
+        let (_, selection) = service.select_recent(&source).unwrap();
+        service.coordinator.ensure_selection(selection).await;
+        let relative = RelativePathKey::from_relative_path(Path::new("photo.jpg")).unwrap();
+        let mut asset = NewAsset::minimal(
+            selection.library_id,
+            relative,
+            "photo.jpg",
+            MediaKind::Jpeg,
+            std::fs::metadata(&image_path).unwrap().len(),
+        );
+        asset.folder_group_id = Some(selection.group_id);
+        {
+            let mut state = service.state().unwrap();
+            state
+                .libraries
+                .catalog_mut()
+                .apply_index_batch(&[
+                    CatalogIndexRecord::Discovered(asset.clone()),
+                    CatalogIndexRecord::Shaped(AssetShapeUpdate {
+                        asset_id: asset.id,
+                        width: 8,
+                        height: 8,
+                        orientation: Some(1),
+                        representative_rgb: None,
+                        shape_status: ShapeStatus::Ready,
+                    }),
+                ])
+                .unwrap();
+            let stored = state
+                .libraries
+                .catalog()
+                .find_asset(asset.id)
+                .unwrap()
+                .unwrap();
+            for class in [DerivativeClass::WallThumbnail]
+                .into_iter()
+                .chain(with_screen.then_some(DerivativeClass::ScreenPreview))
+            {
+                let key = DerivativeKey::compute(&super::derivative_spec(&stored, class));
+                let kind = super::derivative_kind_name(class);
+                state
+                    .libraries
+                    .catalog_mut()
+                    .insert_derivative(&NewDerivative {
+                        id: photo_domain::DerivativeId::new(),
+                        asset_id: asset.id,
+                        folder_group_id: selection.group_id,
+                        kind: kind.to_owned(),
+                        cache_key: key.as_str().to_owned(),
+                        relative_cache_path: std::path::PathBuf::from(format!(
+                            "{kind}/{}.bin",
+                            asset.id.as_uuid().hyphenated()
+                        )),
+                        size_bytes: 1,
+                        durable: true,
+                        created_at: 1,
+                    })
+                    .unwrap();
+            }
+        }
+        service.coordinator.begin_collection(selection).await;
+        let token = service
+            .coordinator
+            .collection_progress_token(selection)
+            .await
+            .expect("thumbnail token");
+        assert!(service.coordinator.finish_thumbnail_phase(&token).await);
+        let derivative_count = Catalog::open(&service.catalog_path)
+            .unwrap()
+            .all_derivatives()
+            .unwrap()
+            .len();
+        (temp, service, selection, asset.id, derivative_count)
+    }
+
+    #[cfg(debug_assertions)]
+    async fn assert_stale_collection_gap_is_suppressed(
+        with_screen: bool,
+        full_group: bool,
+        enqueue_gap: bool,
+    ) {
+        let (_temp, service, selection, asset_id, derivative_count) =
+            collection_gap_fixture(with_screen).await;
+        let screen_encode_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        service
+            .install_screen_preview_encode_test_counter(screen_encode_starts.clone())
+            .await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        if enqueue_gap {
+            service
+                .install_collection_enqueue_test_gate(entered.clone(), release.clone())
+                .await;
+        } else {
+            service
+                .install_collection_publish_test_gate(entered.clone(), release.clone())
+                .await;
+        }
+        let mut updates = service.subscribe_wall_updates();
+        let generation = service.coordinator.background_generation().await;
+        let driver_service = service.clone();
+        let recent = if full_group {
+            Vec::new()
+        } else {
+            vec![asset_id]
+        };
+        let driver = tokio::spawn(async move {
+            driver_service
+                .run_screen_preview_prefetch_for_generation(
+                    recent, full_group, selection, generation,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("collection driver did not reach the guarded gap");
+
+        service.coordinator.invalidate_background().await;
+        service
+            .coordinator
+            .rewind_collection_to_thumbnails(selection)
+            .await;
+        release.notify_waiters();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), driver)
+            .await
+            .expect("stale collection driver did not finish")
+            .expect("stale collection driver panicked");
+        assert!(matches!(outcome, PreviewPrefetchOutcome::Stale));
+        assert_eq!(screen_encode_starts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            Catalog::open(&service.catalog_path)
+                .unwrap()
+                .all_derivatives()
+                .unwrap()
+                .len(),
+            derivative_count,
+            "stale collection work must not add a screen catalogue row"
+        );
+        let mut screen_update = false;
+        while let Ok(event) = updates.try_recv() {
+            if matches!(
+                event,
+                WallUpdate::DerivativesReady { ref derivatives, .. }
+                    if derivatives
+                        .iter()
+                        .any(|derivative| derivative.kind == DerivativeClass::ScreenPreview)
+            ) {
+                screen_update = true;
+            }
+        }
+        assert!(
+            !screen_update,
+            "stale collection work must not publish a screen update"
+        );
+        assert_eq!(
+            service.coordinator.collection_state().await,
+            (
+                crate::derivative_coordinator::CollectionPhase::Thumbnails,
+                None
+            )
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_recent_cached_preview_publication_is_suppressed_after_invalidation() {
+        assert_stale_collection_gap_is_suppressed(true, false, false).await;
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_collection_cached_preview_publication_is_suppressed_after_invalidation() {
+        assert_stale_collection_gap_is_suppressed(true, true, false).await;
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_recent_idle_preview_enqueue_is_suppressed_after_invalidation() {
+        assert_stale_collection_gap_is_suppressed(false, false, true).await;
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_collection_idle_preview_enqueue_is_suppressed_after_invalidation() {
+        assert_stale_collection_gap_is_suppressed(false, true, true).await;
     }
 
     #[cfg(debug_assertions)]
@@ -3299,6 +3742,7 @@ mod tests {
             .await
             .expect("collection should schedule its first missing wall job");
 
+        let foreground_id = asset_ids[500];
         let foreground_queued = Arc::new(tokio::sync::Notify::new());
         service
             .install_visible_derivative_queue_test_hook(foreground_queued.clone())
@@ -3306,9 +3750,11 @@ mod tests {
         let foreground_service = service.clone();
         let foreground = tokio::spawn(async move {
             foreground_service
-                .request_derivatives(crate::DerivativeRequest::visible(vec![
-                    blocked_id.as_uuid().hyphenated().to_string(),
-                ]))
+                .request_derivatives(crate::DerivativeRequest {
+                    asset_ids: vec![foreground_id.as_uuid().hyphenated().to_string()],
+                    priority: crate::DerivativePriority::NearViewport,
+                    kind: DerivativeClass::WallThumbnail,
+                })
                 .await
         });
         tokio::time::timeout(Duration::from_secs(5), foreground_queued.notified())
