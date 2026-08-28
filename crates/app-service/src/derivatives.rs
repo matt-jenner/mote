@@ -1693,10 +1693,10 @@ impl AppService {
     ) {
         let service = self.clone();
         #[cfg(any(test, debug_assertions))]
-        let tracker = self.collection_driver_tracker.clone();
+        let task_guard = self.collection_driver_tracker.start();
         tokio::spawn(async move {
             #[cfg(any(test, debug_assertions))]
-            let _task_guard = tracker.start();
+            let _task_guard = task_guard;
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let _driver = service.collection_driver.lock().await;
             service
@@ -3282,6 +3282,34 @@ mod tests {
                 None
             )
         );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn collection_driver_is_tracked_before_its_first_poll() {
+        let (_temp, service, selection, _asset_id, _derivative_count) =
+            collection_gap_fixture(false).await;
+        let generation = service.coordinator.background_generation().await;
+
+        service.start_collection_driver(Vec::new(), true, selection, generation);
+        assert_eq!(
+            service.collection_driver_active_count_test(),
+            1,
+            "driver admission must be visible before the spawned future is first polled"
+        );
+
+        let quiescence = service.wait_for_collection_drivers_quiescent_test();
+        tokio::pin!(quiescence);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(0), &mut quiescence)
+                .await
+                .is_err(),
+            "quiescence must wait while the delayed driver is still live"
+        );
+        tokio::time::timeout(Duration::from_secs(5), quiescence)
+            .await
+            .expect("collection driver should finish and release its tracking guard");
+        assert_eq!(service.collection_driver_active_count_test(), 0);
     }
 
     #[cfg(debug_assertions)]
