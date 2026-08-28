@@ -254,6 +254,8 @@ pub struct AppService {
     #[cfg(any(test, debug_assertions))]
     pub(crate) derivative_task_tracker: Arc<DerivativeTaskTracker>,
     #[cfg(any(test, debug_assertions))]
+    pub(crate) collection_driver_tracker: Arc<DerivativeTaskTracker>,
+    #[cfg(any(test, debug_assertions))]
     pub(crate) collection_publish_test_gate: Arc<TokioMutex<Option<CollectionTestGate>>>,
     #[cfg(any(test, debug_assertions))]
     pub(crate) collection_enqueue_test_gate: Arc<TokioMutex<Option<CollectionTestGate>>>,
@@ -384,6 +386,8 @@ impl AppService {
             derivative_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]
             derivative_task_tracker: Arc::new(DerivativeTaskTracker::new()),
+            #[cfg(any(test, debug_assertions))]
+            collection_driver_tracker: Arc::new(DerivativeTaskTracker::new()),
             #[cfg(any(test, debug_assertions))]
             collection_publish_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]

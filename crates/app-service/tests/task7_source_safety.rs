@@ -167,173 +167,202 @@ async fn run_task7_source_safety_sequence() {
     assert!(config.data_dir().starts_with(temp.path()));
     assert!(config.cache_dir().starts_with(temp.path()));
 
-    let service = AppService::open(config.clone()).unwrap();
-    let mut updates = service.subscribe_wall_updates();
-    service.start_scan(&source).await.unwrap();
-    wait_for_metadata_settled(&mut updates).await;
+    let current = {
+        let service = AppService::open(config.clone()).unwrap();
+        let mut updates = service.subscribe_wall_updates();
+        service.start_scan(&source).await.unwrap();
+        wait_for_metadata_settled(&mut updates).await;
+        assert_eq!(
+            service.active_scan_count_test(),
+            0,
+            "metadata settlement must leave no active scan"
+        );
 
-    let first_page = service
-        .query_wall(query(SortDirection::OldestFirst, None, 3))
-        .await
-        .unwrap();
-    assert_photo_page(&first_page, 3);
-    let second_page = service
-        .query_wall(query(
-            SortDirection::OldestFirst,
-            first_page.next_cursor.clone(),
-            3,
-        ))
-        .await
-        .unwrap();
-    assert_photo_page(&second_page, 3);
-    assert!(
-        first_page
+        let first_page = service
+            .query_wall(query(SortDirection::OldestFirst, None, 3))
+            .await
+            .unwrap();
+        assert_photo_page(&first_page, 3);
+        let second_page = service
+            .query_wall(query(
+                SortDirection::OldestFirst,
+                first_page.next_cursor.clone(),
+                3,
+            ))
+            .await
+            .unwrap();
+        assert_photo_page(&second_page, 3);
+        assert!(
+            first_page
+                .items
+                .iter()
+                .map(|asset| &asset.id)
+                .collect::<HashSet<_>>()
+                .is_disjoint(
+                    &second_page
+                        .items
+                        .iter()
+                        .map(|asset| &asset.id)
+                        .collect::<HashSet<_>>(),
+                )
+        );
+        let newest_page = service
+            .query_wall(query(SortDirection::NewestFirst, None, 100))
+            .await
+            .unwrap();
+        assert_photo_page(&newest_page, 6);
+        assert_photo_page(
+            &service
+                .query_wall(query(SortDirection::OldestFirst, None, 100))
+                .await
+                .unwrap(),
+            6,
+        );
+
+        let all_ids = newest_page
             .items
             .iter()
-            .map(|asset| &asset.id)
-            .collect::<HashSet<_>>()
-            .is_disjoint(
-                &second_page
-                    .items
-                    .iter()
-                    .map(|asset| &asset.id)
-                    .collect::<HashSet<_>>(),
-            )
-    );
-    let newest_page = service
-        .query_wall(query(SortDirection::NewestFirst, None, 100))
-        .await
-        .unwrap();
-    assert_photo_page(&newest_page, 6);
-    assert_photo_page(
-        &service
-            .query_wall(query(SortDirection::OldestFirst, None, 100))
+            .map(|asset| asset.id.clone())
+            .collect::<Vec<_>>();
+        let current = all_ids[0].clone();
+        let neighbours = all_ids[1..].to_vec();
+        service
+            .set_interaction(photo_app_service::InteractionState::Active)
+            .await;
+
+        let current_set = HashSet::from([current.clone()]);
+        service
+            .request_derivatives(DerivativeRequest::visible(vec![current.clone()]))
             .await
-            .unwrap(),
-        6,
-    );
+            .unwrap();
+        wait_for_derivatives(&mut updates, DerivativeClass::WallThumbnail, &current_set).await;
 
-    let all_ids = newest_page
-        .items
-        .iter()
-        .map(|asset| asset.id.clone())
-        .collect::<Vec<_>>();
-    let current = all_ids[0].clone();
-    let neighbours = all_ids[1..].to_vec();
-    service
-        .set_interaction(photo_app_service::InteractionState::Active)
-        .await;
+        let neighbour_set = neighbours.iter().cloned().collect::<HashSet<_>>();
+        service
+            .request_derivatives(DerivativeRequest {
+                asset_ids: neighbours,
+                priority: DerivativePriority::NearViewport,
+                kind: DerivativeClass::WallThumbnail,
+            })
+            .await
+            .unwrap();
+        wait_for_derivatives(&mut updates, DerivativeClass::WallThumbnail, &neighbour_set).await;
 
-    let current_set = HashSet::from([current.clone()]);
-    service
-        .request_derivatives(DerivativeRequest::visible(vec![current.clone()]))
-        .await
-        .unwrap();
-    wait_for_derivatives(&mut updates, DerivativeClass::WallThumbnail, &current_set).await;
-
-    let neighbour_set = neighbours.iter().cloned().collect::<HashSet<_>>();
-    service
-        .request_derivatives(DerivativeRequest {
-            asset_ids: neighbours,
-            priority: DerivativePriority::NearViewport,
-            kind: DerivativeClass::WallThumbnail,
-        })
-        .await
-        .unwrap();
-    wait_for_derivatives(&mut updates, DerivativeClass::WallThumbnail, &neighbour_set).await;
-
-    let all_set = all_ids.iter().cloned().collect::<HashSet<_>>();
-    service
-        .request_derivatives(DerivativeRequest::visible(all_ids.clone()))
-        .await
-        .unwrap();
-    wait_for_derivatives(&mut updates, DerivativeClass::WallThumbnail, &all_set).await;
-    service.wait_for_derivative_tasks_quiescent_test().await;
-
-    service
-        .request_derivatives(DerivativeRequest::visible_screen_preview(all_ids.clone()))
-        .await
-        .unwrap();
-    wait_for_derivatives(&mut updates, DerivativeClass::ScreenPreview, &all_set).await;
-    service.wait_for_derivative_tasks_quiescent_test().await;
-
-    let current_asset = AssetId::from_uuid(uuid::Uuid::parse_str(&current).unwrap());
-    {
-        let mut catalog = Catalog::open(&config.catalog_path()).unwrap();
-        let asset = catalog.find_asset(current_asset).unwrap().unwrap();
-        let wall = catalog
-            .derivatives_for_assets(&[current_asset], "wall_thumbnail")
-            .unwrap()
-            .into_iter()
-            .next()
-            .expect("full thumbnail phase should persist a wall row");
+        let all_set = all_ids.iter().cloned().collect::<HashSet<_>>();
+        service
+            .request_derivatives(DerivativeRequest::visible(all_ids.clone()))
+            .await
+            .unwrap();
+        wait_for_derivatives(&mut updates, DerivativeClass::WallThumbnail, &all_set).await;
+        service.wait_for_derivative_tasks_quiescent_test().await;
         assert!(
-            catalog
-                .derivatives_for_assets(&[current_asset], "screen_preview")
+            service.collection_driver_active_count_test() > 0,
+            "the active interaction should leave a tracked collection driver awaiting idle"
+        );
+
+        service
+            .request_derivatives(DerivativeRequest::visible_screen_preview(all_ids.clone()))
+            .await
+            .unwrap();
+        wait_for_derivatives(&mut updates, DerivativeClass::ScreenPreview, &all_set).await;
+        service.wait_for_derivative_tasks_quiescent_test().await;
+
+        let current_asset = AssetId::from_uuid(uuid::Uuid::parse_str(&current).unwrap());
+        {
+            let mut catalog = Catalog::open(&config.catalog_path()).unwrap();
+            let asset = catalog.find_asset(current_asset).unwrap().unwrap();
+            let wall = catalog
+                .derivatives_for_assets(&[current_asset], "wall_thumbnail")
                 .unwrap()
                 .into_iter()
                 .next()
-                .is_some(),
-            "full preview phase should persist a screen row"
-        );
-        assert_eq!(catalog.delete_derivatives(&[wall.id]).unwrap(), 1);
-        catalog.mark_root_offline(asset.library_id).unwrap();
-    }
+                .expect("full thumbnail phase should persist a wall row");
+            assert!(
+                catalog
+                    .derivatives_for_assets(&[current_asset], "screen_preview")
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .is_some(),
+                "full preview phase should persist a screen row"
+            );
+            assert_eq!(catalog.delete_derivatives(&[wall.id]).unwrap(), 1);
+            catalog.mark_root_offline(asset.library_id).unwrap();
+        }
 
-    let mut legacy_updates = service.subscribe_wall_updates();
-    service
-        .request_derivatives(DerivativeRequest::visible_screen_preview(vec![
-            current.clone(),
-        ]))
-        .await
-        .unwrap();
-    wait_for_derivatives(
-        &mut legacy_updates,
-        DerivativeClass::WallThumbnail,
-        &current_set,
-    )
-    .await;
-    wait_for_derivatives(
-        &mut legacy_updates,
-        DerivativeClass::ScreenPreview,
-        &current_set,
-    )
-    .await;
-    let repaired = service
-        .query_wall(query(SortDirection::OldestFirst, None, 100))
-        .await
-        .unwrap()
-        .items
-        .into_iter()
-        .find(|asset| asset.id == current)
-        .expect("legacy-repaired asset should stay on the wall");
-    assert!(repaired.wall_thumbnail.is_some());
-    assert!(repaired.screen_preview.is_some());
-    service.wait_for_derivative_tasks_quiescent_test().await;
-    drop(service);
-
-    let reopen_config = config.clone();
-    let reopened = std::thread::spawn(move || AppService::open(reopen_config))
-        .join()
-        .expect("service restart thread panicked")
-        .unwrap();
-    let offline_page = reopened
-        .query_wall(query(SortDirection::NewestFirst, None, 100))
-        .await
-        .unwrap();
-    assert_photo_page(&offline_page, 6);
-    assert!(
-        offline_page
+        let mut legacy_updates = service.subscribe_wall_updates();
+        service
+            .request_derivatives(DerivativeRequest::visible_screen_preview(vec![
+                current.clone(),
+            ]))
+            .await
+            .unwrap();
+        wait_for_derivatives(
+            &mut legacy_updates,
+            DerivativeClass::WallThumbnail,
+            &current_set,
+        )
+        .await;
+        wait_for_derivatives(
+            &mut legacy_updates,
+            DerivativeClass::ScreenPreview,
+            &current_set,
+        )
+        .await;
+        let repaired = service
+            .query_wall(query(SortDirection::OldestFirst, None, 100))
+            .await
+            .unwrap()
             .items
-            .iter()
-            .all(|asset| { asset.wall_thumbnail.is_some() && asset.screen_preview.is_some() })
-    );
-    reopened
-        .request_derivatives(DerivativeRequest::visible_screen_preview(vec![current]))
-        .await
-        .unwrap();
-    reopened.wait_for_derivative_tasks_quiescent_test().await;
-    drop(reopened);
+            .into_iter()
+            .find(|asset| asset.id == current)
+            .expect("legacy-repaired asset should stay on the wall");
+        assert!(repaired.wall_thumbnail.is_some());
+        assert!(repaired.screen_preview.is_some());
+        service.wait_for_derivative_tasks_quiescent_test().await;
+
+        drop(legacy_updates);
+        service
+            .set_interaction(photo_app_service::InteractionState::Idle)
+            .await;
+        service.wait_for_derivative_tasks_quiescent_test().await;
+        service.wait_for_collection_drivers_quiescent_test().await;
+        assert_eq!(service.derivative_active_task_count_test(), 0);
+        assert_eq!(service.collection_driver_active_count_test(), 0);
+        assert_eq!(service.active_scan_count_test(), 0);
+        drop(updates);
+        current
+    };
+
+    {
+        let reopen_config = config.clone();
+        let reopened = std::thread::spawn(move || AppService::open(reopen_config))
+            .join()
+            .expect("service restart thread panicked")
+            .unwrap();
+        let offline_page = reopened
+            .query_wall(query(SortDirection::NewestFirst, None, 100))
+            .await
+            .unwrap();
+        assert_photo_page(&offline_page, 6);
+        assert!(
+            offline_page
+                .items
+                .iter()
+                .all(|asset| { asset.wall_thumbnail.is_some() && asset.screen_preview.is_some() })
+        );
+        reopened
+            .request_derivatives(DerivativeRequest::visible_screen_preview(vec![
+                current.clone(),
+            ]))
+            .await
+            .unwrap();
+        reopened.wait_for_derivative_tasks_quiescent_test().await;
+        reopened.wait_for_collection_drivers_quiescent_test().await;
+        assert_eq!(reopened.derivative_active_task_count_test(), 0);
+        assert_eq!(reopened.collection_driver_active_count_test(), 0);
+        assert_eq!(reopened.active_scan_count_test(), 0);
+    }
 
     let after = source_snapshot(&source);
     assert_eq!(

@@ -1471,6 +1471,29 @@ impl AppService {
         self.derivative_task_tracker.active_count()
     }
 
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn wait_for_collection_drivers_quiescent_test(&self) {
+        self.collection_driver_tracker.wait_for_zero().await;
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn collection_driver_active_count_test(&self) -> usize {
+        self.collection_driver_tracker.active_count()
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn active_scan_count_test(&self) -> usize {
+        usize::from(
+            self.state
+                .lock()
+                .map(|state| state.active_scan.is_some())
+                .unwrap_or(false),
+        )
+    }
+
     /// Installs a deterministic screen-preview boundary after encoding and before commit.
     #[cfg(debug_assertions)]
     #[doc(hidden)]
@@ -1669,7 +1692,11 @@ impl AppService {
         generation: u64,
     ) {
         let service = self.clone();
+        #[cfg(any(test, debug_assertions))]
+        let tracker = self.collection_driver_tracker.clone();
         tokio::spawn(async move {
+            #[cfg(any(test, debug_assertions))]
+            let _task_guard = tracker.start();
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let _driver = service.collection_driver.lock().await;
             service
