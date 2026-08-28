@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(any(test, debug_assertions))]
 use tokio::sync::Mutex as TokioMutex;
-#[cfg(any(test, debug_assertions))]
 use tokio::sync::Notify;
 use tokio::sync::watch;
 
@@ -85,6 +84,105 @@ pub(crate) struct DerivativeTestGate {
     pub(crate) entered: Arc<tokio::sync::Notify>,
     pub(crate) release: Arc<tokio::sync::Notify>,
     pub(crate) starts: Option<Arc<AtomicUsize>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CollectionDriverIntent {
+    pub(crate) selection: SelectionToken,
+    pub(crate) full_group: bool,
+}
+
+struct CollectionDriverControlState {
+    pending: Option<CollectionDriverIntent>,
+    admitted: bool,
+}
+
+pub(crate) struct CollectionDriverControl {
+    state: Mutex<CollectionDriverControlState>,
+    wake: Notify,
+}
+
+impl CollectionDriverControl {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(CollectionDriverControlState {
+                pending: None,
+                admitted: false,
+            }),
+            wake: Notify::new(),
+        }
+    }
+
+    pub(crate) fn request(&self, selection: SelectionToken, full_group: bool) -> bool {
+        let should_admit = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("collection driver control state poisoned");
+            match state.pending.as_mut() {
+                Some(intent) if intent.selection == selection => {
+                    intent.full_group |= full_group;
+                }
+                _ => {
+                    state.pending = Some(CollectionDriverIntent {
+                        selection,
+                        full_group,
+                    });
+                }
+            }
+            if state.admitted {
+                false
+            } else {
+                state.admitted = true;
+                true
+            }
+        };
+        self.wake.notify_waiters();
+        should_admit
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn has_pending(&self) -> bool {
+        self.state
+            .lock()
+            .expect("collection driver control state poisoned")
+            .pending
+            .is_some()
+    }
+
+    pub(crate) fn take_pending(&self) -> Option<CollectionDriverIntent> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("collection driver control state poisoned");
+        state.pending.take()
+    }
+
+    pub(crate) fn release_after_task(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .expect("collection driver control state poisoned");
+        if !state.admitted {
+            return false;
+        }
+        state.admitted = false;
+        if state.pending.is_some() {
+            state.admitted = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn abandon(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("collection driver control state poisoned");
+        state.pending = None;
+        state.admitted = false;
+    }
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -248,13 +346,15 @@ pub struct AppService {
     pub(crate) cache_budget: CacheBudget,
     pub(crate) protected_groups: ProtectedGroups,
     pub(crate) derivative_driver: Arc<tokio::sync::Mutex<()>>,
-    pub(crate) collection_driver: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) collection_driver: Arc<CollectionDriverControl>,
     #[cfg(any(test, debug_assertions))]
     pub(crate) derivative_test_gate: Arc<TokioMutex<Option<DerivativeTestGate>>>,
     #[cfg(any(test, debug_assertions))]
     pub(crate) derivative_task_tracker: Arc<DerivativeTaskTracker>,
     #[cfg(any(test, debug_assertions))]
     pub(crate) collection_driver_tracker: Arc<DerivativeTaskTracker>,
+    #[cfg(debug_assertions)]
+    pub(crate) collection_driver_exit_test_gate: Arc<TokioMutex<Option<CollectionTestGate>>>,
     #[cfg(any(test, debug_assertions))]
     pub(crate) collection_publish_test_gate: Arc<TokioMutex<Option<CollectionTestGate>>>,
     #[cfg(any(test, debug_assertions))]
@@ -381,13 +481,15 @@ impl AppService {
             cache_budget,
             protected_groups: ProtectedGroups::default(),
             derivative_driver: Arc::new(tokio::sync::Mutex::new(())),
-            collection_driver: Arc::new(tokio::sync::Mutex::new(())),
+            collection_driver: Arc::new(CollectionDriverControl::new()),
             #[cfg(any(test, debug_assertions))]
             derivative_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]
             derivative_task_tracker: Arc::new(DerivativeTaskTracker::new()),
             #[cfg(any(test, debug_assertions))]
             collection_driver_tracker: Arc::new(DerivativeTaskTracker::new()),
+            #[cfg(debug_assertions)]
+            collection_driver_exit_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]
             collection_publish_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]

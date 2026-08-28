@@ -20,7 +20,7 @@ use photo_indexer::{InteractionMode, JobPriority};
 use crate::derivative_coordinator::{
     CollectionProgressToken, CommitPermit, RECENT_CAPACITY, WorkKey, WorkTicket,
 };
-use crate::service::SelectionToken;
+use crate::service::{CollectionDriverIntent, SelectionToken};
 use crate::{
     AppService, AppServiceError, DerivativeClass, DerivativePriority, DerivativeReference,
     DerivativeRequest, WallUpdate,
@@ -108,6 +108,18 @@ pub(crate) struct PendingDerivative {
     class: DerivativeClass,
     selection: SelectionToken,
     completion_generation: u64,
+}
+
+struct CollectionDriverTaskGuard {
+    service: AppService,
+}
+
+impl Drop for CollectionDriverTaskGuard {
+    fn drop(&mut self) {
+        if self.service.collection_driver.release_after_task() {
+            self.service.spawn_collection_driver_task();
+        }
+    }
 }
 
 impl AppService {
@@ -1485,6 +1497,17 @@ impl AppService {
 
     #[cfg(debug_assertions)]
     #[doc(hidden)]
+    pub async fn install_collection_driver_exit_test_gate(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.collection_driver_exit_test_gate.lock().await =
+            Some(crate::service::CollectionTestGate { entered, release });
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
     pub fn active_scan_count_test(&self) -> usize {
         usize::from(
             self.state
@@ -1677,32 +1700,72 @@ impl AppService {
         for id in recent.iter().copied() {
             self.coordinator.note_recent(id).await;
         }
-        let generation = self.coordinator.background_generation().await;
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        self.start_collection_driver(recent, full_group, selection, generation);
+        self.start_collection_driver(full_group, selection);
     }
 
-    fn start_collection_driver(
-        &self,
-        recent: Vec<AssetId>,
-        full_group: bool,
-        selection: SelectionToken,
-        generation: u64,
-    ) {
+    fn start_collection_driver(&self, full_group: bool, selection: SelectionToken) {
+        if self.collection_driver.request(selection, full_group) {
+            self.spawn_collection_driver_task();
+        }
+        // A recent request may be the only event that reaches this path.  Wake
+        // the driver's generation wait after recording the coalesced intent so
+        // it cannot sleep through a newly admitted request.
+        self.coordinator.wake();
+    }
+
+    fn spawn_collection_driver_task(&self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.collection_driver.abandon();
+            return;
+        }
         let service = self.clone();
         #[cfg(any(test, debug_assertions))]
         let task_guard = self.collection_driver_tracker.start();
         tokio::spawn(async move {
+            let _admission_guard = CollectionDriverTaskGuard {
+                service: service.clone(),
+            };
             #[cfg(any(test, debug_assertions))]
             let _task_guard = task_guard;
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let _driver = service.collection_driver.lock().await;
-            service
-                .run_preview_prefetch_until_stable(recent, full_group, selection, generation)
-                .await;
+            service.run_collection_driver().await;
         });
+    }
+
+    async fn run_collection_driver(&self) {
+        loop {
+            let Some(intent) = self.next_collection_driver_intent().await else {
+                return;
+            };
+            let generation = self.coordinator.background_generation().await;
+            self.run_preview_prefetch_until_stable(
+                Vec::new(),
+                intent.full_group,
+                intent.selection,
+                generation,
+            )
+            .await;
+        }
+    }
+
+    async fn next_collection_driver_intent(&self) -> Option<CollectionDriverIntent> {
+        #[cfg(debug_assertions)]
+        if !self.collection_driver.has_pending() {
+            self.wait_for_collection_driver_exit_test_gate().await;
+        }
+        self.collection_driver.take_pending()
+    }
+
+    #[cfg(debug_assertions)]
+    async fn wait_for_collection_driver_exit_test_gate(&self) {
+        let gate = self.collection_driver_exit_test_gate.lock().await.take();
+        if let Some(gate) = gate {
+            let release = gate.release.notified();
+            tokio::pin!(release);
+            release.as_mut().enable();
+            gate.entered.notify_one();
+            release.await;
+        }
     }
 
     async fn run_preview_prefetch_until_stable(
@@ -3289,9 +3352,7 @@ mod tests {
     async fn collection_driver_is_tracked_before_its_first_poll() {
         let (_temp, service, selection, _asset_id, _derivative_count) =
             collection_gap_fixture(false).await;
-        let generation = service.coordinator.background_generation().await;
-
-        service.start_collection_driver(Vec::new(), true, selection, generation);
+        service.start_collection_driver(true, selection);
         assert_eq!(
             service.collection_driver_active_count_test(),
             1,
@@ -3309,6 +3370,81 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), quiescence)
             .await
             .expect("collection driver should finish and release its tracking guard");
+        assert_eq!(service.collection_driver_active_count_test(), 0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn collection_driver_triggers_coalesce_under_active_interaction() {
+        let (_temp, service, _selection, asset_id, _derivative_count) =
+            collection_gap_fixture(false).await;
+        service
+            .set_interaction(crate::InteractionState::Active)
+            .await;
+
+        let mut maximum_active = service.collection_driver_active_count_test();
+        for index in 0..1_000 {
+            if index % 2 == 0 {
+                service
+                    .set_interaction(crate::InteractionState::Active)
+                    .await;
+            } else {
+                service
+                    .schedule_screen_preview_prefetch(vec![asset_id])
+                    .await;
+            }
+            maximum_active = maximum_active.max(service.collection_driver_active_count_test());
+            assert!(
+                service.coordinator.test_snapshot().await.recent_len <= 250,
+                "coalesced intent must retain at most the bounded recent window"
+            );
+        }
+        assert_eq!(
+            maximum_active, 1,
+            "1,000 active-interaction triggers must admit one collection driver"
+        );
+
+        service.set_interaction(crate::InteractionState::Idle).await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            service.wait_for_collection_drivers_quiescent_test(),
+        )
+        .await
+        .expect("coalesced collection intent should drain after interaction ends");
+        assert_eq!(service.collection_driver_active_count_test(), 0);
+        assert!(service.coordinator.test_snapshot().await.recent_len <= 250);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn collection_driver_merges_full_group_intent_at_exit_without_lost_wake() {
+        let (_temp, service, _selection, asset_id, _derivative_count) =
+            collection_gap_fixture(false).await;
+        let exit_entered = Arc::new(tokio::sync::Notify::new());
+        let exit_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_collection_driver_exit_test_gate(exit_entered.clone(), exit_release.clone())
+            .await;
+
+        service
+            .schedule_screen_preview_prefetch(vec![asset_id])
+            .await;
+        tokio::time::timeout(Duration::from_secs(5), exit_entered.notified())
+            .await
+            .expect("recent collection driver should reach its exit gate");
+
+        service.prefetch_screen_previews(Vec::new()).await;
+        exit_release.notify_waiters();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            service.wait_for_collection_drivers_quiescent_test(),
+        )
+        .await
+        .expect("full-group intent arriving at exit must not be lost");
+        assert_eq!(
+            service.coordinator.collection_phase().await,
+            crate::derivative_coordinator::CollectionPhase::Complete
+        );
         assert_eq!(service.collection_driver_active_count_test(), 0);
     }
 
@@ -3475,14 +3611,13 @@ mod tests {
             .scheduler
             .set_interaction_mode(photo_indexer::InteractionMode::Idle)
             .await;
-        let generation = service.coordinator.background_generation().await;
-
-        // Let the recent driver acquire and release the mutex first.  Its
-        // phase guard must make this a no-op, leaving the full driver free to
-        // own the subsequent thumbnail traversal.
-        service.start_collection_driver(vec![asset.id], false, selection, generation);
+        // Let the recent intent be admitted first.  Its phase guard must make
+        // the recent-only work a no-op, leaving the merged full-group intent
+        // free to own the subsequent thumbnail traversal.
+        service.coordinator.note_recent(asset.id).await;
+        service.start_collection_driver(false, selection);
         tokio::time::sleep(Duration::from_millis(75)).await;
-        service.start_collection_driver(Vec::new(), true, selection, generation);
+        service.start_collection_driver(true, selection);
         tokio::time::timeout(Duration::from_secs(5), wall_entered.notified())
             .await
             .expect("full-group driver should reach the gated wall");
