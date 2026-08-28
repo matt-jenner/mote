@@ -568,7 +568,11 @@ impl AppService {
             return;
         }
         let service = self.clone();
+        #[cfg(any(test, debug_assertions))]
+        let task_guard = service.derivative_task_tracker.start();
         tokio::spawn(async move {
+            #[cfg(any(test, debug_assertions))]
+            let _task_guard = task_guard;
             service.drive_derivative_workers().await;
         });
     }
@@ -613,7 +617,11 @@ impl AppService {
 
     async fn run_derivative_attempt_supervised(&self, ticket: WorkTicket, key: WorkKey) {
         let service = self.clone();
+        #[cfg(any(test, debug_assertions))]
+        let attempt_guard = self.derivative_task_tracker.start();
         let attempt = tokio::spawn(async move {
+            #[cfg(any(test, debug_assertions))]
+            let _attempt_guard = attempt_guard;
             service.process_derivative_attempt(ticket, key).await;
         });
         #[cfg(any(test, debug_assertions))]
@@ -623,7 +631,11 @@ impl AppService {
                 .await;
         }
         let monitor_service = self.clone();
+        #[cfg(any(test, debug_assertions))]
+        let monitor_guard = self.derivative_task_tracker.start();
         let monitor = tokio::spawn(async move {
+            #[cfg(any(test, debug_assertions))]
+            let _monitor_guard = monitor_guard;
             let joined = attempt.await;
             #[cfg(any(test, debug_assertions))]
             monitor_service
@@ -786,7 +798,11 @@ impl AppService {
         let (completion_sender, completion) = tokio::sync::oneshot::channel();
         if !permit.claim_supervisor() {
             let fallback_service = self.clone();
+            #[cfg(any(test, debug_assertions))]
+            let fallback_guard = fallback_service.derivative_task_tracker.start();
             tokio::spawn(async move {
+                #[cfg(any(test, debug_assertions))]
+                let _fallback_guard = fallback_guard;
                 fallback_service.coordinator.fail_commit(permit).await;
                 #[cfg(any(test, debug_assertions))]
                 fallback_service
@@ -799,7 +815,11 @@ impl AppService {
         let operation_service = self.clone();
         let fallback_permit = permit.clone();
         let operation_cache_key = cache_key.clone();
+        #[cfg(any(test, debug_assertions))]
+        let operation_guard = self.derivative_task_tracker.start();
         let operation_task = tokio::spawn(async move {
+            #[cfg(any(test, debug_assertions))]
+            let _operation_guard = operation_guard;
             let result = tokio::task::spawn_blocking(operation)
                 .await
                 .map_err(|_| DerivativeWorkError::WorkerUnavailable)
@@ -817,7 +837,11 @@ impl AppService {
                 .await;
         });
         let monitor_service = self.clone();
+        #[cfg(any(test, debug_assertions))]
+        let commit_monitor_guard = self.derivative_task_tracker.start();
         tokio::spawn(async move {
+            #[cfg(any(test, debug_assertions))]
+            let _commit_monitor_guard = commit_monitor_guard;
             if operation_task.await.is_err() {
                 monitor_service
                     .resolve_admitted_commit(
@@ -1413,6 +1437,18 @@ impl AppService {
             release,
             starts: Some(starts),
         });
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn wait_for_derivative_tasks_quiescent_test(&self) {
+        self.derivative_task_tracker.wait_for_zero().await;
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn derivative_active_task_count_test(&self) -> usize {
+        self.derivative_task_tracker.active_count()
     }
 
     /// Installs a deterministic screen-preview boundary after encoding and before commit.
@@ -3738,9 +3774,19 @@ mod tests {
                 .run_preview_prefetch_until_stable(Vec::new(), true, selection, generation)
                 .await;
         });
-        tokio::time::timeout(Duration::from_secs(5), wall_entered.notified())
-            .await
-            .expect("collection should start a missing wall job");
+        let expected_worker_slots = super::MAX_DERIVATIVE_WORKERS;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while wall_starts.load(Ordering::Acquire) < expected_worker_slots {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all derivative worker slots should enter the shared wall gate");
+        assert_eq!(
+            wall_starts.load(Ordering::Acquire),
+            expected_worker_slots,
+            "the shared wall gate must hold every active worker slot"
+        );
 
         let catalog_count = {
             let state = service.state().unwrap();
@@ -3815,7 +3861,9 @@ mod tests {
         let _ = foreground.await;
         service.coordinator.abort_all_attempts().await;
         service.coordinator.invalidate_background().await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        service.wait_for_derivative_tasks_quiescent_test().await;
+        assert_eq!(service.derivative_active_task_count_test(), 0);
+        assert_eq!(service.coordinator.test_snapshot().await.queued_jobs, 0);
     }
 
     #[test]

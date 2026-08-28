@@ -88,6 +88,58 @@ pub(crate) struct DerivativeTestGate {
 }
 
 #[cfg(any(test, debug_assertions))]
+pub(crate) struct DerivativeTaskTracker {
+    active: AtomicUsize,
+    quiesced: Notify,
+}
+
+#[cfg(any(test, debug_assertions))]
+pub(crate) struct DerivativeTaskGuard {
+    tracker: Arc<DerivativeTaskTracker>,
+}
+
+#[cfg(any(test, debug_assertions))]
+impl DerivativeTaskTracker {
+    pub(crate) fn new() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            quiesced: Notify::new(),
+        }
+    }
+
+    pub(crate) fn start(self: &Arc<Self>) -> DerivativeTaskGuard {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        DerivativeTaskGuard {
+            tracker: Arc::clone(self),
+        }
+    }
+
+    pub(crate) fn active_count(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_for_zero(&self) {
+        loop {
+            let notified = self.quiesced.notified();
+            if self.active_count() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+impl Drop for DerivativeTaskGuard {
+    fn drop(&mut self) {
+        self.tracker.active.fetch_sub(1, Ordering::AcqRel);
+        // notify_one stores a permit when the waiter has not registered yet,
+        // closing the check/register race in wait_for_zero.
+        self.tracker.quiesced.notify_one();
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
 #[derive(Clone)]
 pub(crate) struct CollectionTestGate {
     pub(crate) entered: Arc<Notify>,
@@ -153,6 +205,8 @@ pub struct AppService {
     pub(crate) collection_driver: Arc<tokio::sync::Mutex<()>>,
     #[cfg(any(test, debug_assertions))]
     pub(crate) derivative_test_gate: Arc<TokioMutex<Option<DerivativeTestGate>>>,
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) derivative_task_tracker: Arc<DerivativeTaskTracker>,
     #[cfg(any(test, debug_assertions))]
     pub(crate) collection_publish_test_gate: Arc<TokioMutex<Option<CollectionTestGate>>>,
     #[cfg(any(test, debug_assertions))]
@@ -282,6 +336,8 @@ impl AppService {
             collection_driver: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(any(test, debug_assertions))]
             derivative_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(any(test, debug_assertions))]
+            derivative_task_tracker: Arc::new(DerivativeTaskTracker::new()),
             #[cfg(any(test, debug_assertions))]
             collection_publish_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]
