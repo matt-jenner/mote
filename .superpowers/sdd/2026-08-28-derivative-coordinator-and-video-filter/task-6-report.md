@@ -116,3 +116,68 @@ path files changed; no video request path was added.
 ## Fix round 1 — SHA
 
 - Implementation and regression tests: `b7c5748` (`fix: preserve preview dedupe across StrictMode`).
+
+## Fix round 2 — RED
+
+- Fix base: `a1ce0af` (`docs: record Task 6 Fix Round 1 verification`).
+- The inactive-key regression failed before the fix: after three rejected
+  attempts, deactivation and reactivation produced no fourth request
+  (`expected 4, received 3`). This exposed `attemptCounts` and
+  `failedRequestKeys` surviving after `requestRecords` was removed.
+- The integrated screen-only wall fixture initially rendered provisionally;
+  it was corrected to a settled page so the actual PhotoWall/AppShell tile
+  path could be exercised. The stale decode assertion was changed from a
+  fixed 25ms delay to an explicit decode-continuation flag.
+
+## Fix round 2 — GREEN
+
+- `npm test` — 16 files, 129 tests passed.
+- `npm run test:browser` — 3 files, 145 tests passed.
+- Exact `PhotoWall.browser.test.tsx` — 48 tests passed.
+- Exact `PhotoViewer.browser.test.tsx` — 87 tests passed.
+- `npm exec --workspace @photo-viewer/interface -- vitest run --project browser-motion` — 1 file, 2 tests passed.
+- `npm exec --workspace @photo-viewer/interface -- vitest run --project browser-contrast` — 1 file, 2 tests passed.
+- `npm run typecheck`, `npm run check`, production build, and `git diff --check` — passed.
+
+The same single non-failing React `ViewerStage` `act(...)` warning remains in
+the viewer/full browser runs; no new warning was introduced.
+
+## Fix round 2 — Browser
+
+- Inactive cleanup now removes request records, attempt counts, retry timers,
+  and failed-key state together for every inactive asset/generation/key.
+  React state is mirrored by a ref so cleanup can clear the plan without
+  leaking state across a later activation.
+- Real unmount sets the mounted fence immediately and defers full plan cleanup
+  to a token-checked microtask. StrictMode replay cancels that deferred clear,
+  preserving in-flight dedupe; a genuine unmount clears timers and all plan
+  maps. Late unresolved completions cannot mutate state or schedule retries.
+- The integrated AppShell/PhotoWall test dispatches pointer and click events
+  on a screen-preview-only colour tile, verifies no open button/dialog, and
+  confirms no screen-preview request or additional derivative request follows
+  activation.
+- The zero-natural-width case now includes an `onOpen` spy, real tile
+  activation attempts, and explicit no-button/no-call assertions.
+
+## Fix round 2 — Appearance
+
+No production appearance changes were made. The always-dark viewer contrast
+coverage continues to pass under system-light appearance.
+
+## Fix round 2 — Source boundary
+
+Only interface preview lifecycle code and browser tests changed. No backend,
+Tauri, plan/specification, progress-ledger, source-media, or native-path files
+were touched, and no video request behavior was added.
+
+## Fix round 2 — Self-review
+
+- Reviewed StrictMode setup/cleanup ordering: the mounted fence is immediate,
+  deferred cleanup is cancelled by replay setup, and active-key cleanup still
+  resets current asset/generation/key changes.
+- Confirmed generated browser attachment/screenshot directories were removed
+  before commit; the worktree is clean and `git diff --check` passes.
+
+## Fix round 2 — SHA
+
+- Implementation and regression tests: `f59dae5` (`fix: clear inactive preview retry state`).
