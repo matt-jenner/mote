@@ -94,6 +94,10 @@ pub(crate) struct CollectionDriverIntent {
 
 struct CollectionDriverControlState {
     pending: Option<CollectionDriverIntent>,
+    // Selection epochs are issued monotonically. Retain the latest one even
+    // after its intent has been taken so a delayed older caller cannot regress
+    // the driver's work while it is between batches.
+    latest_selection: Option<SelectionToken>,
     admitted: bool,
 }
 
@@ -107,6 +111,7 @@ impl CollectionDriverControl {
         Self {
             state: Mutex::new(CollectionDriverControlState {
                 pending: None,
+                latest_selection: None,
                 admitted: false,
             }),
             wake: Notify::new(),
@@ -119,18 +124,28 @@ impl CollectionDriverControl {
                 .state
                 .lock()
                 .expect("collection driver control state poisoned");
-            match state.pending.as_mut() {
-                Some(intent) if intent.selection == selection => {
-                    intent.full_group |= full_group;
-                }
-                _ => {
-                    state.pending = Some(CollectionDriverIntent {
-                        selection,
-                        full_group,
-                    });
+            let is_current = state
+                .latest_selection
+                .is_none_or(|current| selection == current);
+            let is_newer = state
+                .latest_selection
+                .is_some_and(|current| selection.epoch > current.epoch);
+            let accepted = state.latest_selection.is_none() || is_current || is_newer;
+            if accepted {
+                state.latest_selection = Some(selection);
+                match state.pending.as_mut() {
+                    Some(intent) if intent.selection == selection => {
+                        intent.full_group |= full_group;
+                    }
+                    _ => {
+                        state.pending = Some(CollectionDriverIntent {
+                            selection,
+                            full_group,
+                        });
+                    }
                 }
             }
-            if state.admitted {
+            if !accepted || state.admitted {
                 false
             } else {
                 state.admitted = true;
@@ -141,21 +156,16 @@ impl CollectionDriverControl {
         should_admit
     }
 
-    #[cfg(debug_assertions)]
-    pub(crate) fn has_pending(&self) -> bool {
-        self.state
-            .lock()
-            .expect("collection driver control state poisoned")
-            .pending
-            .is_some()
-    }
-
-    pub(crate) fn take_pending(&self) -> Option<CollectionDriverIntent> {
+    pub(crate) fn take_pending_or_release(&self) -> Option<CollectionDriverIntent> {
         let mut state = self
             .state
             .lock()
             .expect("collection driver control state poisoned");
-        state.pending.take()
+        if let Some(intent) = state.pending.take() {
+            return Some(intent);
+        }
+        state.admitted = false;
+        None
     }
 
     pub(crate) fn release_after_task(&self) -> bool {

@@ -2,12 +2,10 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-#[cfg(debug_assertions)]
 use std::sync::Arc;
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicUsize;
-#[cfg(any(test, debug_assertions))]
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use photo_cache::{
     DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget, ImageDerivativeError,
@@ -112,12 +110,25 @@ pub(crate) struct PendingDerivative {
 
 struct CollectionDriverTaskGuard {
     service: AppService,
+    // This distinguishes a future dropped before its first poll from a task
+    // that entered the driver loop and may need to hand off pending intent.
+    started: Arc<AtomicBool>,
+}
+
+impl CollectionDriverTaskGuard {
+    fn mark_started(&self) {
+        self.started.store(true, Ordering::Release);
+    }
 }
 
 impl Drop for CollectionDriverTaskGuard {
     fn drop(&mut self) {
+        if !self.started.load(Ordering::Acquire) {
+            self.service.collection_driver.abandon();
+            return;
+        }
         if self.service.collection_driver.release_after_task() {
-            self.service.spawn_collection_driver_task();
+            let _ = self.service.spawn_collection_driver_task();
         }
     }
 }
@@ -1508,6 +1519,17 @@ impl AppService {
 
     #[cfg(debug_assertions)]
     #[doc(hidden)]
+    pub async fn install_collection_driver_post_take_test_gate(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.collection_driver_exit_test_gate.lock().await =
+            Some(crate::service::CollectionTestGate { entered, release });
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
     pub fn active_scan_count_test(&self) -> usize {
         usize::from(
             self.state
@@ -1705,7 +1727,7 @@ impl AppService {
 
     fn start_collection_driver(&self, full_group: bool, selection: SelectionToken) {
         if self.collection_driver.request(selection, full_group) {
-            self.spawn_collection_driver_task();
+            let _ = self.spawn_collection_driver_task();
         }
         // A recent request may be the only event that reaches this path.  Wake
         // the driver's generation wait after recording the coalesced intent so
@@ -1713,28 +1735,34 @@ impl AppService {
         self.coordinator.wake();
     }
 
-    fn spawn_collection_driver_task(&self) {
+    fn spawn_collection_driver_task(&self) -> Option<tokio::task::JoinHandle<()>> {
         if tokio::runtime::Handle::try_current().is_err() {
             self.collection_driver.abandon();
-            return;
+            return None;
         }
         let service = self.clone();
+        let started = Arc::new(AtomicBool::new(false));
+        let admission_guard = CollectionDriverTaskGuard {
+            service: service.clone(),
+            started: started.clone(),
+        };
         #[cfg(any(test, debug_assertions))]
         let task_guard = self.collection_driver_tracker.start();
-        tokio::spawn(async move {
-            let _admission_guard = CollectionDriverTaskGuard {
-                service: service.clone(),
-            };
+        Some(tokio::spawn(async move {
             #[cfg(any(test, debug_assertions))]
             let _task_guard = task_guard;
+            let _admission_guard = admission_guard;
+            _admission_guard.mark_started();
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             service.run_collection_driver().await;
-        });
+        }))
     }
 
     async fn run_collection_driver(&self) {
         loop {
             let Some(intent) = self.next_collection_driver_intent().await else {
+                #[cfg(debug_assertions)]
+                self.wait_for_collection_driver_exit_test_gate().await;
                 return;
             };
             let generation = self.coordinator.background_generation().await;
@@ -1749,11 +1777,7 @@ impl AppService {
     }
 
     async fn next_collection_driver_intent(&self) -> Option<CollectionDriverIntent> {
-        #[cfg(debug_assertions)]
-        if !self.collection_driver.has_pending() {
-            self.wait_for_collection_driver_exit_test_gate().await;
-        }
-        self.collection_driver.take_pending()
+        self.collection_driver.take_pending_or_release()
     }
 
     #[cfg(debug_assertions)]
@@ -2960,12 +2984,14 @@ mod tests {
     };
     use photo_catalog::{Catalog, NewAsset};
     use photo_domain::{AssetId, FileSignature, MediaKind, RelativePathKey};
+    #[cfg(debug_assertions)]
+    use photo_domain::{FolderGroupId, LibraryId};
     use photo_indexer::{JobPriority, MetadataReader};
     use photo_metadata::{MetadataBundle, MetadataReadWarning};
 
     use crate::service::DerivativeTestGate;
     #[cfg(debug_assertions)]
-    use crate::service::SelectionToken;
+    use crate::service::{CollectionDriverControl, SelectionToken};
     use crate::{AppConfig, AppService, DerivativeClass, WallUpdate};
 
     use super::DerivativeWorkError;
@@ -3374,9 +3400,96 @@ mod tests {
     }
 
     #[cfg(debug_assertions)]
+    #[test]
+    fn collection_driver_keeps_newer_selection_intent_when_older_call_resumes() {
+        let control = CollectionDriverControl::new();
+        let library_id = LibraryId::from_uuid(uuid::Uuid::from_u128(1));
+        let group_id = FolderGroupId::from_uuid(uuid::Uuid::from_u128(2));
+        let older = SelectionToken {
+            library_id,
+            group_id,
+            epoch: 7,
+        };
+        let newer = SelectionToken {
+            library_id,
+            group_id,
+            epoch: 8,
+        };
+
+        assert!(control.request(newer, false));
+        assert!(!control.request(newer, true));
+        assert!(!control.request(older, false));
+        assert!(!control.request(older, true));
+
+        let intent = control
+            .take_pending_or_release()
+            .expect("newer collection intent should remain pending");
+        assert_eq!(intent.selection, newer);
+        assert!(intent.full_group);
+        assert!(!control.request(older, true));
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn collection_driver_processes_newer_full_group_after_older_call_resumes() {
+        let (_temp, service, older, _asset_id, _derivative_count) =
+            collection_gap_fixture(false).await;
+        let source = _temp.path().join("photos");
+        let (_, newer) = service
+            .select_recent(&source)
+            .expect("same source should produce a newer selection epoch");
+        service.coordinator.reset_selection(newer).await;
+
+        assert!(service.collection_driver.request(newer, true));
+        assert!(!service.collection_driver.request(older, true));
+        let _ = service.spawn_collection_driver_task();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            service.wait_for_collection_drivers_quiescent_test(),
+        )
+        .await
+        .expect("newer collection intent should drain");
+        assert_eq!(
+            service.coordinator.collection_phase().await,
+            crate::derivative_coordinator::CollectionPhase::Complete
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn collection_driver_abort_before_first_poll_releases_admission_and_tracking() {
+        let (_temp, service, selection, _asset_id, _derivative_count) =
+            collection_gap_fixture(false).await;
+        assert!(service.collection_driver.request(selection, true));
+        let handle = service
+            .spawn_collection_driver_task()
+            .expect("collection driver should spawn inside the test runtime");
+        assert_eq!(service.collection_driver_active_count_test(), 1);
+
+        handle.abort();
+        let _ = handle.await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            service.wait_for_collection_drivers_quiescent_test(),
+        )
+        .await
+        .expect("aborted pre-poll driver should release its tracker");
+        assert_eq!(service.collection_driver_active_count_test(), 0);
+
+        service.start_collection_driver(true, selection);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            service.wait_for_collection_drivers_quiescent_test(),
+        )
+        .await
+        .expect("a later request should admit and drain a new driver");
+        assert_eq!(service.collection_driver_active_count_test(), 0);
+    }
+
+    #[cfg(debug_assertions)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn collection_driver_triggers_coalesce_under_active_interaction() {
-        let (_temp, service, _selection, asset_id, _derivative_count) =
+        let (_temp, service, _selection, _asset_id, _derivative_count) =
             collection_gap_fixture(false).await;
         service
             .set_interaction(crate::InteractionState::Active)
@@ -3388,11 +3501,11 @@ mod tests {
                 service
                     .set_interaction(crate::InteractionState::Active)
                     .await;
-            } else {
-                service
-                    .schedule_screen_preview_prefetch(vec![asset_id])
-                    .await;
             }
+            let recent_id = AssetId::from_uuid(uuid::Uuid::from_u128((index % 500 + 1) as u128));
+            service
+                .schedule_screen_preview_prefetch(vec![recent_id])
+                .await;
             maximum_active = maximum_active.max(service.collection_driver_active_count_test());
             assert!(
                 service.coordinator.test_snapshot().await.recent_len <= 250,
@@ -3402,6 +3515,16 @@ mod tests {
         assert_eq!(
             maximum_active, 1,
             "1,000 active-interaction triggers must admit one collection driver"
+        );
+        let recent = service.coordinator.recent_ids().await;
+        assert_eq!(recent.len(), 250);
+        assert_eq!(
+            recent.first().copied(),
+            Some(AssetId::from_uuid(uuid::Uuid::from_u128(251)))
+        );
+        assert_eq!(
+            recent.last().copied(),
+            Some(AssetId::from_uuid(uuid::Uuid::from_u128(500)))
         );
 
         service.set_interaction(crate::InteractionState::Idle).await;
@@ -3413,6 +3536,59 @@ mod tests {
         .expect("coalesced collection intent should drain after interaction ends");
         assert_eq!(service.collection_driver_active_count_test(), 0);
         assert!(service.coordinator.test_snapshot().await.recent_len <= 250);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn collection_driver_post_take_request_keeps_quiescence_blocked_until_successor_finishes()
+    {
+        let (_temp, service, _selection, asset_id, _derivative_count) =
+            collection_gap_fixture(false).await;
+        let exit_entered = Arc::new(tokio::sync::Notify::new());
+        let exit_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_collection_driver_post_take_test_gate(
+                exit_entered.clone(),
+                exit_release.clone(),
+            )
+            .await;
+
+        service
+            .schedule_screen_preview_prefetch(vec![asset_id])
+            .await;
+        tokio::time::timeout(Duration::from_secs(5), exit_entered.notified())
+            .await
+            .expect("collection driver should reach its post-take exit gate");
+
+        let quiescence = service.wait_for_collection_drivers_quiescent_test();
+        tokio::pin!(quiescence);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(0), &mut quiescence)
+                .await
+                .is_err()
+        );
+        service.prefetch_screen_previews(Vec::new()).await;
+        assert_eq!(
+            service.collection_driver_active_count_test(),
+            2,
+            "post-take request must admit the successor while the old task is tracked"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(0), &mut quiescence)
+                .await
+                .is_err(),
+            "quiescence must remain blocked while successor work is admitted"
+        );
+
+        exit_release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), quiescence)
+            .await
+            .expect("successor should drain after the post-take gate is released");
+        assert_eq!(service.collection_driver_active_count_test(), 0);
+        assert_eq!(
+            service.coordinator.collection_phase().await,
+            crate::derivative_coordinator::CollectionPhase::Complete
+        );
     }
 
     #[cfg(debug_assertions)]
