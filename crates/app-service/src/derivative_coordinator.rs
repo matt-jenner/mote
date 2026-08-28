@@ -112,6 +112,20 @@ struct CollectionState {
     cursor: Option<WallCursorKey>,
 }
 
+/// An exact snapshot of the collection driver's position.
+///
+/// Collection work may spend a long time resolving a page.  The driver must
+/// present this complete snapshot when it advances or finishes so a visible
+/// request, selection change, or another generation cannot mutate the new
+/// collection state with an old cursor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CollectionProgressToken {
+    pub(crate) selection: SelectionToken,
+    pub(crate) phase: CollectionPhase,
+    pub(crate) cursor: Option<WallCursorKey>,
+    pub(crate) background_generation: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JobStatus {
     Queued,
@@ -1024,63 +1038,119 @@ impl DerivativeCoordinator {
     }
 
     pub(crate) async fn rewind_collection_to_thumbnails(&self, selection: SelectionToken) {
-        let mut state = self.state.lock().await;
-        if state.selection != Some(selection) {
-            return;
+        let changed = {
+            let mut state = self.state.lock().await;
+            if state.selection != Some(selection) {
+                false
+            } else if state.collection
+                != (CollectionState {
+                    phase: CollectionPhase::Thumbnails,
+                    cursor: None,
+                })
+            {
+                state.collection = CollectionState {
+                    phase: CollectionPhase::Thumbnails,
+                    cursor: None,
+                };
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.notify_waiters();
         }
-        if state.collection.phase != CollectionPhase::Thumbnails {
-            state.collection = CollectionState {
-                phase: CollectionPhase::Thumbnails,
-                cursor: None,
-            };
-        }
-        drop(state);
-        self.notify_waiters();
+    }
+
+    pub(crate) async fn collection_progress_token(
+        &self,
+        selection: SelectionToken,
+    ) -> Option<CollectionProgressToken> {
+        let state = self.state.lock().await;
+        (state.selection == Some(selection)).then(|| CollectionProgressToken {
+            selection,
+            phase: state.collection.phase,
+            cursor: state.collection.cursor.clone(),
+            background_generation: state.background_generation,
+        })
+    }
+
+    fn collection_token_matches(state: &CoordinatorState, token: &CollectionProgressToken) -> bool {
+        state.selection == Some(token.selection)
+            && state.background_generation == token.background_generation
+            && state.collection.phase == token.phase
+            && state.collection.cursor == token.cursor
     }
 
     pub(crate) async fn advance_collection(
         &self,
-        selection: SelectionToken,
+        token: &CollectionProgressToken,
         cursor: Option<WallCursorKey>,
-    ) {
-        let mut state = self.state.lock().await;
-        if state.selection != Some(selection) {
-            return;
+    ) -> bool {
+        let changed = {
+            let mut state = self.state.lock().await;
+            if !Self::collection_token_matches(&state, token)
+                || !matches!(
+                    state.collection.phase,
+                    CollectionPhase::Thumbnails | CollectionPhase::Previews
+                )
+            {
+                false
+            } else {
+                state.collection.cursor = cursor;
+                true
+            }
+        };
+        if changed {
+            self.notify_waiters();
         }
-        if matches!(
-            state.collection.phase,
-            CollectionPhase::Thumbnails | CollectionPhase::Previews
-        ) {
-            state.collection.cursor = cursor;
-        }
-        drop(state);
-        self.notify_waiters();
+        changed
     }
 
-    pub(crate) async fn finish_thumbnail_phase(&self, selection: SelectionToken) {
-        let mut state = self.state.lock().await;
-        if state.selection != Some(selection) {
-            return;
+    pub(crate) async fn finish_thumbnail_phase(&self, token: &CollectionProgressToken) -> bool {
+        let changed = {
+            let mut state = self.state.lock().await;
+            if !Self::collection_token_matches(&state, token)
+                || state.collection.phase != CollectionPhase::Thumbnails
+            {
+                false
+            } else {
+                // The phase transition and cursor reset are one state change;
+                // no preview driver can observe a partially advanced state.
+                state.collection = CollectionState {
+                    phase: CollectionPhase::Previews,
+                    cursor: None,
+                };
+                true
+            }
+        };
+        if changed {
+            self.notify_waiters();
         }
-        if state.collection.phase == CollectionPhase::Thumbnails {
-            state.collection.phase = CollectionPhase::Previews;
-            state.collection.cursor = None;
-        }
-        drop(state);
-        self.notify_waiters();
+        changed
     }
 
-    pub(crate) async fn finish_preview_phase(&self, selection: SelectionToken) {
-        let mut state = self.state.lock().await;
-        if state.selection != Some(selection) {
-            return;
+    pub(crate) async fn finish_preview_phase(&self, token: &CollectionProgressToken) -> bool {
+        let changed = {
+            let mut state = self.state.lock().await;
+            if !Self::collection_token_matches(&state, token)
+                || state.collection.phase != CollectionPhase::Previews
+            {
+                false
+            } else {
+                // As above, Complete and the empty cursor are committed
+                // together so stale preview drivers cannot strand a cursor.
+                state.collection = CollectionState {
+                    phase: CollectionPhase::Complete,
+                    cursor: None,
+                };
+                true
+            }
+        };
+        if changed {
+            self.notify_waiters();
         }
-        if state.collection.phase == CollectionPhase::Previews {
-            state.collection.phase = CollectionPhase::Complete;
-            state.collection.cursor = None;
-        }
-        drop(state);
-        self.notify_waiters();
+        changed
     }
 
     pub(crate) async fn collection_state(&self) -> (CollectionPhase, Option<WallCursorKey>) {
@@ -1969,26 +2039,43 @@ mod tests {
             (CollectionPhase::Thumbnails, None)
         );
 
+        let thumbnail_token = fixture
+            .coordinator
+            .collection_progress_token(fixture.selection)
+            .await
+            .expect("thumbnail token");
+
         let thumbnail_cursor = WallCursorKey::Provisional {
             order: 2,
             id: fixture_id(2),
         };
         fixture
             .coordinator
-            .advance_collection(fixture.selection, Some(thumbnail_cursor.clone()))
+            .advance_collection(&thumbnail_token, Some(thumbnail_cursor.clone()))
             .await;
         assert_eq!(
             fixture.coordinator.collection_state().await,
             (CollectionPhase::Thumbnails, Some(thumbnail_cursor))
         );
+        let thumbnail_token = fixture
+            .coordinator
+            .collection_progress_token(fixture.selection)
+            .await
+            .expect("advanced thumbnail token");
         fixture
             .coordinator
-            .finish_thumbnail_phase(fixture.selection)
+            .finish_thumbnail_phase(&thumbnail_token)
             .await;
         assert_eq!(
             fixture.coordinator.collection_state().await,
             (CollectionPhase::Previews, None)
         );
+
+        let preview_token = fixture
+            .coordinator
+            .collection_progress_token(fixture.selection)
+            .await
+            .expect("preview token");
 
         let preview_cursor = WallCursorKey::Captured {
             captured_at_utc: "2026-08-28T00:00:00Z".to_owned(),
@@ -1997,19 +2084,119 @@ mod tests {
         };
         fixture
             .coordinator
-            .advance_collection(fixture.selection, Some(preview_cursor.clone()))
+            .advance_collection(&preview_token, Some(preview_cursor.clone()))
             .await;
         assert_eq!(
             fixture.coordinator.collection_state().await,
             (CollectionPhase::Previews, Some(preview_cursor))
         );
+        let preview_token = fixture
+            .coordinator
+            .collection_progress_token(fixture.selection)
+            .await
+            .expect("advanced preview token");
         fixture
             .coordinator
-            .finish_preview_phase(fixture.selection)
+            .finish_preview_phase(&preview_token)
             .await;
         assert_eq!(
             fixture.coordinator.collection_state().await,
             (CollectionPhase::Complete, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_collection_progress_token_cannot_advance_or_finish_after_rewind() {
+        let fixture = fixture();
+        fixture
+            .coordinator
+            .begin_collection(fixture.selection)
+            .await;
+        let thumbnail_token = fixture
+            .coordinator
+            .collection_progress_token(fixture.selection)
+            .await
+            .expect("collection token");
+        let thumbnail_cursor = WallCursorKey::Provisional {
+            order: 2,
+            id: fixture_id(2),
+        };
+        assert!(
+            fixture
+                .coordinator
+                .advance_collection(&thumbnail_token, Some(thumbnail_cursor.clone()))
+                .await
+        );
+        let advanced_token = fixture
+            .coordinator
+            .collection_progress_token(fixture.selection)
+            .await
+            .expect("advanced collection token");
+
+        fixture
+            .coordinator
+            .rewind_collection_to_thumbnails(fixture.selection)
+            .await;
+        assert!(
+            !fixture
+                .coordinator
+                .advance_collection(&advanced_token, Some(thumbnail_cursor))
+                .await
+        );
+        assert!(
+            !fixture
+                .coordinator
+                .finish_thumbnail_phase(&advanced_token)
+                .await
+        );
+        assert_eq!(
+            fixture.coordinator.collection_state().await,
+            (CollectionPhase::Thumbnails, None)
+        );
+
+        let fresh_thumbnail_token = fixture
+            .coordinator
+            .collection_progress_token(fixture.selection)
+            .await
+            .expect("fresh thumbnail token");
+        assert!(
+            fixture
+                .coordinator
+                .finish_thumbnail_phase(&fresh_thumbnail_token)
+                .await
+        );
+        let preview_token = fixture
+            .coordinator
+            .collection_progress_token(fixture.selection)
+            .await
+            .expect("preview token");
+        fixture.coordinator.invalidate_background().await;
+        fixture
+            .coordinator
+            .rewind_collection_to_thumbnails(fixture.selection)
+            .await;
+        assert!(
+            !fixture
+                .coordinator
+                .advance_collection(
+                    &preview_token,
+                    Some(WallCursorKey::Captured {
+                        captured_at_utc: "2026-08-28T00:00:00Z".to_owned(),
+                        display_path: "photo.jpg".to_owned(),
+                        id: fixture_id(3),
+                    }),
+                )
+                .await
+        );
+        assert!(
+            !fixture
+                .coordinator
+                .finish_preview_phase(&preview_token)
+                .await
+        );
+        assert_eq!(
+            fixture.coordinator.collection_state().await,
+            (CollectionPhase::Thumbnails, None)
         );
     }
 
@@ -2019,6 +2206,11 @@ mod tests {
         let old_selection = fixture.selection;
         let new_selection = selection(2);
         fixture.coordinator.begin_collection(old_selection).await;
+        let stale_token = fixture
+            .coordinator
+            .collection_progress_token(old_selection)
+            .await
+            .expect("old selection token");
         fixture.coordinator.reset_selection(new_selection).await;
         fixture.coordinator.begin_collection(old_selection).await;
         assert_eq!(fixture.coordinator.selection().await, Some(new_selection));
@@ -2033,11 +2225,7 @@ mod tests {
         };
         fixture
             .coordinator
-            .advance_collection(old_selection, Some(stale_cursor))
-            .await;
-        fixture
-            .coordinator
-            .finish_thumbnail_phase(old_selection)
+            .advance_collection(&stale_token, Some(stale_cursor))
             .await;
         assert_eq!(
             fixture.coordinator.collection_state().await,
@@ -2045,18 +2233,20 @@ mod tests {
         );
 
         fixture.coordinator.begin_collection(new_selection).await;
+        let new_token = fixture
+            .coordinator
+            .collection_progress_token(new_selection)
+            .await
+            .expect("new selection token");
         fixture
             .coordinator
-            .finish_thumbnail_phase(old_selection)
+            .finish_thumbnail_phase(&stale_token)
             .await;
         assert_eq!(
             fixture.coordinator.collection_state().await,
             (CollectionPhase::Thumbnails, None)
         );
-        fixture
-            .coordinator
-            .finish_thumbnail_phase(new_selection)
-            .await;
+        fixture.coordinator.finish_thumbnail_phase(&new_token).await;
         assert_eq!(
             fixture.coordinator.collection_state().await,
             (CollectionPhase::Previews, None)

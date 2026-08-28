@@ -434,6 +434,20 @@ async fn recv_derivatives_until(
     }
 }
 
+fn wall_cache_key(asset: &photo_catalog::AssetRecord) -> String {
+    photo_cache::DerivativeKey::compute(&photo_cache::DerivativeSpec {
+        asset_id: asset.id,
+        signature: asset.signature,
+        orientation: asset.orientation.unwrap_or(1),
+        kind: photo_cache::DerivativeKind::WallThumbnail,
+        decoder_version: "image-0.25-v1".to_owned(),
+        colour_space: "srgb".to_owned(),
+        target: photo_cache::DerivativeTarget::LongEdge(1024),
+    })
+    .as_str()
+    .to_owned()
+}
+
 fn query(direction: SortDirection) -> WallQueryRequest {
     WallQueryRequest {
         cursor: None,
@@ -1825,6 +1839,363 @@ async fn terminal_failure_retries_only_after_derivative_key_changes() {
     assert!(matches!(ready, WallUpdate::DerivativesReady { .. }));
 }
 
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_failure_restart_skips_same_key_and_retries_changed_key_once() {
+    let fixture = ProgressiveFixture::new(1);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let asset_id = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items[0]
+        .id
+        .clone();
+    let original = std::fs::read(fixture.source.join("photo-000.jpg")).unwrap();
+    std::fs::write(
+        fixture.source.join("photo-000.jpg"),
+        b"damaged after indexing",
+    )
+    .unwrap();
+
+    let first_attempts = Arc::new(AtomicUsize::new(0));
+    let first_entered = Arc::new(tokio::sync::Notify::new());
+    let first_release = Arc::new(tokio::sync::Notify::new());
+    service
+        .install_derivative_test_class_gate_with_counter(
+            DerivativeClass::WallThumbnail,
+            first_entered.clone(),
+            first_release.clone(),
+            first_attempts.clone(),
+        )
+        .await;
+    let first_request_service = service.clone();
+    let first_request_asset = asset_id.clone();
+    let first_request = tokio::spawn(async move {
+        first_request_service
+            .request_derivatives(DerivativeRequest::visible(vec![first_request_asset]))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), first_entered.notified())
+        .await
+        .expect("initial terminal attempt should reach the gate");
+    assert_eq!(first_attempts.load(Ordering::SeqCst), 1);
+    first_release.notify_waiters();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), first_request)
+            .await
+            .expect("initial terminal request did not finish after release")
+            .unwrap()
+            .is_err()
+    );
+    recv_until(
+        &mut updates,
+        |event| matches!(event, WallUpdate::Warning { asset_id: Some(id), .. } if id == &asset_id),
+    )
+    .await;
+    let failed_before_restart = Catalog::open(&fixture.config.catalog_path())
+        .unwrap()
+        .find_asset(AssetId::from_uuid(
+            uuid::Uuid::parse_str(&asset_id).unwrap(),
+        ))
+        .unwrap()
+        .unwrap();
+    let old_key = wall_cache_key(&failed_before_restart);
+    assert!(
+        Catalog::open(&fixture.config.catalog_path())
+            .unwrap()
+            .find_terminal_derivative_failure(
+                failed_before_restart.id,
+                "wall_thumbnail",
+                &old_key,
+                failed_before_restart.availability,
+            )
+            .unwrap()
+            .is_some()
+    );
+    drop(service);
+
+    let reopen_config = fixture.config.clone();
+    let reopened = std::thread::spawn(move || {
+        AppService::open_with_reader(
+            reopen_config,
+            Arc::new(photo_indexer::DefaultMetadataReader),
+        )
+    })
+    .join()
+    .unwrap()
+    .unwrap();
+    reopened
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    let mut reopened_updates = reopened.subscribe_wall_updates();
+
+    let same_key_attempts = Arc::new(AtomicUsize::new(0));
+    let same_key_entered = Arc::new(tokio::sync::Notify::new());
+    let same_key_release = Arc::new(tokio::sync::Notify::new());
+    reopened
+        .install_derivative_test_class_gate_with_counter(
+            DerivativeClass::WallThumbnail,
+            same_key_entered,
+            same_key_release,
+            same_key_attempts.clone(),
+        )
+        .await;
+    assert!(
+        reopened
+            .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
+            .await
+            .is_err()
+    );
+    assert_eq!(same_key_attempts.load(Ordering::SeqCst), 0);
+
+    let mut changed = original;
+    changed.extend_from_slice(b"newer source signature");
+    std::fs::write(fixture.source.join("photo-000.jpg"), changed).unwrap();
+    reopened.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut reopened_updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let changed_asset = Catalog::open(&fixture.config.catalog_path())
+        .unwrap()
+        .find_asset(AssetId::from_uuid(
+            uuid::Uuid::parse_str(&asset_id).unwrap(),
+        ))
+        .unwrap()
+        .unwrap();
+    let changed_key = wall_cache_key(&changed_asset);
+    assert_ne!(changed_key, old_key);
+
+    let changed_attempts = Arc::new(AtomicUsize::new(0));
+    let changed_entered = Arc::new(tokio::sync::Notify::new());
+    let changed_release = Arc::new(tokio::sync::Notify::new());
+    reopened
+        .install_derivative_test_class_gate_with_counter(
+            DerivativeClass::WallThumbnail,
+            changed_entered.clone(),
+            changed_release.clone(),
+            changed_attempts.clone(),
+        )
+        .await;
+    let changed_request_service = reopened.clone();
+    let changed_request_asset = asset_id.clone();
+    let changed_request = tokio::spawn(async move {
+        changed_request_service
+            .request_derivatives(DerivativeRequest::visible(vec![changed_request_asset]))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), changed_entered.notified())
+        .await
+        .expect("changed terminal attempt should reach the gate");
+    assert_eq!(changed_attempts.load(Ordering::SeqCst), 1);
+    changed_release.notify_waiters();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), changed_request)
+            .await
+            .expect("changed terminal request did not finish after release")
+            .unwrap()
+            .is_ok()
+    );
+    let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    assert!(
+        catalog
+            .find_terminal_derivative_failure(
+                changed_asset.id,
+                "wall_thumbnail",
+                &changed_key,
+                changed_asset.availability,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        catalog
+            .find_terminal_derivative_failure(
+                changed_asset.id,
+                "wall_thumbnail",
+                &old_key,
+                changed_asset.availability,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(catalog.warning_count().unwrap(), 0);
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_failure_restart_skips_same_availability_and_retries_after_recovery_once() {
+    let fixture = ProgressiveFixture::new(1);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let asset_id = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items[0]
+        .id
+        .clone();
+    let asset_uuid = AssetId::from_uuid(uuid::Uuid::parse_str(&asset_id).unwrap());
+    let (library_id, old_key) = {
+        let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+        let asset = catalog.find_asset(asset_uuid).unwrap().unwrap();
+        (asset.library_id, wall_cache_key(&asset))
+    };
+    Catalog::open(&fixture.config.catalog_path())
+        .unwrap()
+        .mark_root_offline(library_id)
+        .unwrap();
+
+    let first_attempts = Arc::new(AtomicUsize::new(0));
+    let first_entered = Arc::new(tokio::sync::Notify::new());
+    let first_release = Arc::new(tokio::sync::Notify::new());
+    service
+        .install_derivative_test_class_gate_with_counter(
+            DerivativeClass::WallThumbnail,
+            first_entered,
+            first_release,
+            first_attempts.clone(),
+        )
+        .await;
+    assert!(
+        service
+            .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
+            .await
+            .is_err()
+    );
+    assert_eq!(first_attempts.load(Ordering::SeqCst), 0);
+    recv_until(&mut updates, |event| {
+        matches!(
+            event,
+            WallUpdate::Warning {
+                asset_id: Some(id),
+                warning: WallWarningState { retryable: false, .. },
+                ..
+            } if id == &asset_id
+        )
+    })
+    .await;
+    drop(service);
+
+    let reopen_config = fixture.config.clone();
+    let reopened = std::thread::spawn(move || {
+        AppService::open_with_reader(
+            reopen_config,
+            Arc::new(photo_indexer::DefaultMetadataReader),
+        )
+    })
+    .join()
+    .unwrap()
+    .unwrap();
+    reopened
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    let mut reopened_updates = reopened.subscribe_wall_updates();
+    let same_attempts = Arc::new(AtomicUsize::new(0));
+    let same_entered = Arc::new(tokio::sync::Notify::new());
+    let same_release = Arc::new(tokio::sync::Notify::new());
+    reopened
+        .install_derivative_test_class_gate_with_counter(
+            DerivativeClass::WallThumbnail,
+            same_entered,
+            same_release,
+            same_attempts.clone(),
+        )
+        .await;
+    assert!(
+        reopened
+            .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
+            .await
+            .is_err()
+    );
+    assert_eq!(same_attempts.load(Ordering::SeqCst), 0);
+
+    reopened.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut reopened_updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let recovered_asset = Catalog::open(&fixture.config.catalog_path())
+        .unwrap()
+        .find_asset(asset_uuid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(wall_cache_key(&recovered_asset), old_key);
+    assert_eq!(
+        recovered_asset.availability,
+        photo_domain::Availability::Available
+    );
+
+    let recovery_attempts = Arc::new(AtomicUsize::new(0));
+    let recovery_entered = Arc::new(tokio::sync::Notify::new());
+    let recovery_release = Arc::new(tokio::sync::Notify::new());
+    reopened
+        .install_derivative_test_class_gate_with_counter(
+            DerivativeClass::WallThumbnail,
+            recovery_entered.clone(),
+            recovery_release.clone(),
+            recovery_attempts.clone(),
+        )
+        .await;
+    let recovery_service = reopened.clone();
+    let recovery_request = tokio::spawn(async move {
+        recovery_service
+            .request_derivatives(DerivativeRequest::visible(vec![asset_id]))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), recovery_entered.notified())
+        .await
+        .expect("availability recovery should reach one wall attempt");
+    assert_eq!(recovery_attempts.load(Ordering::SeqCst), 1);
+    recovery_release.notify_waiters();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), recovery_request)
+            .await
+            .expect("availability recovery request did not finish")
+            .unwrap()
+            .is_ok()
+    );
+    let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    assert!(
+        catalog
+            .find_terminal_derivative_failure(
+                asset_uuid,
+                "wall_thumbnail",
+                &old_key,
+                photo_domain::Availability::RootOffline,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(catalog.warning_count().unwrap(), 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn online_reopen_prefetches_the_full_group_when_only_wall_rows_are_durable() {
     let fixture = ProgressiveFixture::new(2);
@@ -1996,6 +2367,10 @@ async fn every_photo_page_reaches_wall_outcome_before_background_screens_begin()
 
     let wall_entered = Arc::new(tokio::sync::Notify::new());
     let wall_release = Arc::new(tokio::sync::Notify::new());
+    let screen_encode_starts = Arc::new(AtomicUsize::new(0));
+    service
+        .install_screen_preview_encode_test_counter(screen_encode_starts.clone())
+        .await;
     service
         .install_derivative_test_gate(
             late_asset,
@@ -2025,6 +2400,11 @@ async fn every_photo_page_reaches_wall_outcome_before_background_screens_begin()
             "the gated late-page wall thumbnail must not be published while blocked"
         );
     }
+    assert_eq!(
+        screen_encode_starts.load(Ordering::SeqCst),
+        0,
+        "screen encoding must not start while a late wall page is blocked"
+    );
     let screen_rows = Catalog::open(&fixture.config.catalog_path())
         .unwrap()
         .all_derivatives()
@@ -2053,6 +2433,7 @@ async fn every_photo_page_reaches_wall_outcome_before_background_screens_begin()
     })
     .await
     .expect("screen previews should resume after full wall coverage");
+    assert!(screen_encode_starts.load(Ordering::SeqCst) > 0);
     let observation_after_release = observation.lock().unwrap();
     assert_eq!(
         observation_after_release.wall_count_before_first_screen,

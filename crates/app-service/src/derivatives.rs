@@ -383,15 +383,9 @@ impl AppService {
                 continue;
             }
             if let Some(existing) = existing {
-                let _ = state.libraries.catalog_mut().clear_warning(
-                    selection.library_id,
-                    Some(id),
-                    TERMINAL_ASSET_DERIVATIVE_WARNING,
-                );
-                let _ = state
-                    .libraries
-                    .catalog_mut()
-                    .clear_terminal_derivative_failure(id, kind);
+                let catalog = state.libraries.catalog_mut();
+                catalog.clear_terminal_derivative_failure(id, kind)?;
+                let _ = clear_terminal_warning_if_resolved(catalog, selection.library_id, id)?;
                 ready.push(reference(id, class, existing.cache_key.clone()));
             } else {
                 let Some(relative) = asset.relative_path.to_path_buf().ok() else {
@@ -967,10 +961,18 @@ impl AppService {
                 }
                 let source = pending.source;
                 let spec = pending.spec;
+                #[cfg(any(test, debug_assertions))]
+                let encode_counter = self.screen_preview_encode_test_counter.lock().await.clone();
                 let encoded = tokio::task::spawn_blocking({
                     let generator = generator.clone();
                     let spec = spec.clone();
-                    move || generator.encode_screen_preview(&source, &spec)
+                    move || {
+                        #[cfg(any(test, debug_assertions))]
+                        if let Some(counter) = encode_counter {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                        }
+                        generator.encode_screen_preview(&source, &spec)
+                    }
                 })
                 .await
                 .map_err(|_| GenerationFailure {
@@ -1301,6 +1303,13 @@ impl AppService {
     #[doc(hidden)]
     pub async fn install_screen_preview_commit_test_counter(&self, counter: Arc<AtomicUsize>) {
         *self.screen_preview_commit_test_counter.lock().await = Some(counter);
+    }
+
+    /// Installs a counter at the start of screen-preview encoding.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_screen_preview_encode_test_counter(&self, counter: Arc<AtomicUsize>) {
+        *self.screen_preview_encode_test_counter.lock().await = Some(counter);
     }
 
     /// Installs a class-wide deterministic derivative boundary for integration tests.
@@ -1634,7 +1643,20 @@ impl AppService {
         };
         let recent_set = recent_ids.iter().copied().collect::<HashSet<_>>();
 
+        let phase = self.coordinator.collection_phase().await;
         if !full_group {
+            // Recent background work is a preview-only phase.  A recent
+            // driver can acquire the collection mutex before the full-group
+            // driver, so release it immediately while thumbnails are still
+            // dormant or draining; returning Blocked here would strand the
+            // full-group driver behind an endless retry loop.
+            if !matches!(
+                phase,
+                crate::derivative_coordinator::CollectionPhase::Previews
+                    | crate::derivative_coordinator::CollectionPhase::Complete
+            ) {
+                return PreviewPrefetchOutcome::Complete;
+            }
             let Ok((wall_selection, _wall_ready, blocked)) = self
                 .ensure_wall_thumbnails_lane(
                     &recent_ids,
@@ -1659,7 +1681,6 @@ impl AppService {
             return outcome;
         }
 
-        let phase = self.coordinator.collection_phase().await;
         if phase == crate::derivative_coordinator::CollectionPhase::Complete {
             let outcome = self
                 .run_screen_preview_batch(&recent_ids, selection, generation)
@@ -1673,9 +1694,10 @@ impl AppService {
             self.coordinator.begin_collection(selection).await;
         }
 
-        let phase = self.coordinator.collection_phase().await;
-        let mut cursor = self.coordinator.collection_cursor().await;
-        if phase == crate::derivative_coordinator::CollectionPhase::Thumbnails {
+        let Some(mut token) = self.coordinator.collection_progress_token(selection).await else {
+            return PreviewPrefetchOutcome::Stale;
+        };
+        if token.phase == crate::derivative_coordinator::CollectionPhase::Thumbnails {
             loop {
                 if self.coordinator.background_generation().await != generation {
                     return PreviewPrefetchOutcome::Stale;
@@ -1684,7 +1706,7 @@ impl AppService {
                     return PreviewPrefetchOutcome::Blocked;
                 }
                 let Ok((page_selection, page_ids, next)) =
-                    self.remaining_group_ids_page(cursor.clone(), None)
+                    self.remaining_group_ids_page(token.cursor.clone(), None)
                 else {
                     return PreviewPrefetchOutcome::Terminate;
                 };
@@ -1708,14 +1730,24 @@ impl AppService {
                         return PreviewPrefetchOutcome::Blocked;
                     }
                 }
-                self.coordinator
-                    .advance_collection(selection, next.clone())
-                    .await;
-                let Some(next) = next else {
-                    self.coordinator.finish_thumbnail_phase(selection).await;
+                let advanced = match next.clone() {
+                    Some(next) => {
+                        self.coordinator
+                            .advance_collection(&token, Some(next))
+                            .await
+                    }
+                    None => self.coordinator.finish_thumbnail_phase(&token).await,
+                };
+                if !advanced {
+                    return PreviewPrefetchOutcome::Stale;
+                }
+                let Some(_next) = next else {
                     break;
                 };
-                cursor = Some(next);
+                token = match self.coordinator.collection_progress_token(selection).await {
+                    Some(token) => token,
+                    None => return PreviewPrefetchOutcome::Stale,
+                };
             }
         }
 
@@ -1726,7 +1758,16 @@ impl AppService {
             return recent_outcome;
         }
 
-        let mut cursor = self.coordinator.collection_cursor().await;
+        let Some(mut token) = self.coordinator.collection_progress_token(selection).await else {
+            return PreviewPrefetchOutcome::Stale;
+        };
+        if token.phase != crate::derivative_coordinator::CollectionPhase::Previews {
+            return if token.phase == crate::derivative_coordinator::CollectionPhase::Complete {
+                PreviewPrefetchOutcome::Complete
+            } else {
+                PreviewPrefetchOutcome::Stale
+            };
+        }
         loop {
             if self.coordinator.background_generation().await != generation {
                 return PreviewPrefetchOutcome::Stale;
@@ -1735,7 +1776,7 @@ impl AppService {
                 return PreviewPrefetchOutcome::Blocked;
             }
             let Ok((page_selection, page_ids, next)) =
-                self.remaining_group_ids_page(cursor.clone(), Some(&recent_set))
+                self.remaining_group_ids_page(token.cursor.clone(), Some(&recent_set))
             else {
                 return PreviewPrefetchOutcome::Terminate;
             };
@@ -1765,15 +1806,25 @@ impl AppService {
             {
                 return PreviewPrefetchOutcome::Blocked;
             }
-            self.coordinator
-                .advance_collection(selection, next.clone())
-                .await;
-            let Some(next) = next else {
+            let advanced = match next.clone() {
+                Some(next) => {
+                    self.coordinator
+                        .advance_collection(&token, Some(next))
+                        .await
+                }
+                None => self.coordinator.finish_preview_phase(&token).await,
+            };
+            if !advanced {
+                return PreviewPrefetchOutcome::Stale;
+            }
+            let Some(_next) = next else {
                 break;
             };
-            cursor = Some(next);
+            token = match self.coordinator.collection_progress_token(selection).await {
+                Some(token) => token,
+                None => return PreviewPrefetchOutcome::Stale,
+            };
         }
-        self.coordinator.finish_preview_phase(selection).await;
         self.coordinator.remove_recent(&recent_set).await;
         PreviewPrefetchOutcome::Complete
     }
@@ -2273,22 +2324,29 @@ impl AppService {
                 Some(asset_id),
                 ASSET_DERIVATIVE_WARNING,
             )?;
-            let terminal_warning_removed = state.libraries.catalog_mut().clear_warning(
-                selection.library_id,
-                Some(asset_id),
-                TERMINAL_ASSET_DERIVATIVE_WARNING,
-            )?;
             let cache_warning_removed = state.libraries.catalog_mut().clear_warning(
                 selection.library_id,
                 None,
                 catalog_code,
             )?;
-            state
-                .libraries
-                .catalog_mut()
-                .clear_terminal_derivative_failure(asset_id, derivative_kind_name(class))?;
+            let catalog = state.libraries.catalog_mut();
+            catalog.clear_terminal_derivative_failure(asset_id, derivative_kind_name(class))?;
+            let has_current_terminal_failure = match catalog.find_asset(asset_id)? {
+                Some(asset) => has_current_terminal_derivative_failure(catalog, &asset)?,
+                None => true,
+            };
+            let terminal_warning_removed = if has_current_terminal_failure {
+                0
+            } else {
+                catalog.clear_warning(
+                    selection.library_id,
+                    Some(asset_id),
+                    TERMINAL_ASSET_DERIVATIVE_WARNING,
+                )?
+            };
             let source_id = selection.library_id.as_uuid().hyphenated().to_string();
-            if asset_warning_removed + terminal_warning_removed > 0 {
+            if !has_current_terminal_failure && asset_warning_removed + terminal_warning_removed > 0
+            {
                 let _ = self.updates.send(WallUpdate::WarningCleared {
                     selection_id: selection.selection_id(),
                     source_id: source_id.clone(),
@@ -2330,6 +2388,51 @@ fn cache_warning_identity(class: DerivativeClass) -> (&'static str, &'static str
             "The preview cache is unavailable. Browsing can continue while the app retries it.",
         ),
     }
+}
+
+fn has_current_terminal_derivative_failure(
+    catalog: &Catalog,
+    asset: &photo_catalog::AssetRecord,
+) -> Result<bool, photo_catalog::CatalogError> {
+    if asset.media_kind == MediaKind::Video || asset.folder_group_id.is_none() {
+        return Ok(false);
+    }
+    for class in [
+        DerivativeClass::WallThumbnail,
+        DerivativeClass::ScreenPreview,
+    ] {
+        let key = DerivativeKey::compute(&derivative_spec(asset, class));
+        if catalog
+            .find_terminal_derivative_failure(
+                asset.id,
+                derivative_kind_name(class),
+                key.as_str(),
+                asset.availability,
+            )?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn clear_terminal_warning_if_resolved(
+    catalog: &mut Catalog,
+    library_id: photo_domain::LibraryId,
+    asset_id: AssetId,
+) -> Result<u64, photo_catalog::CatalogError> {
+    let Some(asset) = catalog.find_asset(asset_id)? else {
+        return Ok(0);
+    };
+    if has_current_terminal_derivative_failure(catalog, &asset)? {
+        return Ok(0);
+    }
+    catalog.clear_warning(
+        library_id,
+        Some(asset_id),
+        TERMINAL_ASSET_DERIVATIVE_WARNING,
+    )
 }
 
 fn parse_ids(raw_ids: Vec<String>) -> Result<Vec<AssetId>, AppServiceError> {
@@ -2465,12 +2568,17 @@ mod tests {
     use std::time::Duration;
 
     use image::{ImageBuffer, Rgb};
+    #[cfg(debug_assertions)]
+    use photo_cache::DerivativeKey;
     use photo_cache::{
         CacheBudget, DerivativeKind, DerivativeSpec, DerivativeTarget, EncodedScreenPreview,
         ImageDerivativeGenerator,
     };
     #[cfg(debug_assertions)]
-    use photo_catalog::{AssetShapeUpdate, CatalogIndexRecord, ShapeStatus};
+    use photo_catalog::{
+        AssetShapeUpdate, CatalogIndexRecord, CatalogWarningRecord, ShapeStatus,
+        TerminalDerivativeFailure,
+    };
     use photo_catalog::{Catalog, NewAsset};
     use photo_domain::{AssetId, FileSignature, MediaKind, RelativePathKey};
     use photo_indexer::{JobPriority, MetadataReader};
@@ -2676,6 +2784,353 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[tokio::test]
+    async fn recent_background_driver_cannot_encode_before_preview_phase() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(&source).unwrap();
+        let image_path = source.join("photo.jpg");
+        ImageBuffer::from_pixel(8, 8, Rgb([20_u8, 40, 60]))
+            .save(&image_path)
+            .unwrap();
+        let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+        let service = AppService::open(config).unwrap();
+        let (_, selection) = service.select_recent(&source).unwrap();
+        service.coordinator.ensure_selection(selection).await;
+        let asset = NewAsset {
+            id: AssetId::for_path(
+                selection.library_id,
+                &RelativePathKey::from_relative_path(Path::new("photo.jpg")).unwrap(),
+            ),
+            library_id: selection.library_id,
+            relative_path: RelativePathKey::from_relative_path(Path::new("photo.jpg")).unwrap(),
+            display_path: "photo.jpg".to_owned(),
+            media_kind: MediaKind::Jpeg,
+            signature: FileSignature {
+                size_bytes: std::fs::metadata(&image_path).unwrap().len(),
+                modified_unix_ns: 1,
+                sidecar_modified_unix_ns: None,
+            },
+            folder_group_id: Some(selection.group_id),
+        };
+        {
+            let mut state = service.state().unwrap();
+            state
+                .libraries
+                .catalog_mut()
+                .apply_index_batch(&[
+                    CatalogIndexRecord::Discovered(asset.clone()),
+                    CatalogIndexRecord::Shaped(AssetShapeUpdate {
+                        asset_id: asset.id,
+                        width: 8,
+                        height: 8,
+                        orientation: Some(1),
+                        representative_rgb: None,
+                        shape_status: ShapeStatus::Ready,
+                    }),
+                ])
+                .unwrap();
+        }
+        service.coordinator.begin_collection(selection).await;
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_derivative_test_class_gate_with_counter(
+                DerivativeClass::ScreenPreview,
+                entered,
+                release,
+                starts.clone(),
+            )
+            .await;
+
+        service.run_screen_preview_prefetch(vec![asset.id]).await;
+
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            service.coordinator.collection_state().await,
+            (
+                crate::derivative_coordinator::CollectionPhase::Thumbnails,
+                None
+            )
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recent_driver_winning_collection_mutex_cannot_encode_before_full_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(&source).unwrap();
+        let image_path = source.join("photo.jpg");
+        ImageBuffer::from_pixel(8, 8, Rgb([20_u8, 40, 60]))
+            .save(&image_path)
+            .unwrap();
+        let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+        let service = AppService::open(config).unwrap();
+        let (_, selection) = service.select_recent(&source).unwrap();
+        service.coordinator.ensure_selection(selection).await;
+        let relative = RelativePathKey::from_relative_path(Path::new("photo.jpg")).unwrap();
+        let asset = NewAsset {
+            id: AssetId::for_path(selection.library_id, &relative),
+            library_id: selection.library_id,
+            relative_path: relative,
+            display_path: "photo.jpg".to_owned(),
+            media_kind: MediaKind::Jpeg,
+            signature: FileSignature {
+                size_bytes: std::fs::metadata(&image_path).unwrap().len(),
+                modified_unix_ns: 1,
+                sidecar_modified_unix_ns: None,
+            },
+            folder_group_id: Some(selection.group_id),
+        };
+        {
+            let mut state = service.state().unwrap();
+            state
+                .libraries
+                .catalog_mut()
+                .apply_index_batch(&[
+                    CatalogIndexRecord::Discovered(asset.clone()),
+                    CatalogIndexRecord::Shaped(AssetShapeUpdate {
+                        asset_id: asset.id,
+                        width: 8,
+                        height: 8,
+                        orientation: Some(1),
+                        representative_rgb: None,
+                        shape_status: ShapeStatus::Ready,
+                    }),
+                ])
+                .unwrap();
+        }
+        service.coordinator.begin_collection(selection).await;
+        let wall_entered = Arc::new(tokio::sync::Notify::new());
+        let wall_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_derivative_test_gate(
+                asset.id.as_uuid().hyphenated().to_string(),
+                DerivativeClass::WallThumbnail,
+                wall_entered.clone(),
+                wall_release.clone(),
+            )
+            .await
+            .unwrap();
+        let screen_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        service
+            .install_screen_preview_encode_test_counter(screen_starts.clone())
+            .await;
+        service
+            .scheduler
+            .set_interaction_mode(photo_indexer::InteractionMode::Idle)
+            .await;
+        let generation = service.coordinator.background_generation().await;
+
+        // Let the recent driver acquire and release the mutex first.  Its
+        // phase guard must make this a no-op, leaving the full driver free to
+        // own the subsequent thumbnail traversal.
+        service.start_collection_driver(vec![asset.id], false, selection, generation);
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        service.start_collection_driver(Vec::new(), true, selection, generation);
+        tokio::time::timeout(Duration::from_secs(5), wall_entered.notified())
+            .await
+            .expect("full-group driver should reach the gated wall");
+        assert_eq!(screen_starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            service.coordinator.collection_phase().await,
+            crate::derivative_coordinator::CollectionPhase::Thumbnails
+        );
+
+        wall_release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if service.coordinator.collection_phase().await
+                    == crate::derivative_coordinator::CollectionPhase::Complete
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("full-group driver should finish after the wall release");
+        assert!(screen_starts.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn clearing_one_terminal_class_keeps_warning_for_the_other_class() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(&source).unwrap();
+        let relative = RelativePathKey::from_relative_path(Path::new("photo.jpg")).unwrap();
+        let source_path = source.join("photo.jpg");
+        ImageBuffer::from_pixel(8, 8, Rgb([20_u8, 40, 60]))
+            .save(&source_path)
+            .unwrap();
+        let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+        let service = AppService::open(config.clone()).unwrap();
+        let (_, selection) = service.select_recent(&source).unwrap();
+        let asset = NewAsset {
+            id: AssetId::for_path(selection.library_id, &relative),
+            library_id: selection.library_id,
+            relative_path: relative,
+            display_path: "photo.jpg".to_owned(),
+            media_kind: MediaKind::Jpeg,
+            signature: FileSignature {
+                size_bytes: std::fs::metadata(&source_path).unwrap().len(),
+                modified_unix_ns: 1,
+                sidecar_modified_unix_ns: None,
+            },
+            folder_group_id: Some(selection.group_id),
+        };
+        {
+            let mut state = service.state().unwrap();
+            state
+                .libraries
+                .catalog_mut()
+                .apply_index_batch(&[
+                    CatalogIndexRecord::Discovered(asset.clone()),
+                    CatalogIndexRecord::Shaped(AssetShapeUpdate {
+                        asset_id: asset.id,
+                        width: 8,
+                        height: 8,
+                        orientation: Some(1),
+                        representative_rgb: None,
+                        shape_status: ShapeStatus::Ready,
+                    }),
+                ])
+                .unwrap();
+        }
+        let stored_asset = Catalog::open(&config.catalog_path())
+            .unwrap()
+            .find_asset(asset.id)
+            .unwrap()
+            .unwrap();
+        {
+            let mut state = service.state().unwrap();
+            for class in [
+                DerivativeClass::WallThumbnail,
+                DerivativeClass::ScreenPreview,
+            ] {
+                let key = DerivativeKey::compute(&super::derivative_spec(&stored_asset, class));
+                state
+                    .libraries
+                    .catalog_mut()
+                    .record_terminal_derivative_failure(&TerminalDerivativeFailure {
+                        asset_id: asset.id,
+                        kind: super::derivative_kind_name(class).to_owned(),
+                        cache_key: key.as_str().to_owned(),
+                        availability: stored_asset.availability,
+                        failure_code: "derivative_generation_terminal".to_owned(),
+                        occurred_at: 1,
+                    })
+                    .unwrap();
+            }
+            state
+                .libraries
+                .catalog_mut()
+                .record_warning_once(&CatalogWarningRecord {
+                    library_id: selection.library_id,
+                    asset_id: Some(asset.id),
+                    code: "derivative_generation_terminal".to_owned(),
+                    message: "terminal".to_owned(),
+                })
+                .unwrap();
+        }
+
+        service.clear_derivative_warnings(selection, asset.id, DerivativeClass::WallThumbnail);
+        let catalog = Catalog::open(&config.catalog_path()).unwrap();
+        let screen_key = DerivativeKey::compute(&super::derivative_spec(
+            &stored_asset,
+            DerivativeClass::ScreenPreview,
+        ));
+        assert!(
+            catalog
+                .find_terminal_derivative_failure(
+                    asset.id,
+                    "screen_preview",
+                    screen_key.as_str(),
+                    stored_asset.availability,
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(catalog.warning_count().unwrap(), 1);
+
+        service.clear_derivative_warnings(selection, asset.id, DerivativeClass::ScreenPreview);
+        let catalog = Catalog::open(&config.catalog_path()).unwrap();
+        assert_eq!(catalog.warning_count().unwrap(), 0);
+        assert!(
+            catalog
+                .find_terminal_derivative_failure(
+                    asset.id,
+                    "screen_preview",
+                    screen_key.as_str(),
+                    stored_asset.availability,
+                )
+                .unwrap()
+                .is_none()
+        );
+
+        let mut catalog = Catalog::open(&config.catalog_path()).unwrap();
+        let wall_key = DerivativeKey::compute(&super::derivative_spec(
+            &stored_asset,
+            DerivativeClass::WallThumbnail,
+        ));
+        catalog
+            .record_terminal_derivative_failure(&TerminalDerivativeFailure {
+                asset_id: asset.id,
+                kind: "wall_thumbnail".to_owned(),
+                cache_key: wall_key.as_str().to_owned(),
+                availability: stored_asset.availability,
+                failure_code: "derivative_generation_terminal".to_owned(),
+                occurred_at: 2,
+            })
+            .unwrap();
+        catalog
+            .record_terminal_derivative_failure(&TerminalDerivativeFailure {
+                asset_id: asset.id,
+                kind: "screen_preview".to_owned(),
+                cache_key: screen_key.as_str().to_owned(),
+                availability: stored_asset.availability,
+                failure_code: "derivative_generation_terminal".to_owned(),
+                occurred_at: 2,
+            })
+            .unwrap();
+        catalog
+            .record_warning_once(&CatalogWarningRecord {
+                library_id: selection.library_id,
+                asset_id: Some(asset.id),
+                code: "derivative_generation_terminal".to_owned(),
+                message: "terminal".to_owned(),
+            })
+            .unwrap();
+        drop(catalog);
+
+        service.clear_derivative_warnings(selection, asset.id, DerivativeClass::ScreenPreview);
+        let catalog = Catalog::open(&config.catalog_path()).unwrap();
+        assert!(
+            catalog
+                .find_terminal_derivative_failure(
+                    asset.id,
+                    "wall_thumbnail",
+                    wall_key.as_str(),
+                    stored_asset.availability,
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(catalog.warning_count().unwrap(), 1);
+        service.clear_derivative_warnings(selection, asset.id, DerivativeClass::WallThumbnail);
+        assert_eq!(
+            Catalog::open(&config.catalog_path())
+                .unwrap()
+                .warning_count()
+                .unwrap(),
+            0
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
     async fn remaining_idle_group_enumeration_stays_bounded_for_ten_thousand_assets() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("photos");
@@ -2757,6 +3212,124 @@ mod tests {
         assert!(snapshot.recent_len <= 250);
         assert!(snapshot.largest_loaded_page <= 250);
         assert!(snapshot.queued_jobs <= 250);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn collection_schedules_bounded_missing_work_with_concurrent_foreground_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(&source).unwrap();
+        let service = AppService::open(AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let (_bootstrap, selection) = service.select_recent(&source).unwrap();
+        service.coordinator.ensure_selection(selection).await;
+        let mut records = Vec::with_capacity(20_000);
+        let mut asset_ids = Vec::with_capacity(10_000);
+        {
+            let mut state = service.state().unwrap();
+            for index in 0..10_000 {
+                let relative = RelativePathKey::from_relative_path(std::path::Path::new(&format!(
+                    "photo-{index:05}.jpg"
+                )))
+                .unwrap();
+                let mut asset = NewAsset::minimal(
+                    selection.library_id,
+                    relative,
+                    format!("photo-{index:05}.jpg"),
+                    MediaKind::Jpeg,
+                    1,
+                );
+                asset.folder_group_id = Some(selection.group_id);
+                asset_ids.push(asset.id);
+                records.push(CatalogIndexRecord::Discovered(asset.clone()));
+                records.push(CatalogIndexRecord::Shaped(AssetShapeUpdate {
+                    asset_id: asset.id,
+                    width: 16,
+                    height: 9,
+                    orientation: Some(1),
+                    representative_rgb: None,
+                    shape_status: ShapeStatus::Ready,
+                }));
+                if records.len() >= 500 {
+                    state
+                        .libraries
+                        .catalog_mut()
+                        .apply_index_batch(&records)
+                        .unwrap();
+                    records.clear();
+                }
+            }
+            if !records.is_empty() {
+                state
+                    .libraries
+                    .catalog_mut()
+                    .apply_index_batch(&records)
+                    .unwrap();
+            }
+        }
+
+        let blocked_id = asset_ids[0];
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_derivative_test_gate(
+                blocked_id.as_uuid().hyphenated().to_string(),
+                DerivativeClass::WallThumbnail,
+                entered.clone(),
+                release.clone(),
+            )
+            .await
+            .unwrap();
+        service
+            .scheduler
+            .set_interaction_mode(photo_indexer::InteractionMode::Idle)
+            .await;
+        let generation = service.coordinator.background_generation().await;
+        let collection_service = service.clone();
+        let collection = tokio::spawn(async move {
+            collection_service
+                .run_preview_prefetch_until_stable(Vec::new(), true, selection, generation)
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("collection should schedule its first missing wall job");
+
+        let foreground_queued = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_visible_derivative_queue_test_hook(foreground_queued.clone())
+            .await;
+        let foreground_service = service.clone();
+        let foreground = tokio::spawn(async move {
+            foreground_service
+                .request_derivatives(crate::DerivativeRequest::visible(vec![
+                    blocked_id.as_uuid().hyphenated().to_string(),
+                ]))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), foreground_queued.notified())
+            .await
+            .expect("foreground request should be queued while collection is held");
+        let snapshot = service.coordinator.test_snapshot().await;
+        assert!(snapshot.largest_loaded_page <= 250);
+        assert!(snapshot.recent_len <= 250);
+        assert!(snapshot.queued_jobs <= 251);
+
+        release.notify_waiters();
+        // The bound is sampled while both collection and foreground work are
+        // live.  Stop those deterministic workers after the observation so a
+        // 10k fixture does not turn this bound test into a full image crawl.
+        collection.abort();
+        foreground.abort();
+        let _ = collection.await;
+        let _ = foreground.await;
+        service.coordinator.abort_all_attempts().await;
+        service.coordinator.invalidate_background().await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
     #[test]
