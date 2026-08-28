@@ -1,13 +1,14 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering};
 
 use crate::dto::{DerivativeClass, DerivativeReference};
 use crate::service::SelectionToken;
 use photo_catalog::WallCursorKey;
-use photo_domain::AssetId;
+use photo_domain::{AssetId, Availability};
 use photo_indexer::{IndexJob, IndexScheduler, JobPriority};
 use tokio::sync::{Mutex, Notify, oneshot};
 
@@ -33,12 +34,29 @@ impl WorkLane {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkKey {
     pub(crate) selection: SelectionToken,
     pub(crate) asset_id: AssetId,
     pub(crate) class: DerivativeClass,
     pub(crate) cache_key: String,
+    pub(crate) availability: Availability,
+}
+
+impl Hash for WorkKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.selection.hash(state);
+        self.asset_id.hash(state);
+        self.class.hash(state);
+        self.cache_key.hash(state);
+        let availability = match self.availability {
+            Availability::Available => 0_u8,
+            Availability::RootOffline => 1,
+            Availability::Missing => 2,
+            Availability::Unreadable => 3,
+        };
+        availability.hash(state);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -72,11 +90,20 @@ impl CommitPermit {
 pub(crate) type WorkResultReceiver = oneshot::Receiver<Option<DerivativeReference>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CollectionPhase {
+pub enum CollectionPhase {
     Dormant,
     Thumbnails,
     Previews,
     Complete,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CoordinatorTestSnapshot {
+    pub recent_len: usize,
+    pub largest_loaded_page: usize,
+    pub queued_jobs: usize,
+    pub phase: CollectionPhase,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -180,6 +207,8 @@ pub(crate) struct DerivativeCoordinator {
     wake: Arc<Notify>,
     change_generation: Arc<AtomicU64>,
     commit_completion_generation: Arc<AtomicU64>,
+    #[cfg(debug_assertions)]
+    largest_loaded_page: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     wait_test_hook: Arc<Mutex<Option<Arc<Notify>>>>,
     #[cfg(any(test, debug_assertions))]
@@ -206,6 +235,8 @@ impl DerivativeCoordinator {
             wake: Arc::new(Notify::new()),
             change_generation: Arc::new(AtomicU64::new(0)),
             commit_completion_generation: Arc::new(AtomicU64::new(0)),
+            #[cfg(debug_assertions)]
+            largest_loaded_page: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             wait_test_hook: Arc::new(Mutex::new(None)),
             #[cfg(any(test, debug_assertions))]
@@ -233,6 +264,8 @@ impl DerivativeCoordinator {
             wake: Arc::new(Notify::new()),
             change_generation: Arc::new(AtomicU64::new(0)),
             commit_completion_generation: Arc::new(AtomicU64::new(0)),
+            #[cfg(debug_assertions)]
+            largest_loaded_page: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             wait_test_hook: Arc::new(Mutex::new(None)),
             #[cfg(any(test, debug_assertions))]
@@ -658,6 +691,51 @@ impl DerivativeCoordinator {
         let _ = delivery_task.await;
     }
 
+    /// Finishes a committed attempt as an asset-terminal outcome.  Unlike a failed
+    /// commit this also remembers the exact work key, so a duplicate request for
+    /// the same source signature is answered without scheduling another attempt.
+    pub(crate) async fn terminal_commit(&self, permit: CommitPermit) -> bool {
+        let (waiters, completion) = {
+            let mut state = self.state.lock().await;
+            let ticket = WorkTicket {
+                job_id: permit.job_id,
+                attempt: permit.attempt,
+            };
+            let Some(ticket_state) = state.tickets.get(&ticket) else {
+                return false;
+            };
+            if ticket_state.status != TicketStatus::Committing
+                || ticket_state.key.selection != permit.selection
+            {
+                return false;
+            }
+            let key = ticket_state.key.clone();
+            let Some(work) = state.jobs.get(&key) else {
+                return false;
+            };
+            if work.ticket != Some(ticket) || work.status != JobStatus::Committing {
+                return false;
+            }
+            remember_terminal(&mut state, key.clone());
+            let work = state.jobs.remove(&key).expect("job was present");
+            state.job_names.remove(&work.job_name);
+            state.tickets.remove(&ticket);
+            let completion = work.completion.clone();
+            let waiters = work
+                .foreground_waiters
+                .into_iter()
+                .chain(work.background_waiters)
+                .collect::<Vec<_>>();
+            (waiters, completion)
+        };
+        for waiter in waiters {
+            let _ = waiter.send(None);
+        }
+        completion.notify_waiters();
+        self.notify_waiters();
+        true
+    }
+
     pub(crate) async fn abort_attempt(&self, ticket: WorkTicket) {
         let status = {
             let state = self.state.lock().await;
@@ -865,6 +943,14 @@ impl DerivativeCoordinator {
         self.state.lock().await.recent.drain(..).collect()
     }
 
+    pub(crate) async fn remove_recent(&self, consumed: &HashSet<AssetId>) {
+        self.state
+            .lock()
+            .await
+            .recent
+            .retain(|asset_id| !consumed.contains(asset_id));
+    }
+
     pub(crate) async fn selection(&self) -> Option<SelectionToken> {
         self.state.lock().await.selection
     }
@@ -892,6 +978,8 @@ impl DerivativeCoordinator {
                 phase: CollectionPhase::Dormant,
                 cursor: None,
             };
+            #[cfg(debug_assertions)]
+            self.largest_loaded_page.store(0, AtomicOrdering::Release);
             let keys = state
                 .jobs
                 .iter()
@@ -925,10 +1013,27 @@ impl DerivativeCoordinator {
         } else {
             state.selection = Some(selection);
         }
-        state.collection = CollectionState {
-            phase: CollectionPhase::Thumbnails,
-            cursor: None,
-        };
+        if state.collection.phase == CollectionPhase::Dormant {
+            state.collection = CollectionState {
+                phase: CollectionPhase::Thumbnails,
+                cursor: None,
+            };
+        }
+        drop(state);
+        self.notify_waiters();
+    }
+
+    pub(crate) async fn rewind_collection_to_thumbnails(&self, selection: SelectionToken) {
+        let mut state = self.state.lock().await;
+        if state.selection != Some(selection) {
+            return;
+        }
+        if state.collection.phase != CollectionPhase::Thumbnails {
+            state.collection = CollectionState {
+                phase: CollectionPhase::Thumbnails,
+                cursor: None,
+            };
+        }
         drop(state);
         self.notify_waiters();
     }
@@ -991,6 +1096,23 @@ impl DerivativeCoordinator {
         self.state.lock().await.collection.cursor.clone()
     }
 
+    #[cfg(debug_assertions)]
+    pub(crate) fn note_loaded_page(&self, page_size: usize) {
+        self.largest_loaded_page
+            .fetch_max(page_size, AtomicOrdering::AcqRel);
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) async fn test_snapshot(&self) -> CoordinatorTestSnapshot {
+        let state = self.state.lock().await;
+        CoordinatorTestSnapshot {
+            recent_len: state.recent.len(),
+            largest_loaded_page: self.largest_loaded_page.load(AtomicOrdering::Acquire),
+            queued_jobs: state.jobs.len(),
+            phase: state.collection.phase,
+        }
+    }
+
     pub(crate) async fn mark_terminal(&self, ticket: WorkTicket) -> bool {
         let waiters = {
             let mut state = self.state.lock().await;
@@ -1008,7 +1130,7 @@ impl DerivativeCoordinator {
                 return false;
             }
 
-            state.terminal.insert(key.clone());
+            remember_terminal(&mut state, key.clone());
             let work = state.jobs.remove(&key).expect("job was present");
             state.job_names.remove(&work.job_name);
             state.tickets.remove(&ticket);
@@ -1140,6 +1262,16 @@ fn completed_after(
     })
 }
 
+fn remember_terminal(state: &mut CoordinatorState, key: WorkKey) {
+    state.terminal.insert(key);
+    while state.terminal.len() > RECENT_CAPACITY {
+        let Some(oldest) = state.terminal.iter().next().cloned() else {
+            break;
+        };
+        state.terminal.remove(&oldest);
+    }
+}
+
 fn current_completed(state: &CoordinatorState, key: &WorkKey) -> Option<CompletedCommit> {
     state.completed.get(key).and_then(|history| {
         history
@@ -1235,11 +1367,12 @@ fn queue_new_job(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Duration;
 
     use photo_catalog::WallCursorKey;
-    use photo_domain::{AssetId, FolderGroupId, LibraryId};
+    use photo_domain::{AssetId, Availability, FolderGroupId, LibraryId};
     use photo_indexer::{IndexScheduler, SchedulerConfig};
     use tokio::sync::Notify;
 
@@ -1293,6 +1426,7 @@ mod tests {
             asset_id,
             class: DerivativeClass::ScreenPreview,
             cache_key: cache_key.to_owned(),
+            availability: Availability::Available,
         }
     }
 
@@ -1315,15 +1449,31 @@ mod tests {
     #[tokio::test]
     async fn recent_window_is_deduplicated_and_capped_at_250() {
         let fixture = fixture();
-        for id in fixture_ids(0..300) {
+        for id in fixture_ids(0..10_000) {
             fixture.coordinator.note_recent(id).await;
         }
-        fixture.coordinator.note_recent(fixture_id(299)).await;
+        fixture.coordinator.note_recent(fixture_id(9_999)).await;
 
         let recent = fixture.coordinator.recent_ids().await;
         assert_eq!(recent.len(), 250);
-        assert_eq!(recent.first(), Some(&fixture_id(50)));
-        assert_eq!(recent.last(), Some(&fixture_id(299)));
+        assert_eq!(recent.first(), Some(&fixture_id(9_750)));
+        assert_eq!(recent.last(), Some(&fixture_id(9_999)));
+    }
+
+    #[tokio::test]
+    async fn removing_consumed_recent_ids_preserves_newer_entries() {
+        let fixture = fixture();
+        let consumed = fixture_id(1);
+        let newer = fixture_id(2);
+        fixture.coordinator.note_recent(consumed).await;
+        fixture.coordinator.note_recent(newer).await;
+
+        fixture
+            .coordinator
+            .remove_recent(&HashSet::from([consumed]))
+            .await;
+
+        assert_eq!(fixture.coordinator.recent_ids().await, vec![newer]);
     }
 
     #[tokio::test]
@@ -1376,6 +1526,31 @@ mod tests {
 
         assert_eq!(stale.await.unwrap(), None);
         assert_eq!(foreground.await.unwrap(), Some(reference()));
+    }
+
+    #[tokio::test]
+    async fn terminal_commit_releases_invalidation_waiters() {
+        let fixture = fixture();
+        let waiter = fixture
+            .coordinator
+            .enqueue(screen_key(), WorkLane::IdlePreview)
+            .await;
+        let ticket = fixture.coordinator.next_work().await.unwrap();
+        let permit = fixture
+            .coordinator
+            .admit_commit(ticket, fixture.selection, None)
+            .await
+            .expect("the background attempt should be admitted");
+        let coordinator = fixture.coordinator.clone();
+        let invalidation = tokio::spawn(async move {
+            coordinator.invalidate_background().await;
+        });
+        fixture.coordinator.terminal_commit(permit).await;
+        tokio::time::timeout(Duration::from_secs(1), invalidation)
+            .await
+            .expect("terminal commit must release invalidation")
+            .unwrap();
+        assert_eq!(waiter.await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -1574,6 +1749,7 @@ mod tests {
             asset_id: fixture_id(2),
             class: DerivativeClass::WallThumbnail,
             cache_key: "wall-v2".to_owned(),
+            availability: Availability::Available,
         };
         let waiter = fixture.enqueue(fresh, WorkLane::VisibleWall).await;
         assert!(fixture.coordinator.next_work().await.is_some());

@@ -196,6 +196,26 @@ impl AppService {
             return;
         };
         self.wake_derivative_workers();
+        if !selection_root.is_dir() {
+            if let Ok(mut state) = self.state.lock()
+                && state.active_scan == Some(owner)
+            {
+                let _ = mark_unavailable_selection(&mut state, owner);
+                state.active_scan = None;
+                state.active_cancel = None;
+                let _ = self.updates.send(WallUpdate::SourceUnavailable {
+                    selection_id: owner.selection.selection_id(),
+                    source_id: owner
+                        .selection
+                        .library_id
+                        .as_uuid()
+                        .hyphenated()
+                        .to_string(),
+                });
+            }
+            self.wake_derivative_workers();
+            return;
+        }
         let indexer = match FolderPolicyEngine::new(Vec::new()) {
             Ok(policy) => Indexer::with_scheduler(
                 self.metadata_reader.clone(),

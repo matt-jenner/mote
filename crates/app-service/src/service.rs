@@ -143,6 +143,7 @@ pub struct AppService {
     pub(crate) cache_budget: CacheBudget,
     pub(crate) protected_groups: ProtectedGroups,
     pub(crate) derivative_driver: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) collection_driver: Arc<tokio::sync::Mutex<()>>,
     #[cfg(any(test, debug_assertions))]
     pub(crate) derivative_test_gate: Arc<TokioMutex<Option<DerivativeTestGate>>>,
     #[cfg(any(test, debug_assertions))]
@@ -265,6 +266,7 @@ impl AppService {
             cache_budget,
             protected_groups: ProtectedGroups::default(),
             derivative_driver: Arc::new(tokio::sync::Mutex::new(())),
+            collection_driver: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(any(test, debug_assertions))]
             derivative_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]
@@ -646,6 +648,12 @@ impl AppService {
         })
     }
 
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn coordinator_test_snapshot(&self) -> crate::CoordinatorTestSnapshot {
+        self.coordinator.test_snapshot().await
+    }
+
     pub fn update_appearance(
         &self,
         appearance: Appearance,
@@ -741,14 +749,14 @@ pub(crate) fn wall_asset_from_record(
 }
 
 fn map_asset_warning_code(code: &str) -> crate::WallWarningState {
-    let public_code = if code == "derivative_generation_failed" {
-        "derivativeUnavailable"
-    } else {
-        "assetWarning"
+    let (public_code, retryable) = match code {
+        "derivative_generation_failed" => ("derivativeUnavailable", true),
+        "derivative_generation_terminal" => ("derivativeUnavailable", false),
+        _ => ("assetWarning", true),
     };
     crate::WallWarningState {
         code: public_code.to_owned(),
-        retryable: true,
+        retryable,
     }
 }
 

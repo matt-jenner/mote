@@ -362,6 +362,29 @@ impl ProgressiveFixture {
         }
     }
 
+    fn mixed_collection() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(&source).unwrap();
+        ImageBuffer::from_pixel(16, 12, Rgb([10_u8, 20, 30]))
+            .save(source.join("a.jpg"))
+            .unwrap();
+        std::fs::write(source.join("corrupt.jpg"), b"not a jpeg").unwrap();
+        ImageBuffer::from_pixel(16, 12, Rgb([50_u8, 50, 50]))
+            .save(source.join("offline.jpg"))
+            .unwrap();
+        ImageBuffer::from_pixel(16, 12, Rgb([30_u8, 20, 10]))
+            .save(source.join("b.jpg"))
+            .unwrap();
+        std::fs::write(source.join("clip.mp4"), b"not a video").unwrap();
+        let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+        Self {
+            temp,
+            source,
+            config,
+        }
+    }
+
     fn service(&self, reader: BlockingReader) -> AppService {
         AppService::open_with_reader(self.config.clone(), Arc::new(reader)).unwrap()
     }
@@ -1616,12 +1639,15 @@ async fn read_derivative_fails_closed_after_switching_active_source() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn derivative_failure_records_and_publishes_a_retryable_asset_warning() {
+async fn derivative_failure_records_and_publishes_a_terminal_asset_warning() {
     let fixture = ProgressiveFixture::new(1);
     let service =
         AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
             .unwrap();
     let mut updates = service.subscribe_wall_updates();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
     service.start_scan(&fixture.source).await.unwrap();
     recv_until(&mut updates, |event| {
         matches!(event, WallUpdate::MetadataSettled { .. })
@@ -1660,7 +1686,7 @@ async fn derivative_failure_records_and_publishes_a_retryable_asset_warning() {
         warning,
         WallUpdate::Warning {
             asset_id: Some(id),
-            warning: WallWarningState { retryable: true, .. },
+            warning: WallWarningState { retryable: false, .. },
             ..
         } if id == asset_id
     ));
@@ -1672,7 +1698,7 @@ async fn derivative_failure_records_and_publishes_a_retryable_asset_warning() {
         page.items[0]
             .warning
             .as_ref()
-            .is_some_and(|warning| warning.retryable && warning.code == "derivativeUnavailable")
+            .is_some_and(|warning| !warning.retryable && warning.code == "derivativeUnavailable")
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
@@ -1684,7 +1710,14 @@ async fn derivative_failure_records_and_publishes_a_retryable_asset_warning() {
         "wall and screen failures for one asset must share one bounded warning"
     );
 
-    std::fs::write(fixture.source.join("photo-000.jpg"), original).unwrap();
+    let mut changed = original.clone();
+    changed.extend_from_slice(b"newer source signature");
+    std::fs::write(fixture.source.join("photo-000.jpg"), changed).unwrap();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
     service
         .request_derivatives(photo_app_service::DerivativeRequest::visible(vec![
             asset_id,
@@ -1717,12 +1750,15 @@ async fn derivative_failure_records_and_publishes_a_retryable_asset_warning() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn repeated_derivative_failures_return_errors_until_the_asset_recovers() {
+async fn terminal_failure_retries_only_after_derivative_key_changes() {
     let fixture = ProgressiveFixture::new(1);
     let service =
         AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
             .unwrap();
     let mut updates = service.subscribe_wall_updates();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
     service.start_scan(&fixture.source).await.unwrap();
     recv_until(&mut updates, |event| {
         matches!(event, WallUpdate::MetadataSettled { .. })
@@ -1770,7 +1806,14 @@ async fn repeated_derivative_failures_return_errors_until_the_asset_recovers() {
         "the repeated failure must not publish a duplicate warning"
     );
 
-    std::fs::write(fixture.source.join("photo-000.jpg"), original).unwrap();
+    let mut changed = original.clone();
+    changed.extend_from_slice(b"newer source signature");
+    std::fs::write(fixture.source.join("photo-000.jpg"), changed).unwrap();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
     service
         .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
         .await
@@ -1869,7 +1912,7 @@ async fn online_reopen_prefetches_the_full_group_when_only_wall_rows_are_durable
 
 #[cfg(debug_assertions)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn full_group_prefetch_completes_all_wall_pages_before_any_screen_preview() {
+async fn every_photo_page_reaches_wall_outcome_before_background_screens_begin() {
     let fixture = ProgressiveFixture::new(301);
     let service = AppService::open_with_reader(
         fixture.config.clone(),
@@ -3545,6 +3588,182 @@ async fn screen_preview_prefetch_waits_for_foreground_indexing_to_drain() {
     .await;
     let screen = recv_derivatives_until(&mut updates, DerivativeClass::ScreenPreview, 4).await;
     assert_eq!(screen.len(), 4);
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_photo_failures_and_videos_do_not_starve_healthy_previews() {
+    let fixture = ProgressiveFixture::mixed_collection();
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+
+    std::fs::remove_file(fixture.source.join("offline.jpg")).unwrap();
+    service
+        .set_interaction(photo_app_service::InteractionState::Idle)
+        .await;
+
+    let screens = tokio::time::timeout(
+        Duration::from_secs(2),
+        recv_derivatives_until(&mut updates, DerivativeClass::ScreenPreview, 2),
+    )
+    .await
+    .expect("healthy photos should receive screen previews after terminal failures");
+    assert_eq!(screens.len(), 2);
+
+    let wall = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    assert_eq!(
+        wall.items
+            .iter()
+            .map(|asset| asset.display_name.as_str())
+            .collect::<Vec<_>>(),
+        ["a.jpg", "b.jpg", "corrupt.jpg", "offline.jpg"]
+    );
+    assert!(
+        wall.items
+            .iter()
+            .all(|asset| asset.media_kind != WallMediaKind::Video)
+    );
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_wall_failure_persists_a_nonretryable_warning() {
+    let fixture = ProgressiveFixture::mixed_collection();
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    service
+        .set_interaction(photo_app_service::InteractionState::Idle)
+        .await;
+
+    let warning = recv_until(&mut updates, |event| {
+        matches!(
+            event,
+            WallUpdate::Warning {
+                asset_id: Some(_),
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(matches!(
+        warning,
+        WallUpdate::Warning {
+            warning: WallWarningState {
+                code,
+                retryable: false,
+            },
+            ..
+        } if code == "derivativeUnavailable"
+    ));
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_failure_retries_when_availability_changes_without_a_new_key() {
+    let fixture = ProgressiveFixture::new(1);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let asset_id = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items[0]
+        .id
+        .clone();
+    let active_selection = Catalog::open(&fixture.config.catalog_path())
+        .unwrap()
+        .load_app_state()
+        .unwrap()
+        .active_selection
+        .unwrap();
+    Catalog::open(&fixture.config.catalog_path())
+        .unwrap()
+        .mark_root_offline(active_selection.library_id)
+        .unwrap();
+
+    service
+        .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
+        .await
+        .expect_err("an unavailable source must terminalize the wall request");
+    recv_until(&mut updates, |event| {
+        matches!(
+            event,
+            WallUpdate::Warning {
+                asset_id: Some(id),
+                warning: WallWarningState {
+                    retryable: false,
+                    ..
+                },
+                ..
+            } if id == &asset_id
+        )
+    })
+    .await;
+
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    service
+        .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
+        .await
+        .expect("the same source key must retry after availability recovers");
+    assert!(
+        service
+            .query_wall(query(SortDirection::OldestFirst))
+            .await
+            .unwrap()
+            .items[0]
+            .warning
+            .is_none()
+    );
+    assert_eq!(
+        Catalog::open(&fixture.config.catalog_path())
+            .unwrap()
+            .warning_count()
+            .unwrap(),
+        0
+    );
 }
 
 #[test]

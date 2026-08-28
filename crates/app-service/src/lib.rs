@@ -7,6 +7,8 @@ mod service;
 mod wall;
 
 pub use config::AppConfig;
+#[cfg(debug_assertions)]
+pub use derivative_coordinator::{CollectionPhase, CoordinatorTestSnapshot};
 pub use dto::{BootstrapState, SettingsState, SourceAvailability, SourceSummary};
 pub use dto::{
     DerivativeClass, DerivativePriority, DerivativeReference, DerivativeRequest, InteractionState,
