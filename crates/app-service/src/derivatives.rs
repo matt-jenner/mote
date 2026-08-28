@@ -14,7 +14,7 @@ use photo_cache::{
     ImageDerivativeGenerator,
 };
 use photo_catalog::{Catalog, NewDerivative, WallOrder};
-use photo_domain::{AssetId, Availability, DerivativeId, FolderGroupId};
+use photo_domain::{AssetId, Availability, DerivativeId, FolderGroupId, MediaKind};
 use photo_indexer::{IndexJob, InteractionMode, JobPriority};
 use tokio::sync::{Mutex, oneshot};
 
@@ -304,6 +304,13 @@ impl AppService {
         }
 
         let request_selection = self.active_selection_token()?;
+        let ids = {
+            let state = self.state()?;
+            photo_asset_ids_for_group(state.libraries.catalog(), request_selection.group_id, &ids)?
+        };
+        if ids.is_empty() {
+            return Ok(());
+        }
         let _wall_request = (request.kind == DerivativeClass::WallThumbnail)
             .then(|| self.begin_preview_wall_request(request_selection));
         let priority = match request.priority {
@@ -457,39 +464,46 @@ impl AppService {
             .canonical_root_key
             .to_path_buf()
             .map_err(|error| photo_catalog::CatalogError::InvalidData(error.to_string()))?;
+        let mut photo_assets = Vec::with_capacity(ids.len());
+        for id in ids.iter().copied() {
+            let asset = state
+                .libraries
+                .catalog()
+                .find_asset(id)?
+                .ok_or(AppServiceError::UnknownAsset)?;
+            if asset.folder_group_id != Some(group) {
+                return Err(AppServiceError::ForeignAsset);
+            }
+            if asset.media_kind != MediaKind::Video {
+                photo_assets.push((id, asset));
+            }
+        }
+        let photo_ids = photo_assets.iter().map(|(id, _)| *id).collect::<Vec<_>>();
         let kind = derivative_kind_name(class);
         let records = state
             .libraries
             .catalog()
-            .derivatives_for_assets(ids, kind)?;
+            .derivatives_for_assets(&photo_ids, kind)?;
         let prerequisite_records = match class {
             DerivativeClass::WallThumbnail => state.libraries.catalog().derivatives_for_assets(
-                ids,
+                &photo_ids,
                 derivative_kind_name(DerivativeClass::ScreenPreview),
             )?,
             DerivativeClass::ScreenPreview => state.libraries.catalog().derivatives_for_assets(
-                ids,
+                &photo_ids,
                 derivative_kind_name(DerivativeClass::WallThumbnail),
             )?,
         };
         let mut ready = Vec::new();
         let mut pending = Vec::new();
-        for id in ids {
-            let asset = state
-                .libraries
-                .catalog()
-                .find_asset(*id)?
-                .ok_or(AppServiceError::UnknownAsset)?;
-            if asset.folder_group_id != Some(group) {
-                return Err(AppServiceError::ForeignAsset);
-            }
+        for (id, asset) in photo_assets {
             let spec = derivative_spec(&asset, class);
             let key = DerivativeKey::compute(&spec);
             if class == DerivativeClass::ScreenPreview {
                 let wall_spec = derivative_spec(&asset, DerivativeClass::WallThumbnail);
                 let wall_key = DerivativeKey::compute(&wall_spec);
                 let wall_ready = prerequisite_records.iter().any(|record| {
-                    record.asset_id == *id
+                    record.asset_id == id
                         && record.folder_group_id == group
                         && record.cache_key == wall_key.as_str()
                 });
@@ -498,11 +512,11 @@ impl AppService {
                 }
             }
             if let Some(existing) = records.iter().find(|record| {
-                record.asset_id == *id
+                record.asset_id == id
                     && record.folder_group_id == group
                     && record.cache_key == key.as_str()
             }) {
-                ready.push(reference(*id, class, existing.cache_key.clone()));
+                ready.push(reference(id, class, existing.cache_key.clone()));
             } else {
                 let Some(relative) = asset.relative_path.to_path_buf().ok() else {
                     continue;
@@ -513,7 +527,7 @@ impl AppService {
                     prerequisite_records
                         .iter()
                         .find(|record| {
-                            record.asset_id == *id
+                            record.asset_id == id
                                 && record.folder_group_id == group
                                 && record.cache_key == screen_key.as_str()
                         })
@@ -524,7 +538,7 @@ impl AppService {
                 if matches!(asset.availability, Availability::Available) || cached_source.is_some()
                 {
                     pending.push(PendingDerivative {
-                        id: *id,
+                        id,
                         source: root.join(relative),
                         cached_source,
                         spec,
@@ -1634,6 +1648,26 @@ fn parse_ids(raw_ids: Vec<String>) -> Result<Vec<AssetId>, AppServiceError> {
         }
     }
     Ok(ids)
+}
+
+fn photo_asset_ids_for_group(
+    catalog: &Catalog,
+    group: FolderGroupId,
+    ids: &[AssetId],
+) -> Result<Vec<AssetId>, AppServiceError> {
+    let mut photo_ids = Vec::with_capacity(ids.len());
+    for id in ids {
+        let asset = catalog
+            .find_asset(*id)?
+            .ok_or(AppServiceError::UnknownAsset)?;
+        if asset.folder_group_id != Some(group) {
+            return Err(AppServiceError::ForeignAsset);
+        }
+        if asset.media_kind != MediaKind::Video {
+            photo_ids.push(*id);
+        }
+    }
+    Ok(photo_ids)
 }
 
 fn derivative_spec(asset: &photo_catalog::AssetRecord, class: DerivativeClass) -> DerivativeSpec {

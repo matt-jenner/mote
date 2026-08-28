@@ -130,6 +130,87 @@ fn wall_pages_skip_videos_before_limit_and_cursor_calculation() {
 }
 
 #[test]
+fn captured_wall_pages_skip_videos_and_preserve_literal_cursors() {
+    let fixture = WallFixture::with_assets([
+        captured_asset("a.jpg", MediaKind::Jpeg, 1, "2024-01-01T00:00:00Z"),
+        captured_asset("clip.mp4", MediaKind::Video, 2, "2024-01-02T00:00:00Z"),
+        captured_asset("b.jpg", MediaKind::Jpeg, 3, "2024-01-03T00:00:00Z"),
+    ]);
+    let a_id = AssetId::for_path(
+        fixture.library,
+        &RelativePathKey::from_relative_path(Path::new("a.jpg")).unwrap(),
+    );
+    let b_id = AssetId::for_path(
+        fixture.library,
+        &RelativePathKey::from_relative_path(Path::new("b.jpg")).unwrap(),
+    );
+
+    let ascending = fixture
+        .catalog
+        .wall_page(fixture.group, WallOrder::CapturedAscending, None, 1)
+        .unwrap();
+    assert_eq!(display_paths(&ascending.items), ["a.jpg"]);
+    assert_eq!(
+        ascending.next,
+        Some(WallCursorKey::Captured {
+            captured_at_utc: "2024-01-01T00:00:00Z".to_owned(),
+            display_path: "a.jpg".to_owned(),
+            id: a_id,
+        })
+    );
+    let ascending_tail = fixture
+        .catalog
+        .wall_page(
+            fixture.group,
+            WallOrder::CapturedAscending,
+            ascending.next,
+            1,
+        )
+        .unwrap();
+    assert_eq!(display_paths(&ascending_tail.items), ["b.jpg"]);
+    assert_eq!(
+        ascending_tail.next,
+        Some(WallCursorKey::Captured {
+            captured_at_utc: "2024-01-03T00:00:00Z".to_owned(),
+            display_path: "b.jpg".to_owned(),
+            id: b_id,
+        })
+    );
+
+    let descending = fixture
+        .catalog
+        .wall_page(fixture.group, WallOrder::CapturedDescending, None, 1)
+        .unwrap();
+    assert_eq!(display_paths(&descending.items), ["b.jpg"]);
+    assert_eq!(
+        descending.next,
+        Some(WallCursorKey::Captured {
+            captured_at_utc: "2024-01-03T00:00:00Z".to_owned(),
+            display_path: "b.jpg".to_owned(),
+            id: b_id,
+        })
+    );
+    let descending_tail = fixture
+        .catalog
+        .wall_page(
+            fixture.group,
+            WallOrder::CapturedDescending,
+            descending.next,
+            1,
+        )
+        .unwrap();
+    assert_eq!(display_paths(&descending_tail.items), ["a.jpg"]);
+    assert_eq!(
+        descending_tail.next,
+        Some(WallCursorKey::Captured {
+            captured_at_utc: "2024-01-01T00:00:00Z".to_owned(),
+            display_path: "a.jpg".to_owned(),
+            id: a_id,
+        })
+    );
+}
+
+#[test]
 fn wall_records_for_assets_omit_video_ids() {
     let fixture = WallFixture::with_photo_and_video();
     let rows = fixture
@@ -206,6 +287,7 @@ struct FixtureAsset {
     path: &'static str,
     media_kind: MediaKind,
     order: u64,
+    captured_at_utc: Option<&'static str>,
 }
 
 fn asset(path: &'static str, media_kind: MediaKind, order: u64) -> FixtureAsset {
@@ -213,6 +295,21 @@ fn asset(path: &'static str, media_kind: MediaKind, order: u64) -> FixtureAsset 
         path,
         media_kind,
         order,
+        captured_at_utc: None,
+    }
+}
+
+fn captured_asset(
+    path: &'static str,
+    media_kind: MediaKind,
+    order: u64,
+    captured_at_utc: &'static str,
+) -> FixtureAsset {
+    FixtureAsset {
+        path,
+        media_kind,
+        order,
+        captured_at_utc: Some(captured_at_utc),
     }
 }
 
@@ -250,14 +347,23 @@ impl WallFixture {
             fixture.catalog.upsert_asset(&value).unwrap();
             fixture
                 .catalog
-                .apply_index_batch(&[CatalogIndexRecord::Shaped(AssetShapeUpdate {
-                    asset_id: value.id,
-                    width: 16,
-                    height: 9,
-                    orientation: Some(1),
-                    representative_rgb: None,
-                    shape_status: ShapeStatus::Ready,
-                })])
+                .apply_index_batch(&[
+                    CatalogIndexRecord::Shaped(AssetShapeUpdate {
+                        asset_id: value.id,
+                        width: 16,
+                        height: 9,
+                        orientation: Some(1),
+                        representative_rgb: None,
+                        shape_status: ShapeStatus::Ready,
+                    }),
+                    CatalogIndexRecord::Metadata(AssetMetadataUpdate {
+                        asset_id: value.id,
+                        captured_at_utc: item.captured_at_utc.map(Into::into),
+                        rating: None,
+                        keywords: vec![],
+                        provenance: vec![],
+                    }),
+                ])
                 .unwrap();
         }
         fixture

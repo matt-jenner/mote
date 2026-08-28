@@ -12,7 +12,8 @@ use photo_app_service::{
     OrderState, SortDirection, SourceAvailability, WallAsset, WallMediaKind, WallPage,
     WallQueryRequest, WallShapeState, WallUpdate, WallWarningState,
 };
-use photo_catalog::Catalog;
+use photo_catalog::{Catalog, NewDerivative};
+use photo_domain::{AssetId, DerivativeId, LibraryId, RelativePathKey};
 use photo_metadata::{MetadataBundle, MetadataCandidate, MetadataReadWarning, MetadataSource};
 
 #[derive(Clone)]
@@ -2267,6 +2268,88 @@ async fn video_only_selection_has_an_empty_photo_wall() {
         std::fs::metadata(&video_path).unwrap().modified().unwrap(),
         modified_before
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn derivative_requests_omit_indexed_video_ids() {
+    let fixture = ProgressiveFixture::video_only();
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    let bootstrap = service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+
+    let library_id = LibraryId::from_uuid(
+        uuid::Uuid::parse_str(
+            &bootstrap
+                .active_source
+                .as_ref()
+                .expect("video scan should select a source")
+                .id,
+        )
+        .unwrap(),
+    );
+    let video_id = AssetId::for_path(
+        library_id,
+        &RelativePathKey::from_relative_path(Path::new("clip.mp4")).unwrap(),
+    );
+    let mut catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    let video = catalog.find_asset(video_id).unwrap().unwrap();
+    let group = video.folder_group_id.unwrap();
+    let cache_key = photo_cache::DerivativeKey::compute(&photo_cache::DerivativeSpec {
+        asset_id: video.id,
+        signature: video.signature,
+        orientation: video.orientation.unwrap_or(1),
+        kind: photo_cache::DerivativeKind::WallThumbnail,
+        decoder_version: "image-0.25-v1".to_owned(),
+        colour_space: "srgb".to_owned(),
+        target: photo_cache::DerivativeTarget::LongEdge(1024),
+    });
+    catalog
+        .insert_derivative(&NewDerivative {
+            id: DerivativeId::new(),
+            asset_id: video.id,
+            folder_group_id: group,
+            kind: "wall_thumbnail".to_owned(),
+            cache_key: cache_key.as_str().to_owned(),
+            relative_cache_path: PathBuf::from("video-placeholder.webp"),
+            size_bytes: 0,
+            durable: true,
+            created_at: 1,
+        })
+        .unwrap();
+    drop(catalog);
+
+    service
+        .request_derivatives(DerivativeRequest::visible(vec![
+            video_id.as_uuid().hyphenated().to_string(),
+        ]))
+        .await
+        .expect("video derivative requests should be omitted");
+
+    assert!(
+        Catalog::open(&fixture.config.catalog_path())
+            .unwrap()
+            .all_derivatives()
+            .unwrap()
+            .iter()
+            .any(|derivative| derivative.asset_id == video_id),
+        "the cached video fixture should remain indexed"
+    );
+    while let Ok(event) = updates.try_recv() {
+        assert!(!matches!(
+            event,
+            WallUpdate::DerivativesReady { derivatives, .. }
+                if derivatives.iter().any(|derivative| derivative.asset_id
+                    == video_id.as_uuid().hyphenated().to_string())
+        ));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
