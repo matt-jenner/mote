@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::dto::{DerivativeClass, DerivativeReference};
 use crate::service::SelectionToken;
@@ -115,14 +116,6 @@ struct CoordinatorState {
     collection: CollectionState,
 }
 
-#[derive(Clone, Copy)]
-struct WaitSnapshot {
-    selection: Option<SelectionToken>,
-    background_generation: u64,
-    pending_jobs: usize,
-    background_permits: usize,
-}
-
 impl Default for CoordinatorState {
     fn default() -> Self {
         Self {
@@ -147,6 +140,7 @@ pub(crate) struct DerivativeCoordinator {
     state: Mutex<CoordinatorState>,
     scheduler: Arc<IndexScheduler>,
     wake: Notify,
+    change_generation: AtomicU64,
 }
 
 impl DerivativeCoordinator {
@@ -155,6 +149,7 @@ impl DerivativeCoordinator {
             state: Mutex::new(CoordinatorState::default()),
             scheduler,
             wake: Notify::new(),
+            change_generation: AtomicU64::new(0),
         }
     }
 
@@ -170,6 +165,7 @@ impl DerivativeCoordinator {
             state: Mutex::new(state),
             scheduler,
             wake: Notify::new(),
+            change_generation: AtomicU64::new(0),
         }
     }
 
@@ -294,7 +290,7 @@ impl DerivativeCoordinator {
                 .enqueue(IndexJob::new(job_name, priority))
                 .await;
         }
-        self.wake.notify_waiters();
+        self.notify_waiters();
         receiver
     }
 
@@ -345,7 +341,7 @@ impl DerivativeCoordinator {
                 }
             };
             if let Some(ticket) = result {
-                self.wake.notify_waiters();
+                self.notify_waiters();
                 return Some(ticket);
             }
         }
@@ -426,7 +422,7 @@ impl DerivativeCoordinator {
         self.scheduler
             .enqueue(IndexJob::new(schedule.0, schedule.1))
             .await;
-        self.wake.notify_waiters();
+        self.notify_waiters();
         true
     }
 
@@ -458,7 +454,7 @@ impl DerivativeCoordinator {
                 .chain(work.background_waiters)
                 .collect()
         };
-        self.wake.notify_waiters();
+        self.notify_waiters();
         waiters
     }
 
@@ -499,7 +495,7 @@ impl DerivativeCoordinator {
             for waiter in waiters {
                 let _ = waiter.send(None);
             }
-            self.wake.notify_waiters();
+            self.notify_waiters();
             if completion_waits.is_empty() {
                 return;
             }
@@ -599,7 +595,7 @@ impl DerivativeCoordinator {
                 .chain(work.background_waiters)
                 .collect()
         };
-        self.wake.notify_waiters();
+        self.notify_waiters();
         waiters
     }
 
@@ -672,7 +668,7 @@ impl DerivativeCoordinator {
         for waiter in waiters {
             let _ = waiter.send(None);
         }
-        self.wake.notify_waiters();
+        self.notify_waiters();
     }
 
     pub(crate) async fn begin_collection(&self, selection: SelectionToken) {
@@ -689,7 +685,7 @@ impl DerivativeCoordinator {
             cursor: None,
         };
         drop(state);
-        self.wake.notify_waiters();
+        self.notify_waiters();
     }
 
     pub(crate) async fn advance_collection(
@@ -708,7 +704,7 @@ impl DerivativeCoordinator {
             state.collection.cursor = cursor;
         }
         drop(state);
-        self.wake.notify_waiters();
+        self.notify_waiters();
     }
 
     pub(crate) async fn finish_thumbnail_phase(&self, selection: SelectionToken) {
@@ -721,7 +717,7 @@ impl DerivativeCoordinator {
             state.collection.cursor = None;
         }
         drop(state);
-        self.wake.notify_waiters();
+        self.notify_waiters();
     }
 
     pub(crate) async fn finish_preview_phase(&self, selection: SelectionToken) {
@@ -734,7 +730,7 @@ impl DerivativeCoordinator {
             state.collection.cursor = None;
         }
         drop(state);
-        self.wake.notify_waiters();
+        self.notify_waiters();
     }
 
     pub(crate) async fn collection_state(&self) -> (CollectionPhase, Option<WallCursorKey>) {
@@ -779,7 +775,7 @@ impl DerivativeCoordinator {
         for waiter in waiters {
             let _ = waiter.send(None);
         }
-        self.wake.notify_waiters();
+        self.notify_waiters();
         true
     }
 
@@ -792,47 +788,30 @@ impl DerivativeCoordinator {
     }
 
     pub(crate) async fn wait_for_change(&self) {
-        let mut baseline = None;
-        loop {
-            let notified = self.wake.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let current = self.wait_snapshot().await;
-            let baseline = baseline.get_or_insert(current);
-            if self.has_actionable_queued_work(current).await
-                || current.selection != baseline.selection
-                || current.background_generation != baseline.background_generation
-                || current.background_permits != baseline.background_permits
-                || (baseline.pending_jobs > 0 && current.pending_jobs == 0)
-            {
-                return;
-            }
+        let observed = self.change_generation();
+        self.wait_for_change_since(observed).await;
+    }
+
+    pub(crate) async fn wait_for_change_since(&self, observed: u64) {
+        let notified = self.wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.change_generation() == observed {
             notified.await;
         }
     }
 
-    async fn wait_snapshot(&self) -> WaitSnapshot {
-        let state = self.state.lock().await;
-        WaitSnapshot {
-            selection: state.selection,
-            background_generation: state.background_generation,
-            pending_jobs: state.jobs.len(),
-            background_permits: self.scheduler.available_background_permits(),
-        }
+    pub(crate) fn change_generation(&self) -> u64 {
+        self.change_generation.load(AtomicOrdering::Acquire)
     }
 
-    async fn has_actionable_queued_work(&self, snapshot: WaitSnapshot) -> bool {
-        let state = self.state.lock().await;
-        state.jobs.values().any(|work| {
-            work.status == JobStatus::Queued
-                && (!work.lane.is_background()
-                    || work.background_generation == snapshot.background_generation)
-                && !(work.lane.is_background() && snapshot.background_permits <= 1)
-        })
+    fn notify_waiters(&self) {
+        self.change_generation.fetch_add(1, AtomicOrdering::AcqRel);
+        self.wake.notify_waiters();
     }
 
     pub(crate) fn wake(&self) {
-        self.wake.notify_waiters();
+        self.notify_waiters();
     }
 }
 
@@ -995,7 +974,8 @@ mod tests {
         let fixture = fixture();
         assert!(fixture.coordinator.next_work().await.is_none());
 
-        let waiter = fixture.coordinator.wait_for_change();
+        let observed = fixture.coordinator.change_generation();
+        let waiter = fixture.coordinator.wait_for_change_since(observed);
         let _queued = fixture.enqueue(screen_key(), WorkLane::IdlePreview).await;
 
         tokio::time::timeout(Duration::from_millis(50), waiter)
@@ -1066,6 +1046,84 @@ mod tests {
         fixture.coordinator.complete(ticket, reference()).await;
         assert_eq!(waiter.await.unwrap(), Some(reference()));
         assert_eq!(promoted.await.unwrap(), Some(reference()));
+    }
+
+    #[tokio::test]
+    async fn wait_for_change_consumes_one_event_before_waiting_for_another() {
+        let fixture = fixture();
+        let _idle = fixture.enqueue(screen_key(), WorkLane::IdlePreview).await;
+        let observed = fixture.coordinator.change_generation();
+        let first = fixture.coordinator.wait_for_change_since(observed);
+        let promoted = fixture.enqueue(screen_key(), WorkLane::ViewerPreview).await;
+        tokio::time::timeout(Duration::from_millis(100), first)
+            .await
+            .expect("promotion did not wake the first wait");
+
+        let observed = fixture.coordinator.change_generation();
+        let second = fixture.coordinator.wait_for_change_since(observed);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), second)
+                .await
+                .is_err(),
+            "queued actionable work caused the second wait to spin"
+        );
+
+        let observed = fixture.coordinator.change_generation();
+        let third = fixture.coordinator.wait_for_change_since(observed);
+        fixture.coordinator.wake();
+        tokio::time::timeout(Duration::from_millis(100), third)
+            .await
+            .expect("distinct coordinator event did not wake the wait");
+
+        let ticket = fixture.coordinator.next_work().await.unwrap();
+        fixture.coordinator.complete(ticket, reference()).await;
+        assert_eq!(promoted.await.unwrap(), Some(reference()));
+    }
+
+    #[tokio::test]
+    async fn explicit_wake_is_observed_when_coordinator_snapshot_is_unchanged() {
+        let fixture = fixture();
+        let before = (
+            fixture.coordinator.selection().await,
+            fixture.coordinator.background_generation().await,
+            fixture.coordinator.pending_job_count().await,
+            fixture.scheduler.available_background_permits(),
+        );
+        let first = fixture
+            .coordinator
+            .wait_for_change_since(fixture.coordinator.change_generation());
+        fixture.coordinator.wake();
+        tokio::time::timeout(Duration::from_millis(100), first)
+            .await
+            .expect("explicit wake did not advance coordinator generation");
+        assert_eq!(
+            (
+                fixture.coordinator.selection().await,
+                fixture.coordinator.background_generation().await,
+                fixture.coordinator.pending_job_count().await,
+                fixture.scheduler.available_background_permits(),
+            ),
+            before,
+            "the explicit wake should not change the coordinator snapshot"
+        );
+
+        let second = fixture
+            .coordinator
+            .wait_for_change_since(fixture.coordinator.change_generation());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), second)
+                .await
+                .is_err(),
+            "unchanged coordinator snapshot caused a stale wake"
+        );
+
+        let third = fixture
+            .coordinator
+            .wait_for_change_since(fixture.coordinator.change_generation());
+        fixture.coordinator.wake();
+        tokio::time::timeout(Duration::from_millis(100), third)
+            .await
+            .expect("second explicit wake did not advance coordinator generation");
     }
 
     #[tokio::test]

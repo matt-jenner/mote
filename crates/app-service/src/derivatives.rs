@@ -1057,6 +1057,7 @@ impl AppService {
         generation: u64,
     ) {
         let mut generation = generation;
+        let mut observed_change = self.coordinator.change_generation();
         loop {
             match self
                 .run_screen_preview_prefetch_for_generation(
@@ -1067,13 +1068,19 @@ impl AppService {
                 )
                 .await
             {
-                PreviewPrefetchOutcome::Blocked => self.coordinator.wait_for_change().await,
+                PreviewPrefetchOutcome::Blocked => {
+                    self.coordinator
+                        .wait_for_change_since(observed_change)
+                        .await;
+                    observed_change = self.coordinator.change_generation();
+                }
                 PreviewPrefetchOutcome::Complete | PreviewPrefetchOutcome::Terminate => return,
                 PreviewPrefetchOutcome::Stale => {
                     if !self.selection_is_active(selection) {
                         return;
                     }
                     generation = self.coordinator.background_generation().await;
+                    observed_change = self.coordinator.change_generation();
                 }
             }
         }
@@ -1658,7 +1665,9 @@ fn reference(id: AssetId, kind: DerivativeClass, key: String) -> DerivativeRefer
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::path::Path;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
 
     use image::{ImageBuffer, Rgb};
     use photo_cache::{
@@ -1667,12 +1676,34 @@ mod tests {
     };
     use photo_catalog::{AssetShapeUpdate, Catalog, CatalogIndexRecord, NewAsset, ShapeStatus};
     use photo_domain::{AssetId, FileSignature, MediaKind, RelativePathKey};
-    use photo_indexer::JobPriority;
+    use photo_indexer::{JobPriority, MetadataReader};
+    use photo_metadata::{MetadataBundle, MetadataReadWarning};
 
     use crate::service::DerivativeTestGate;
     use crate::{AppConfig, AppService, DerivativeClass, WallUpdate};
 
     use super::DerivativeWorkError;
+
+    struct BlockingReader {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    impl MetadataReader for BlockingReader {
+        fn read(
+            &self,
+            _media_path: &Path,
+            _sidecar_path: Option<&Path>,
+        ) -> Result<MetadataBundle, MetadataReadWarning> {
+            self.entered.notify_one();
+            let (released, changed) = &*self.gate;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = changed.wait(released).unwrap();
+            }
+            Ok(MetadataBundle::default())
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn healthy_visible_derivative_publishes_before_a_blocked_one() {
@@ -1758,6 +1789,78 @@ mod tests {
         request.await.unwrap().unwrap();
         assert_eq!(std::fs::read(&blocked_path).unwrap(), blocked_before);
         assert_eq!(std::fs::read(&healthy_path).unwrap(), healthy_before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scan_completion_wakes_prefetch_when_coordinator_snapshot_is_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(&source).unwrap();
+        ImageBuffer::from_pixel(8, 8, Rgb([20_u8, 40, 60]))
+            .save(source.join("photo.jpg"))
+            .unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+        let service = AppService::open_with_reader(
+            config,
+            Arc::new(BlockingReader {
+                gate: gate.clone(),
+                entered: entered.clone(),
+            }),
+        )
+        .unwrap();
+        let (_, selection) = service.select_recent(&source).unwrap();
+        service.coordinator.ensure_selection(selection).await;
+        let mut updates = service.subscribe_wall_updates();
+        let entered_wait = entered.notified();
+        service.start_selected_scan(selection).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered_wait)
+            .await
+            .expect("scan did not reach the blocking metadata reader");
+
+        let generation = service.coordinator.background_generation().await;
+        let change_generation = service.coordinator.change_generation();
+        let prefetch_service = service.clone();
+        let prefetch = tokio::spawn(async move {
+            prefetch_service
+                .run_preview_prefetch_until_stable(Vec::new(), true, selection, generation)
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !prefetch.is_finished(),
+            "prefetch did not block while the scan was active"
+        );
+        assert_eq!(service.coordinator.selection().await, Some(selection));
+        assert_eq!(
+            service.coordinator.background_generation().await,
+            generation
+        );
+        assert_eq!(service.coordinator.pending_job_count().await, 0);
+        assert_eq!(service.scheduler.available_background_permits(), 4);
+
+        {
+            let (released, changed) = &*gate;
+            *released.lock().unwrap() = true;
+            changed.notify_all();
+        }
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            receive_until(&mut updates, |event| {
+                matches!(event, WallUpdate::MetadataSettled { .. })
+            }),
+        )
+        .await
+        .expect("scan did not complete after releasing the metadata reader");
+        assert!(
+            service.coordinator.change_generation() > change_generation,
+            "scan completion did not record its explicit coordinator wake"
+        );
+        tokio::time::timeout(Duration::from_secs(5), prefetch)
+            .await
+            .expect("prefetch was not woken by scan completion")
+            .expect("prefetch task panicked");
     }
 
     #[test]
