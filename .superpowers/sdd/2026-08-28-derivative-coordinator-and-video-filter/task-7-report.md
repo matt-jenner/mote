@@ -13,9 +13,12 @@ native user-acceptance action was performed.
 This fix round adds one test-only app-service harness for the exact checked-in
 demo source tree. The harness and its test-only BLAKE3 dependency are committed
 in `67393e1224f8cf6e6944e8fd4a625ff0baf6bbe5` (`test: guard demo source tree`).
-The verification/report follow-up is intentionally separate; its post-commit
-name-status comparison is documented below so the later commit is not mistaken
-for an implementation change or given an impossible self-referential SHA.
+The lifecycle correction is committed in
+`27af6bc955d0d147ee6db25d88fe2b9bf80e216b` (`test: close app-service lifecycle
+before restart`). The verification/report follow-up is intentionally separate;
+its post-commit name-status comparison is documented below so the later commit
+is not mistaken for an implementation change or given an impossible
+self-referential SHA.
 
 ## RED/GREEN evidence
 
@@ -53,6 +56,37 @@ test were green:
 cargo fmt --all -- --check
 exit 0
 
+cargo test -p photo-app-service --test task7_source_safety -- --nocapture
+test task7_source_tree_safety_harness ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The lifecycle regression was then exercised test-first. Adding the collection
+driver probe before its implementation produced the expected compile failure:
+
+```text
+cargo test -p photo-app-service --test task7_source_safety -- --nocapture
+error[E0599]: no method named `collection_driver_active_count_test` found for struct `AppService`
+```
+
+After the probe and tracker were added, the old single-scope restart boundary
+was forced to fail before the scope fix. The tracked collection-driver count
+was four while interaction remained Active even though derivative work had
+reported zero:
+
+```text
+thread 'task7_source_tree_safety_harness' panicked at crates/app-service/tests/task7_source_safety.rs:256:5:
+assertion `left == right` failed: the first service scope must not overlap a restart
+  left: 4
+  right: 0
+```
+
+The corrected test transitions the first service to Idle, waits for both
+derivative and collection-driver trackers, asserts zero active scan/driver/
+derivative counters, drops update receivers, exits that scope, and only then
+opens the restarted service. The focused GREEN result after the correction was:
+
+```text
 cargo test -p photo-app-service --test task7_source_safety -- --nocapture
 test task7_source_tree_safety_harness ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
@@ -233,8 +267,17 @@ The metadata diff and per-file hash diff each had 0 lines, and
 `git status --short -- apps/interface/public/demo-photos` had no output. No
 `PHOTO_VIEWER_PROFILE` variable was used. The harness creates a
 `tempdir()/catalog` and `tempdir()/cache`, asserts both paths are contained by
-the same temporary root, and drops the restarted service before the after
-snapshot.
+the same temporary root, and keeps every catalogue/cache handle within that
+temporary root.
+
+The fix-round capture artifacts were
+`/tmp/photo-viewer-task7-round2-before-mtime.txt`,
+`/tmp/photo-viewer-task7-round2-after-mtime.txt`,
+`/tmp/photo-viewer-task7-round2-before-file-sha.txt`, and
+`/tmp/photo-viewer-task7-round2-after-file-sha.txt`; the recorded comparison
+artifacts `/tmp/photo-viewer-task7-round2-mtime.diff`,
+`/tmp/photo-viewer-task7-round2-file-sha.diff`, and
+`/tmp/photo-viewer-task7-round2-source-status.txt` were all zero lines.
 
 The committed test-only harness opens that exact tree read-only and performs
 the whole app-service sequence: scan; first and cursor-continuation wall pages;
@@ -247,6 +290,18 @@ rows and no video rows throughout. The harness snapshots every source file's
 bytes, BLAKE3 digest, size, and nanosecond mtime before the first service open
 and after the restarted service is dropped.
 
+The lifecycle boundary is explicit rather than inferred from dropping a
+service handle. With interaction Active, the old sequence recorded four live
+collection drivers after the derivative tracker reached zero. The test-only
+collection-driver tracker now covers each spawned driver, including its delay
+and collection mutex wait. The first service transitions to Idle, awaits zero
+derivative tasks and zero collection drivers, asserts zero active scan/driver/
+derivative counters, drops both update receivers, and exits its lexical scope.
+Only in the next scope does the test open the restarted service and issue the
+offline cached request; it awaits both trackers and asserts all counters are
+zero before that scope ends. No sleep, runtime-drop ordering, or environment
+profile is used as a quiescence signal.
+
 The browser tests use the same `/demo-photos/*.jpg` URLs for wall sorting,
 viewer opening, and zoom. The full browser run emitted one known non-failing
 React `ViewerStage` `act(...)` warning; there was no unhandled rejection,
@@ -254,52 +309,75 @@ accessibility violation, or screenshot attachment. The progressive-wall suite
 and cache suite remain temporary-fixture-only; no desktop process was started.
 
 The source audit was rerun from the accepted base through the complete code/test
-head in implementation commit `67393e1224f8cf6e6944e8fd4a625ff0baf6bbe5`:
+head in lifecycle implementation commit
+`27af6bc955d0d147ee6db25d88fe2b9bf80e216b`:
 
 ```text
 base=14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc
-head=67393e1224f8cf6e6944e8fd4a625ff0baf6bbe5
+head=27af6bc955d0d147ee6db25d88fe2b9bf80e216b
 ```
 
 The exact added-line audit command scans Rust, TypeScript, and TSX for broad
 filesystem create/write/save/copy/move/rename/remove/delete/unlink forms,
 `OpenOptions`, `File::create`, `write_all`, `write_atomic`, rating/tag/delete
-operations, and source/cache/folder/path DTO tokens:
+operations, source/cache/folder/path DTO tokens, `relative_cache_path`, and
+`write_png`:
 
 ```text
+base=14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc
+head=27af6bc955d0d147ee6db25d88fe2b9bf80e216b
 git diff --name-status "$base..$head" -- '*.rs' '*.ts' '*.tsx'
 git diff --unified=0 --no-color "$base..$head" -- '*.rs' '*.ts' '*.tsx' | awk '
 /^\+\+\+ b\// { file=substr($0,7); next }
 /^@@ / { p=index($0,"+"); if (p) { h=substr($0,p+1); sub(",.*","",h); line=h+0 }; next }
 /^\+/ && !/^\+\+\+/ {
   text=substr($0,2)
-  if (text ~ /(std::fs::(create_dir_all|write|rename|remove_file|remove_dir_all|copy)|fs::(write|rename|remove|copy)|File::create|OpenOptions|write_all|write_atomic|writeFile|write_file|copyFile|copy_file|moveFile|move_file|rename|removeFile|remove_file|unlink|delete_derivatives|deleteAsset|setRating|updateRating|\.save[[:space:]]*\(|selectedFolder(Name)?|selected_folder|sourcePath|folderPath|relativePath|displayPath|nativePath|cachePath|locateFolder)/) print file ":" line ": " text
+  if (text ~ /(std::fs::(create_dir_all|write|rename|remove_file|remove_dir_all|copy)|fs::(write|rename|remove|copy)|File::create|OpenOptions|write_all|write_atomic|write_png|writeFile|write_file|copyFile|copy_file|moveFile|move_file|rename|removeFile|remove_file|unlink|delete_derivatives|deleteAsset|setRating|updateRating|\.save[[:space:]]*\(|selectedFolder(Name)?|selected_folder|sourcePath|folderPath|relativePath|relative_cache_path|displayPath|nativePath|cachePath|locateFolder)/) {
+    sub(/^[[:space:]]+/, "", text)
+    print file ":" line ": " text
+  }
   line++
 }
 '
 ```
 
-The added-line audit returned 41 matches. Every match is reproduced below with
-its file and line; the classification after the list covers each match.
+The command's direct output contained 45 name-status lines and 56 matching
+added lines. The captured direct outputs are
+`/tmp/photo-viewer-task7-audit-round2-name-status.txt` (SHA-256
+`65815f310b627be306187c4c09cc2fee9df2ba2863625fc0e049cb69f46cd767`) and
+`/tmp/photo-viewer-task7-audit-round2-matches-normalized.txt` (SHA-256
+`47800798d467dfc23796d7837b8bbff2d66d6f131a2e9859b8adda47467f48b2`). Every
+match from that direct output is reproduced below with its file and line; the
+classification after the list covers each match.
 
 ```text
-apps/interface/src/components/PhotoViewer.browser.test.tsx:1933: selectedFolderName: "Video fixture"
-crates/app-service/src/derivatives.rs:2910: std::fs::create_dir_all(&source).unwrap();
-crates/app-service/src/derivatives.rs:2914: .save(&blocked_path)
-crates/app-service/src/derivatives.rs:2917: .save(&healthy_path)
-crates/app-service/src/derivatives.rs:2996: std::fs::create_dir_all(&source).unwrap();
-crates/app-service/src/derivatives.rs:2998: .save(source.join("photo.jpg"))
-crates/app-service/src/derivatives.rs:3090: std::fs::create_dir_all(&source).unwrap();
-crates/app-service/src/derivatives.rs:3093: .save(&image_path)
-crates/app-service/src/derivatives.rs:3289: std::fs::create_dir_all(&source).unwrap();
-crates/app-service/src/derivatives.rs:3292: .save(&image_path)
-crates/app-service/src/derivatives.rs:3362: std::fs::create_dir_all(&source).unwrap();
-crates/app-service/src/derivatives.rs:3365: .save(&image_path)
-crates/app-service/src/derivatives.rs:3465: .save(&source_path)
-crates/app-service/src/derivatives.rs:3636: std::fs::create_dir_all(&source).unwrap();
+apps/interface/src/components/PhotoViewer.browser.test.tsx:1933: selectedFolderName: "Video fixture",
+crates/app-service/src/derivatives.rs:419: .map(|record| record.relative_cache_path.clone())
+crates/app-service/src/derivatives.rs:987: relative_cache_path: generated.relative_path.clone(),
+crates/app-service/src/derivatives.rs:1212: .map(|record| record.relative_cache_path)
+crates/app-service/src/derivatives.rs:1253: .map(|record| record.relative_cache_path)
+crates/app-service/src/derivatives.rs:2937: std::fs::create_dir_all(&source).unwrap();
+crates/app-service/src/derivatives.rs:2941: .save(&blocked_path)
+crates/app-service/src/derivatives.rs:2944: .save(&healthy_path)
+crates/app-service/src/derivatives.rs:3023: std::fs::create_dir_all(&source).unwrap();
+crates/app-service/src/derivatives.rs:3025: .save(source.join("photo.jpg"))
+crates/app-service/src/derivatives.rs:3117: std::fs::create_dir_all(&source).unwrap();
+crates/app-service/src/derivatives.rs:3120: .save(&image_path)
+crates/app-service/src/derivatives.rs:3173: relative_cache_path: std::path::PathBuf::from(format!(
+crates/app-service/src/derivatives.rs:3316: std::fs::create_dir_all(&source).unwrap();
+crates/app-service/src/derivatives.rs:3319: .save(&image_path)
+crates/app-service/src/derivatives.rs:3389: std::fs::create_dir_all(&source).unwrap();
+crates/app-service/src/derivatives.rs:3392: .save(&image_path)
+crates/app-service/src/derivatives.rs:3492: .save(&source_path)
+crates/app-service/src/derivatives.rs:3663: std::fs::create_dir_all(&source).unwrap();
+crates/app-service/tests/progressive_wall.rs:140: relative_cache_path: PathBuf,
+crates/app-service/tests/progressive_wall.rs:188: relative_cache_path: record.relative_cache_path,
+crates/app-service/tests/progressive_wall.rs:222: let relative_cache_path = PathBuf::from("evictable/old-preview.jpg");
 crates/app-service/tests/progressive_wall.rs:223: std::fs::create_dir_all(
 crates/app-service/tests/progressive_wall.rs:227: .join(relative_cache_path.parent().unwrap()),
 crates/app-service/tests/progressive_wall.rs:230: std::fs::write(
+crates/app-service/tests/progressive_wall.rs:231: fixture.config.cache_dir().join(&relative_cache_path),
+crates/app-service/tests/progressive_wall.rs:242: relative_cache_path,
 crates/app-service/tests/progressive_wall.rs:355: std::fs::create_dir_all(&source).unwrap();
 crates/app-service/tests/progressive_wall.rs:356: std::fs::write(source.join("clip.mp4"), b"not a video").unwrap();
 crates/app-service/tests/progressive_wall.rs:368: std::fs::create_dir_all(&source).unwrap();
@@ -319,30 +397,42 @@ crates/app-service/tests/progressive_wall.rs:1825: std::fs::write(fixture.source
 crates/app-service/tests/progressive_wall.rs:1868: std::fs::write(
 crates/app-service/tests/progressive_wall.rs:1967: std::fs::write(fixture.source.join("photo-000.jpg"), changed).unwrap();
 crates/app-service/tests/progressive_wall.rs:2238: catalog.delete_derivatives(&screen_ids).unwrap();
+crates/app-service/tests/progressive_wall.rs:2741: .join(&screen_row.relative_cache_path)
+crates/app-service/tests/progressive_wall.rs:3829: relative_cache_path: PathBuf::from("video-placeholder.webp"),
 crates/app-service/tests/progressive_wall.rs:3993: std::fs::remove_file(fixture.source.join("offline.jpg")).unwrap();
-crates/app-service/tests/task7_source_safety.rs:279: assert_eq!(catalog.delete_derivatives(&[wall.id]).unwrap(), 1);
+crates/app-service/tests/task7_source_safety.rs:289: assert_eq!(catalog.delete_derivatives(&[wall.id]).unwrap(), 1);
 crates/cache/src/image_derivative.rs:141: let write_result = self.writer.write_atomic(relative_path.clone(), |file| {
 crates/cache/src/image_derivative.rs:142: std::io::Write::write_all(file, &encoded)
 crates/cache/tests/image_derivative.rs:81: std::fs::copy(fixture.path(), &cached_screen).unwrap();
+crates/indexer/tests/progressive_scan.rs:324: write_png(&fixture.path().join("a.jpg"), [255, 0, 0]);
+crates/indexer/tests/progressive_scan.rs:325: write_png(&fixture.path().join("b.jpg"), [0, 0, 255]);
 crates/indexer/tests/progressive_scan.rs:326: std::fs::write(fixture.path().join("clip.mp4"), b"not a video").unwrap();
 ```
 
-Classification of all 41 matches:
+Classification of all 56 matches:
 
 - The browser `selectedFolderName` value is a path-free fixture label.
-- Every `derivatives.rs` match at lines 2910--3636 is inside the test module
-  and creates temporary image fixtures or records temporary cache paths.
-- Every `progressive_wall.rs` create/save/write match at lines 222--379,
-  1607--1868, and 1967 is temporary fixture setup or changed-signature test
-  input. The two `rename` lines at 1489/1521 move only a temporary fixture to
-  simulate source availability. The `delete_derivatives` line at 2238
-  operates on temporary catalogue records. The `remove_file` line at 3993
-  removes a temporary fixture.
-- The new safety test's `delete_derivatives` line at 279 removes only its
+- The four production `derivatives.rs` matches at lines 419, 987, 1212, and
+  1253 only read or record managed-cache-relative catalogue metadata; they do
+  not perform filesystem operations. The `derivatives.rs` matches at lines
+  2937--3663 and the `relative_cache_path` line at 3173 are inside its test
+  module and create temporary image fixtures or temporary catalogue/cache
+  records.
+- The `progressive_wall.rs` matches at lines 140, 188, 222, 227, 230, 231,
+  and 242 describe or create an evictable path under the test's temporary
+  cache directory. Lines 355--379 and 1607--1967 create temporary image/video
+  fixtures or write changed-signature test input. The two `rename` lines at
+  1489/1521 move only a temporary fixture to simulate source availability.
+  The `delete_derivatives` line at 2238 operates on temporary catalogue
+  records; line 2741 inspects a path under the temporary cache root; line 3829
+  records a temporary catalogue placeholder; and line 3993 removes a
+  temporary fixture.
+- The safety test's `delete_derivatives` line at 289 removes only its
   temporary catalogue row while leaving the checked-in source untouched.
 - `CacheWriter::write_atomic` and `Write::write_all` in production
   `crates/cache/src/image_derivative.rs` write managed cache files. The cache
-  test copy and indexer test write operate under temporary fixtures.
+  test copy and the indexer `write_png` calls at lines 324/325 plus the video
+  fixture write at 326 operate under temporary fixtures.
 
 No production source-media write, delete, rename, move, or copy call was
 introduced. The changed app-service DTO has no native source-path field; the
@@ -376,15 +466,14 @@ controller-owned. This task did not launch or restart the `wall-demo` app.
 
 ## Commit boundary evidence
 
-The implementation/test boundary is the code commit
-`67393e1224f8cf6e6944e8fd4a625ff0baf6bbe5`. The subsequent verification,
-README, and report changes are a separate documentation-only follow-up. After
-that follow-up commit, the exact name/status comparison was:
+The implementation/test boundary is the lifecycle code/test commit
+`27af6bc955d0d147ee6db25d88fe2b9bf80e216b`. The subsequent verification and
+report changes are a separate documentation-only follow-up. After that
+follow-up commit, the exact name/status comparison was:
 
 ```text
-git diff --name-status 67393e1224f8cf6e6944e8fd4a625ff0baf6bbe5..HEAD
+git diff --name-status 27af6bc955d0d147ee6db25d88fe2b9bf80e216b..HEAD
 M	.superpowers/sdd/2026-08-28-derivative-coordinator-and-video-filter/task-7-report.md
-M	README.md
 M	docs/superpowers/verification/2026-08-27-viewer-zoom-pan.md
 ```
 
@@ -396,6 +485,8 @@ post-commit `git show` handoff rather than embedded in its own content.
 
 - `Cargo.lock`
 - `crates/app-service/Cargo.toml`
+- `crates/app-service/src/derivatives.rs`
+- `crates/app-service/src/service.rs`
 - `crates/app-service/tests/task7_source_safety.rs`
 - `crates/catalog-bench/src/lib.rs`
 - `crates/catalog-bench/tests/benchmark_smoke.rs`

@@ -5,6 +5,8 @@ Branch: `codex/viewer-zoom-pan`
 Feature base: `14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc`
 Feature head: final delivery commit; exact SHA is recorded in the companion
 Task 6 report after commit finalization.
+Task 7 lifecycle code/test head: `27af6bc955d0d147ee6db25d88fe2b9bf80e216b`;
+the documentation-only follow-up boundary is recorded below.
 
 ## Implementation
 
@@ -493,6 +495,15 @@ The metadata diff had 0 lines, the per-file hash diff had 0 lines, and
 `PHOTO_VIEWER_PROFILE` variable was used: the app-service harness creates
 `tempdir()/catalog` and `tempdir()/cache` and asserts both are contained by the
 same temporary root before opening the service.
+The fix-round before/after manifests and comparison outputs are retained at
+`/tmp/photo-viewer-task7-round2-before-mtime.txt`,
+`/tmp/photo-viewer-task7-round2-after-mtime.txt`,
+`/tmp/photo-viewer-task7-round2-before-file-sha.txt`,
+`/tmp/photo-viewer-task7-round2-after-file-sha.txt`,
+`/tmp/photo-viewer-task7-round2-mtime.diff`,
+`/tmp/photo-viewer-task7-round2-file-sha.diff`, and
+`/tmp/photo-viewer-task7-round2-source-status.txt`; each diff/status output is
+zero lines.
 
 The committed harness opens the exact source tree read-only, scans it, asserts
 the first cursor page and continuation contain exactly six JPEG rows with no
@@ -507,6 +518,16 @@ request. The test snapshots every source file's bytes, BLAKE3 digest, size,
 and nanosecond mtime immediately before this sequence and after the restarted
 service is dropped.
 
+The restart is a real scope boundary. While interaction is Active, the old
+sequence leaves four collection drivers live after derivative work reaches
+zero; the regression assertion records that overlap. The test-only collection
+driver tracker now covers those spawned tasks. The first service transitions to
+Idle, waits for zero derivative tasks and zero collection drivers, asserts zero
+active scan/driver/derivative counters, drops update receivers, and exits its
+scope. A distinct reopened service scope then performs the offline request and
+reaches the same zero-counter state before it ends. No sleep or runtime-drop
+ordering is used as a quiescence signal.
+
 The browser tests use the same `/demo-photos/*.jpg` URLs for wall sorting,
 viewer opening, and zoom. The full run emitted one known non-failing React
 `ViewerStage` `act(...)` warning; it had no rejection, accessibility failure,
@@ -514,22 +535,31 @@ or screenshot attachment. No desktop development process was started by this
 task.
 
 The feature-range source audit used accepted base
-`14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc` through the code/test head
-`67393e1` (`test: guard demo source tree`). The added-line audit covers Rust,
-TypeScript, and TSX and includes filesystem create/write/save/copy/move/
-rename/remove/delete/unlink forms, `OpenOptions`, `File::create`,
-`write_all`, `write_atomic`, and source/cache/folder/path DTO tokens. Its
-exact command and all 41 file:line matches, with classifications, are in the
-companion Task 7 report.
+`14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc` through lifecycle code/test head
+`27af6bc955d0d147ee6db25d88fe2b9bf80e216b` (`test: close app-service lifecycle
+before restart`). The added-line audit covers Rust, TypeScript, and TSX and
+includes filesystem create/write/save/copy/move/rename/remove/delete/unlink
+forms, `OpenOptions`, `File::create`, `write_all`, `write_atomic`,
+`relative_cache_path`, and `write_png`. It returned 56 matches, including both
+`crates/indexer/tests/progressive_scan.rs:324-325` `write_png` calls; the exact
+command, direct-output hashes (`65815f310b627be306187c4c09cc2fee9df2ba2863625fc0e049cb69f46cd767`
+for 45 name-status lines and `47800798d467dfc23796d7837b8bbff2d66d6f131a2e9859b8adda47467f48b2`
+for the normalized 56-match output), all matches, and classifications are in
+the companion Task 7 report.
 
 ```text
-git diff --name-status 14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc..67393e1 -- '*.rs' '*.ts' '*.tsx'
-git diff --unified=0 --no-color 14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc..67393e1 -- '*.rs' '*.ts' '*.tsx' | awk '
+base=14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc
+head=27af6bc955d0d147ee6db25d88fe2b9bf80e216b
+git diff --name-status "$base..$head" -- '*.rs' '*.ts' '*.tsx'
+git diff --unified=0 --no-color "$base..$head" -- '*.rs' '*.ts' '*.tsx' | awk '
 /^\+\+\+ b\// { file=substr($0,7); next }
 /^@@ / { p=index($0,"+"); if (p) { h=substr($0,p+1); sub(",.*","",h); line=h+0 }; next }
 /^\+/ && !/^\+\+\+/ {
   text=substr($0,2)
-  if (text ~ /(std::fs::(create_dir_all|write|rename|remove_file|remove_dir_all|copy)|fs::(write|rename|remove|copy)|File::create|OpenOptions|write_all|write_atomic|writeFile|write_file|copyFile|copy_file|moveFile|move_file|rename|removeFile|remove_file|unlink|delete_derivatives|deleteAsset|setRating|updateRating|\.save[[:space:]]*\(|selectedFolder(Name)?|selected_folder|sourcePath|folderPath|relativePath|displayPath|nativePath|cachePath|locateFolder)/) print file ":" line ": " text
+  if (text ~ /(std::fs::(create_dir_all|write|rename|remove_file|remove_dir_all|copy)|fs::(write|rename|remove|copy)|File::create|OpenOptions|write_all|write_atomic|write_png|writeFile|write_file|copyFile|copy_file|moveFile|move_file|rename|removeFile|remove_file|unlink|delete_derivatives|deleteAsset|setRating|updateRating|\.save[[:space:]]*\(|selectedFolder(Name)?|selected_folder|sourcePath|folderPath|relativePath|relative_cache_path|displayPath|nativePath|cachePath|locateFolder)/) {
+    sub(/^[[:space:]]+/, "", text)
+    print file ":" line ": " text
+  }
   line++
 }
 '
