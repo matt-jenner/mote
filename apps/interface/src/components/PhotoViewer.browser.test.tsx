@@ -1864,7 +1864,8 @@ describe("immersive photo viewer checkpoint", () => {
 		const view = await renderViewerWall(service);
 		await view.getByRole("button", { name: "Choose Folder" }).click();
 		await service.finishFixtureScan();
-		await expect.element(view.getByText("Video · poster only")).toBeVisible();
+		expect(view.getByText("Video · poster only").query()).toBeNull();
+		expect(document.querySelector("figcaption")).toBeNull();
 		expect(
 			view.getByRole("button", { name: "Open Clip", exact: true }).query(),
 		).toBeNull();
@@ -1918,16 +1919,44 @@ describe("immersive photo viewer checkpoint", () => {
 		await expect
 			.element(view.getByRole("dialog", { name: "Photo viewer" }))
 			.toBeVisible();
-		await expect
-			.poll(() =>
-				service.derivativeRequests.some(
-					(request) =>
-						request.kind === "screenPreview" &&
-						request.priority === "visible" &&
-						request.assetIds.includes("coast"),
-				),
-			)
-			.toBe(true);
+		const visibleCurrentRequests = () =>
+			service.derivativeRequests.filter(
+				(request) =>
+					request.kind === "screenPreview" &&
+					request.priority === "visible" &&
+					request.assetIds.length === 1 &&
+					request.assetIds[0] === "coast",
+			).length;
+		await expect.poll(visibleCurrentRequests).toBe(1);
+		await new Promise((resolve) => window.setTimeout(resolve, 25));
+		expect(visibleCurrentRequests()).toBe(1);
+	});
+
+	it("does not request screen previews for a defensive video asset", async () => {
+		const requests: DerivativeRequest[] = [];
+		const service = previewService(async (request) => {
+			requests.push({ ...request, assetIds: [...request.assetIds] });
+		});
+		const video = {
+			...asset("clip", "Clip", 1),
+			mediaKind: "video" as const,
+			screenPreview: {
+				assetId: "clip",
+				kind: "screenPreview" as const,
+				key: "clip-screen",
+			},
+		};
+		const view = await render(
+			<PhotoServiceProvider service={service}>
+				<PreviewHarness assets={[video]} service={service} />
+			</PhotoServiceProvider>,
+		);
+		await new Promise((resolve) => window.setTimeout(resolve, 25));
+		expect(requests).toHaveLength(0);
+		expect(
+			view.getByTestId("viewer-stage").element().querySelector("img"),
+		).toBeNull();
+		await view.unmount();
 	});
 
 	it("prioritizes current preview work before immediate neighbours", async () => {
@@ -2815,6 +2844,16 @@ describe("immersive photo viewer checkpoint", () => {
 			.getByRole("dialog", { name: "Photo viewer" })
 			.element();
 		const stage = view.getByTestId("viewer-stage").element();
+		await expect
+			.poll(
+				() =>
+					(
+						view
+							.getByRole("button", { name: "Zoom in" })
+							.element() as HTMLButtonElement
+					).disabled,
+			)
+			.toBe(false);
 		vi.useFakeTimers();
 		try {
 			const dispatch = (
@@ -3304,7 +3343,9 @@ describe("immersive photo viewer checkpoint", () => {
 			await vi.advanceTimersByTimeAsync(100);
 			tap(122, 700);
 			await vi.advanceTimersByTimeAsync(180);
-			expect(controls?.getAttribute("aria-hidden")).toBe("true");
+			await expect
+				.poll(() => controls?.getAttribute("aria-hidden"))
+				.toBe("true");
 		} finally {
 			vi.useRealTimers();
 		}

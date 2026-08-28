@@ -103,8 +103,10 @@ export function AppShell() {
 						"[data-asset-id]",
 					) ?? []),
 				].find((candidate) => candidate.dataset.assetId === anchor.assetId);
-		if (tile && typeof tile.focus === "function")
-			tile.focus({ preventScroll: true });
+		const focusTarget =
+			tile?.querySelector<HTMLElement>("button[aria-label^='Open ']") ?? tile;
+		if (focusTarget && typeof focusTarget.focus === "function")
+			focusTarget.focus({ preventScroll: true });
 		else wallRegionRef.current?.focus({ preventScroll: true });
 		setHighlightedAssetId(anchor.assetId);
 		const timer = window.setTimeout(() => setHighlightedAssetId(null), 600);

@@ -172,10 +172,28 @@ button.tile {
 	opacity: 1;
 }
 
+.tileOpenOverlay {
+	position: absolute;
+	inset: 0;
+	z-index: 0;
+	width: 100%;
+	height: 100%;
+	padding: 0;
+	background: transparent;
+	border: 0;
+	cursor: pointer;
+}
+
+.tileOpenOverlay:focus-visible {
+	outline: 2px solid var(--focus-ring);
+	outline-offset: -2px;
+}
+
 .tileWarning {
 	position: absolute;
 	top: 6px;
 	right: 6px;
+	z-index: 1;
 	display: grid;
 	place-items: center;
 	width: 18px;
@@ -187,23 +205,6 @@ button.tile {
 	border: 1px solid var(--separator);
 	border-radius: 50%;
 }
-
-.videoCue {
-	position: absolute;
-	right: 6px;
-	bottom: 6px;
-	left: 6px;
-	padding: 4px 6px;
-	color: var(--text-primary);
-	font-size: 10px;
-	font-weight: 600;
-	line-height: 1.1;
-	text-align: center;
-	background: color-mix(in srgb, var(--canvas) 78%, transparent);
-	border: 1px solid var(--separator);
-	border-radius: var(--radius-small);
-}
-
 .fallback {
 	display: grid;
 	place-content: center;

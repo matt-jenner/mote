@@ -142,6 +142,7 @@ export function useViewerPreview({
 				const asset = assets.find((candidate) => candidate.id === assetId);
 				if (
 					!asset ||
+					asset.mediaKind === "video" ||
 					asset.screenPreview ||
 					(asset.warning && !asset.warning.retryable)
 				)
@@ -166,7 +167,8 @@ export function useViewerPreview({
 			const attempts = new Map<string, RequestRecord>();
 			for (const assetId of new Set(assetIds)) {
 				const asset = assets.find((candidate) => candidate.id === assetId);
-				if (!asset || asset.screenPreview) continue;
+				if (!asset || asset.mediaKind === "video" || asset.screenPreview)
+					continue;
 				if (asset.warning && !asset.warning.retryable) continue;
 				const key = requestKey(asset, previewGeneration);
 				const previous = requestRecords.current.get(key);
@@ -283,15 +285,21 @@ export function useViewerPreview({
 	);
 
 	const current = assets[Math.trunc(currentIndex)];
-	const currentUrl = toUrl(service, current?.screenPreview ?? null);
-	const baseUrl = toUrl(service, current?.wallThumbnail ?? null);
+	const isPhoto = current?.mediaKind !== "video";
+	const currentUrl = isPhoto
+		? toUrl(service, current?.screenPreview ?? null)
+		: null;
+	const baseUrl = isPhoto
+		? toUrl(service, current?.wallThumbnail ?? null)
+		: null;
 	const currentKey = current ? requestKey(current, previewGeneration) : null;
 	return {
 		currentUrl,
 		baseUrl,
 		reportInteraction,
 		largePreviewUnavailable: Boolean(
-			current &&
+			isPhoto &&
+				current &&
 				((currentKey !== null && failedRequestKeys.has(currentKey)) ||
 					(current.screenPreview !== null && currentUrl === null) ||
 					(current.screenPreview === null &&

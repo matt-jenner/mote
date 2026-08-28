@@ -384,15 +384,23 @@ export function PhotoViewerOverlay({
 	}, []);
 
 	const infoOpenRef = useRef(state.infoOpen);
+	const transformModeRef = useRef(transform.mode);
+	const onSetInfoOpenRef = useRef(handleSetInfoOpen);
+	const discreteResetRef = useRef(handleDiscreteReset);
+	const onCloseRef = useRef(handleClose);
 	const escapeRef = useRef<() => void>(() => undefined);
 	infoOpenRef.current = state.infoOpen;
+	transformModeRef.current = transform.mode;
+	onSetInfoOpenRef.current = handleSetInfoOpen;
+	discreteResetRef.current = handleDiscreteReset;
+	onCloseRef.current = handleClose;
 	escapeRef.current = () => {
 		if (infoOpenRef.current) {
-			handleSetInfoOpen(false);
-		} else if (transform.mode === "zoomed") {
-			handleDiscreteReset();
+			onSetInfoOpenRef.current(false);
+		} else if (transformModeRef.current === "zoomed") {
+			discreteResetRef.current();
 		} else {
-			handleClose();
+			onCloseRef.current();
 		}
 	};
 

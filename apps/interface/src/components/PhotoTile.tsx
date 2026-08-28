@@ -1,8 +1,21 @@
 import { CircleAlert } from "lucide-react";
-import { useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useLayoutEffect, useRef, useState } from "react";
 import type { PhotoService } from "../services/photoService";
 import styles from "../styles/photoWall.module.css";
 import type { PositionedWallAsset } from "../wall/layoutJustifiedRows";
+
+type TilePaintPhase =
+	| "placeholder"
+	| "decoding"
+	| "fading"
+	| "interactive"
+	| "failed";
+
+interface TileRevision {
+	assetId: string;
+	derivativeKey: string;
+	url: string;
+}
 
 interface PhotoTileProps {
 	positioned: PositionedWallAsset;
@@ -19,6 +32,17 @@ function rgb(value: number | null): string | undefined {
 	return `rgb(${red}, ${green}, ${blue})`;
 }
 
+function matchesImageUrl(image: HTMLImageElement, url: string): boolean {
+	if (!url) return false;
+	const source = image.getAttribute("src");
+	if (source === url) return true;
+	try {
+		return image.src === new URL(url, image.baseURI).href;
+	} catch {
+		return false;
+	}
+}
+
 export function PhotoTile({
 	positioned,
 	service,
@@ -26,10 +50,19 @@ export function PhotoTile({
 	highlighted = false,
 }: PhotoTileProps) {
 	const { asset } = positioned;
-	const [loaded, setLoaded] = useState(false);
-	const [failed, setFailed] = useState(false);
+	const [phase, setPhase] = useState<TilePaintPhase>("placeholder");
 	const [previewFailed, setPreviewFailed] = useState(false);
 	const imageRef = useRef<HTMLImageElement | null>(null);
+	const revisionRef = useRef(0);
+	const currentRevisionRef = useRef<TileRevision | null>(null);
+	const phaseRef = useRef<TilePaintPhase>("placeholder");
+	const reducedMotionRef = useRef(false);
+	const loadHandlerRef = useRef<((image: HTMLImageElement) => void) | null>(
+		null,
+	);
+	const errorHandlerRef = useRef<((image: HTMLImageElement) => void) | null>(
+		null,
+	);
 	const thumbnail = asset.wallThumbnail;
 	const shapeState = asset.shapeState;
 	let url: string | null = null;
@@ -40,50 +73,165 @@ export function PhotoTile({
 			url = null;
 		}
 	}
+	const derivativeKey = thumbnail?.key ?? "";
+	const hasThumbnail = thumbnail !== null;
+	const updatePhase = useCallback((next: TilePaintPhase) => {
+		phaseRef.current = next;
+		setPhase(next);
+	}, []);
 
 	useLayoutEffect(() => {
-		setLoaded(false);
-		setPreviewFailed(false);
-		setFailed(
-			(shapeState === "fallback" || asset.availability !== "available") && !url,
-		);
+		const revision = ++revisionRef.current;
+		const tileRevision: TileRevision = {
+			assetId: asset.id,
+			derivativeKey,
+			url: url ?? "",
+		};
+		currentRevisionRef.current = tileRevision;
+		const reducedMotion = window.matchMedia(
+			"(prefers-reduced-motion: reduce)",
+		).matches;
+		reducedMotionRef.current = reducedMotion;
 		let cancelled = false;
-		const markCachedImageLoaded = () => {
-			if (cancelled) return;
-			const image = imageRef.current;
-			if (!image) return;
+		let cachedCheckFrame: number | null = null;
+		let interactiveFrame: number | null = null;
+		let loadSeen = false;
+		let decodeSeen = false;
+		let decodeStarted = false;
+		let failed = false;
+		const image = imageRef.current;
+		const isCurrent = () => !cancelled && revisionRef.current === revision;
+		const cancelInteractiveFrame = () => {
+			if (interactiveFrame === null) return;
+			window.cancelAnimationFrame(interactiveFrame);
+			interactiveFrame = null;
+		};
+		const failPreview = () => {
+			if (!isCurrent() || failed) return;
+			failed = true;
+			cancelInteractiveFrame();
+			setPreviewFailed(true);
+			updatePhase("failed");
+		};
+		const moveToFading = () => {
+			if (!isCurrent() || failed || !loadSeen || !decodeSeen) return;
+			updatePhase("fading");
+			if (!reducedMotion) return;
+			cancelInteractiveFrame();
+			interactiveFrame = window.requestAnimationFrame(() => {
+				interactiveFrame = null;
+				if (isCurrent()) updatePhase("interactive");
+			});
+		};
+		const markDecoded = () => {
 			if (
-				url &&
-				image &&
-				(image.getAttribute("src") === url ||
-					image.src === new URL(url, image.baseURI).href) &&
-				image.complete &&
-				image.naturalWidth > 0
-			) {
-				setLoaded(true);
+				!isCurrent() ||
+				failed ||
+				!image ||
+				!matchesImageUrl(image, tileRevision.url)
+			)
+				return;
+			decodeSeen = true;
+			if (!loadSeen && image.complete && image.naturalWidth > 0)
+				loadSeen = true;
+			moveToFading();
+		};
+		const startDecode = () => {
+			if (
+				decodeStarted ||
+				!isCurrent() ||
+				!image ||
+				!matchesImageUrl(image, tileRevision.url)
+			)
+				return;
+			decodeStarted = true;
+			try {
+				void image.decode().then(markDecoded, failPreview);
+			} catch {
+				failPreview();
 			}
 		};
-		const image = imageRef.current;
-		markCachedImageLoaded();
-		const frame = window.requestAnimationFrame(markCachedImageLoaded);
-		if (image) {
-			try {
-				void image.decode().then(markCachedImageLoaded, () => undefined);
-			} catch {
-				// The normal load/error handlers remain responsible for this image.
-			}
+		const markLoaded = () => {
+			if (
+				!isCurrent() ||
+				failed ||
+				!image ||
+				!matchesImageUrl(image, tileRevision.url)
+			)
+				return;
+			loadSeen = true;
+			startDecode();
+		};
+		const markCachedImageLoaded = () => {
+			if (
+				!isCurrent() ||
+				failed ||
+				!image ||
+				!matchesImageUrl(image, tileRevision.url)
+			)
+				return;
+			if (image.complete && image.naturalWidth > 0) markLoaded();
+		};
+		const loadHandler = (currentImage: HTMLImageElement) => {
+			if (
+				currentImage === image &&
+				matchesImageUrl(currentImage, tileRevision.url)
+			)
+				markLoaded();
+		};
+		const errorHandler = (currentImage: HTMLImageElement) => {
+			if (
+				currentImage === image &&
+				matchesImageUrl(currentImage, tileRevision.url)
+			)
+				failPreview();
+		};
+		loadHandlerRef.current = loadHandler;
+		errorHandlerRef.current = errorHandler;
+
+		setPreviewFailed(false);
+		if (
+			(shapeState === "fallback" || asset.availability !== "available") &&
+			!url
+		) {
+			updatePhase("failed");
+		} else if (!url || !hasThumbnail) {
+			updatePhase("placeholder");
+		} else {
+			updatePhase("decoding");
+			markCachedImageLoaded();
+			cachedCheckFrame = window.requestAnimationFrame(() => {
+				cachedCheckFrame = null;
+				markCachedImageLoaded();
+			});
+			startDecode();
 		}
+
 		return () => {
 			cancelled = true;
-			window.cancelAnimationFrame(frame);
+			if (loadHandlerRef.current === loadHandler) loadHandlerRef.current = null;
+			if (errorHandlerRef.current === errorHandler)
+				errorHandlerRef.current = null;
+			if (cachedCheckFrame !== null)
+				window.cancelAnimationFrame(cachedCheckFrame);
+			cancelInteractiveFrame();
 		};
-	}, [asset.availability, shapeState, url]);
+	}, [
+		asset.availability,
+		asset.id,
+		derivativeKey,
+		hasThumbnail,
+		shapeState,
+		url,
+		updatePhase,
+	]);
 
 	const style = {
 		width: `${positioned.width}px`,
 		height: `${positioned.height}px`,
 		"--tile-colour": rgb(asset.representativeRgb),
 	};
+	const failed = phase === "failed" && !url;
 	const layers = failed ? (
 		<div className={styles.fallback} data-testid="photo-fallback">
 			<span aria-hidden="true" className={styles.fallbackMark}>
@@ -95,25 +243,28 @@ export function PhotoTile({
 		<>
 			<div aria-hidden="true" className={styles.neutralLayer} />
 			<div aria-hidden="true" className={styles.colourLayer} />
-			{url && !previewFailed ? (
+			{url ? (
 				<img
 					alt={asset.displayName}
-					className={`${styles.imageLayer} ${loaded ? styles.imageLoaded : ""}`}
+					className={`${styles.imageLayer} ${phase === "fading" || phase === "interactive" ? styles.imageLoaded : ""}`}
 					decoding="async"
 					draggable={false}
-					key={url}
-					onError={() => setPreviewFailed(true)}
-					onLoad={(event) => {
-						const image = event.currentTarget;
-						if (
-							image === imageRef.current &&
-							(image.getAttribute("src") === url ||
-								image.src === new URL(url, image.baseURI).href)
-						)
-							setLoaded(true);
-					}}
+					onError={(event) => errorHandlerRef.current?.(event.currentTarget)}
+					onLoad={(event) => loadHandlerRef.current?.(event.currentTarget)}
 					ref={imageRef}
 					src={url}
+					onTransitionEnd={(event) => {
+						if (
+							event.propertyName === "opacity" &&
+							!reducedMotionRef.current &&
+							phaseRef.current === "fading" &&
+							currentRevisionRef.current?.assetId === asset.id &&
+							currentRevisionRef.current?.derivativeKey === derivativeKey &&
+							currentRevisionRef.current?.url === url &&
+							matchesImageUrl(event.currentTarget, url)
+						)
+							updatePhase("interactive");
+					}}
 				/>
 			) : null}
 			{previewFailed || asset.warning ? (
@@ -136,47 +287,30 @@ export function PhotoTile({
 			) : null}
 		</>
 	);
+	const className = `${styles.tile} ${highlighted ? styles.tileReturnHighlight : ""}`;
 	const canOpen =
 		asset.mediaKind !== "video" &&
-		Boolean(asset.wallThumbnail) &&
-		loaded &&
+		phase === "interactive" &&
+		Boolean(thumbnail) &&
 		!previewFailed;
-	const className = `${styles.tile} ${highlighted ? styles.tileReturnHighlight : ""}`;
 
-	if (!canOpen) {
-		return (
-			<figure
-				aria-label={
-					asset.mediaKind === "video"
-						? `${asset.displayName}; video poster only; playback unavailable`
-						: undefined
-				}
-				className={className}
-				data-asset-id={asset.id}
-				data-media-kind={asset.mediaKind}
-				role={asset.mediaKind === "video" ? "group" : undefined}
-				style={style}
-			>
-				{layers}
-				{asset.mediaKind === "video" ? (
-					<figcaption className={styles.videoCue}>
-						Video · poster only
-					</figcaption>
-				) : null}
-			</figure>
-		);
-	}
 	return (
-		<button
-			aria-label={`Open ${asset.displayName}`}
+		<figure
 			className={className}
 			data-asset-id={asset.id}
-			onClick={() => onOpen(asset.id)}
-			style={style}
 			data-media-kind={asset.mediaKind}
-			type="button"
+			style={style}
+			tabIndex={-1}
 		>
 			{layers}
-		</button>
+			{canOpen ? (
+				<button
+					aria-label={`Open ${asset.displayName}`}
+					className={`${styles.tileOpenOverlay} ${highlighted ? styles.tileReturnHighlight : ""}`}
+					onClick={() => onOpen(asset.id)}
+					type="button"
+				/>
+			) : null}
+		</figure>
 	);
 }

@@ -380,6 +380,24 @@ function overrideImageRuntime(overrides: ImageRuntimeOverrides) {
 	};
 }
 
+function overrideReducedMotion(matches: boolean) {
+	const original = window.matchMedia;
+	window.matchMedia = ((query: string) => {
+		const list = original.call(window, query);
+		if (query !== "(prefers-reduced-motion: reduce)") return list;
+		return new Proxy(list, {
+			get(target, property, _receiver) {
+				if (property === "matches") return matches;
+				const value = Reflect.get(target, property, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+	}) as typeof window.matchMedia;
+	return () => {
+		window.matchMedia = original;
+	};
+}
+
 function suppressCapture(type: "error" | "load") {
 	const handler = (event: Event) => event.stopImmediatePropagation();
 	window.addEventListener(type, handler, true);
@@ -1122,6 +1140,261 @@ describe("progressive photo wall", () => {
 			document.querySelector("[data-asset-id='screen-only']")?.tagName,
 		).toBe("FIGURE");
 		await screen.unmount();
+	});
+
+	it("keeps the current tile inert through decode and fade, then enables it", async () => {
+		const service = new ControlledWallService();
+		service.setDerivativeUrl(
+			"paint-before-open",
+			"/demo-photos/coast.jpg?paint-before-open=1",
+		);
+		const decodeGate = gate<void>();
+		let complete = false;
+		let naturalWidth = 0;
+		const restoreImageRuntime = overrideImageRuntime({
+			complete: () => complete,
+			naturalWidth: () => naturalWidth,
+			decode: () => decodeGate.promise,
+		});
+		const restoreReducedMotion = overrideReducedMotion(false);
+		const restoreLoadCapture = suppressCapture("load");
+		const positioned = {
+			asset: asset("paint-before-open", "Photo A", 1, {
+				wallThumbnail: {
+					assetId: "paint-before-open",
+					kind: "wallThumbnail" as const,
+					key: "paint-before-open",
+				},
+			}),
+			left: 0,
+			width: 320,
+			height: 220,
+		};
+		try {
+			const screen = await render(
+				<PhotoTile positioned={positioned} service={service} />,
+			);
+			const image = screen.getByRole("img", { name: "Photo A" });
+			expect(
+				screen
+					.getByRole("button", { name: "Open Photo A", exact: true })
+					.query(),
+			).toBeNull();
+
+			complete = true;
+			naturalWidth = 320;
+			image.element().dispatchEvent(new Event("load"));
+			decodeGate.resolve();
+			await expect
+				.poll(() => getComputedStyle(image.element()).opacity)
+				.toBe("1");
+			expect(
+				screen
+					.getByRole("button", { name: "Open Photo A", exact: true })
+					.query(),
+			).toBeNull();
+
+			image.element().dispatchEvent(
+				new TransitionEvent("transitionend", {
+					bubbles: true,
+					propertyName: "opacity",
+				}),
+			);
+			await expect
+				.element(
+					screen.getByRole("button", { name: "Open Photo A", exact: true }),
+				)
+				.toBeVisible();
+			expect(getComputedStyle(image.element()).opacity).toBe("1");
+			screen.unmount();
+		} finally {
+			restoreLoadCapture();
+			restoreImageRuntime();
+			restoreReducedMotion();
+		}
+	});
+
+	it("ignores a stale opacity transition after a thumbnail URL replacement", async () => {
+		const service = new ControlledWallService();
+		service.setDerivativeUrl("paint-old", "/demo-photos/coast.jpg?paint-old=1");
+		service.setDerivativeUrl(
+			"paint-new",
+			"/demo-photos/forest.jpg?paint-new=1",
+		);
+		const oldDecode = gate<void>();
+		const newDecode = gate<void>();
+		let oldComplete = false;
+		let newComplete = false;
+		const restoreImageRuntime = overrideImageRuntime({
+			complete: (image) =>
+				image.src.includes("paint-new") ? newComplete : oldComplete,
+			naturalWidth: (image) =>
+				image.src.includes("paint-new")
+					? newComplete
+						? 320
+						: 0
+					: oldComplete
+						? 320
+						: 0,
+			decode: (image) =>
+				image.src.includes("paint-new") ? newDecode.promise : oldDecode.promise,
+		});
+		const restoreLoadCapture = suppressCapture("load");
+		const restoreReducedMotion = overrideReducedMotion(false);
+		function SwapHarness() {
+			const [key, setKey] = useState("paint-old");
+			const positioned = {
+				asset: asset("paint-replacement", "Photo A", 1, {
+					wallThumbnail: {
+						assetId: "paint-replacement",
+						kind: "wallThumbnail" as const,
+						key,
+					},
+				}),
+				left: 0,
+				width: 320,
+				height: 220,
+			};
+			return (
+				<>
+					<button onClick={() => setKey("paint-new")} type="button">
+						Replace thumbnail
+					</button>
+					<PhotoTile positioned={positioned} service={service} />
+				</>
+			);
+		}
+		try {
+			const screen = await render(<SwapHarness />);
+			const image = screen.getByRole("img", { name: "Photo A" });
+			const imageElement = image.element();
+			oldComplete = true;
+			oldDecode.resolve();
+			await expect.poll(() => getComputedStyle(imageElement).opacity).toBe("1");
+			expect(
+				screen
+					.getByRole("button", { name: "Open Photo A", exact: true })
+					.query(),
+			).toBeNull();
+
+			await screen.getByRole("button", { name: "Replace thumbnail" }).click();
+			await expect
+				.poll(() => imageElement.getAttribute("src"))
+				.toContain("paint-new=1");
+			expect(imageElement).toBe(image.element());
+			expect(getComputedStyle(imageElement).opacity).toBe("0");
+			imageElement.dispatchEvent(
+				new TransitionEvent("transitionend", {
+					bubbles: true,
+					propertyName: "opacity",
+				}),
+			);
+			expect(
+				screen
+					.getByRole("button", { name: "Open Photo A", exact: true })
+					.query(),
+			).toBeNull();
+
+			newComplete = true;
+			newDecode.resolve();
+			await expect.poll(() => getComputedStyle(imageElement).opacity).toBe("1");
+			imageElement.dispatchEvent(
+				new TransitionEvent("transitionend", {
+					bubbles: true,
+					propertyName: "opacity",
+				}),
+			);
+			await expect
+				.element(
+					screen.getByRole("button", { name: "Open Photo A", exact: true }),
+				)
+				.toBeVisible();
+			screen.unmount();
+		} finally {
+			restoreLoadCapture();
+			restoreImageRuntime();
+			restoreReducedMotion();
+		}
+	});
+
+	it("uses one reduced-motion frame after decode before enabling the overlay", async () => {
+		const service = new ControlledWallService();
+		service.setDerivativeUrl(
+			"reduced-paint",
+			"/demo-photos/coast.jpg?reduced-paint=1",
+		);
+		const decodeGate = gate<void>();
+		let complete = false;
+		let naturalWidth = 0;
+		const restoreImageRuntime = overrideImageRuntime({
+			complete: () => complete,
+			naturalWidth: () => naturalWidth,
+			decode: () => decodeGate.promise,
+		});
+		const restoreReducedMotion = overrideReducedMotion(true);
+		const originalRequestAnimationFrame = window.requestAnimationFrame;
+		const originalCancelAnimationFrame = window.cancelAnimationFrame;
+		const frames = new Map<number, FrameRequestCallback>();
+		let nextFrame = 0;
+		let frameRequests = 0;
+		window.requestAnimationFrame = (callback) => {
+			const id = ++nextFrame;
+			frameRequests += 1;
+			frames.set(id, callback);
+			return id;
+		};
+		window.cancelAnimationFrame = (id) => {
+			frames.delete(id);
+		};
+		const restoreLoadCapture = suppressCapture("load");
+		const positioned = {
+			asset: asset("reduced-paint", "Photo A", 1, {
+				wallThumbnail: {
+					assetId: "reduced-paint",
+					kind: "wallThumbnail" as const,
+					key: "reduced-paint",
+				},
+			}),
+			left: 0,
+			width: 320,
+			height: 220,
+		};
+		try {
+			const screen = await render(
+				<PhotoTile positioned={positioned} service={service} />,
+			);
+			const image = screen.getByRole("img", { name: "Photo A" });
+			const initialFrameRequests = frameRequests;
+			complete = true;
+			naturalWidth = 320;
+			image.element().dispatchEvent(new Event("load"));
+			decodeGate.resolve();
+			await expect.poll(() => frameRequests).toBe(initialFrameRequests + 1);
+			expect(
+				screen
+					.getByRole("button", { name: "Open Photo A", exact: true })
+					.query(),
+			).toBeNull();
+			const frameId = [...frames.keys()].at(-1);
+			if (frameId === undefined) throw new Error("missing paint frame");
+			const frame = frames.get(frameId);
+			if (!frame) throw new Error("missing paint frame callback");
+			frames.delete(frameId);
+			frame(performance.now());
+			await expect
+				.element(
+					screen.getByRole("button", { name: "Open Photo A", exact: true }),
+				)
+				.toBeVisible();
+			screen.unmount();
+		} finally {
+			frames.clear();
+			window.requestAnimationFrame = originalRequestAnimationFrame;
+			window.cancelAnimationFrame = originalCancelAnimationFrame;
+			restoreLoadCapture();
+			restoreImageRuntime();
+			restoreReducedMotion();
+		}
 	});
 
 	it("keeps a published wall thumbnail inert until its image is decoded", async () => {
