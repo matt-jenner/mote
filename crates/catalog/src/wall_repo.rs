@@ -77,6 +77,12 @@ pub struct WallCatalogPage {
     pub next: Option<WallCursorKey>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhotoAssetIdPage {
+    pub items: Vec<AssetId>,
+    pub next: Option<WallCursorKey>,
+}
+
 impl Catalog {
     pub fn wall_records_for_assets(
         &self,
@@ -88,6 +94,7 @@ impl Catalog {
                     EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id), \
                     (SELECT code FROM warnings WHERE warnings.asset_id = assets.id ORDER BY CASE code WHEN 'derivative_generation_failed' THEN 0 ELSE 1 END, occurred_at DESC, id DESC LIMIT 1) \
              FROM assets WHERE folder_group_id = ?1 AND id = ?2 \
+               AND media_kind <> 'video' \
                AND shape_status IN ('ready','fallback') AND width IS NOT NULL AND height IS NOT NULL",
         )?;
         let mut records = Vec::with_capacity(assets.len());
@@ -128,7 +135,8 @@ impl Catalog {
             "SELECT id, display_path, media_kind, provisional_order, captured_at_utc, width, height, representative_rgb, availability, shape_status, rating, \
                     EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id), \
                     (SELECT code FROM warnings WHERE warnings.asset_id = assets.id ORDER BY CASE code WHEN 'derivative_generation_failed' THEN 0 ELSE 1 END, occurred_at DESC, id DESC LIMIT 1) \
-             FROM assets WHERE folder_group_id = ?1 AND shape_status IN ('ready','fallback') AND width IS NOT NULL AND height IS NOT NULL",
+             FROM assets WHERE folder_group_id = ?1 AND media_kind <> 'video' \
+               AND shape_status IN ('ready','fallback') AND width IS NOT NULL AND height IS NOT NULL",
         );
         match order {
             WallOrder::Provisional => {
@@ -199,6 +207,20 @@ impl Catalog {
         });
         Ok(WallCatalogPage { items, next })
     }
+
+    pub fn photo_asset_ids_page(
+        &self,
+        group: FolderGroupId,
+        order: WallOrder,
+        cursor: Option<WallCursorKey>,
+        limit: u32,
+    ) -> Result<PhotoAssetIdPage, CatalogError> {
+        let page = self.wall_page(group, order, cursor, limit)?;
+        Ok(PhotoAssetIdPage {
+            items: page.items.into_iter().map(|row| row.id).collect(),
+            next: page.next,
+        })
+    }
 }
 
 fn decode_wall_record(row: &rusqlite::Row<'_>) -> Result<WallCatalogRecord, rusqlite::Error> {
@@ -256,6 +278,7 @@ mod tests {
             "EXPLAIN QUERY PLAN
              SELECT id FROM assets
              WHERE folder_group_id = ?1
+               AND media_kind <> 'video'
                AND shape_status IN ('ready', 'fallback')
                AND width IS NOT NULL
                AND height IS NOT NULL
@@ -265,7 +288,7 @@ mod tests {
         assert!(
             details
                 .iter()
-                .any(|detail| detail.contains("assets_group_provisional_wall")),
+                .any(|detail| detail.contains("assets_group_provisional_photo")),
             "expected provisional wall index in query plan: {details:?}"
         );
     }
@@ -278,6 +301,7 @@ mod tests {
             "EXPLAIN QUERY PLAN
              SELECT id FROM assets
              WHERE folder_group_id = ?1
+               AND media_kind <> 'video'
                AND shape_status IN ('ready', 'fallback')
                AND width IS NOT NULL
                AND height IS NOT NULL
@@ -288,7 +312,7 @@ mod tests {
         assert!(
             details
                 .iter()
-                .any(|detail| detail.contains("assets_group_capture_wall")),
+                .any(|detail| detail.contains("assets_group_capture_photo")),
             "expected captured wall index in query plan: {details:?}"
         );
     }
@@ -301,6 +325,7 @@ mod tests {
             "EXPLAIN QUERY PLAN
              SELECT id FROM assets
              WHERE folder_group_id = ?1
+               AND media_kind <> 'video'
                AND shape_status IN ('ready', 'fallback')
                AND width IS NOT NULL
                AND height IS NOT NULL
@@ -311,7 +336,7 @@ mod tests {
         assert!(
             details
                 .iter()
-                .any(|detail| detail.contains("assets_group_capture_desc_wall")),
+                .any(|detail| detail.contains("assets_group_capture_desc_photo")),
             "expected descending capture wall index in query plan: {details:?}"
         );
         assert!(
@@ -331,6 +356,7 @@ mod tests {
                 "EXPLAIN QUERY PLAN
                  SELECT id FROM assets
                  WHERE folder_group_id = ?1
+                   AND media_kind <> 'video'
                    AND shape_status IN ('ready', 'fallback')
                    AND width IS NOT NULL
                    AND height IS NOT NULL
@@ -349,7 +375,7 @@ mod tests {
         assert!(
             provisional_details
                 .iter()
-                .any(|detail| detail.contains("assets_group_provisional_wall")),
+                .any(|detail| detail.contains("assets_group_provisional_photo")),
             "expected provisional keyset index in query plan: {provisional_details:?}"
         );
 
@@ -361,6 +387,7 @@ mod tests {
                 "EXPLAIN QUERY PLAN
                  SELECT id FROM assets
                  WHERE folder_group_id = ?1
+                   AND media_kind <> 'video'
                    AND shape_status IN ('ready', 'fallback')
                    AND width IS NOT NULL
                    AND height IS NOT NULL
@@ -381,7 +408,7 @@ mod tests {
         assert!(
             captured_details
                 .iter()
-                .any(|detail| detail.contains("assets_group_capture_wall")),
+                .any(|detail| detail.contains("assets_group_capture_photo")),
             "expected capture keyset index in query plan: {captured_details:?}"
         );
         assert!(
@@ -397,6 +424,7 @@ mod tests {
                 "EXPLAIN QUERY PLAN
                  SELECT id FROM assets
                  WHERE folder_group_id = ?1
+                   AND media_kind <> 'video'
                    AND shape_status IN ('ready', 'fallback')
                    AND width IS NOT NULL
                    AND height IS NOT NULL
@@ -423,7 +451,7 @@ mod tests {
         assert!(
             descending_details
                 .iter()
-                .any(|detail| detail.contains("assets_group_capture_desc_wall")),
+                .any(|detail| detail.contains("assets_group_capture_desc_photo")),
             "expected descending capture keyset index in query plan: {descending_details:?}"
         );
         assert!(

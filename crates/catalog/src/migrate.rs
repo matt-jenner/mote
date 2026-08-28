@@ -14,6 +14,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0004_wall_projection.sql"),
     include_str!("../migrations/0005_group_scoped_generations.sql"),
     include_str!("../migrations/0006_wall_state_indexes.sql"),
+    include_str!("../migrations/0007_derivative_coordinator.sql"),
 ];
 
 pub(crate) fn migrate_with(path: &Path, migrations: &[&str]) -> Result<Connection, CatalogError> {

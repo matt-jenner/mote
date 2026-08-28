@@ -148,6 +148,19 @@ impl ProgressiveFixture {
         }
     }
 
+    fn video_only() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("videos");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("clip.mp4"), b"not a video").unwrap();
+        let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+        Self {
+            temp,
+            source,
+            config,
+        }
+    }
+
     fn service(&self, reader: BlockingReader) -> AppService {
         AppService::open_with_reader(self.config.clone(), Arc::new(reader)).unwrap()
     }
@@ -2221,6 +2234,39 @@ async fn reconciliation_batches_preserve_cached_wall_and_screen_references_onlin
             .all(|asset| asset.wall_thumbnail.is_some() && asset.screen_preview.is_some())
     );
     std::fs::rename(unavailable, &fixture.source).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn video_only_selection_has_an_empty_photo_wall() {
+    let fixture = ProgressiveFixture::video_only();
+    let video_path = fixture.source.join("clip.mp4");
+    let video_before = std::fs::read(&video_path).unwrap();
+    let modified_before = std::fs::metadata(&video_path).unwrap().modified().unwrap();
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+
+    let page = service
+        .query_wall(query(SortDirection::NewestFirst))
+        .await
+        .unwrap();
+    assert!(page.items.is_empty());
+    assert!(page.next_cursor.is_none());
+    assert_eq!(page.order_state, OrderState::Settled);
+    assert_eq!(page.source_warnings, Vec::new());
+    assert_eq!(std::fs::read(&video_path).unwrap(), video_before);
+    assert_eq!(
+        std::fs::metadata(&video_path).unwrap().modified().unwrap(),
+        modified_before
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

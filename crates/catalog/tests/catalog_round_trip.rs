@@ -2,9 +2,10 @@ use std::path::Path;
 
 use photo_catalog::{
     Catalog, CatalogWarningRecord, NewAsset, NewDerivative, NewFolderGroup, NewLibrary,
-    SqliteVersion,
+    SqliteVersion, TerminalDerivativeFailure,
 };
 use photo_domain::{Availability, DerivativeId, FolderGroupId, MediaKind, RelativePathKey};
+use rusqlite::{Connection, params};
 
 #[test]
 fn opens_with_safe_sqlite_and_round_trips_library_and_asset() {
@@ -108,6 +109,191 @@ fn unavailable_asset_count_tracks_retained_offline_rows() {
     assert_eq!(catalog.unavailable_asset_count(library.id).unwrap(), 0);
     assert_eq!(catalog.mark_root_offline(library.id).unwrap(), 3);
     assert_eq!(catalog.unavailable_asset_count(library.id).unwrap(), 3);
+}
+
+#[test]
+fn terminal_derivative_failure_round_trips_by_current_key() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured(
+            "Pictures",
+            Path::new("/mounted/Pictures"),
+        ))
+        .unwrap();
+    let asset = NewAsset::minimal(
+        library.id,
+        RelativePathKey::from_relative_path(Path::new("photo.jpg")).unwrap(),
+        "photo.jpg",
+        MediaKind::Jpeg,
+        1,
+    );
+    catalog.upsert_asset(&asset).unwrap();
+    let failure = TerminalDerivativeFailure {
+        asset_id: asset.id,
+        kind: "wall_thumbnail".to_owned(),
+        cache_key: "wall-v1".to_owned(),
+        availability: Availability::RootOffline,
+        failure_code: "source_unavailable".to_owned(),
+        occurred_at: 123,
+    };
+
+    catalog
+        .record_terminal_derivative_failure(&failure)
+        .unwrap();
+
+    assert_eq!(
+        catalog
+            .find_terminal_derivative_failure(
+                asset.id,
+                "wall_thumbnail",
+                "wall-v1",
+                Availability::RootOffline,
+            )
+            .unwrap(),
+        Some(failure)
+    );
+    assert!(
+        catalog
+            .find_terminal_derivative_failure(
+                asset.id,
+                "wall_thumbnail",
+                "wall-v2",
+                Availability::RootOffline,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        catalog
+            .find_terminal_derivative_failure(
+                asset.id,
+                "wall_thumbnail",
+                "wall-v1",
+                Availability::Available,
+            )
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn terminal_derivative_failure_is_replaced_cleared_and_cascaded() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("catalog.sqlite");
+    let (library_id, asset_id) = {
+        let mut catalog = Catalog::open(&path).unwrap();
+        let library = catalog
+            .add_library(&NewLibrary::configured(
+                "Pictures",
+                Path::new("/mounted/Pictures"),
+            ))
+            .unwrap();
+        let asset = NewAsset::minimal(
+            library.id,
+            RelativePathKey::from_relative_path(Path::new("photo.jpg")).unwrap(),
+            "photo.jpg",
+            MediaKind::Jpeg,
+            1,
+        );
+        catalog.upsert_asset(&asset).unwrap();
+        catalog
+            .record_terminal_derivative_failure(&TerminalDerivativeFailure {
+                asset_id: asset.id,
+                kind: "wall_thumbnail".to_owned(),
+                cache_key: "wall-v1".to_owned(),
+                availability: Availability::RootOffline,
+                failure_code: "source_unavailable".to_owned(),
+                occurred_at: 123,
+            })
+            .unwrap();
+        catalog
+            .record_terminal_derivative_failure(&TerminalDerivativeFailure {
+                asset_id: asset.id,
+                kind: "wall_thumbnail".to_owned(),
+                cache_key: "wall-v2".to_owned(),
+                availability: Availability::Available,
+                failure_code: "source_unreadable".to_owned(),
+                occurred_at: 456,
+            })
+            .unwrap();
+        assert!(
+            catalog
+                .find_terminal_derivative_failure(
+                    asset.id,
+                    "wall_thumbnail",
+                    "wall-v1",
+                    Availability::RootOffline,
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            catalog
+                .find_terminal_derivative_failure(
+                    asset.id,
+                    "wall_thumbnail",
+                    "wall-v2",
+                    Availability::Available,
+                )
+                .unwrap()
+                .unwrap()
+                .failure_code,
+            "source_unreadable"
+        );
+
+        catalog
+            .clear_terminal_derivative_failure(asset.id, "wall_thumbnail")
+            .unwrap();
+        assert!(
+            catalog
+                .find_terminal_derivative_failure(
+                    asset.id,
+                    "wall_thumbnail",
+                    "wall-v2",
+                    Availability::Available,
+                )
+                .unwrap()
+                .is_none()
+        );
+        catalog
+            .record_terminal_derivative_failure(&TerminalDerivativeFailure {
+                asset_id: asset.id,
+                kind: "wall_thumbnail".to_owned(),
+                cache_key: "wall-v3".to_owned(),
+                availability: Availability::Available,
+                failure_code: "source_unreadable".to_owned(),
+                occurred_at: 789,
+            })
+            .unwrap();
+        (library.id, asset.id)
+    };
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM assets WHERE id = ?1",
+            params![asset_id.as_uuid().as_bytes()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = Catalog::open(&path).unwrap();
+    assert!(reopened.find_asset(asset_id).unwrap().is_none());
+    assert!(
+        reopened
+            .find_terminal_derivative_failure(
+                asset_id,
+                "wall_thumbnail",
+                "wall-v3",
+                Availability::Available,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(reopened.find_library(library_id).unwrap().is_some());
 }
 
 #[test]

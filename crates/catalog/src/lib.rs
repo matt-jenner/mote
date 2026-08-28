@@ -1,6 +1,7 @@
 mod asset_repo;
 mod cache_repo;
 mod connection;
+mod derivative_failure_repo;
 mod generation_repo;
 mod health_repo;
 mod index_repo;
@@ -15,6 +16,7 @@ use std::path::Path;
 
 pub use asset_repo::{AssetRecord, NewAsset};
 pub use cache_repo::{CacheEvictionGroup, DerivativeRecord, NewDerivative, NewFolderGroup};
+pub use derivative_failure_repo::TerminalDerivativeFailure;
 pub use generation_repo::GenerationCompletion;
 pub use health_repo::CatalogHealthSnapshot;
 pub use index_repo::{
@@ -25,7 +27,9 @@ pub use library_repo::{LibraryRootRecord, NewLibrary};
 use rusqlite::Connection;
 pub use settings_repo::{AppStateRecord, StoredSourceSelection};
 use thiserror::Error;
-pub use wall_repo::{ShapeStatus, WallCatalogPage, WallCatalogRecord, WallCursorKey, WallOrder};
+pub use wall_repo::{
+    PhotoAssetIdPage, ShapeStatus, WallCatalogPage, WallCatalogRecord, WallCursorKey, WallOrder,
+};
 
 pub struct Catalog {
     pub(crate) connection: Connection,

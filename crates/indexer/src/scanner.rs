@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use photo_core::{FolderPolicyEngine, FolderStructureSnapshot};
-use photo_domain::{FolderGroupId, LibraryId};
+use photo_domain::{FolderGroupId, LibraryId, MediaKind};
 use photo_metadata::{
     EmbeddedExifReader, MediaProbe, MetadataBundle, MetadataReadWarning, MetadataResolver,
     RepresentativeRgb,
@@ -176,21 +176,24 @@ impl<R: MetadataReader> Indexer<R> {
                             break;
                         }
                         let asset_id = item.asset.id;
+                        let counts_as_photo = item.asset.media_kind != MediaKind::Video;
                         {
                             let mut s = summary.lock().await;
                             s.discovered += 1;
                         }
-                        let discovered = progress.0.fetch_add(1, Ordering::Relaxed) + 1;
-                        if discovered.is_multiple_of(32) {
-                            let _ = events
-                                .send(IndexEvent::Progress(ScanProgress {
-                                    stage: ScanStage::Discovering,
-                                    discovered,
-                                    shaped: progress.1.load(Ordering::Relaxed),
-                                    enriched: progress.2.load(Ordering::Relaxed),
-                                    total: None,
-                                }))
-                                .await;
+                        if counts_as_photo {
+                            let discovered = progress.0.fetch_add(1, Ordering::Relaxed) + 1;
+                            if discovered.is_multiple_of(32) {
+                                let _ = events
+                                    .send(IndexEvent::Progress(ScanProgress {
+                                        stage: ScanStage::Discovering,
+                                        discovered,
+                                        shaped: progress.1.load(Ordering::Relaxed),
+                                        enriched: progress.2.load(Ordering::Relaxed),
+                                        total: None,
+                                    }))
+                                    .await;
+                            }
                         }
                         let _ = events
                             .send(IndexEvent::Discovered {
@@ -222,17 +225,19 @@ impl<R: MetadataReader> Indexer<R> {
                                         orientation,
                                     })
                                     .await;
-                                let shaped = progress.1.fetch_add(1, Ordering::Relaxed) + 1;
-                                if shaped.is_multiple_of(32) {
-                                    let _ = events
-                                        .send(IndexEvent::Progress(ScanProgress {
-                                            stage: ScanStage::Shaping,
-                                            discovered: progress.0.load(Ordering::Relaxed),
-                                            shaped,
-                                            enriched: progress.2.load(Ordering::Relaxed),
-                                            total: None,
-                                        }))
-                                        .await;
+                                if counts_as_photo {
+                                    let shaped = progress.1.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if shaped.is_multiple_of(32) {
+                                        let _ = events
+                                            .send(IndexEvent::Progress(ScanProgress {
+                                                stage: ScanStage::Shaping,
+                                                discovered: progress.0.load(Ordering::Relaxed),
+                                                shaped,
+                                                enriched: progress.2.load(Ordering::Relaxed),
+                                                total: None,
+                                            }))
+                                            .await;
+                                    }
                                 }
                             }
                             Ok(Err(w)) => {
@@ -253,17 +258,19 @@ impl<R: MetadataReader> Indexer<R> {
                                         message: w.message,
                                     })
                                     .await;
-                                let shaped = progress.1.fetch_add(1, Ordering::Relaxed) + 1;
-                                if shaped.is_multiple_of(32) {
-                                    let _ = events
-                                        .send(IndexEvent::Progress(ScanProgress {
-                                            stage: ScanStage::Shaping,
-                                            discovered: progress.0.load(Ordering::Relaxed),
-                                            shaped,
-                                            enriched: progress.2.load(Ordering::Relaxed),
-                                            total: None,
-                                        }))
-                                        .await;
+                                if counts_as_photo {
+                                    let shaped = progress.1.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if shaped.is_multiple_of(32) {
+                                        let _ = events
+                                            .send(IndexEvent::Progress(ScanProgress {
+                                                stage: ScanStage::Shaping,
+                                                discovered: progress.0.load(Ordering::Relaxed),
+                                                shaped,
+                                                enriched: progress.2.load(Ordering::Relaxed),
+                                                total: None,
+                                            }))
+                                            .await;
+                                    }
                                 }
                             }
                             Err(_) => {}
@@ -296,6 +303,7 @@ impl<R: MetadataReader> Indexer<R> {
                             break;
                         }
                         let id = item.asset.id;
+                        let counts_as_photo = item.asset.media_kind != MediaKind::Video;
                         if !admit_enrichment(&cancel, &scheduler, &admissions).await {
                             break;
                         }
@@ -342,17 +350,19 @@ impl<R: MetadataReader> Indexer<R> {
                                         metadata: MetadataResolver::resolve(p.metadata),
                                     })
                                     .await;
-                                let enriched = progress.2.fetch_add(1, Ordering::Relaxed) + 1;
-                                if enriched.is_multiple_of(32) {
-                                    let _ = events
-                                        .send(IndexEvent::Progress(ScanProgress {
-                                            stage: ScanStage::Enriching,
-                                            discovered: progress.0.load(Ordering::Relaxed),
-                                            shaped: progress.1.load(Ordering::Relaxed),
-                                            enriched,
-                                            total: None,
-                                        }))
-                                        .await;
+                                if counts_as_photo {
+                                    let enriched = progress.2.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if enriched.is_multiple_of(32) {
+                                        let _ = events
+                                            .send(IndexEvent::Progress(ScanProgress {
+                                                stage: ScanStage::Enriching,
+                                                discovered: progress.0.load(Ordering::Relaxed),
+                                                shaped: progress.1.load(Ordering::Relaxed),
+                                                enriched,
+                                                total: None,
+                                            }))
+                                            .await;
+                                    }
                                 }
                             }
                             Ok(Err(w)) => {
@@ -392,7 +402,7 @@ impl<R: MetadataReader> Indexer<R> {
                     discovered: progress.0.load(Ordering::Relaxed),
                     shaped: progress.1.load(Ordering::Relaxed),
                     enriched: progress.2.load(Ordering::Relaxed),
-                    total: Some(summary.discovered),
+                    total: Some(progress.0.load(Ordering::Relaxed)),
                 }))
                 .await;
             let _ = events_tx.send(IndexEvent::Completed(summary)).await;

@@ -4,7 +4,7 @@ use photo_catalog::{
     AssetMetadataUpdate, AssetShapeUpdate, Catalog, CatalogError, CatalogIndexRecord, NewAsset,
     NewFolderGroup, NewLibrary, ShapeStatus, WallCursorKey, WallOrder,
 };
-use photo_domain::{FolderGroupId, MediaKind, RelativePathKey};
+use photo_domain::{AssetId, FolderGroupId, MediaKind, RelativePathKey};
 use rusqlite::Connection;
 
 fn id_key(id: photo_domain::AssetId) -> [u8; 16] {
@@ -108,6 +108,70 @@ fn provisional_pages_paginate_with_stable_order() {
 }
 
 #[test]
+fn wall_pages_skip_videos_before_limit_and_cursor_calculation() {
+    let fixture = WallFixture::with_assets([
+        asset("a.jpg", MediaKind::Jpeg, 1),
+        asset("clip.mp4", MediaKind::Video, 2),
+        asset("b.jpg", MediaKind::Jpeg, 3),
+    ]);
+
+    let first = fixture
+        .catalog
+        .wall_page(fixture.group, WallOrder::Provisional, None, 1)
+        .unwrap();
+    assert_eq!(display_paths(&first.items), ["a.jpg"]);
+
+    let second = fixture
+        .catalog
+        .wall_page(fixture.group, WallOrder::Provisional, first.next, 1)
+        .unwrap();
+    assert_eq!(display_paths(&second.items), ["b.jpg"]);
+    assert!(second.next.is_some());
+}
+
+#[test]
+fn wall_records_for_assets_omit_video_ids() {
+    let fixture = WallFixture::with_photo_and_video();
+    let rows = fixture
+        .catalog
+        .wall_records_for_assets(fixture.group, &[fixture.photo, fixture.video])
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+        [fixture.photo]
+    );
+}
+
+#[test]
+fn photo_asset_ids_page_projects_photo_ids_with_keyset_cursor() {
+    let fixture = WallFixture::with_assets([
+        asset("a.jpg", MediaKind::Jpeg, 1),
+        asset("clip.mp4", MediaKind::Video, 2),
+        asset("b.jpg", MediaKind::Jpeg, 3),
+    ]);
+    let first = fixture
+        .catalog
+        .photo_asset_ids_page(fixture.group, WallOrder::Provisional, None, 1)
+        .unwrap();
+    let first_id = AssetId::for_path(
+        fixture.library,
+        &RelativePathKey::from_relative_path(Path::new("a.jpg")).unwrap(),
+    );
+    assert_eq!(first.items, [first_id]);
+
+    let second = fixture
+        .catalog
+        .photo_asset_ids_page(fixture.group, WallOrder::Provisional, first.next, 1)
+        .unwrap();
+    let second_id = AssetId::for_path(
+        fixture.library,
+        &RelativePathKey::from_relative_path(Path::new("b.jpg")).unwrap(),
+    );
+    assert_eq!(second.items, [second_id]);
+    assert!(second.next.is_some());
+}
+
+#[test]
 fn wall_page_projects_asset_rating() {
     let mut fixture = WallFixture::new();
     let id = fixture.shaped("rated.jpg", ShapeStatus::Ready, 16, 9);
@@ -133,7 +197,32 @@ struct WallFixture {
     catalog: Catalog,
     library: photo_domain::LibraryId,
     group: FolderGroupId,
+    photo: AssetId,
+    video: AssetId,
 }
+
+#[derive(Clone, Copy)]
+struct FixtureAsset {
+    path: &'static str,
+    media_kind: MediaKind,
+    order: u64,
+}
+
+fn asset(path: &'static str, media_kind: MediaKind, order: u64) -> FixtureAsset {
+    FixtureAsset {
+        path,
+        media_kind,
+        order,
+    }
+}
+
+fn display_paths(items: &[photo_catalog::WallCatalogRecord]) -> Vec<&str> {
+    items
+        .iter()
+        .map(|item| item.display_path.as_str())
+        .collect()
+}
+
 impl WallFixture {
     fn new() -> Self {
         let mut catalog = Catalog::open_in_memory().unwrap();
@@ -145,7 +234,59 @@ impl WallFixture {
             catalog,
             library: library.id,
             group,
+            photo: AssetId::from_uuid(uuid::Uuid::nil()),
+            video: AssetId::from_uuid(uuid::Uuid::from_bytes([1; 16])),
         }
+    }
+
+    fn with_assets<const N: usize>(assets: [FixtureAsset; N]) -> Self {
+        let mut fixture = Self::new();
+        let mut assets = assets;
+        assets.sort_by_key(|asset| asset.order);
+        for item in assets {
+            let key = RelativePathKey::from_relative_path(Path::new(item.path)).unwrap();
+            let mut value = NewAsset::minimal(fixture.library, key, item.path, item.media_kind, 1);
+            value.folder_group_id = Some(fixture.group);
+            fixture.catalog.upsert_asset(&value).unwrap();
+            fixture
+                .catalog
+                .apply_index_batch(&[CatalogIndexRecord::Shaped(AssetShapeUpdate {
+                    asset_id: value.id,
+                    width: 16,
+                    height: 9,
+                    orientation: Some(1),
+                    representative_rgb: None,
+                    shape_status: ShapeStatus::Ready,
+                })])
+                .unwrap();
+        }
+        fixture
+    }
+
+    fn with_photo_and_video() -> Self {
+        let mut fixture = Self::with_assets([
+            asset("photo.jpg", MediaKind::Jpeg, 1),
+            asset("clip.mp4", MediaKind::Video, 2),
+        ]);
+        fixture.photo = fixture
+            .catalog
+            .find_asset(AssetId::for_path(
+                fixture.library,
+                &RelativePathKey::from_relative_path(Path::new("photo.jpg")).unwrap(),
+            ))
+            .unwrap()
+            .unwrap()
+            .id;
+        fixture.video = fixture
+            .catalog
+            .find_asset(AssetId::for_path(
+                fixture.library,
+                &RelativePathKey::from_relative_path(Path::new("clip.mp4")).unwrap(),
+            ))
+            .unwrap()
+            .unwrap()
+            .id;
+        fixture
     }
     fn add(
         &mut self,

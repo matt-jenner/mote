@@ -8,7 +8,7 @@ use photo_core::FolderPolicyEngine;
 use photo_domain::{MediaKind, RelativePathKey};
 use photo_indexer::{
     CatalogWriter, DefaultMetadataReader, IndexEvent, IndexScheduler, Indexer, InteractionMode,
-    MetadataReader, ScanRequest, SchedulerConfig,
+    MetadataReader, ScanProgress, ScanRequest, ScanStage, SchedulerConfig,
 };
 use photo_metadata::{
     Keyword, MetadataBundle, MetadataReadWarning, ProvenanceRecord, RepresentativeRgb,
@@ -316,6 +316,44 @@ async fn emits_shape_before_blocked_metadata_and_before_scan_completion() {
     let summary = scan.join().await.unwrap();
     assert_eq!(summary.discovered, 2);
     assert_eq!(summary.failed, 0);
+}
+
+#[tokio::test]
+async fn video_discovery_is_indexed_but_not_counted_in_photo_progress() {
+    let fixture = tempfile::tempdir().unwrap();
+    write_png(&fixture.path().join("a.jpg"), [255, 0, 0]);
+    write_png(&fixture.path().join("b.jpg"), [0, 0, 255]);
+    std::fs::write(fixture.path().join("clip.mp4"), b"not a video").unwrap();
+
+    let indexer = Indexer::new(NoopMetadataReader, empty_policy_engine());
+    let mut scan = indexer.start(ScanRequest::new(fixture.path())).unwrap();
+    let mut discovered = Vec::new();
+    let mut final_progress = None;
+    while let Some(event) = scan.events.recv().await {
+        match event {
+            IndexEvent::Discovered { asset } => discovered.push(asset.display_path),
+            IndexEvent::Progress(progress) if progress.stage == ScanStage::Completed => {
+                final_progress = Some(progress)
+            }
+            IndexEvent::Completed(_) => break,
+            _ => {}
+        }
+    }
+    let summary = scan.join().await.unwrap();
+
+    discovered.sort();
+    assert_eq!(discovered, ["a.jpg", "b.jpg", "clip.mp4"]);
+    assert_eq!(
+        final_progress,
+        Some(ScanProgress {
+            stage: ScanStage::Completed,
+            discovered: 2,
+            shaped: 2,
+            enriched: 2,
+            total: Some(2),
+        })
+    );
+    assert_eq!(summary.discovered, 3);
 }
 
 #[tokio::test]
