@@ -519,7 +519,7 @@ The feature-range source audit used accepted base
 TypeScript, and TSX and includes filesystem create/write/save/copy/move/
 rename/remove/delete/unlink forms, `OpenOptions`, `File::create`,
 `write_all`, `write_atomic`, and source/cache/folder/path DTO tokens. Its
-exact command and all 56 file:line matches, with classifications, are in the
+exact command and all 41 file:line matches, with classifications, are in the
 companion Task 7 report.
 
 ```text
@@ -529,7 +529,7 @@ git diff --unified=0 --no-color 14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc..67393e
 /^@@ / { p=index($0,"+"); if (p) { h=substr($0,p+1); sub(",.*","",h); line=h+0 }; next }
 /^\+/ && !/^\+\+\+/ {
   text=substr($0,2)
-  if (text ~ /(std::fs::(create_dir_all|write|rename|remove_file|remove_dir_all|copy)|fs::(write|rename|remove|copy)|\.save[[:space:]]*\(|File::create|OpenOptions|write_all|write_atomic|writeFile|write_file|copyFile|copy_file|moveFile|move_file|rename|removeFile|remove_file|unlink|delete_derivatives|deleteAsset|setRating|updateRating|selectedFolder(Name)?|selected_folder|source(Path|_path)|folder(Path|_path)|relative(Path|_path)|display(Path|_path)|native(Path|_path)|cache(Path|_path)|locateFolder)/) print file ":" line ": " text
+  if (text ~ /(std::fs::(create_dir_all|write|rename|remove_file|remove_dir_all|copy)|fs::(write|rename|remove|copy)|File::create|OpenOptions|write_all|write_atomic|writeFile|write_file|copyFile|copy_file|moveFile|move_file|rename|removeFile|remove_file|unlink|delete_derivatives|deleteAsset|setRating|updateRating|\.save[[:space:]]*\(|selectedFolder(Name)?|selected_folder|sourcePath|folderPath|relativePath|displayPath|nativePath|cachePath|locateFolder)/) print file ":" line ": " text
   line++
 }
 '

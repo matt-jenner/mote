@@ -273,21 +273,17 @@ git diff --unified=0 --no-color "$base..$head" -- '*.rs' '*.ts' '*.tsx' | awk '
 /^@@ / { p=index($0,"+"); if (p) { h=substr($0,p+1); sub(",.*","",h); line=h+0 }; next }
 /^\+/ && !/^\+\+\+/ {
   text=substr($0,2)
-  if (text ~ /(std::fs::(create_dir_all|write|rename|remove_file|remove_dir_all|copy)|fs::(write|rename|remove|copy)|\.save[[:space:]]*\(|File::create|OpenOptions|write_all|write_atomic|writeFile|write_file|copyFile|copy_file|moveFile|move_file|rename|removeFile|remove_file|unlink|delete_derivatives|deleteAsset|setRating|updateRating|selectedFolder(Name)?|selected_folder|source(Path|_path)|folder(Path|_path)|relative(Path|_path)|display(Path|_path)|native(Path|_path)|cache(Path|_path)|locateFolder)/) print file ":" line ": " text
+  if (text ~ /(std::fs::(create_dir_all|write|rename|remove_file|remove_dir_all|copy)|fs::(write|rename|remove|copy)|File::create|OpenOptions|write_all|write_atomic|writeFile|write_file|copyFile|copy_file|moveFile|move_file|rename|removeFile|remove_file|unlink|delete_derivatives|deleteAsset|setRating|updateRating|\.save[[:space:]]*\(|selectedFolder(Name)?|selected_folder|sourcePath|folderPath|relativePath|displayPath|nativePath|cachePath|locateFolder)/) print file ":" line ": " text
   line++
 }
 '
 ```
 
-The added-line audit returned 56 matches. Every match is reproduced below with
+The added-line audit returned 41 matches. Every match is reproduced below with
 its file and line; the classification after the list covers each match.
 
 ```text
 apps/interface/src/components/PhotoViewer.browser.test.tsx:1933: selectedFolderName: "Video fixture"
-crates/app-service/src/derivatives.rs:419: .map(|record| record.relative_cache_path.clone())
-crates/app-service/src/derivatives.rs:987: relative_cache_path: generated.relative_path.clone(),
-crates/app-service/src/derivatives.rs:1212: .map(|record| record.relative_cache_path)
-crates/app-service/src/derivatives.rs:1253: .map(|record| record.relative_cache_path)
 crates/app-service/src/derivatives.rs:2910: std::fs::create_dir_all(&source).unwrap();
 crates/app-service/src/derivatives.rs:2914: .save(&blocked_path)
 crates/app-service/src/derivatives.rs:2917: .save(&healthy_path)
@@ -295,23 +291,15 @@ crates/app-service/src/derivatives.rs:2996: std::fs::create_dir_all(&source).unw
 crates/app-service/src/derivatives.rs:2998: .save(source.join("photo.jpg"))
 crates/app-service/src/derivatives.rs:3090: std::fs::create_dir_all(&source).unwrap();
 crates/app-service/src/derivatives.rs:3093: .save(&image_path)
-crates/app-service/src/derivatives.rs:3146: relative_cache_path: std::path::PathBuf::from(format!(
 crates/app-service/src/derivatives.rs:3289: std::fs::create_dir_all(&source).unwrap();
 crates/app-service/src/derivatives.rs:3292: .save(&image_path)
 crates/app-service/src/derivatives.rs:3362: std::fs::create_dir_all(&source).unwrap();
 crates/app-service/src/derivatives.rs:3365: .save(&image_path)
-crates/app-service/src/derivatives.rs:3463: let source_path = source.join("photo.jpg");
 crates/app-service/src/derivatives.rs:3465: .save(&source_path)
-crates/app-service/src/derivatives.rs:3477: size_bytes: std::fs::metadata(&source_path).unwrap().len(),
 crates/app-service/src/derivatives.rs:3636: std::fs::create_dir_all(&source).unwrap();
-crates/app-service/tests/progressive_wall.rs:140: relative_cache_path: PathBuf,
-crates/app-service/tests/progressive_wall.rs:188: relative_cache_path: record.relative_cache_path,
-crates/app-service/tests/progressive_wall.rs:222: let relative_cache_path = PathBuf::from("evictable/old-preview.jpg");
 crates/app-service/tests/progressive_wall.rs:223: std::fs::create_dir_all(
 crates/app-service/tests/progressive_wall.rs:227: .join(relative_cache_path.parent().unwrap()),
 crates/app-service/tests/progressive_wall.rs:230: std::fs::write(
-crates/app-service/tests/progressive_wall.rs:231: fixture.config.cache_dir().join(&relative_cache_path),
-crates/app-service/tests/progressive_wall.rs:242: relative_cache_path,
 crates/app-service/tests/progressive_wall.rs:355: std::fs::create_dir_all(&source).unwrap();
 crates/app-service/tests/progressive_wall.rs:356: std::fs::write(source.join("clip.mp4"), b"not a video").unwrap();
 crates/app-service/tests/progressive_wall.rs:368: std::fs::create_dir_all(&source).unwrap();
@@ -331,8 +319,6 @@ crates/app-service/tests/progressive_wall.rs:1825: std::fs::write(fixture.source
 crates/app-service/tests/progressive_wall.rs:1868: std::fs::write(
 crates/app-service/tests/progressive_wall.rs:1967: std::fs::write(fixture.source.join("photo-000.jpg"), changed).unwrap();
 crates/app-service/tests/progressive_wall.rs:2238: catalog.delete_derivatives(&screen_ids).unwrap();
-crates/app-service/tests/progressive_wall.rs:2741: .join(&screen_row.relative_cache_path)
-crates/app-service/tests/progressive_wall.rs:3829: relative_cache_path: PathBuf::from("video-placeholder.webp"),
 crates/app-service/tests/progressive_wall.rs:3993: std::fs::remove_file(fixture.source.join("offline.jpg")).unwrap();
 crates/app-service/tests/task7_source_safety.rs:279: assert_eq!(catalog.delete_derivatives(&[wall.id]).unwrap(), 1);
 crates/cache/src/image_derivative.rs:141: let write_result = self.writer.write_atomic(relative_path.clone(), |file| {
@@ -341,21 +327,17 @@ crates/cache/tests/image_derivative.rs:81: std::fs::copy(fixture.path(), &cached
 crates/indexer/tests/progressive_scan.rs:326: std::fs::write(fixture.path().join("clip.mp4"), b"not a video").unwrap();
 ```
 
-Classification of all 56 matches:
+Classification of all 41 matches:
 
 - The browser `selectedFolderName` value is a path-free fixture label.
-- The four `derivatives.rs` `relative_cache_path` reads/fields and the
-  `source_path`/`source` lines are internal worker state. Source paths are
-  opened only for decoding; derivative generation writes only managed cache
-  files.
 - Every `derivatives.rs` match at lines 2910--3636 is inside the test module
   and creates temporary image fixtures or records temporary cache paths.
 - Every `progressive_wall.rs` create/save/write match at lines 222--379,
   1607--1868, and 1967 is temporary fixture setup or changed-signature test
   input. The two `rename` lines at 1489/1521 move only a temporary fixture to
-  simulate source availability. The `delete_derivatives` line at 2238 and
-  `relative_cache_path` lines at 2741/3829 operate on temporary catalogue or
-  cache records. The `remove_file` line at 3993 removes a temporary fixture.
+  simulate source availability. The `delete_derivatives` line at 2238
+  operates on temporary catalogue records. The `remove_file` line at 3993
+  removes a temporary fixture.
 - The new safety test's `delete_derivatives` line at 279 removes only its
   temporary catalogue row while leaving the checked-in source untouched.
 - `CacheWriter::write_atomic` and `Write::write_all` in production
