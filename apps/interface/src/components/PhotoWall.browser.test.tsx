@@ -1170,6 +1170,69 @@ describe("progressive photo wall", () => {
 		await screen.unmount();
 	});
 
+	it("keeps an integrated screen-only tile inert on pointer activation", async () => {
+		await page.viewport(1440, 1024);
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(
+			0,
+			pageOf(
+				[
+					asset("screen-only-integrated", "Screen only", 1, {
+						wallThumbnail: null,
+						screenPreview: {
+							assetId: "screen-only-integrated",
+							kind: "screenPreview" as const,
+							key: "screen-only-integrated-preview",
+						},
+					}),
+				],
+				"settled",
+			),
+		);
+		const wall = screen.getByRole("region", { name: "Photos" });
+		await expect
+			.poll(() =>
+				wall
+					.element()
+					.querySelector("[data-asset-id='screen-only-integrated']"),
+			)
+			.not.toBeNull();
+		const tile = wall
+			.element()
+			.querySelector<HTMLElement>("[data-asset-id='screen-only-integrated']");
+		if (!tile) throw new Error("integrated screen-only tile did not render");
+		const screenRequests = () =>
+			service.derivativeRequests.filter(
+				(request) => request.kind === "screenPreview",
+			).length;
+		const derivativeRequestsBeforeActivation =
+			service.derivativeRequests.length;
+		expect(screenRequests()).toBe(0);
+		tile.dispatchEvent(
+			new PointerEvent("pointerdown", {
+				bubbles: true,
+				cancelable: true,
+				isPrimary: true,
+				pointerId: 42,
+				pointerType: "mouse",
+			}),
+		);
+		tile.dispatchEvent(
+			new MouseEvent("click", { bubbles: true, cancelable: true }),
+		);
+		expect(screenRequests()).toBe(0);
+		expect(service.derivativeRequests.length).toBe(
+			derivativeRequestsBeforeActivation,
+		);
+		expect(
+			screen.getByRole("dialog", { name: "Photo viewer" }).query(),
+		).toBeNull();
+		expect(tile.querySelector("button")).toBeNull();
+		screen.unmount();
+	});
+
 	it("keeps the current tile inert through decode and fade, then enables it", async () => {
 		const service = new ControlledWallService();
 		const onOpen = vi.fn();
@@ -1822,6 +1885,7 @@ describe("progressive photo wall", () => {
 
 	it("keeps a zero-width completed image on the preview failure path", async () => {
 		const service = new ControlledWallService();
+		const onOpen = vi.fn();
 		service.setDerivativeUrl(
 			"zero-width",
 			"/demo-photos/missing-zero-width.jpg?zero-width=1",
@@ -1845,12 +1909,28 @@ describe("progressive photo wall", () => {
 		const restoreErrorCapture = suppressCapture("error");
 		try {
 			const screen = await render(
-				<PhotoTile positioned={positioned} service={service} />,
+				<PhotoTile onOpen={onOpen} positioned={positioned} service={service} />,
 			);
 			const image = screen.getByRole("img", { name: "Coast" });
 			expect((image.element() as HTMLImageElement).complete).toBe(true);
 			expect((image.element() as HTMLImageElement).naturalWidth).toBe(0);
 			expect(getComputedStyle(image.element()).opacity).toBe("0");
+			const tile = document.querySelector<HTMLElement>(
+				"[data-asset-id='coast']",
+			);
+			tile?.dispatchEvent(
+				new PointerEvent("pointerdown", {
+					bubbles: true,
+					isPrimary: true,
+					pointerId: 41,
+					pointerType: "mouse",
+				}),
+			);
+			tile?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+			expect(
+				screen.getByRole("button", { name: "Open Coast", exact: true }).query(),
+			).toBeNull();
+			expect(onOpen).not.toHaveBeenCalled();
 			screen.unmount();
 		} finally {
 			restoreErrorCapture();
@@ -1868,6 +1948,10 @@ describe("progressive photo wall", () => {
 		);
 		const oldDecode = gate<void>();
 		const newDecode = gate<void>();
+		let oldDecodeContinuationRan = false;
+		const oldDecodeResult = oldDecode.promise.then(() => {
+			oldDecodeContinuationRan = true;
+		});
 		const oldComplete = true;
 		let newComplete = false;
 		const restoreImageRuntime = overrideImageRuntime({
@@ -1882,7 +1966,7 @@ describe("progressive photo wall", () => {
 						? 320
 						: 0,
 			decode: (image) =>
-				image.src.includes("forest") ? newDecode.promise : oldDecode.promise,
+				image.src.includes("forest") ? newDecode.promise : oldDecodeResult,
 		});
 		const restoreLoadCapture = suppressCapture("load");
 		function SwapHarness() {
@@ -1938,7 +2022,7 @@ describe("progressive photo wall", () => {
 			);
 			newComplete = true;
 			oldDecode.resolve();
-			await new Promise((resolve) => window.setTimeout(resolve, 25));
+			await expect.poll(() => oldDecodeContinuationRan).toBe(true);
 			expect(getComputedStyle(image.element()).opacity).toBe("0");
 			newDecode.resolve();
 			await expect

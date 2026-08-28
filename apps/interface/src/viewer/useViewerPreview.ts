@@ -116,12 +116,24 @@ export function useViewerPreview({
 	const [failedRequestKeys, setFailedRequestKeys] = useState<Set<string>>(
 		() => new Set(),
 	);
+	const failedRequestKeysRef = useRef(failedRequestKeys);
 	const requestRecords = useRef(new Map<string, RequestRecord>());
 	const attemptCounts = useRef(new Map<string, number>());
 	const retryTimers = useRef(new Set<number>());
 	const interactionActive = useRef(false);
 	const interactionTimer = useRef<number | null>(null);
 	const mountedRef = useRef(false);
+	const lifecycleCleanupToken = useRef(0);
+	const updateFailedRequestKeys = useCallback(
+		(update: (previous: Set<string>) => Set<string>) => {
+			setFailedRequestKeys((previous) => {
+				const next = update(previous);
+				failedRequestKeysRef.current = next;
+				return next;
+			});
+		},
+		[],
+	);
 
 	const reportInteraction = useCallback(() => {
 		interactionActive.current = true;
@@ -151,14 +163,29 @@ export function useViewerPreview({
 				activeKeys.add(requestKey(asset, previewGeneration));
 			}
 		}
-		for (const [key, record] of requestRecords.current) {
+		const knownKeys = new Set([
+			...requestRecords.current.keys(),
+			...attemptCounts.current.keys(),
+			...failedRequestKeysRef.current,
+		]);
+		const inactiveKeys: string[] = [];
+		for (const key of knownKeys) {
 			if (activeKeys.has(key)) continue;
-			if (record.retryTimer !== null) {
+			inactiveKeys.push(key);
+			const record = requestRecords.current.get(key);
+			if (record?.retryTimer !== null && record?.retryTimer !== undefined) {
 				window.clearTimeout(record.retryTimer);
 				retryTimers.current.delete(record.retryTimer);
 			}
 			requestRecords.current.delete(key);
+			attemptCounts.current.delete(key);
 		}
+		if (inactiveKeys.length > 0)
+			updateFailedRequestKeys((previous) => {
+				const next = new Set(previous);
+				for (const key of inactiveKeys) next.delete(key);
+				return next;
+			});
 
 		const requestPlan = (
 			assetIds: readonly string[],
@@ -222,7 +249,7 @@ export function useViewerPreview({
 					for (const [key, record] of attempts) {
 						if (requestRecords.current.get(key) !== record) continue;
 						record.status = "completed";
-						setFailedRequestKeys((previous) => {
+						updateFailedRequestKeys((previous) => {
 							if (!previous.has(key)) return previous;
 							const next = new Set(previous);
 							next.delete(key);
@@ -239,7 +266,7 @@ export function useViewerPreview({
 						const record = attempts.get(key);
 						if (!record || requestRecords.current.get(key) !== record) continue;
 						record.status = "failed";
-						setFailedRequestKeys((previous) => {
+						updateFailedRequestKeys((previous) => {
 							if (previous.has(key)) return previous;
 							const next = new Set(previous);
 							next.add(key);
@@ -278,18 +305,26 @@ export function useViewerPreview({
 	}, [assets, currentIndex, previewGeneration, retryTick, service]);
 
 	useEffect(() => {
+		const cleanupToken = ++lifecycleCleanupToken.current;
 		mountedRef.current = true;
 		return () => {
 			mountedRef.current = false;
-			if (interactionTimer.current !== null)
-				window.clearTimeout(interactionTimer.current);
-			for (const timer of retryTimers.current) window.clearTimeout(timer);
-			for (const record of requestRecords.current.values())
-				record.retryTimer = null;
-			retryTimers.current.clear();
-			// Keep request records through StrictMode's effect replay so an
-			// in-flight request cannot be duplicated. A real unmount drops
-			// these refs with the hook instance.
+			queueMicrotask(() => {
+				if (
+					mountedRef.current ||
+					lifecycleCleanupToken.current !== cleanupToken
+				)
+					return;
+				if (interactionTimer.current !== null)
+					window.clearTimeout(interactionTimer.current);
+				for (const timer of retryTimers.current) window.clearTimeout(timer);
+				for (const record of requestRecords.current.values())
+					record.retryTimer = null;
+				requestRecords.current.clear();
+				attemptCounts.current.clear();
+				retryTimers.current.clear();
+				failedRequestKeysRef.current = new Set();
+			});
 		};
 	}, []);
 

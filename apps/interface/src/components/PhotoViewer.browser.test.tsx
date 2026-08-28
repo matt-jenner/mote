@@ -31,14 +31,17 @@ import { ViewerStage } from "./ViewerStage";
 interface Gate<T> {
 	promise: Promise<T>;
 	resolve: (value: T) => void;
+	reject: (reason?: unknown) => void;
 }
 
 function gate<T>(): Gate<T> {
 	let resolve!: (value: T) => void;
-	const promise = new Promise<T>((nextResolve) => {
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((nextResolve, nextReject) => {
 		resolve = nextResolve;
+		reject = nextReject;
 	});
-	return { promise, resolve };
+	return { promise, resolve, reject };
 }
 
 function asset(id: string, displayName: string, order: number): WallAsset {
@@ -376,6 +379,52 @@ function PreviewHarness({
 				previewGeneration={generation}
 				service={service}
 			/>
+		</>
+	);
+}
+
+function ActivatablePreviewHarness({
+	assets,
+	service,
+}: {
+	assets: readonly WallAsset[];
+	service: PhotoService;
+}) {
+	const [active, setActive] = useState(true);
+	const activeAssets = active ? assets : [];
+	const preview = useViewerPreview({
+		assets: activeAssets,
+		currentIndex: 0,
+		previewGeneration: 1,
+	});
+	const current = activeAssets[0];
+	return (
+		<>
+			<button
+				data-testid="deactivate-preview"
+				onClick={() => setActive(false)}
+				type="button"
+			>
+				Deactivate
+			</button>
+			<button
+				data-testid="activate-preview"
+				onClick={() => setActive(true)}
+				type="button"
+			>
+				Activate
+			</button>
+			<output data-testid="preview-active">{String(active)}</output>
+			{current ? (
+				<ViewerStage
+					asset={current}
+					baseUrl={preview.baseUrl}
+					currentUrl={preview.currentUrl}
+					largePreviewUnavailable={preview.largePreviewUnavailable}
+					previewGeneration={1}
+					service={service}
+				/>
+			) : null}
 		</>
 	);
 }
@@ -4166,6 +4215,78 @@ describe("immersive photo viewer checkpoint", () => {
 		await expect
 			.poll(() => requests.filter((ids) => ids.includes("a")).length)
 			.toBe(2);
+	});
+
+	it("clears per-key retry state after deactivation and reactivation", async () => {
+		const requests: DerivativeRequest[] = [];
+		const service = previewService(async (request) => {
+			requests.push({ ...request, assetIds: [...request.assetIds] });
+			if (requests.length <= 3) throw new Error("temporary failure");
+		});
+		vi.useFakeTimers();
+		try {
+			const view = await render(
+				<PhotoServiceProvider service={service}>
+					<ActivatablePreviewHarness
+						assets={[asset("a", "A", 1)]}
+						service={service}
+					/>
+				</PhotoServiceProvider>,
+			);
+			await vi.advanceTimersByTimeAsync(0);
+			await expect.poll(() => requests.length).toBe(1);
+			await vi.advanceTimersByTimeAsync(100);
+			await expect.poll(() => requests.length).toBe(2);
+			await vi.advanceTimersByTimeAsync(250);
+			await expect.poll(() => requests.length).toBe(3);
+			await vi.advanceTimersByTimeAsync(0);
+			await expect
+				.element(view.getByTestId("viewer-stage"))
+				.toHaveAttribute("data-large-preview-unavailable", "true");
+
+			await view.getByTestId("deactivate-preview").click();
+			await expect
+				.element(view.getByTestId("preview-active"))
+				.toHaveTextContent("false");
+			await view.getByTestId("activate-preview").click();
+			await expect.poll(() => requests.length).toBe(4);
+			await expect
+				.element(view.getByTestId("viewer-stage"))
+				.toHaveAttribute("data-large-preview-unavailable", "false");
+			await view.unmount();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("fences a late preview rejection after a real unmount", async () => {
+		const requests: DerivativeRequest[] = [];
+		let rejectPending = (_reason?: unknown): void => undefined;
+		const pending = new Promise<void>((_resolve, reject) => {
+			rejectPending = reject;
+		});
+		const service = previewService(async (request) => {
+			requests.push({ ...request, assetIds: [...request.assetIds] });
+			await pending;
+		});
+		vi.useFakeTimers();
+		try {
+			const view = await render(
+				<PhotoServiceProvider service={service}>
+					<PreviewHarness assets={[asset("a", "A", 1)]} service={service} />
+				</PhotoServiceProvider>,
+			);
+			await vi.advanceTimersByTimeAsync(0);
+			await expect.poll(() => requests.length).toBe(1);
+			await view.unmount();
+			rejectPending(new Error("late failure"));
+			await Promise.resolve();
+			await Promise.resolve();
+			await vi.advanceTimersByTimeAsync(1000);
+			expect(requests).toHaveLength(1);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("keeps an in-flight preview rejection alive across an equivalent asset refresh", async () => {
