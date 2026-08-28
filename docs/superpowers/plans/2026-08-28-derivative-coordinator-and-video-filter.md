@@ -106,6 +106,7 @@ CREATE TABLE derivative_failures (
   asset_id BLOB NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
   kind TEXT NOT NULL CHECK(kind IN ('wall_thumbnail', 'screen_preview')),
   cache_key TEXT NOT NULL,
+  availability TEXT NOT NULL,
   failure_code TEXT NOT NULL,
   occurred_at INTEGER NOT NULL,
   PRIMARY KEY(asset_id, kind)
@@ -145,6 +146,7 @@ pub struct TerminalDerivativeFailure {
     pub asset_id: AssetId,
     pub kind: String,
     pub cache_key: String,
+    pub availability: Availability,
     pub failure_code: String,
     pub occurred_at: i64,
 }
@@ -155,6 +157,7 @@ impl Catalog {
         asset_id: AssetId,
         kind: &str,
         cache_key: &str,
+        availability: Availability,
     ) -> Result<Option<TerminalDerivativeFailure>, CatalogError>;
 
     pub fn record_terminal_derivative_failure(
@@ -170,7 +173,7 @@ impl Catalog {
 }
 ```
 
-Prove a changed cache key does not match the old failure, a new failure replaces the previous key, success clears it, and deleting the asset cascades the row.
+Prove a changed cache key does not match the old failure, a changed availability state does not match it, a new failure replaces the previous key/state, success clears it, and deleting the asset cascades the row. This makes an offline failure terminal only while the asset remains offline; returning online makes it eligible without requiring media bytes to change.
 
 - [ ] **Step 4: Run terminal-outcome tests and verify RED**
 
@@ -804,7 +807,7 @@ async fn terminal_photo_failures_and_videos_do_not_starve_healthy_previews() {
 }
 ```
 
-Restart the service with the same catalogue and prove terminal failures with the same key are not attempted again. Change the corrupt asset's modified timestamp/key and prove one new attempt occurs.
+Restart the service with the same catalogue and prove terminal failures with the same key and availability are not attempted again. Change the corrupt asset's modified timestamp/key and prove one new attempt occurs. Mark the unavailable asset available without changing its media signature and prove the availability mismatch permits one new attempt.
 
 - [ ] **Step 3: Run phase and starvation tests and verify RED**
 
