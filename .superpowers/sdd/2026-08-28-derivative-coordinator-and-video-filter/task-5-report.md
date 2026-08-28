@@ -328,3 +328,76 @@ or report-facing data.
 ### Commit
 
 Fix-round 3 test-hardening commit: `a8d0eefd5b40a4abd23bf93638ac9baa4e5370ee` (`test: make collection bound gate deterministic`).
+
+## Fix round 4
+
+### Review findings addressed
+
+- The 10k bound test now waits for the literal configured derivative worker
+  count (`MAX_DERIVATIVE_WORKERS`, two) in the class-wide wall gate's atomic
+  entry counter before replacing that gate. Both active workers have therefore
+  cloned the original gate and remain held by its retained release handle;
+  the separate per-asset foreground gate cannot race either worker's gate
+  snapshot.
+- Debug/test-only derivative task tracking now covers driver tasks, attempt
+  tasks, attempt monitors, and admitted-commit operation/monitor tasks. A
+  count-and-notify guard decrements on cancellation, panic, or normal return.
+  `wait_for_zero` creates its notification future before the atomic count
+  check and uses `notify_one`, which preserves a permit across the
+  check/register window and avoids a lost wakeup. Cleanup releases both gates,
+  aborts caller futures, aborts coordinator attempts, invalidates queued
+  background work, waits for zero active derivative tasks, and asserts both
+  zero active tasks and zero coordinator jobs. No fixed delay remains.
+
+### GREEN evidence
+
+```text
+$ cargo test -p photo-app-service --lib collection_schedules_bounded_missing_work_with_concurrent_foreground_request -- --test-threads=1
+test result: ok. 1 passed; 0 failed
+
+$ focused bound test repeated 100 times (8 concurrent processes)
+100-run-exit=0
+
+$ cargo test -p photo-app-service --lib -- --test-threads=1
+test result: ok. 62 passed; 0 failed
+
+$ cargo test -p photo-app-service --test progressive_wall -- --test-threads=1
+test result: ok. 54 passed; 0 failed
+
+$ cargo test -p photo-catalog --test wall_query -- --test-threads=1
+test result: ok. 19 passed; 0 failed
+
+$ cargo test -p photo-catalog --test catalog_round_trip -- --test-threads=1
+test result: ok. 12 passed; 0 failed
+
+$ cargo clippy -p photo-app-service -p photo-catalog --all-targets --all-features -- -D warnings
+Finished successfully
+
+$ cargo fmt --all -- --check
+exit=0
+
+$ git diff --check
+exit=0
+
+$ cargo check --workspace --release
+Finished successfully
+
+$ cargo test --workspace --all-targets -- --test-threads=1
+workspace_exit=0
+```
+
+### Boundedness and cleanup evidence
+
+The test's first snapshot still proves `largest_loaded_page == 250`,
+`recent_len <= 250`, and `queued_jobs == 250` with both configured workers
+held. After the independent near-viewport admission it proves exactly 251
+jobs. After releasing, cancelling, and invalidating, it awaits tracked
+quiescence and proves `derivative_active_task_count_test() == 0` and
+`queued_jobs == 0`. The tracker exposes only an integer count and a wait
+operation; it stores no asset IDs, source paths, or cache paths. The bounded
+10k fixture continues to flush insertion records in 500-record batches and
+retains no full ID vector.
+
+### Commit
+
+Fix-round 4 test-hardening commit: `e7f134c183c319a9f3be9f54689ae2fbfc6671c7` (`test: await derivative worker quiescence`).
