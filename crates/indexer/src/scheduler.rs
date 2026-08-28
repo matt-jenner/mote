@@ -186,16 +186,17 @@ impl IndexScheduler {
         let mut state = self.state.lock().await;
         loop {
             let entry = state.heap.peek()?.clone();
-            if !entry.name.starts_with(owner_prefix) {
-                return None;
-            }
             let valid = state.queued.get(&entry.name).is_some_and(|current| {
                 current.sequence == entry.sequence && current.job.priority == entry.priority
             });
-            state.heap.pop();
             if !valid {
+                state.heap.pop();
                 continue;
             }
+            if !entry.name.starts_with(owner_prefix) {
+                return None;
+            }
+            state.heap.pop();
             return state.queued.remove(&entry.name).map(|queued| queued.job);
         }
     }
