@@ -12,8 +12,9 @@ use photo_app_service::{
     OrderState, SortDirection, SourceAvailability, WallAsset, WallMediaKind, WallPage,
     WallQueryRequest, WallShapeState, WallUpdate, WallWarningState,
 };
-use photo_catalog::{Catalog, NewDerivative};
-use photo_domain::{AssetId, DerivativeId, LibraryId, RelativePathKey};
+use photo_cache::CacheBudget;
+use photo_catalog::{Catalog, CatalogWarningRecord, NewDerivative, NewFolderGroup};
+use photo_domain::{AssetId, DerivativeId, FolderGroupId, LibraryId, RelativePathKey};
 use photo_metadata::{MetadataBundle, MetadataCandidate, MetadataReadWarning, MetadataSource};
 
 #[derive(Clone)]
@@ -128,6 +129,122 @@ fn managed_cache_files(root: &Path) -> BTreeSet<PathBuf> {
     let mut files = BTreeSet::new();
     visit(root, &mut files);
     files
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CacheCatalogWarningSnapshot {
+    cache_files: BTreeSet<PathBuf>,
+    derivatives: Vec<(String, String, PathBuf, u64, bool)>,
+    source_warnings: Vec<String>,
+}
+
+fn snapshot_cache_catalog_warnings(config: &AppConfig) -> CacheCatalogWarningSnapshot {
+    let catalog = Catalog::open(&config.catalog_path()).unwrap();
+    let active_selection = catalog.load_app_state().unwrap().active_selection.unwrap();
+    let source_warnings = catalog
+        .source_warning_summaries(active_selection.library_id)
+        .unwrap()
+        .into_iter()
+        .map(|warning| warning.code)
+        .collect();
+    let derivatives = catalog
+        .all_derivatives()
+        .unwrap()
+        .into_iter()
+        .map(|record| {
+            (
+                record.kind,
+                record.cache_key,
+                record.relative_cache_path,
+                record.size_bytes,
+                record.durable,
+            )
+        })
+        .collect();
+    CacheCatalogWarningSnapshot {
+        cache_files: managed_cache_files(config.cache_dir()),
+        derivatives,
+        source_warnings,
+    }
+}
+
+fn seed_evictable_screen_preview_and_warning(fixture: &ProgressiveFixture, asset_id: &str) {
+    let asset_id = AssetId::from_uuid(uuid::Uuid::parse_str(asset_id).unwrap());
+    let mut catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    let active_selection = catalog.load_app_state().unwrap().active_selection.unwrap();
+    let active_group = catalog
+        .folder_group_for_path(
+            active_selection.library_id,
+            &active_selection.relative_folder,
+        )
+        .unwrap()
+        .unwrap();
+    let evictable_group = catalog
+        .upsert_folder_group(&NewFolderGroup {
+            id: FolderGroupId::new(),
+            library_id: active_selection.library_id,
+            relative_path: RelativePathKey::from_relative_path(Path::new("evictable")).unwrap(),
+            display_path: "evictable".to_owned(),
+            last_viewed_at: Some(1),
+        })
+        .unwrap();
+    assert_ne!(evictable_group, active_group);
+    let relative_cache_path = PathBuf::from("evictable/old-preview.jpg");
+    std::fs::create_dir_all(
+        fixture
+            .config
+            .cache_dir()
+            .join(relative_cache_path.parent().unwrap()),
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.config.cache_dir().join(&relative_cache_path),
+        vec![0_u8; 1_000_000],
+    )
+    .unwrap();
+    catalog
+        .insert_derivative(&NewDerivative {
+            id: DerivativeId::new(),
+            asset_id,
+            folder_group_id: evictable_group,
+            kind: "screen_preview".to_owned(),
+            cache_key: "evictable-screen-preview".to_owned(),
+            relative_cache_path,
+            size_bytes: 1_000_000,
+            durable: false,
+            created_at: 1,
+        })
+        .unwrap();
+    catalog
+        .record_warning_once(&CatalogWarningRecord {
+            library_id: active_selection.library_id,
+            asset_id: None,
+            code: "screen_preview_cache_unavailable".to_owned(),
+            message: "seeded test warning".to_owned(),
+        })
+        .unwrap();
+}
+
+fn derivative_update_counts(
+    updates: &mut tokio::sync::broadcast::Receiver<WallUpdate>,
+) -> (usize, usize, usize) {
+    let mut screen_publications = 0;
+    let mut warnings = 0;
+    let mut warning_clears = 0;
+    while let Ok(event) = updates.try_recv() {
+        match event {
+            WallUpdate::DerivativesReady { derivatives, .. } => {
+                screen_publications += derivatives
+                    .iter()
+                    .filter(|derivative| derivative.kind == DerivativeClass::ScreenPreview)
+                    .count();
+            }
+            WallUpdate::Warning { .. } => warnings += 1,
+            WallUpdate::WarningCleared { .. } => warning_clears += 1,
+            _ => {}
+        }
+    }
+    (screen_publications, warnings, warning_clears)
 }
 
 impl ProgressiveFixture {
@@ -1879,6 +1996,184 @@ async fn stale_screen_preview_is_discarded_after_post_encode_invalidation() {
             WallUpdate::DerivativesReady { derivatives, .. }
                 if derivatives.iter().any(|item| item.kind == DerivativeClass::ScreenPreview)
         ));
+    }
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalidation_before_commit_admission_has_no_side_effects() {
+    for _ in 0..20 {
+        let (fixture, mut service, asset_id) = prepare_wall_ready_fixture().await;
+        seed_evictable_screen_preview_and_warning(&fixture, &asset_id);
+        service.set_derivative_cache_budget_for_test(CacheBudget::from_total_space(1_000_000));
+        let before = snapshot_cache_catalog_warnings(&fixture.config);
+        let mut updates = service.subscribe_wall_updates();
+
+        let post_encode_entered = Arc::new(tokio::sync::Notify::new());
+        let post_encode_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_screen_preview_post_encode_test_gate(
+                post_encode_entered.clone(),
+                post_encode_release.clone(),
+            )
+            .await;
+        let commits = Arc::new(AtomicUsize::new(0));
+        service
+            .install_screen_preview_commit_test_counter(commits.clone())
+            .await;
+        let completed = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_derivative_completion_test_hook(completed.clone())
+            .await;
+
+        service
+            .set_interaction(photo_app_service::InteractionState::Idle)
+            .await;
+        let background_service = service.clone();
+        let background_asset = asset_id.clone();
+        let background = tokio::spawn(async move {
+            background_service
+                .request_derivatives(DerivativeRequest {
+                    asset_ids: vec![background_asset],
+                    priority: photo_app_service::DerivativePriority::NearViewport,
+                    kind: DerivativeClass::ScreenPreview,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), post_encode_entered.notified())
+            .await
+            .expect("screen preview should reach the pre-admission gate");
+
+        service
+            .set_interaction(photo_app_service::InteractionState::Active)
+            .await;
+        service
+            .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
+            .await
+            .unwrap();
+        post_encode_release.notify_waiters();
+        assert!(background.await.unwrap().is_err());
+        tokio::time::timeout(Duration::from_secs(5), completed.notified())
+            .await
+            .expect("stale worker should finish after admission is rejected");
+
+        let after = snapshot_cache_catalog_warnings(&fixture.config);
+        assert_eq!(after, before);
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+        assert_eq!(derivative_update_counts(&mut updates), (0, 0, 0));
+    }
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admitted_commit_finishes_before_later_invalidation() {
+    for _ in 0..20 {
+        let (fixture, mut service, asset_id) = prepare_wall_ready_fixture().await;
+        seed_evictable_screen_preview_and_warning(&fixture, &asset_id);
+        service.set_derivative_cache_budget_for_test(CacheBudget::from_total_space(1_000_000));
+        let mut updates = service.subscribe_wall_updates();
+        let commits = Arc::new(AtomicUsize::new(0));
+        service
+            .install_screen_preview_commit_test_counter(commits.clone())
+            .await;
+
+        let pre_admission_entered = Arc::new(tokio::sync::Notify::new());
+        let pre_admission_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_screen_preview_post_encode_test_gate(
+                pre_admission_entered.clone(),
+                pre_admission_release.clone(),
+            )
+            .await;
+        let post_admission_entered = Arc::new(tokio::sync::Notify::new());
+        let post_admission_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_screen_preview_post_admission_test_gate(
+                post_admission_entered.clone(),
+                post_admission_release.clone(),
+            )
+            .await;
+        let completed = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_derivative_completion_test_hook(completed.clone())
+            .await;
+        let invalidation_waiting = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_background_invalidation_wait_test_hook(invalidation_waiting.clone())
+            .await;
+
+        service
+            .set_interaction(photo_app_service::InteractionState::Idle)
+            .await;
+        let background_service = service.clone();
+        let background_asset = asset_id.clone();
+        let background = tokio::spawn(async move {
+            background_service
+                .request_derivatives(DerivativeRequest {
+                    asset_ids: vec![background_asset],
+                    priority: photo_app_service::DerivativePriority::NearViewport,
+                    kind: DerivativeClass::ScreenPreview,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), pre_admission_entered.notified())
+            .await
+            .expect("screen preview should reach the pre-admission gate");
+        pre_admission_release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), post_admission_entered.notified())
+            .await
+            .expect("screen preview should reach the post-admission gate");
+
+        service
+            .set_interaction(photo_app_service::InteractionState::Active)
+            .await;
+        let visible_service = service.clone();
+        let visible_asset = asset_id.clone();
+        let visible = tokio::spawn(async move {
+            visible_service
+                .request_derivatives(DerivativeRequest::visible(vec![visible_asset]))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), invalidation_waiting.notified())
+            .await
+            .expect("visible invalidation should wait on the admitted commit");
+        assert!(!visible.is_finished());
+
+        post_admission_release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), completed.notified())
+            .await
+            .expect("admitted worker should finish its complete-commit path");
+        let background_result = background.await.unwrap();
+        assert!(
+            background_result.is_ok(),
+            "background result: {background_result:?}"
+        );
+        assert!(visible.await.unwrap().is_ok());
+
+        let snapshot = snapshot_cache_catalog_warnings(&fixture.config);
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            snapshot
+                .derivatives
+                .iter()
+                .filter(|(kind, ..)| kind == "screen_preview")
+                .count(),
+            1
+        );
+        assert!(
+            snapshot
+                .derivatives
+                .iter()
+                .all(|(_, key, ..)| key != "evictable-screen-preview")
+        );
+        assert!(
+            !snapshot
+                .cache_files
+                .iter()
+                .any(|path| path.ends_with("evictable/old-preview.jpg"))
+        );
+        assert!(snapshot.source_warnings.is_empty());
+        assert_eq!(derivative_update_counts(&mut updates), (1, 0, 1));
     }
 }
 

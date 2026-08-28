@@ -544,6 +544,8 @@ impl AppService {
                     }
                 }
             }
+            #[cfg(any(test, debug_assertions))]
+            self.notify_derivative_completion_test_hook().await;
         }
     }
 
@@ -712,6 +714,9 @@ impl AppService {
                         error: DerivativeWorkError::PreviewSuperseded,
                         permit: None,
                     })?;
+                #[cfg(any(test, debug_assertions))]
+                self.wait_for_screen_preview_post_admission_test_gate(id)
+                    .await;
                 let cache_budget = self.cache_budget;
                 let protected = self.protected_groups.clone();
                 let cache_root = self.cache_root.clone();
@@ -897,6 +902,32 @@ impl AppService {
         }
     }
 
+    #[cfg(any(test, debug_assertions))]
+    async fn wait_for_screen_preview_post_admission_test_gate(&self, asset_id: AssetId) {
+        let gate = self
+            .screen_preview_post_admission_test_gate
+            .lock()
+            .await
+            .clone();
+        if let Some(gate) = gate
+            .filter(|gate| {
+                gate.class
+                    .is_none_or(|class| class == DerivativeClass::ScreenPreview)
+            })
+            .filter(|gate| gate.blocked_asset.is_none_or(|blocked| blocked == asset_id))
+        {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    async fn notify_derivative_completion_test_hook(&self) {
+        if let Some(marker) = self.derivative_completion_test_hook.lock().await.take() {
+            marker.notify_one();
+        }
+    }
+
     /// Installs a deterministic derivative boundary for integration tests.
     #[cfg(debug_assertions)]
     #[doc(hidden)]
@@ -962,6 +993,50 @@ impl AppService {
                 release,
                 starts: None,
             });
+    }
+
+    /// Installs a deterministic screen-preview boundary after admission and before commit.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_screen_preview_post_admission_test_gate(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        *self.screen_preview_post_admission_test_gate.lock().await =
+            Some(crate::service::DerivativeTestGate {
+                blocked_asset: None,
+                class: Some(DerivativeClass::ScreenPreview),
+                entered,
+                release,
+                starts: None,
+            });
+    }
+
+    /// Installs a one-shot marker for the next derivative attempt to finish.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_derivative_completion_test_hook(&self, marker: Arc<tokio::sync::Notify>) {
+        *self.derivative_completion_test_hook.lock().await = Some(marker);
+    }
+
+    /// Installs a cache budget for deterministic managed-cache tests.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn set_derivative_cache_budget_for_test(&mut self, budget: photo_cache::CacheBudget) {
+        self.cache_budget = budget;
+    }
+
+    /// Installs a marker when background invalidation begins waiting on a commit.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_background_invalidation_wait_test_hook(
+        &self,
+        marker: Arc<tokio::sync::Notify>,
+    ) {
+        self.coordinator
+            .install_invalidation_wait_test_hook(marker)
+            .await;
     }
 
     #[cfg(debug_assertions)]

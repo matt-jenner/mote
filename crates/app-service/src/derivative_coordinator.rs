@@ -143,6 +143,8 @@ pub(crate) struct DerivativeCoordinator {
     change_generation: AtomicU64,
     #[cfg(test)]
     wait_test_hook: Mutex<Option<Arc<Notify>>>,
+    #[cfg(any(test, debug_assertions))]
+    invalidation_wait_test_hook: Mutex<Option<Arc<Notify>>>,
 }
 
 impl DerivativeCoordinator {
@@ -154,6 +156,8 @@ impl DerivativeCoordinator {
             change_generation: AtomicU64::new(0),
             #[cfg(test)]
             wait_test_hook: Mutex::new(None),
+            #[cfg(any(test, debug_assertions))]
+            invalidation_wait_test_hook: Mutex::new(None),
         }
     }
 
@@ -172,6 +176,8 @@ impl DerivativeCoordinator {
             change_generation: AtomicU64::new(0),
             #[cfg(test)]
             wait_test_hook: Mutex::new(None),
+            #[cfg(any(test, debug_assertions))]
+            invalidation_wait_test_hook: Mutex::new(None),
         }
     }
 
@@ -498,6 +504,12 @@ impl DerivativeCoordinator {
                 }
                 (waiters, completion_waits)
             };
+            #[cfg(any(test, debug_assertions))]
+            if !completion_waits.is_empty()
+                && let Some(hook) = self.invalidation_wait_test_hook.lock().await.take()
+            {
+                hook.notify_one();
+            }
             for waiter in waiters {
                 let _ = waiter.send(None);
             }
@@ -830,6 +842,11 @@ impl DerivativeCoordinator {
     #[cfg(test)]
     pub(crate) async fn install_wait_test_hook(&self, entered: Arc<Notify>) {
         *self.wait_test_hook.lock().await = Some(entered);
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) async fn install_invalidation_wait_test_hook(&self, entered: Arc<Notify>) {
+        *self.invalidation_wait_test_hook.lock().await = Some(entered);
     }
 }
 
