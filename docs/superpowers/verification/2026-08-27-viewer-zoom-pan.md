@@ -5,7 +5,7 @@ Branch: `codex/viewer-zoom-pan`
 Feature base: `14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc`
 Feature head: final delivery commit; exact SHA is recorded in the companion
 Task 6 report after commit finalization.
-Task 7 lifecycle code/test head: `27af6bc955d0d147ee6db25d88fe2b9bf80e216b`;
+Task 7 lifecycle code/test head: `d8a01019a5eef89a689bed0d1c6b213fbed7460e`;
 the documentation-only follow-up boundary is recorded below.
 
 ## Implementation
@@ -424,7 +424,7 @@ screenshot attachment was produced.
 
 ```text
 cargo test --workspace --all-features
-269 passed; 0 failed; 0 ignored
+270 passed; 0 failed; 0 ignored
 
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 Finished `dev` profile; no warnings or errors
@@ -521,12 +521,20 @@ service is dropped.
 The restart is a real scope boundary. While interaction is Active, the old
 sequence leaves four collection drivers live after derivative work reaches
 zero; the regression assertion records that overlap. The test-only collection
-driver tracker now covers those spawned tasks. The first service transitions to
+driver tracker now covers those spawned tasks. Admission is recorded
+synchronously before each spawned future's first poll, including the initial
+delay, so quiescence cannot observe a false zero. The first service transitions to
 Idle, waits for zero derivative tasks and zero collection drivers, asserts zero
 active scan/driver/derivative counters, drops update receivers, and exits its
 scope. A distinct reopened service scope then performs the offline request and
 reaches the same zero-counter state before it ends. No sleep or runtime-drop
 ordering is used as a quiescence signal.
+
+The direct first-poll regression passed 100 consecutive repetitions. The full
+source-safety/restart harness passed 10 consecutive repetitions; each full run
+includes the read-only source snapshot and real service restart and took about
+9.7 seconds, so 100 complete repetitions were not practical in the available
+run window.
 
 The browser tests use the same `/demo-photos/*.jpg` URLs for wall sorting,
 viewer opening, and zoom. The full run emitted one known non-failing React
@@ -536,20 +544,20 @@ task.
 
 The feature-range source audit used accepted base
 `14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc` through lifecycle code/test head
-`27af6bc955d0d147ee6db25d88fe2b9bf80e216b` (`test: close app-service lifecycle
-before restart`). The added-line audit covers Rust, TypeScript, and TSX and
+`d8a01019a5eef89a689bed0d1c6b213fbed7460e` (`test: admit collection drivers
+before spawn`). The added-line audit covers Rust, TypeScript, and TSX and
 includes filesystem create/write/save/copy/move/rename/remove/delete/unlink
 forms, `OpenOptions`, `File::create`, `write_all`, `write_atomic`,
 `relative_cache_path`, and `write_png`. It returned 56 matches, including both
 `crates/indexer/tests/progressive_scan.rs:324-325` `write_png` calls; the exact
 command, direct-output hashes (`65815f310b627be306187c4c09cc2fee9df2ba2863625fc0e049cb69f46cd767`
-for 45 name-status lines and `47800798d467dfc23796d7837b8bbff2d66d6f131a2e9859b8adda47467f48b2`
+for 45 name-status lines and `e1c5e509255c759b827d2c9317b41d9e41f47368a7cb1b569d4dcccee0e1d135`
 for the normalized 56-match output), all matches, and classifications are in
 the companion Task 7 report.
 
 ```text
 base=14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc
-head=27af6bc955d0d147ee6db25d88fe2b9bf80e216b
+head=d8a01019a5eef89a689bed0d1c6b213fbed7460e
 git diff --name-status "$base..$head" -- '*.rs' '*.ts' '*.tsx'
 git diff --unified=0 --no-color "$base..$head" -- '*.rs' '*.ts' '*.tsx' | awk '
 /^\+\+\+ b\// { file=substr($0,7); next }

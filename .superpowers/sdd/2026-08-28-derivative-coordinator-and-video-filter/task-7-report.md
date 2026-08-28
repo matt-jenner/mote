@@ -15,10 +15,12 @@ demo source tree. The harness and its test-only BLAKE3 dependency are committed
 in `67393e1224f8cf6e6944e8fd4a625ff0baf6bbe5` (`test: guard demo source tree`).
 The lifecycle correction is committed in
 `27af6bc955d0d147ee6db25d88fe2b9bf80e216b` (`test: close app-service lifecycle
-before restart`). The verification/report follow-up is intentionally separate;
-its post-commit name-status comparison is documented below so the later commit
-is not mistaken for an implementation change or given an impossible
-self-referential SHA.
+before restart`). The round-3 collection-driver admission correction is
+committed in `d8a01019a5eef89a689bed0d1c6b213fbed7460e` (`test: admit
+collection drivers before spawn`). The verification/report follow-up is
+intentionally separate; its post-commit name-status comparison is documented
+below so the later commit is not mistaken for an implementation change or
+given an impossible self-referential SHA.
 
 ## RED/GREEN evidence
 
@@ -59,6 +61,40 @@ exit 0
 cargo test -p photo-app-service --test task7_source_safety -- --nocapture
 test task7_source_tree_safety_harness ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The delayed collection-driver regression was then added before moving the
+tracker admission ahead of `tokio::spawn`. Against the late-admission version,
+the new test was red because the driver had not yet been polled:
+
+```text
+cargo test -p photo-app-service collection_driver_is_tracked_before_its_first_poll -- --nocapture
+assertion `left == right` failed: driver admission must be visible before the spawned future is first polled
+  left: 0
+ right: 1
+```
+
+The implementation now acquires the test/debug tracking guard synchronously,
+moves it into the spawned future, and lets guard drop cover normal completion,
+cancellation, panic, or spawn unwind. The test deliberately exercises the
+driver's initial delay and asserts that quiescence cannot complete while the
+not-yet-polled driver is admitted:
+
+```text
+cargo test -p photo-app-service collection_driver_is_tracked_before_its_first_poll -- --nocapture
+test derivatives::tests::collection_driver_is_tracked_before_its_first_poll ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 63 filtered out; finished in 0.11s
+```
+
+The focused admission regression passed 100 consecutive repetitions. The
+complete source-safety/restart harness passed 10 consecutive repetitions; each
+full run includes the read-only source snapshot and real service restart and
+took about 9.7 seconds, so 100 complete repetitions were not practical in the
+available run window:
+
+```text
+collection_driver_first_poll_repetitions=100
+source_safety_restart_repetitions=10
 ```
 
 The lifecycle regression was then exercised test-first. Adding the collection
@@ -191,7 +227,7 @@ passed after local-network approval.
 
 ```text
 cargo test --workspace --all-features
-269 passed; 0 failed; 0 ignored
+270 passed; 0 failed; 0 ignored
 
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 Finished `dev` profile; no warnings or errors
@@ -294,7 +330,9 @@ The lifecycle boundary is explicit rather than inferred from dropping a
 service handle. With interaction Active, the old sequence recorded four live
 collection drivers after the derivative tracker reached zero. The test-only
 collection-driver tracker now covers each spawned driver, including its delay
-and collection mutex wait. The first service transitions to Idle, awaits zero
+and collection mutex wait. Admission is recorded synchronously before the
+spawned future's first poll, so the delayed-driver regression cannot observe a
+false zero. The first service transitions to Idle, awaits zero
 derivative tasks and zero collection drivers, asserts zero active scan/driver/
 derivative counters, drops both update receivers, and exits its lexical scope.
 Only in the next scope does the test open the restarted service and issue the
@@ -310,11 +348,11 @@ and cache suite remain temporary-fixture-only; no desktop process was started.
 
 The source audit was rerun from the accepted base through the complete code/test
 head in lifecycle implementation commit
-`27af6bc955d0d147ee6db25d88fe2b9bf80e216b`:
+`d8a01019a5eef89a689bed0d1c6b213fbed7460e`:
 
 ```text
 base=14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc
-head=27af6bc955d0d147ee6db25d88fe2b9bf80e216b
+head=d8a01019a5eef89a689bed0d1c6b213fbed7460e
 ```
 
 The exact added-line audit command scans Rust, TypeScript, and TSX for broad
@@ -325,7 +363,7 @@ operations, source/cache/folder/path DTO tokens, `relative_cache_path`, and
 
 ```text
 base=14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc
-head=27af6bc955d0d147ee6db25d88fe2b9bf80e216b
+head=d8a01019a5eef89a689bed0d1c6b213fbed7460e
 git diff --name-status "$base..$head" -- '*.rs' '*.ts' '*.tsx'
 git diff --unified=0 --no-color "$base..$head" -- '*.rs' '*.ts' '*.tsx' | awk '
 /^\+\+\+ b\// { file=substr($0,7); next }
@@ -343,10 +381,10 @@ git diff --unified=0 --no-color "$base..$head" -- '*.rs' '*.ts' '*.tsx' | awk '
 
 The command's direct output contained 45 name-status lines and 56 matching
 added lines. The captured direct outputs are
-`/tmp/photo-viewer-task7-audit-round2-name-status.txt` (SHA-256
+`/tmp/photo-viewer-task7-audit-round3-name-status.txt` (SHA-256
 `65815f310b627be306187c4c09cc2fee9df2ba2863625fc0e049cb69f46cd767`) and
-`/tmp/photo-viewer-task7-audit-round2-matches-normalized.txt` (SHA-256
-`47800798d467dfc23796d7837b8bbff2d66d6f131a2e9859b8adda47467f48b2`). Every
+`/tmp/photo-viewer-task7-audit-round3-matches.txt` (SHA-256
+`e1c5e509255c759b827d2c9317b41d9e41f47368a7cb1b569d4dcccee0e1d135`). Every
 match from that direct output is reproduced below with its file and line; the
 classification after the list covers each match.
 
@@ -364,12 +402,12 @@ crates/app-service/src/derivatives.rs:3025: .save(source.join("photo.jpg"))
 crates/app-service/src/derivatives.rs:3117: std::fs::create_dir_all(&source).unwrap();
 crates/app-service/src/derivatives.rs:3120: .save(&image_path)
 crates/app-service/src/derivatives.rs:3173: relative_cache_path: std::path::PathBuf::from(format!(
-crates/app-service/src/derivatives.rs:3316: std::fs::create_dir_all(&source).unwrap();
-crates/app-service/src/derivatives.rs:3319: .save(&image_path)
-crates/app-service/src/derivatives.rs:3389: std::fs::create_dir_all(&source).unwrap();
-crates/app-service/src/derivatives.rs:3392: .save(&image_path)
-crates/app-service/src/derivatives.rs:3492: .save(&source_path)
-crates/app-service/src/derivatives.rs:3663: std::fs::create_dir_all(&source).unwrap();
+crates/app-service/src/derivatives.rs:3344: std::fs::create_dir_all(&source).unwrap();
+crates/app-service/src/derivatives.rs:3347: .save(&image_path)
+crates/app-service/src/derivatives.rs:3417: std::fs::create_dir_all(&source).unwrap();
+crates/app-service/src/derivatives.rs:3420: .save(&image_path)
+crates/app-service/src/derivatives.rs:3520: .save(&source_path)
+crates/app-service/src/derivatives.rs:3691: std::fs::create_dir_all(&source).unwrap();
 crates/app-service/tests/progressive_wall.rs:140: relative_cache_path: PathBuf,
 crates/app-service/tests/progressive_wall.rs:188: relative_cache_path: record.relative_cache_path,
 crates/app-service/tests/progressive_wall.rs:222: let relative_cache_path = PathBuf::from("evictable/old-preview.jpg");
@@ -415,7 +453,7 @@ Classification of all 56 matches:
 - The four production `derivatives.rs` matches at lines 419, 987, 1212, and
   1253 only read or record managed-cache-relative catalogue metadata; they do
   not perform filesystem operations. The `derivatives.rs` matches at lines
-  2937--3663 and the `relative_cache_path` line at 3173 are inside its test
+  2937--3691 and the `relative_cache_path` line at 3173 are inside its test
   module and create temporary image fixtures or temporary catalogue/cache
   records.
 - The `progressive_wall.rs` matches at lines 140, 188, 222, 227, 230, 231,
@@ -466,13 +504,13 @@ controller-owned. This task did not launch or restart the `wall-demo` app.
 
 ## Commit boundary evidence
 
-The implementation/test boundary is the lifecycle code/test commit
-`27af6bc955d0d147ee6db25d88fe2b9bf80e216b`. The subsequent verification and
+The implementation/test boundary is the round-3 lifecycle code/test commit
+`d8a01019a5eef89a689bed0d1c6b213fbed7460e`. The subsequent verification and
 report changes are a separate documentation-only follow-up. After that
 follow-up commit, the exact name/status comparison was:
 
 ```text
-git diff --name-status 27af6bc955d0d147ee6db25d88fe2b9bf80e216b..HEAD
+git diff --name-status d8a01019a5eef89a689bed0d1c6b213fbed7460e..HEAD
 M	.superpowers/sdd/2026-08-28-derivative-coordinator-and-video-filter/task-7-report.md
 M	docs/superpowers/verification/2026-08-27-viewer-zoom-pan.md
 ```
