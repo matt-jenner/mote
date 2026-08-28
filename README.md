@@ -76,6 +76,12 @@ reusing the first catalog or derivative cache. No command in this workflow
 copies, renames, deletes, or otherwise modifies photos in the selected source
 folder.
 
+The automated source-safety check opens that demo folder read-only and keeps its
+catalogue and derivative cache in a temporary directory outside the source
+tree. It verifies the source bytes and modification times before and after
+scan, cache repair, derivative phases, sorting, viewer-equivalent requests,
+restart, and offline cached reads.
+
 The catalogue retains indexed videos, but photo surfaces hide them without a
 placeholder or hidden count until cross-platform video playback ships. A wall
 tile becomes openable only after its current thumbnail has painted. Background

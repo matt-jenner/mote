@@ -302,6 +302,7 @@ git status --short
 git show -s --format='%h %s' HEAD
 The exact post-commit SHA and subject are recorded in the companion Task 6 and
 final-fix reports after commit finalization.
+```
 
 ## Task 7 automated verification (2026-08-28)
 
@@ -455,8 +456,10 @@ its native executable is 23,448,864 bytes.
 
 ### Source and cache safety audit
 
-The controlled fixture tree was snapshotted before and after clean-profile
-fixture coverage. The before metadata snapshot was:
+The controlled fixture tree was snapshotted immediately before and after one
+complete automated safety window. The exact tree is
+`apps/interface/public/demo-photos`; the six-file `mtime|size` manifest was
+identical at both boundaries:
 
 ```text
 apps/interface/public/demo-photos/city.jpg|1787835664|615559
@@ -467,48 +470,82 @@ apps/interface/public/demo-photos/mountain.jpg|1787835664|483651
 apps/interface/public/demo-photos/portrait.jpg|1787835664|319646
 ```
 
+The exact command window was:
+
+```text
+find apps/interface/public/demo-photos -type f -print0 | sort -z | xargs -0 stat -f '%N|%m|%z'
+find apps/interface/public/demo-photos -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256
+
+cargo test -p photo-app-service --test task7_source_safety -- --nocapture
+1 passed; 0 failed
+
+npm run test:browser
+3 files, 145 passed; 0 failed
+
+find apps/interface/public/demo-photos -type f -print0 | sort -z | xargs -0 stat -f '%N|%m|%z'
+find apps/interface/public/demo-photos -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256
+```
+
 The before and after aggregate SHA-256 was
 `a4c522354a075e2a6b6804a31b9df42dcd56b6509cef14ae4667e700227ae3e6`.
-The metadata diff had 0 lines and the per-file hash diff had 0 lines. The
-clean-profile commands used fixture-only temporary state:
+The metadata diff had 0 lines, the per-file hash diff had 0 lines, and
+`git status --short -- apps/interface/public/demo-photos` had no output. No
+`PHOTO_VIEWER_PROFILE` variable was used: the app-service harness creates
+`tempdir()/catalog` and `tempdir()/cache` and asserts both are contained by the
+same temporary root before opening the service.
 
-```text
-PHOTO_VIEWER_PROFILE=task-7-clean cargo test -p photo-app-service --test progressive_wall
-54 passed; 0 failed
+The committed harness opens the exact source tree read-only, scans it, asserts
+the first cursor page and continuation contain exactly six JPEG rows with no
+video rows, sorts both directions, plans a current visible request and
+near-viewport neighbours, completes the thumbnail phase, then the preview
+phase, and waits for derivative quiescence. It removes only a temporary
+catalogue wall row to model a legacy cached screen preview, marks that
+catalogue root offline, and proves the wall thumbnail is repaired from the
+managed screen cache. It then restarts the service outside the runtime,
+re-queries the six cached rows, and completes an offline cached preview
+request. The test snapshots every source file's bytes, BLAKE3 digest, size,
+and nanosecond mtime immediately before this sequence and after the restarted
+service is dropped.
 
-PHOTO_VIEWER_PROFILE=task-7-clean cargo test -p photo-cache --test image_derivative
-10 passed; 0 failed
-
-PHOTO_VIEWER_PROFILE=task-7-clean npm run test:browser
-3 files, 145 passed; 0 failed
-```
-
-The progressive-wall tests cover scanning, thumbnail and preview phase order,
-corrupt-asset isolation, terminal outcomes, sorting-related wall requests,
-and online/offline restart behavior. The cache suite covers legacy preview
-repair and source-preserving derivative generation. The browser suite covers
-wall sorting, viewer opening, and zoom. No desktop development process was
-started by this task.
+The browser tests use the same `/demo-photos/*.jpg` URLs for wall sorting,
+viewer opening, and zoom. The full run emitted one known non-failing React
+`ViewerStage` `act(...)` warning; it had no rejection, accessibility failure,
+or screenshot attachment. No desktop development process was started by this
+task.
 
 The feature-range source audit used accepted base
-`14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc` and pre-verification head
-`fd557572cd9dca2214d99f1e0b6a8d8d526794d2`. The targeted diff search was:
+`14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc` through the code/test head
+`67393e1` (`test: guard demo source tree`). The added-line audit covers Rust,
+TypeScript, and TSX and includes filesystem create/write/save/copy/move/
+rename/remove/delete/unlink forms, `OpenOptions`, `File::create`,
+`write_all`, `write_atomic`, and source/cache/folder/path DTO tokens. Its
+exact command and all 56 file:line matches, with classifications, are in the
+companion Task 7 report.
 
 ```text
-git diff --unified=0 14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc..fd557572cd9dca2214d99f1e0b6a8d8d526794d2 -- apps/interface/src crates apps/desktop/src-tauri/src | rg -n -i '(writeFile|write_file|rename|removeFile|remove_file|unlink|copyFile|copy_file|setRating|updateRating|deleteAsset|sourcePath|selectedFolder|folderPath|locateFolder)'
+git diff --name-status 14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc..67393e1 -- '*.rs' '*.ts' '*.tsx'
+git diff --unified=0 --no-color 14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc..67393e1 -- '*.rs' '*.ts' '*.tsx' | awk '
+/^\+\+\+ b\// { file=substr($0,7); next }
+/^@@ / { p=index($0,"+"); if (p) { h=substr($0,p+1); sub(",.*","",h); line=h+0 }; next }
+/^\+/ && !/^\+\+\+/ {
+  text=substr($0,2)
+  if (text ~ /(std::fs::(create_dir_all|write|rename|remove_file|remove_dir_all|copy)|fs::(write|rename|remove|copy)|\.save[[:space:]]*\(|File::create|OpenOptions|write_all|write_atomic|writeFile|write_file|copyFile|copy_file|moveFile|move_file|rename|removeFile|remove_file|unlink|delete_derivatives|deleteAsset|setRating|updateRating|selectedFolder(Name)?|selected_folder|source(Path|_path)|folder(Path|_path)|relative(Path|_path)|display(Path|_path)|native(Path|_path)|cache(Path|_path)|locateFolder)/) print file ":" line ": " text
+  line++
+}
+'
 ```
 
-It found only these harmless contexts:
+Production source code contains no source-media write, delete, rename, move,
+or copy call and no native source-path DTO field. Production cache writes are
+confined to `CacheWriter::write_atomic`/`Write::write_all` under the managed
+cache root; source paths are only opened for decoding. The matched test lines
+are temporary image/video fixture setup, source-availability simulation, or
+temporary catalogue/cache cleanup; the new safety test's only deletion is its
+temporary catalogue row. In-memory `HashMap::remove`, DOM `delete`, and
+`tokio::spawn(async move ...)` matches were separately reviewed as non-filesystem
+operations.
 
-- `selectedFolderName: "Video fixture"` in a path-free browser fixture;
-- `std::fs::rename(&fixture.source, &unavailable)` and the reverse operation
-  in temporary progressive-wall fixtures used to simulate source availability;
-- `std::fs::remove_file(fixture.source.join("offline.jpg"))` in a temporary
-  fixture cleanup path.
-
-There were no production source-media write, delete, rename, move, or copy
-calls, and no native source-path DTO fields. The existing managed wall-demo
-cache root was checked without changing it:
+The existing managed wall-demo cache root was inspected without changing it:
 
 ```text
 /Users/jennerm/Library/Caches/app.photoviewer.desktop/profiles/wall-demo
@@ -533,4 +570,3 @@ cache_root_exists=yes
 The native acceptance build was created, but the native demo was intentionally
 not launched here. The controller still owns the required user acceptance
 observations and must leave the `wall-demo` process in the requested state.
-```
