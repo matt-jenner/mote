@@ -9,7 +9,7 @@ use photo_core::{
 };
 use photo_domain::{Appearance, AssetId, Availability, MediaKind};
 use photo_indexer::{DefaultMetadataReader, IndexScheduler, MetadataReader};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 #[cfg(any(test, debug_assertions))]
 use std::sync::atomic::AtomicUsize;
@@ -24,7 +24,6 @@ pub(crate) struct ServiceState {
     pub(crate) active_scan: Option<ScanOwner>,
     pub(crate) active_cancel: Option<watch::Sender<bool>>,
     pub(crate) protected_group: Option<photo_domain::FolderGroupId>,
-    pub(crate) recent_derivative_ids: Vec<AssetId>,
     pub(crate) selection_epoch: u64,
     pub(crate) published_wall_cache_warning: Option<SelectionToken>,
     pub(crate) published_screen_cache_warning: Option<SelectionToken>,
@@ -93,19 +92,6 @@ pub(crate) struct DerivativeRequestTestHook {
     pub(crate) release: Option<Arc<Notify>>,
 }
 
-#[derive(Default)]
-pub(crate) struct PreviewGateState {
-    pub(crate) recent_ids: Vec<AssetId>,
-    pub(crate) full_group_prefetch: bool,
-    pub(crate) generation: u64,
-    pub(crate) task_running: bool,
-    pub(crate) wall_requests_in_flight: usize,
-    pub(crate) wall_request_selection: Option<SelectionToken>,
-    pub(crate) wall_request_generation: u64,
-    pub(crate) next_wall_request_id: u64,
-    pub(crate) active_wall_request_ids: HashSet<u64>,
-}
-
 trait RecentSourceValidator: Send + Sync {
     fn validate_recent(&self, folder: &Path) -> Result<ValidatedSourceFolder, AddLibraryError>;
 }
@@ -140,7 +126,7 @@ pub struct AppService {
     pub(crate) cache_root: PathBuf,
     pub(crate) cache_budget: CacheBudget,
     pub(crate) protected_groups: ProtectedGroups,
-    pub(crate) screen_preview_commit_lock: Arc<Mutex<()>>,
+    pub(crate) derivative_driver: Arc<tokio::sync::Mutex<()>>,
     #[cfg(any(test, debug_assertions))]
     pub(crate) derivative_test_gate: Arc<TokioMutex<Option<DerivativeTestGate>>>,
     #[cfg(any(test, debug_assertions))]
@@ -149,11 +135,6 @@ pub struct AppService {
     pub(crate) derivative_request_test_hook: Arc<TokioMutex<Option<DerivativeRequestTestHook>>>,
     #[cfg(debug_assertions)]
     pub(crate) derivative_visible_queue_test_hook: Arc<TokioMutex<Option<Arc<Notify>>>>,
-    pub(crate) preview_gate: Arc<Mutex<PreviewGateState>>,
-    pub(crate) preview_gate_wake: Arc<Notify>,
-    #[cfg(debug_assertions)]
-    pub(crate) preview_gate_checks: Arc<AtomicUsize>,
-    pub(crate) derivative_queue: Arc<crate::derivatives::DerivativeQueue>,
     pub(crate) metadata_reader: ReaderAdapter,
     source_validator: Arc<dyn RecentSourceValidator>,
     selection_request_sequence: Arc<AtomicU64>,
@@ -233,7 +214,6 @@ impl AppService {
                 active_scan: None,
                 active_cancel: None,
                 protected_group: None,
-                recent_derivative_ids: Vec::new(),
                 selection_epoch: u64::from(should_reconcile),
                 published_wall_cache_warning: None,
                 published_screen_cache_warning: None,
@@ -245,7 +225,7 @@ impl AppService {
             cache_root,
             cache_budget,
             protected_groups: ProtectedGroups::default(),
-            screen_preview_commit_lock: Arc::new(Mutex::new(())),
+            derivative_driver: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(any(test, debug_assertions))]
             derivative_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]
@@ -254,11 +234,6 @@ impl AppService {
             derivative_request_test_hook: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]
             derivative_visible_queue_test_hook: Arc::new(TokioMutex::new(None)),
-            preview_gate: Arc::new(Mutex::new(PreviewGateState::default())),
-            preview_gate_wake: Arc::new(Notify::new()),
-            #[cfg(debug_assertions)]
-            preview_gate_checks: Arc::new(AtomicUsize::new(0)),
-            derivative_queue: Arc::new(crate::derivatives::DerivativeQueue::default()),
             metadata_reader: ReaderAdapter(reader),
             source_validator,
             selection_request_sequence: Arc::new(AtomicU64::new(0)),
@@ -389,10 +364,6 @@ impl AppService {
             .wrapping_add(1)
             .max(1);
         let validated = self.source_validator.validate_recent(folder)?;
-        let _screen_commit_guard = self
-            .screen_preview_commit_lock
-            .lock()
-            .map_err(|_| AppServiceError::StatePoisoned)?;
         let mut state = self.state()?;
         let prepared = state.libraries.prepare_validated_recent(validated)?;
         self.latest_validated_selection
@@ -439,7 +410,6 @@ impl AppService {
         state.active_scan = None;
         state.published_wall_cache_warning = None;
         state.published_screen_cache_warning = None;
-        state.recent_derivative_ids.clear();
         state.selection_epoch = state.selection_epoch.wrapping_add(1).max(1);
         if previous != Some(group) {
             if let Some(previous) = previous {
@@ -454,11 +424,10 @@ impl AppService {
         };
         let bootstrap = Self::bootstrap_locked(&state)?;
         drop(state);
-        self.reset_preview_gate();
+        let coordinator = self.coordinator.clone();
         if tokio::runtime::Handle::try_current().is_ok() {
-            let queue = self.derivative_queue.clone();
             tokio::spawn(async move {
-                queue.invalidate_except(token).await;
+                coordinator.reset_selection(token).await;
             });
         }
         Ok((bootstrap, token))

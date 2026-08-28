@@ -389,6 +389,39 @@ impl DerivativeCoordinator {
         }
     }
 
+    /// Returns a running attempt to the coordinator-owned scheduler after a driver
+    /// observes that its lane is paused by interaction policy.
+    pub(crate) async fn requeue(&self, ticket: WorkTicket) -> bool {
+        let schedule = {
+            let mut state = self.state.lock().await;
+            let Some(ticket_state) = state.tickets.remove(&ticket) else {
+                return false;
+            };
+            if ticket_state.status != TicketStatus::Running {
+                state.tickets.insert(ticket, ticket_state);
+                return false;
+            }
+            let key = ticket_state.key;
+            let Some(work) = state.jobs.get_mut(&key) else {
+                return false;
+            };
+            if work.ticket != Some(ticket) || work.status != JobStatus::Running {
+                return false;
+            }
+            work.ticket = None;
+            work.status = JobStatus::Queued;
+            let job_name = work.job_name.clone();
+            let priority = scheduler_priority(work.lane);
+            state.job_names.insert(job_name.clone(), key);
+            (job_name, priority)
+        };
+        self.scheduler
+            .enqueue(IndexJob::new(schedule.0, schedule.1))
+            .await;
+        self.wake.notify_waiters();
+        true
+    }
+
     async fn finish_running(
         &self,
         ticket: WorkTicket,
@@ -589,6 +622,12 @@ impl DerivativeCoordinator {
         self.state.lock().await.selection
     }
 
+    pub(crate) async fn ensure_selection(&self, selection: SelectionToken) {
+        if self.selection().await != Some(selection) {
+            self.reset_selection(selection).await;
+        }
+    }
+
     pub(crate) async fn reset_selection(&self, selection: SelectionToken) {
         let waiters = {
             let mut state = self.state.lock().await;
@@ -747,6 +786,10 @@ impl DerivativeCoordinator {
         if self.pending_job_count().await == 0 {
             notified.await;
         }
+    }
+
+    pub(crate) fn wake(&self) {
+        self.wake.notify_waiters();
     }
 }
 

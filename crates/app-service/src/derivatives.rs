@@ -1,13 +1,12 @@
 //! Derivative request orchestration lives here so source paths never cross the DTO boundary.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 #[cfg(debug_assertions)]
 use std::sync::Arc;
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::Ordering;
 
 use photo_cache::{
     DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget, ImageDerivativeError,
@@ -15,9 +14,9 @@ use photo_cache::{
 };
 use photo_catalog::{Catalog, NewDerivative, WallOrder};
 use photo_domain::{AssetId, Availability, DerivativeId, FolderGroupId, MediaKind};
-use photo_indexer::{IndexJob, InteractionMode, JobPriority};
-use tokio::sync::{Mutex, oneshot};
+use photo_indexer::{InteractionMode, JobPriority};
 
+use crate::derivative_coordinator::{CommitPermit, WorkKey, WorkTicket};
 use crate::service::SelectionToken;
 use crate::{
     AppService, AppServiceError, DerivativeClass, DerivativePriority, DerivativeReference,
@@ -29,7 +28,6 @@ const ASSET_DERIVATIVE_WARNING: &str = "derivative_generation_failed";
 const WALL_CACHE_DERIVATIVE_WARNING: &str = "wall_thumbnail_cache_unavailable";
 const SCREEN_CACHE_DERIVATIVE_WARNING: &str = "screen_preview_cache_unavailable";
 const MAX_DERIVATIVE_WORKERS: usize = 2;
-const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(50);
 
 fn record_timing_stage(stage: &'static str, started: std::time::Instant) {
     tracing::debug!(
@@ -46,6 +44,23 @@ enum DerivativeWorkError {
     WorkerUnavailable,
     PreviewSuperseded,
     WallThumbnailRequired,
+}
+
+struct GeneratedWork {
+    reference: DerivativeReference,
+    permit: CommitPermit,
+}
+
+struct GenerationFailure {
+    error: DerivativeWorkError,
+    permit: Option<CommitPermit>,
+}
+
+enum PreviewPrefetchOutcome {
+    Complete,
+    Blocked,
+    Stale,
+    Terminate,
 }
 
 impl From<ImageDerivativeError> for DerivativeWorkError {
@@ -88,168 +103,6 @@ pub(crate) struct PendingDerivative {
     group: FolderGroupId,
     class: DerivativeClass,
     selection: SelectionToken,
-    preview_generation: Option<u64>,
-}
-
-struct SharedDerivative {
-    pending: PendingDerivative,
-    job_name: String,
-    waiters: Vec<oneshot::Sender<Option<DerivativeReference>>>,
-}
-
-#[derive(Default)]
-struct QueueState {
-    by_key: HashMap<String, SharedDerivative>,
-    job_to_key: HashMap<String, String>,
-}
-
-#[derive(Default)]
-pub(crate) struct DerivativeQueue {
-    state: Mutex<QueueState>,
-    driver: Mutex<()>,
-    sequence: AtomicU64,
-}
-
-impl DerivativeQueue {
-    async fn enqueue(
-        &self,
-        scheduler: &photo_indexer::IndexScheduler,
-        pending: PendingDerivative,
-        priority: JobPriority,
-    ) -> oneshot::Receiver<Option<DerivativeReference>> {
-        let immutable_key = DerivativeKey::compute(&pending.spec).as_str().to_owned();
-        let (send, receive) = oneshot::channel();
-        let mut state = self.state.lock().await;
-        if let Some(existing) = state.by_key.get_mut(&immutable_key)
-            && existing.pending.selection == pending.selection
-        {
-            existing.waiters.push(send);
-            let job_name = existing.job_name.clone();
-            drop(state);
-            scheduler.enqueue(IndexJob::new(job_name, priority)).await;
-            return receive;
-        }
-        if let Some(replaced) = state.by_key.remove(&immutable_key) {
-            state.job_to_key.remove(&replaced.job_name);
-        }
-        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let job_name = format!("photo-derivative:{sequence}");
-        state
-            .job_to_key
-            .insert(job_name.clone(), immutable_key.clone());
-        state.by_key.insert(
-            immutable_key,
-            SharedDerivative {
-                pending,
-                job_name: job_name.clone(),
-                waiters: vec![send],
-            },
-        );
-        drop(state);
-        scheduler.enqueue(IndexJob::new(job_name, priority)).await;
-        receive
-    }
-
-    async fn next_owned(
-        &self,
-        scheduler: &photo_indexer::IndexScheduler,
-    ) -> Option<(IndexJob, String, PendingDerivative)> {
-        let mut foreign = Vec::new();
-        while let Some(job) = scheduler.next().await {
-            let owned = {
-                let mut state = self.state.lock().await;
-                state.job_to_key.remove(job.name()).and_then(|key| {
-                    state
-                        .by_key
-                        .get(&key)
-                        .map(|work| (key, work.pending.clone()))
-                })
-            };
-            if let Some((key, pending)) = owned {
-                for job in foreign {
-                    scheduler.enqueue(job).await;
-                }
-                return Some((job, key, pending));
-            }
-            if job.name().starts_with("photo-derivative:") {
-                continue;
-            }
-            foreign.push(job);
-        }
-        for job in foreign {
-            scheduler.enqueue(job).await;
-        }
-        None
-    }
-
-    async fn requeue(&self, job: &IndexJob, key: &str) {
-        let mut state = self.state.lock().await;
-        if state.by_key.contains_key(key) {
-            state
-                .job_to_key
-                .insert(job.name().to_owned(), key.to_owned());
-        }
-    }
-
-    async fn finish(&self, key: &str, job_name: &str, result: Option<DerivativeReference>) {
-        let work = {
-            let mut state = self.state.lock().await;
-            if state
-                .by_key
-                .get(key)
-                .is_some_and(|work| work.job_name == job_name)
-            {
-                state.by_key.remove(key)
-            } else {
-                None
-            }
-        };
-        if let Some(work) = work {
-            for waiter in work.waiters {
-                let _ = waiter.send(result.clone());
-            }
-        }
-    }
-
-    pub(crate) async fn invalidate_except(&self, selection: SelectionToken) {
-        let mut state = self.state.lock().await;
-        let stale = state
-            .by_key
-            .iter()
-            .filter(|(_, work)| work.pending.selection != selection)
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        for key in stale {
-            if let Some(work) = state.by_key.remove(&key) {
-                state.job_to_key.remove(&work.job_name);
-            }
-        }
-    }
-
-    async fn is_empty(&self) -> bool {
-        self.state.lock().await.by_key.is_empty()
-    }
-}
-
-struct WallRequestGuard {
-    service: AppService,
-    selection: SelectionToken,
-    generation: u64,
-    request_id: u64,
-}
-
-impl Drop for WallRequestGuard {
-    fn drop(&mut self) {
-        self.service
-            .finish_wall_request(self.selection, self.generation, self.request_id);
-    }
-}
-
-enum PreviewPrefetchOutcome {
-    Complete,
-    Blocked,
-    Stale,
-    Terminate,
 }
 
 impl AppService {
@@ -260,38 +113,22 @@ impl AppService {
                 crate::InteractionState::Active => InteractionMode::Active,
             })
             .await;
-        if state == crate::InteractionState::Idle && !self.derivative_queue.is_empty().await {
-            let service = self.clone();
-            tokio::spawn(async move {
-                service.drive_derivative_queue(true).await;
-            });
+        self.coordinator.wake();
+        if state == crate::InteractionState::Idle {
+            self.start_derivative_driver();
         }
-        let recent = self
-            .state()
-            .map(|state| state.recent_derivative_ids.clone())
-            .unwrap_or_default();
-        self.schedule_screen_preview_prefetch(recent);
+        let recent = self.coordinator.recent_ids().await;
+        self.schedule_screen_preview_prefetch(recent).await;
     }
 
     pub async fn request_derivatives(
         &self,
         request: DerivativeRequest,
     ) -> Result<(), AppServiceError> {
-        if request.priority == DerivativePriority::Visible
-            && request.kind == DerivativeClass::WallThumbnail
-        {
-            self.fence_visible_wall_request();
-            #[cfg(debug_assertions)]
-            if let Some(hook) = self.derivative_request_test_hook.lock().await.clone() {
-                hook.started.notify_one();
-                if let Some(release) = hook.release {
-                    release.notified().await;
-                }
-            }
-        }
         if request.asset_ids.len() > 250 {
             return Err(AppServiceError::InvalidLimit);
         }
+        let lane = request_lane(&request);
         let ids = parse_ids(request.asset_ids)?;
         if ids.is_empty() {
             let _ = self.updates.send(WallUpdate::DerivativesReady {
@@ -306,19 +143,26 @@ impl AppService {
         let request_selection = self.active_selection_token()?;
         let ids = {
             let state = self.state()?;
-            photo_asset_ids_for_group(state.libraries.catalog(), request_selection.group_id, &ids)?
+            validate_requested_assets(state.libraries.catalog(), request_selection.group_id, &ids)?
         };
         if ids.is_empty() {
             return Ok(());
         }
-        let _wall_request = (request.kind == DerivativeClass::WallThumbnail)
-            .then(|| self.begin_preview_wall_request(request_selection));
-        let priority = match request.priority {
-            DerivativePriority::Visible => JobPriority::Visible,
-            DerivativePriority::NearViewport => JobPriority::NearViewport,
-        };
+        self.coordinator.ensure_selection(request_selection).await;
+        if request.priority == DerivativePriority::Visible
+            && request.kind == DerivativeClass::WallThumbnail
+        {
+            self.coordinator.invalidate_background().await;
+            #[cfg(debug_assertions)]
+            if let Some(hook) = self.derivative_request_test_hook.lock().await.clone() {
+                hook.started.notify_one();
+                if let Some(release) = hook.release {
+                    release.notified().await;
+                }
+            }
+        }
         let derivative_ids = if request.kind == DerivativeClass::ScreenPreview {
-            let (_, wall_ready) = self.ensure_wall_thumbnails(&ids, priority).await?;
+            let (_, wall_ready) = self.ensure_wall_thumbnails(&ids, request.priority).await?;
             if wall_ready.len() != ids.len() {
                 return Err(AppServiceError::DerivativeUnavailable);
             }
@@ -335,27 +179,22 @@ impl AppService {
         if !ready.is_empty() {
             self.publish_derivatives_if_active(selection, ready);
         }
-        if request.kind == DerivativeClass::WallThumbnail
-            && let Ok(mut state) = self.state.lock()
-            && state.selection_epoch == selection.epoch
-            && state.protected_group == Some(selection.group_id)
-        {
-            append_unique(&mut state.recent_derivative_ids, ids.iter().copied());
-        }
-        let pending_ids = pending
-            .iter()
-            .map(|work| work.id.as_uuid().hyphenated().to_string())
-            .collect::<HashSet<_>>();
-        let generated = self.run_derivative_jobs_publishing(pending, priority).await;
+        let generated = self.run_derivative_jobs_publishing(pending, lane).await;
         successful_ids.extend(generated.iter().map(|reference| reference.asset_id.clone()));
-        let has_unresolved = pending_ids.difference(&successful_ids).next().is_some();
+        let has_unresolved = derivative_ids
+            .iter()
+            .any(|id| !successful_ids.contains(&id.as_uuid().hyphenated().to_string()));
         let successful_in_request = derivative_ids
             .iter()
             .copied()
             .filter(|id| successful_ids.contains(&id.as_uuid().hyphenated().to_string()))
             .collect::<Vec<_>>();
         if request.kind == DerivativeClass::WallThumbnail {
-            self.schedule_screen_preview_prefetch(successful_in_request);
+            for id in successful_in_request.iter().copied() {
+                self.coordinator.note_recent(id).await;
+            }
+            self.schedule_screen_preview_prefetch(successful_in_request)
+                .await;
         }
         if has_unresolved {
             return Err(AppServiceError::DerivativeUnavailable);
@@ -366,7 +205,7 @@ impl AppService {
     async fn ensure_wall_thumbnails(
         &self,
         ids: &[AssetId],
-        priority: JobPriority,
+        priority: DerivativePriority,
     ) -> Result<(SelectionToken, HashSet<AssetId>), AppServiceError> {
         let (selection, cached, pending) =
             self.resolve_derivatives(ids, DerivativeClass::WallThumbnail)?;
@@ -379,7 +218,12 @@ impl AppService {
         if !cached.is_empty() {
             self.publish_derivatives_if_active(selection, cached);
         }
-        let generated = self.run_derivative_jobs_publishing(pending, priority).await;
+        let generated = self
+            .run_derivative_jobs_publishing(
+                pending,
+                request_lane_for(DerivativeClass::WallThumbnail, priority),
+            )
+            .await;
         ready_ids.extend(
             generated
                 .iter()
@@ -401,13 +245,12 @@ impl AppService {
         ),
         AppServiceError,
     > {
-        self.resolve_derivatives_with_generation(ids, class, None)
+        self.resolve_derivatives_with_generation(ids, class)
     }
 
     fn resolve_screen_previews(
         &self,
         ids: &[AssetId],
-        generation: u64,
     ) -> Result<
         (
             SelectionToken,
@@ -416,18 +259,13 @@ impl AppService {
         ),
         AppServiceError,
     > {
-        self.resolve_derivatives_with_generation(
-            ids,
-            DerivativeClass::ScreenPreview,
-            Some(generation),
-        )
+        self.resolve_derivatives_with_generation(ids, DerivativeClass::ScreenPreview)
     }
 
     fn resolve_derivatives_with_generation(
         &self,
         ids: &[AssetId],
         class: DerivativeClass,
-        preview_generation: Option<u64>,
     ) -> Result<
         (
             SelectionToken,
@@ -511,11 +349,21 @@ impl AppService {
                     continue;
                 }
             }
-            if let Some(existing) = records.iter().find(|record| {
+            let existing = records.iter().find(|record| {
                 record.asset_id == id
                     && record.folder_group_id == group
                     && record.cache_key == key.as_str()
-            }) {
+            });
+            if existing.is_none()
+                && state
+                    .libraries
+                    .catalog()
+                    .find_terminal_derivative_failure(id, kind, key.as_str(), asset.availability)?
+                    .is_some()
+            {
+                continue;
+            }
+            if let Some(existing) = existing {
                 ready.push(reference(id, class, existing.cache_key.clone()));
             } else {
                 let Some(relative) = asset.relative_path.to_path_buf().ok() else {
@@ -545,7 +393,6 @@ impl AppService {
                         group,
                         class,
                         selection: selection_token,
-                        preview_generation,
                     });
                 }
             }
@@ -559,45 +406,55 @@ impl AppService {
         pending: Vec<PendingDerivative>,
         priority: JobPriority,
     ) -> Vec<DerivativeReference> {
-        self.run_derivative_jobs_with_publication(pending, priority, false)
+        let lane = pending
+            .first()
+            .map(|work| lane_for_priority(work.class, priority))
+            .unwrap_or(crate::derivative_coordinator::WorkLane::IdlePreview);
+        self.run_derivative_jobs_with_publication(pending, lane)
             .await
     }
 
     async fn run_derivative_jobs_publishing(
         &self,
         pending: Vec<PendingDerivative>,
-        priority: JobPriority,
+        lane: crate::derivative_coordinator::WorkLane,
     ) -> Vec<DerivativeReference> {
-        self.run_derivative_jobs_with_publication(pending, priority, true)
+        self.run_derivative_jobs_with_publication(pending, lane)
             .await
     }
 
     async fn run_derivative_jobs_with_publication(
         &self,
         pending: Vec<PendingDerivative>,
-        priority: JobPriority,
-        publish: bool,
+        lane: crate::derivative_coordinator::WorkLane,
     ) -> Vec<DerivativeReference> {
         let mut receivers = Vec::with_capacity(pending.len());
         for pending in pending {
+            let key = WorkKey {
+                selection: pending.selection,
+                asset_id: pending.id,
+                class: pending.class,
+                cache_key: DerivativeKey::compute(&pending.spec).as_str().to_owned(),
+            };
+            let prerequisite = (pending.class == DerivativeClass::ScreenPreview).then(|| {
+                DerivativeKey::compute(&wall_spec_from(&pending.spec))
+                    .as_str()
+                    .to_owned()
+            });
             receivers.push(
-                self.derivative_queue
-                    .enqueue(&self.scheduler, pending, priority)
+                self.coordinator
+                    .enqueue_with_prerequisite(key, lane, prerequisite)
                     .await,
             );
         }
         if !receivers.is_empty() {
-            self.wake_preview_gate();
             #[cfg(debug_assertions)]
-            if priority == JobPriority::Visible
+            if lane == crate::derivative_coordinator::WorkLane::VisibleWall
                 && let Some(hook) = self.derivative_visible_queue_test_hook.lock().await.clone()
             {
                 hook.notify_one();
             }
-            let service = self.clone();
-            tokio::spawn(async move {
-                service.drive_derivative_queue(publish).await;
-            });
+            self.start_derivative_driver();
         }
         let mut ready = Vec::new();
         for receiver in receivers {
@@ -608,8 +465,18 @@ impl AppService {
         ready
     }
 
-    async fn drive_derivative_queue(&self, publish: bool) {
-        let _driver = self.derivative_queue.driver.lock().await;
+    fn start_derivative_driver(&self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            service.drive_derivative_workers().await;
+        });
+    }
+
+    async fn drive_derivative_workers(&self) {
+        let _driver = self.derivative_driver.lock().await;
         let worker_count = self
             .scheduler
             .available_background_permits()
@@ -618,7 +485,7 @@ impl AppService {
         for _ in 0..worker_count {
             let service = self.clone();
             workers.push(tokio::spawn(async move {
-                service.drive_derivative_worker(publish).await;
+                service.drive_derivative_worker().await;
             }));
         }
         for worker in workers {
@@ -626,44 +493,41 @@ impl AppService {
         }
     }
 
-    async fn drive_derivative_worker(&self, publish: bool) {
+    async fn drive_derivative_worker(&self) {
         loop {
-            let Some((job, key, pending)) = self.derivative_queue.next_owned(&self.scheduler).await
-            else {
+            let Some(ticket) = self.coordinator.next_work().await else {
                 break;
             };
-            if should_pause(
-                job.priority(),
-                self.scheduler.available_background_permits(),
-            ) {
-                self.derivative_queue.requeue(&job, &key).await;
-                self.scheduler.enqueue(job).await;
+            let lane = self.coordinator.lane(ticket).await;
+            let priority = crate::derivative_coordinator::scheduler_priority(lane);
+            if should_pause(priority, self.scheduler.available_background_permits()) {
+                self.coordinator.requeue(ticket).await;
                 break;
             }
-            let selection = pending.selection;
-            let asset_id = pending.id;
-            let class = pending.class;
-            let preview_generation = pending.preview_generation;
-            if class == DerivativeClass::ScreenPreview
-                && preview_generation
-                    .is_some_and(|generation| !self.preview_generation_is_current(generation))
-            {
-                self.derivative_queue.finish(&key, job.name(), None).await;
-                self.wake_preview_gate();
+            let Some(key) = self.coordinator.work_key(ticket).await else {
                 continue;
-            }
-            let result = if self.selection_is_active(selection) {
-                match self.generate_derivative(pending).await {
-                    Ok(reference) => {
-                        self.clear_derivative_warnings(selection, asset_id, class);
-                        if publish {
-                            self.publish_derivatives_if_active(selection, vec![reference.clone()]);
-                        }
-                        Some(reference)
-                    }
-                    Err(DerivativeWorkError::PreviewSuperseded) => None,
-                    Err(DerivativeWorkError::WallThumbnailRequired) => None,
-                    Err(error) => {
+            };
+            let selection = key.selection;
+            let asset_id = key.asset_id;
+            let class = key.class;
+            let outcome = if self.selection_is_active(selection) {
+                self.generate_derivative(ticket, key).await
+            } else {
+                Err(GenerationFailure {
+                    error: DerivativeWorkError::WorkerUnavailable,
+                    permit: None,
+                })
+            };
+            match outcome {
+                Ok(GeneratedWork { reference, permit }) => {
+                    self.clear_derivative_warnings(selection, asset_id, class);
+                    self.publish_derivatives_if_active(selection, vec![reference.clone()]);
+                    self.coordinator.complete_commit(permit, reference).await;
+                }
+                Err(GenerationFailure { error, permit }) => {
+                    if !matches!(error, DerivativeWorkError::PreviewSuperseded)
+                        && !matches!(error, DerivativeWorkError::WallThumbnailRequired)
+                    {
                         match error.scope() {
                             DerivativeFailureScope::Asset => {
                                 self.record_asset_derivative_warning(selection, asset_id);
@@ -672,72 +536,68 @@ impl AppService {
                                 self.record_cache_derivative_warning(selection, class);
                             }
                         }
-                        None
+                    }
+                    if let Some(permit) = permit {
+                        self.coordinator.fail_commit(permit).await;
+                    } else {
+                        self.coordinator.discard(ticket).await;
                     }
                 }
-            } else {
-                None
-            };
-            self.derivative_queue.finish(&key, job.name(), result).await;
-            self.wake_preview_gate();
+            }
         }
     }
 
     async fn generate_derivative(
         &self,
-        pending: PendingDerivative,
-    ) -> Result<DerivativeReference, DerivativeWorkError> {
+        ticket: WorkTicket,
+        key: WorkKey,
+    ) -> Result<GeneratedWork, GenerationFailure> {
+        let pending = self
+            .pending_for_key(&key)
+            .map_err(|error| GenerationFailure {
+                error,
+                permit: None,
+            })?
+            .ok_or_else(|| GenerationFailure {
+                error: DerivativeWorkError::WorkerUnavailable,
+                permit: None,
+            })?;
         let id = pending.id;
         let group = pending.group;
         let class = pending.class;
         let selection = pending.selection;
-        let preview_generation = pending.preview_generation;
         #[cfg(any(test, debug_assertions))]
         self.wait_for_test_derivative_gate(id, class).await;
-        if class == DerivativeClass::ScreenPreview
-            && pending
-                .preview_generation
-                .is_some_and(|generation| !self.preview_generation_is_current(generation))
-        {
-            return Err(DerivativeWorkError::PreviewSuperseded);
-        }
         if !self.selection_is_active(selection) {
-            return Err(DerivativeWorkError::WorkerUnavailable);
+            return Err(GenerationFailure {
+                error: DerivativeWorkError::WorkerUnavailable,
+                permit: None,
+            });
         }
-        if class == DerivativeClass::ScreenPreview {
-            let wall_spec = wall_spec_from(&pending.spec);
-            let wall_key = DerivativeKey::compute(&wall_spec);
-            let wall_ready = self
-                .state()
-                .map_err(|_| DerivativeWorkError::WorkerUnavailable)?
-                .libraries
-                .catalog()
-                .find_derivative(
-                    id,
-                    derivative_kind_name(DerivativeClass::WallThumbnail),
-                    wall_key.as_str(),
-                )
-                .map_err(|_| DerivativeWorkError::WorkerUnavailable)?
-                .is_some_and(|record| record.folder_group_id == group);
-            if !wall_ready {
-                return Err(DerivativeWorkError::WallThumbnailRequired);
-            }
-        }
-        let cached_screen_preview = if class == DerivativeClass::WallThumbnail {
-            pending
-                .cached_source
-                .clone()
-                .or(self.cached_screen_preview_for_wall(id, group, &pending.spec)?)
-        } else {
-            None
-        };
-        let generator = ImageDerivativeGenerator::new(&self.cache_root)?;
-        let generated = match class {
+        let generator =
+            ImageDerivativeGenerator::new(&self.cache_root).map_err(|error| GenerationFailure {
+                error: error.into(),
+                permit: None,
+            })?;
+        match class {
             DerivativeClass::WallThumbnail => {
+                let permit = self
+                    .coordinator
+                    .admit_commit(ticket, selection, None)
+                    .await
+                    .ok_or_else(|| GenerationFailure {
+                        error: DerivativeWorkError::PreviewSuperseded,
+                        permit: None,
+                    })?;
                 let source = pending.source;
-                let cached_source = cached_screen_preview;
+                let cached_source = pending.cached_source.clone().or(self
+                    .cached_screen_preview_for_wall(id, group, &pending.spec)
+                    .map_err(|error| GenerationFailure {
+                        error,
+                        permit: Some(permit),
+                    })?);
                 let spec = pending.spec;
-                tokio::task::spawn_blocking(move || {
+                let generated = tokio::task::spawn_blocking(move || {
                     if let Some(cached_source) = cached_source {
                         let repair = generator
                             .generate_wall_thumbnail_from_cached_preview(&cached_source, &spec);
@@ -755,75 +615,222 @@ impl AppService {
                     }
                 })
                 .await
-                .map_err(|_| DerivativeWorkError::WorkerUnavailable)??
+                .map_err(|_| GenerationFailure {
+                    error: DerivativeWorkError::WorkerUnavailable,
+                    permit: Some(permit),
+                })?
+                .map_err(|error| GenerationFailure {
+                    error: error.into(),
+                    permit: Some(permit),
+                })?;
+                let mut state = self.state().map_err(|_| GenerationFailure {
+                    error: DerivativeWorkError::WorkerUnavailable,
+                    permit: Some(permit),
+                })?;
+                let catalog_started = std::time::Instant::now();
+                let catalog_result =
+                    state
+                        .libraries
+                        .catalog_mut()
+                        .upsert_derivative(&NewDerivative {
+                            id: DerivativeId::new(),
+                            asset_id: id,
+                            folder_group_id: group,
+                            kind: derivative_kind_name(class).into(),
+                            cache_key: generated.key.as_str().into(),
+                            relative_cache_path: generated.relative_path,
+                            size_bytes: generated.size_bytes,
+                            durable: true,
+                            created_at: 0,
+                        });
+                record_timing_stage("catalog_commit", catalog_started);
+                catalog_result.map_err(|error| GenerationFailure {
+                    error: ImageDerivativeError::Catalog(error).into(),
+                    permit: Some(permit),
+                })?;
+                Ok(GeneratedWork {
+                    reference: reference(id, class, generated.key.as_str().into()),
+                    permit,
+                })
             }
             DerivativeClass::ScreenPreview => {
+                let wall_spec = wall_spec_from(&pending.spec);
+                let wall_key = DerivativeKey::compute(&wall_spec);
+                let wall_ready = self
+                    .state()
+                    .map_err(|_| GenerationFailure {
+                        error: DerivativeWorkError::WorkerUnavailable,
+                        permit: None,
+                    })?
+                    .libraries
+                    .catalog()
+                    .find_derivative(
+                        id,
+                        derivative_kind_name(DerivativeClass::WallThumbnail),
+                        wall_key.as_str(),
+                    )
+                    .map_err(|_| GenerationFailure {
+                        error: DerivativeWorkError::WorkerUnavailable,
+                        permit: None,
+                    })?
+                    .is_some_and(|record| record.folder_group_id == group);
+                if !wall_ready {
+                    return Err(GenerationFailure {
+                        error: DerivativeWorkError::WallThumbnailRequired,
+                        permit: None,
+                    });
+                }
                 let source = pending.source;
                 let spec = pending.spec;
-                let catalog_path = self.catalog_path.clone();
-                let cache_budget = self.cache_budget;
-                let protected = self.protected_groups.clone();
                 let encoded = tokio::task::spawn_blocking({
                     let generator = generator.clone();
                     let spec = spec.clone();
                     move || generator.encode_screen_preview(&source, &spec)
                 })
                 .await
-                .map_err(|_| DerivativeWorkError::WorkerUnavailable)??;
+                .map_err(|_| GenerationFailure {
+                    error: DerivativeWorkError::WorkerUnavailable,
+                    permit: None,
+                })?
+                .map_err(|error| GenerationFailure {
+                    error: error.into(),
+                    permit: None,
+                })?;
                 #[cfg(any(test, debug_assertions))]
                 self.wait_for_screen_preview_post_encode_test_gate(id).await;
-                if preview_generation
-                    .is_some_and(|generation| !self.preview_generation_is_current(generation))
-                {
-                    return Err(DerivativeWorkError::PreviewSuperseded);
-                }
                 if !self.selection_is_active(selection) {
-                    return Err(DerivativeWorkError::WorkerUnavailable);
+                    return Err(GenerationFailure {
+                        error: DerivativeWorkError::WorkerUnavailable,
+                        permit: None,
+                    });
                 }
-                let service = self.clone();
-                tokio::task::spawn_blocking(move || {
-                    service.commit_screen_preview_if_active(
-                        generator,
+                let permit = self
+                    .coordinator
+                    .admit_commit(ticket, selection, Some(wall_key.as_str()))
+                    .await
+                    .ok_or_else(|| GenerationFailure {
+                        error: DerivativeWorkError::PreviewSuperseded,
+                        permit: None,
+                    })?;
+                let cache_budget = self.cache_budget;
+                let protected = self.protected_groups.clone();
+                let cache_root = self.cache_root.clone();
+                let catalog_path = self.catalog_path.clone();
+                let generated = tokio::task::spawn_blocking(move || {
+                    let generator = ImageDerivativeGenerator::new(&cache_root)?;
+                    let mut catalog = Catalog::open(&catalog_path)?;
+                    generator.commit_screen_preview(
                         encoded,
                         &spec,
                         group,
+                        &mut catalog,
                         cache_budget,
                         &protected,
-                        selection,
-                        preview_generation,
-                        &catalog_path,
                     )
                 })
                 .await
-                .map_err(|_| DerivativeWorkError::WorkerUnavailable)??
+                .map_err(|_| GenerationFailure {
+                    error: DerivativeWorkError::WorkerUnavailable,
+                    permit: Some(permit),
+                })?
+                .map_err(|error| GenerationFailure {
+                    error: error.into(),
+                    permit: Some(permit),
+                })?;
+                Ok(GeneratedWork {
+                    reference: reference(id, class, generated.key.as_str().into()),
+                    permit,
+                })
             }
-        };
-        if !self.selection_is_active(selection) {
-            return Err(DerivativeWorkError::WorkerUnavailable);
         }
-        if class == DerivativeClass::WallThumbnail {
-            let mut state = self
-                .state()
-                .map_err(|_| DerivativeWorkError::WorkerUnavailable)?;
-            let catalog_started = std::time::Instant::now();
-            let catalog_result = state
+    }
+
+    fn pending_for_key(
+        &self,
+        key: &WorkKey,
+    ) -> Result<Option<PendingDerivative>, DerivativeWorkError> {
+        let state = self
+            .state()
+            .map_err(|_| DerivativeWorkError::WorkerUnavailable)?;
+        let stored = state
+            .libraries
+            .catalog()
+            .load_app_state()
+            .map_err(|_| DerivativeWorkError::WorkerUnavailable)?;
+        let selection = stored
+            .active_selection
+            .ok_or(DerivativeWorkError::WorkerUnavailable)?;
+        let group = state
+            .libraries
+            .catalog()
+            .folder_group_for_path(selection.library_id, &selection.relative_folder)
+            .map_err(|_| DerivativeWorkError::WorkerUnavailable)?
+            .ok_or(DerivativeWorkError::WorkerUnavailable)?;
+        if key.selection
+            != (SelectionToken {
+                library_id: selection.library_id,
+                group_id: group,
+                epoch: state.selection_epoch,
+            })
+        {
+            return Ok(None);
+        }
+        let asset = state
+            .libraries
+            .catalog()
+            .find_asset(key.asset_id)
+            .map_err(|_| DerivativeWorkError::WorkerUnavailable)?
+            .ok_or(DerivativeWorkError::WorkerUnavailable)?;
+        if asset.folder_group_id != Some(group) || asset.media_kind == MediaKind::Video {
+            return Ok(None);
+        }
+        let spec = derivative_spec(&asset, key.class);
+        if DerivativeKey::compute(&spec).as_str() != key.cache_key {
+            return Ok(None);
+        }
+        let library = state
+            .libraries
+            .catalog()
+            .find_library(selection.library_id)
+            .map_err(|_| DerivativeWorkError::WorkerUnavailable)?
+            .ok_or(DerivativeWorkError::WorkerUnavailable)?;
+        let root = library
+            .canonical_root_key
+            .to_path_buf()
+            .map_err(|_| DerivativeWorkError::WorkerUnavailable)?;
+        let relative = asset
+            .relative_path
+            .to_path_buf()
+            .map_err(|_| DerivativeWorkError::WorkerUnavailable)?;
+        let cached_source = if key.class == DerivativeClass::WallThumbnail {
+            let screen_spec = derivative_spec(&asset, DerivativeClass::ScreenPreview);
+            let screen_key = DerivativeKey::compute(&screen_spec);
+            state
                 .libraries
-                .catalog_mut()
-                .upsert_derivative(&NewDerivative {
-                    id: DerivativeId::new(),
-                    asset_id: id,
-                    folder_group_id: group,
-                    kind: derivative_kind_name(class).into(),
-                    cache_key: generated.key.as_str().into(),
-                    relative_cache_path: generated.relative_path,
-                    size_bytes: generated.size_bytes,
-                    durable: true,
-                    created_at: 0,
-                });
-            record_timing_stage("catalog_commit", catalog_started);
-            catalog_result.map_err(ImageDerivativeError::from)?;
+                .catalog()
+                .find_derivative(
+                    key.asset_id,
+                    derivative_kind_name(DerivativeClass::ScreenPreview),
+                    screen_key.as_str(),
+                )
+                .map_err(|_| DerivativeWorkError::WorkerUnavailable)?
+                .filter(|record| record.folder_group_id == group && record.asset_id == key.asset_id)
+                .map(|record| record.relative_cache_path)
+        } else {
+            None
+        };
+        if !matches!(asset.availability, Availability::Available) && cached_source.is_none() {
+            return Ok(None);
         }
-        Ok(reference(id, class, generated.key.as_str().into()))
+        Ok(Some(PendingDerivative {
+            id: key.asset_id,
+            source: root.join(relative),
+            cached_source,
+            spec,
+            group,
+            class: key.class,
+            selection: key.selection,
+        }))
     }
 
     fn cached_screen_preview_for_wall(
@@ -967,27 +974,7 @@ impl AppService {
         *self.derivative_visible_queue_test_hook.lock().await = Some(queued);
     }
 
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn reset_preview_gate_test_checks(&self) {
-        self.preview_gate_checks.store(0, Ordering::SeqCst);
-    }
-
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn preview_gate_test_checks(&self) -> usize {
-        self.preview_gate_checks.load(Ordering::SeqCst)
-    }
-
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn preview_gate_generation_test(&self) -> u64 {
-        self.preview_gate
-            .lock()
-            .map(|gate| gate.generation)
-            .unwrap_or_default()
-    }
-
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn commit_screen_preview_if_active(
         &self,
@@ -998,18 +985,8 @@ impl AppService {
         budget: photo_cache::CacheBudget,
         protected: &photo_cache::ProtectedGroups,
         selection: SelectionToken,
-        preview_generation: Option<u64>,
         catalog_path: &std::path::Path,
     ) -> Result<photo_cache::GeneratedDerivative, DerivativeWorkError> {
-        let _commit_guard = self
-            .screen_preview_commit_lock
-            .lock()
-            .map_err(|_| DerivativeWorkError::WorkerUnavailable)?;
-        if preview_generation
-            .is_some_and(|generation| !self.preview_generation_is_current(generation))
-        {
-            return Err(DerivativeWorkError::PreviewSuperseded);
-        }
         if !self.selection_is_active(selection) {
             return Err(DerivativeWorkError::WorkerUnavailable);
         }
@@ -1020,259 +997,142 @@ impl AppService {
     }
 
     pub(crate) async fn prefetch_screen_previews(&self, recent: Vec<AssetId>) {
-        self.schedule_screen_preview_prefetch_for_group(recent, true);
+        self.schedule_screen_preview_prefetch_for_group(recent, true)
+            .await;
     }
 
-    pub(crate) fn wake_preview_gate(&self) {
-        self.preview_gate_wake.notify_one();
+    pub(crate) fn wake_derivative_workers(&self) {
+        self.coordinator.wake();
+        self.start_derivative_driver();
     }
 
-    fn schedule_screen_preview_prefetch(&self, recent: Vec<AssetId>) {
-        self.schedule_screen_preview_prefetch_for_group(recent, false);
+    async fn schedule_screen_preview_prefetch(&self, recent: Vec<AssetId>) {
+        self.schedule_screen_preview_prefetch_for_group(recent, false)
+            .await;
     }
 
-    fn schedule_screen_preview_prefetch_for_group(&self, recent: Vec<AssetId>, full_group: bool) {
-        let stable_recent = self
-            .state()
-            .map(|state| state.recent_derivative_ids.clone())
-            .unwrap_or_default();
-        let should_spawn = {
-            let Ok(mut gate) = self.preview_gate.lock() else {
-                return;
-            };
-            append_unique(&mut gate.recent_ids, stable_recent);
-            append_unique(&mut gate.recent_ids, recent);
-            gate.full_group_prefetch |= full_group;
-            gate.generation = gate.generation.wrapping_add(1).max(1);
-            if gate.task_running || (gate.recent_ids.is_empty() && !gate.full_group_prefetch) {
-                false
-            } else {
-                gate.task_running = true;
-                true
-            }
-        };
-        self.preview_gate_wake.notify_one();
-        if !should_spawn {
+    async fn schedule_screen_preview_prefetch_for_group(
+        &self,
+        recent: Vec<AssetId>,
+        full_group: bool,
+    ) {
+        let Ok(selection) = self.active_selection_token() else {
             return;
+        };
+        self.coordinator.ensure_selection(selection).await;
+        for id in recent.iter().copied() {
+            self.coordinator.note_recent(id).await;
         }
+        let generation = self.coordinator.background_generation().await;
         if tokio::runtime::Handle::try_current().is_err() {
-            if let Ok(mut gate) = self.preview_gate.lock() {
-                gate.task_running = false;
-            }
             return;
         }
         let service = self.clone();
         tokio::spawn(async move {
-            service.run_preview_gate().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            service
+                .run_preview_prefetch_until_stable(recent, full_group, selection, generation)
+                .await;
         });
     }
 
-    pub(crate) fn reset_preview_gate(&self) {
-        if let Ok(mut gate) = self.preview_gate.lock() {
-            gate.recent_ids.clear();
-            gate.full_group_prefetch = false;
-            gate.generation = gate.generation.wrapping_add(1).max(1);
-            gate.wall_requests_in_flight = 0;
-            gate.wall_request_selection = None;
-            gate.wall_request_generation = gate.wall_request_generation.wrapping_add(1).max(1);
-            gate.active_wall_request_ids.clear();
-        }
-        self.wake_preview_gate();
-    }
-
-    fn fence_visible_wall_request(&self) {
-        if let Ok(mut gate) = self.preview_gate.lock() {
-            gate.generation = gate.generation.wrapping_add(1).max(1);
-        }
-        self.wake_preview_gate();
-    }
-
-    fn begin_preview_wall_request(&self, selection: SelectionToken) -> WallRequestGuard {
-        let (generation, request_id) = {
-            let mut gate = self
-                .preview_gate
-                .lock()
-                .expect("preview gate lock must not be poisoned");
-            if gate.wall_request_selection != Some(selection) {
-                gate.active_wall_request_ids.clear();
-                gate.wall_requests_in_flight = 0;
-                gate.wall_request_selection = Some(selection);
-                gate.wall_request_generation = gate.wall_request_generation.wrapping_add(1).max(1);
-            }
-            gate.next_wall_request_id = gate.next_wall_request_id.wrapping_add(1).max(1);
-            let request_id = gate.next_wall_request_id;
-            gate.active_wall_request_ids.insert(request_id);
-            gate.wall_requests_in_flight = gate.active_wall_request_ids.len();
-            gate.generation = gate.generation.wrapping_add(1).max(1);
-            (gate.wall_request_generation, request_id)
-        };
-        self.wake_preview_gate();
-        WallRequestGuard {
-            service: self.clone(),
-            selection,
-            generation,
-            request_id,
-        }
-    }
-
-    fn finish_wall_request(&self, selection: SelectionToken, generation: u64, request_id: u64) {
-        if let Ok(mut gate) = self.preview_gate.lock()
-            && gate.wall_request_selection == Some(selection)
-            && gate.wall_request_generation == generation
-            && gate.active_wall_request_ids.remove(&request_id)
-        {
-            gate.wall_requests_in_flight = gate.active_wall_request_ids.len();
-            gate.generation = gate.generation.wrapping_add(1).max(1);
-        }
-        self.wake_preview_gate();
-    }
-
-    async fn run_preview_gate(&self) {
+    async fn run_preview_prefetch_until_stable(
+        &self,
+        recent: Vec<AssetId>,
+        full_group: bool,
+        selection: SelectionToken,
+        generation: u64,
+    ) {
+        let mut generation = generation;
         loop {
-            let (generation, recent) = {
-                let Ok(mut gate) = self.preview_gate.lock() else {
-                    return;
-                };
-                if gate.recent_ids.is_empty() && !gate.full_group_prefetch {
-                    gate.task_running = false;
-                    return;
-                }
-                (gate.generation, gate.recent_ids.clone())
-            };
-
-            tokio::select! {
-                _ = tokio::time::sleep(PREVIEW_DEBOUNCE) => {}
-                _ = self.preview_gate_wake.notified() => continue,
-            }
-
-            let wake = self.preview_gate_wake.notified();
-            if self.preview_selection_if_ready(generation).await.is_none() {
-                wake.await;
-                continue;
-            }
             match self
-                .run_screen_preview_prefetch_for_generation(recent, generation)
+                .run_screen_preview_prefetch_for_generation(
+                    recent.clone(),
+                    full_group,
+                    selection,
+                    generation,
+                )
                 .await
             {
-                PreviewPrefetchOutcome::Complete => {
-                    let should_continue = {
-                        let Ok(mut gate) = self.preview_gate.lock() else {
-                            return;
-                        };
-                        if gate.generation == generation {
-                            gate.recent_ids.clear();
-                            gate.full_group_prefetch = false;
-                            gate.task_running = false;
-                            false
-                        } else {
-                            true
-                        }
-                    };
-                    if !should_continue {
+                PreviewPrefetchOutcome::Blocked => self.coordinator.wait_for_change().await,
+                PreviewPrefetchOutcome::Complete | PreviewPrefetchOutcome::Terminate => return,
+                PreviewPrefetchOutcome::Stale => {
+                    if !self.selection_is_active(selection) {
                         return;
                     }
-                }
-                PreviewPrefetchOutcome::Blocked => {
-                    self.preview_gate_wake.notified().await;
-                }
-                PreviewPrefetchOutcome::Stale => {}
-                PreviewPrefetchOutcome::Terminate => {
-                    let Ok(mut gate) = self.preview_gate.lock() else {
-                        return;
-                    };
-                    if gate.generation == generation {
-                        gate.recent_ids.clear();
-                        gate.full_group_prefetch = false;
-                        gate.task_running = false;
-                        return;
-                    }
+                    generation = self.coordinator.background_generation().await;
                 }
             }
         }
-    }
-
-    async fn preview_selection_if_ready(&self, generation: u64) -> Option<SelectionToken> {
-        if self
-            .preview_gate
-            .lock()
-            .ok()
-            .is_none_or(|gate| gate.generation != generation)
-        {
-            return None;
-        }
-        let selection = self.active_selection_token().ok()?;
-        if !self.preview_work_can_continue(selection).await {
-            return None;
-        }
-        Some(selection)
-    }
-
-    async fn preview_work_can_continue(&self, selection: SelectionToken) -> bool {
-        #[cfg(debug_assertions)]
-        self.preview_gate_checks.fetch_add(1, Ordering::SeqCst);
-        if self
-            .preview_gate
-            .lock()
-            .map(|gate| gate.wall_requests_in_flight > 0)
-            .unwrap_or(true)
-        {
-            return false;
-        }
-        if !self.selection_is_active(selection)
-            || self
-                .state()
-                .map(|state| state.active_scan.is_some())
-                .unwrap_or(true)
-            || self.scheduler.available_background_permits() <= 1
-        {
-            return false;
-        }
-        self.derivative_queue.is_empty().await
     }
 
     #[cfg(test)]
     async fn run_screen_preview_prefetch(&self, recent: Vec<AssetId>) {
-        let generation = self
-            .preview_gate
-            .lock()
-            .map(|gate| gate.generation)
-            .unwrap_or_default();
-        let _ = self
-            .run_screen_preview_prefetch_for_generation(recent, generation)
+        let Ok(selection) = self.active_selection_token() else {
+            return;
+        };
+        let generation = self.coordinator.background_generation().await;
+        self.run_preview_prefetch_until_stable(recent, true, selection, generation)
             .await;
     }
 
     async fn run_screen_preview_prefetch_for_generation(
         &self,
         recent: Vec<AssetId>,
+        full_group: bool,
+        selection: SelectionToken,
         generation: u64,
     ) -> PreviewPrefetchOutcome {
-        if !self.preview_generation_is_current(generation) {
+        if self.coordinator.background_generation().await != generation
+            || !self.selection_is_active(selection)
+        {
             return PreviewPrefetchOutcome::Stale;
         }
-        let Ok(selection) = self.active_selection_token() else {
-            return PreviewPrefetchOutcome::Terminate;
-        };
         if !self.preview_work_can_continue(selection).await {
             return PreviewPrefetchOutcome::Blocked;
         }
         let recent_ids = recent.clone();
         let recent = recent.into_iter().collect::<HashSet<_>>();
-        let Ok((selection, wall_ready)) = self
-            .ensure_wall_thumbnails(&recent_ids, JobPriority::NearViewport)
+        let Ok((wall_selection, wall_ready)) = self
+            .ensure_wall_thumbnails(&recent_ids, DerivativePriority::NearViewport)
             .await
         else {
             return PreviewPrefetchOutcome::Terminate;
         };
-        if !self.preview_generation_is_current(generation) {
+        if wall_selection != selection
+            || self.coordinator.background_generation().await != generation
+        {
             return PreviewPrefetchOutcome::Stale;
         }
         if wall_ready.len() != recent.len() {
             return PreviewPrefetchOutcome::Blocked;
         }
+        if !full_group {
+            let recent_ready = recent.iter().copied().collect::<Vec<_>>();
+            let Ok((screen_selection, cached, pending)) =
+                self.resolve_screen_previews(&recent_ready)
+            else {
+                return PreviewPrefetchOutcome::Terminate;
+            };
+            if screen_selection != selection {
+                return PreviewPrefetchOutcome::Stale;
+            }
+            if !cached.is_empty() {
+                self.publish_derivatives_if_active(screen_selection, cached);
+            }
+            let _generated = self
+                .run_derivative_jobs_publishing(
+                    pending,
+                    crate::derivative_coordinator::WorkLane::IdlePreview,
+                )
+                .await;
+            return PreviewPrefetchOutcome::Complete;
+        }
+
+        self.coordinator.begin_collection(selection).await;
         let mut cursor = None;
         loop {
-            if !self.preview_generation_is_current(generation) {
+            if self.coordinator.background_generation().await != generation {
                 return PreviewPrefetchOutcome::Stale;
             }
             if !self.preview_work_can_continue(selection).await {
@@ -1288,36 +1148,30 @@ impl AppService {
             }
             if !remaining.is_empty() {
                 let Ok((wall_selection, wall_ready)) = self
-                    .ensure_wall_thumbnails(&remaining, JobPriority::IdleLibrary)
+                    .ensure_wall_thumbnails_lane(
+                        &remaining,
+                        crate::derivative_coordinator::WorkLane::IdleWall,
+                    )
                     .await
                 else {
                     return PreviewPrefetchOutcome::Terminate;
                 };
-                if wall_selection != selection {
-                    return PreviewPrefetchOutcome::Stale;
-                }
-                if !self.preview_generation_is_current(generation) {
-                    return PreviewPrefetchOutcome::Stale;
-                }
-                if wall_ready.len() != remaining.len() {
+                if wall_selection != selection || wall_ready.len() != remaining.len() {
                     return PreviewPrefetchOutcome::Blocked;
                 }
             }
+            self.coordinator
+                .advance_collection(selection, next.clone())
+                .await;
             let Some(next) = next else {
                 break;
             };
             cursor = Some(next);
         }
+        self.coordinator.finish_thumbnail_phase(selection).await;
 
-        if !self.preview_generation_is_current(generation) {
-            return PreviewPrefetchOutcome::Stale;
-        }
-        if !self.preview_work_can_continue(selection).await {
-            return PreviewPrefetchOutcome::Blocked;
-        }
         let recent_ready = recent.iter().copied().collect::<Vec<_>>();
-        let Ok((screen_selection, cached, pending)) =
-            self.resolve_screen_previews(&recent_ready, generation)
+        let Ok((screen_selection, cached, pending)) = self.resolve_screen_previews(&recent_ready)
         else {
             return PreviewPrefetchOutcome::Terminate;
         };
@@ -1328,15 +1182,15 @@ impl AppService {
             self.publish_derivatives_if_active(screen_selection, cached);
         }
         let _generated = self
-            .run_derivative_jobs_publishing(pending, JobPriority::NearViewport)
+            .run_derivative_jobs_publishing(
+                pending,
+                crate::derivative_coordinator::WorkLane::IdlePreview,
+            )
             .await;
-        if !self.preview_generation_is_current(generation) {
-            return PreviewPrefetchOutcome::Stale;
-        }
 
         let mut cursor = None;
         loop {
-            if !self.preview_generation_is_current(generation) {
+            if self.coordinator.background_generation().await != generation {
                 return PreviewPrefetchOutcome::Stale;
             }
             if !self.preview_work_can_continue(selection).await {
@@ -1352,7 +1206,7 @@ impl AppService {
             }
             if !remaining.is_empty() {
                 let Ok((resolved_selection, cached, pending)) =
-                    self.resolve_screen_previews(&remaining, generation)
+                    self.resolve_screen_previews(&remaining)
                 else {
                     return PreviewPrefetchOutcome::Terminate;
                 };
@@ -1363,18 +1217,61 @@ impl AppService {
                     self.publish_derivatives_if_active(resolved_selection, cached);
                 }
                 let _generated = self
-                    .run_derivative_jobs_publishing(pending, JobPriority::IdleLibrary)
+                    .run_derivative_jobs_publishing(
+                        pending,
+                        crate::derivative_coordinator::WorkLane::IdlePreview,
+                    )
                     .await;
-                if !self.preview_generation_is_current(generation) {
-                    return PreviewPrefetchOutcome::Stale;
-                }
             }
+            self.coordinator
+                .advance_collection(selection, next.clone())
+                .await;
             let Some(next) = next else {
                 break;
             };
             cursor = Some(next);
         }
+        self.coordinator.finish_preview_phase(selection).await;
         PreviewPrefetchOutcome::Complete
+    }
+
+    async fn preview_work_can_continue(&self, selection: SelectionToken) -> bool {
+        if !self.selection_is_active(selection)
+            || self
+                .state()
+                .map(|state| state.active_scan.is_some())
+                .unwrap_or(true)
+            || self.scheduler.available_background_permits() <= 1
+        {
+            return false;
+        }
+        self.coordinator.pending_job_count().await == 0
+    }
+
+    async fn ensure_wall_thumbnails_lane(
+        &self,
+        ids: &[AssetId],
+        lane: crate::derivative_coordinator::WorkLane,
+    ) -> Result<(SelectionToken, HashSet<AssetId>), AppServiceError> {
+        let (selection, cached, pending) =
+            self.resolve_derivatives(ids, DerivativeClass::WallThumbnail)?;
+        let mut ready_ids = cached
+            .iter()
+            .map(|reference| reference.asset_id.clone())
+            .filter_map(|id| uuid::Uuid::parse_str(&id).ok())
+            .map(AssetId::from_uuid)
+            .collect::<HashSet<_>>();
+        if !cached.is_empty() {
+            self.publish_derivatives_if_active(selection, cached);
+        }
+        let generated = self.run_derivative_jobs_publishing(pending, lane).await;
+        ready_ids.extend(
+            generated
+                .iter()
+                .filter_map(|reference| uuid::Uuid::parse_str(&reference.asset_id).ok())
+                .map(AssetId::from_uuid),
+        );
+        Ok((selection, ready_ids))
     }
 
     fn remaining_group_ids_page(
@@ -1445,13 +1342,6 @@ impl AppService {
             group_id: group,
             epoch: state.selection_epoch,
         })
-    }
-
-    fn preview_generation_is_current(&self, generation: u64) -> bool {
-        self.preview_gate
-            .lock()
-            .map(|gate| gate.generation == generation)
-            .unwrap_or(false)
     }
 
     fn selection_is_active(&self, selection: SelectionToken) -> bool {
@@ -1581,6 +1471,10 @@ impl AppService {
                 None,
                 catalog_code,
             )?;
+            state
+                .libraries
+                .catalog_mut()
+                .clear_terminal_derivative_failure(asset_id, derivative_kind_name(class))?;
             let source_id = selection.library_id.as_uuid().hyphenated().to_string();
             if asset_warning_removed > 0 {
                 let _ = self.updates.send(WallUpdate::WarningCleared {
@@ -1626,17 +1520,6 @@ fn cache_warning_identity(class: DerivativeClass) -> (&'static str, &'static str
     }
 }
 
-fn append_unique<I>(target: &mut Vec<AssetId>, ids: I)
-where
-    I: IntoIterator<Item = AssetId>,
-{
-    for id in ids {
-        if !target.contains(&id) {
-            target.push(id);
-        }
-    }
-}
-
 fn parse_ids(raw_ids: Vec<String>) -> Result<Vec<AssetId>, AppServiceError> {
     let mut ids = Vec::with_capacity(raw_ids.len());
     let mut seen = HashSet::new();
@@ -1650,7 +1533,7 @@ fn parse_ids(raw_ids: Vec<String>) -> Result<Vec<AssetId>, AppServiceError> {
     Ok(ids)
 }
 
-fn photo_asset_ids_for_group(
+fn validate_requested_assets(
     catalog: &Catalog,
     group: FolderGroupId,
     ids: &[AssetId],
@@ -1663,9 +1546,10 @@ fn photo_asset_ids_for_group(
         if asset.folder_group_id != Some(group) {
             return Err(AppServiceError::ForeignAsset);
         }
-        if asset.media_kind != MediaKind::Video {
-            photo_ids.push(*id);
+        if asset.media_kind == MediaKind::Video {
+            return Err(AppServiceError::DerivativeUnavailable);
         }
+        photo_ids.push(*id);
     }
     Ok(photo_ids)
 }
@@ -1709,6 +1593,44 @@ fn derivative_kind_name(class: DerivativeClass) -> &'static str {
     }
 }
 
+fn request_lane(request: &DerivativeRequest) -> crate::derivative_coordinator::WorkLane {
+    request_lane_for(request.kind, request.priority)
+}
+
+fn request_lane_for(
+    class: DerivativeClass,
+    priority: DerivativePriority,
+) -> crate::derivative_coordinator::WorkLane {
+    use crate::derivative_coordinator::WorkLane;
+
+    match (class, priority) {
+        (DerivativeClass::WallThumbnail, DerivativePriority::Visible) => WorkLane::VisibleWall,
+        (DerivativeClass::WallThumbnail, DerivativePriority::NearViewport) => WorkLane::NearWall,
+        (DerivativeClass::ScreenPreview, DerivativePriority::Visible) => WorkLane::ViewerPreview,
+        (DerivativeClass::ScreenPreview, DerivativePriority::NearViewport) => WorkLane::IdlePreview,
+    }
+}
+
+#[cfg(test)]
+fn lane_for_priority(
+    class: DerivativeClass,
+    priority: JobPriority,
+) -> crate::derivative_coordinator::WorkLane {
+    match class {
+        DerivativeClass::WallThumbnail => match priority {
+            JobPriority::Visible => crate::derivative_coordinator::WorkLane::VisibleWall,
+            JobPriority::NearViewport => crate::derivative_coordinator::WorkLane::NearWall,
+            _ => crate::derivative_coordinator::WorkLane::IdleWall,
+        },
+        DerivativeClass::ScreenPreview => match priority {
+            JobPriority::Visible | JobPriority::ViewerPreview => {
+                crate::derivative_coordinator::WorkLane::ViewerPreview
+            }
+            _ => crate::derivative_coordinator::WorkLane::IdlePreview,
+        },
+    }
+}
+
 fn should_pause(priority: JobPriority, background_permits: usize) -> bool {
     priority == JobPriority::IdleLibrary && background_permits <= 1
 }
@@ -1723,162 +1645,21 @@ fn reference(id: AssetId, kind: DerivativeClass, key: String) -> DerivativeRefer
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::path::PathBuf;
     use std::sync::Arc;
 
     use image::{ImageBuffer, Rgb};
     use photo_cache::{
-        CacheBudget, DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget,
-        EncodedScreenPreview, ImageDerivativeGenerator,
+        CacheBudget, DerivativeKind, DerivativeSpec, DerivativeTarget, EncodedScreenPreview,
+        ImageDerivativeGenerator,
     };
     use photo_catalog::{AssetShapeUpdate, Catalog, CatalogIndexRecord, NewAsset, ShapeStatus};
-    use photo_domain::{
-        AssetId, FileSignature, FolderGroupId, LibraryId, MediaKind, RelativePathKey,
-    };
-    use photo_indexer::{IndexJob, IndexScheduler, JobPriority, SchedulerConfig};
+    use photo_domain::{AssetId, FileSignature, MediaKind, RelativePathKey};
+    use photo_indexer::JobPriority;
 
-    use crate::service::{DerivativeTestGate, SelectionToken};
-    use crate::{AppConfig, AppService, DerivativeClass, DerivativeReference, WallUpdate};
+    use crate::service::DerivativeTestGate;
+    use crate::{AppConfig, AppService, DerivativeClass, WallUpdate};
 
-    use super::{DerivativeQueue, DerivativeWorkError, PendingDerivative};
-
-    #[tokio::test]
-    async fn derivative_driver_leaves_foreign_scheduler_jobs_available() {
-        let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig::default()));
-        scheduler
-            .enqueue(IndexJob::new("foreign", JobPriority::Visible))
-            .await;
-        let queue = DerivativeQueue::default();
-
-        assert!(queue.next_owned(&scheduler).await.is_none());
-        assert_eq!(scheduler.next().await.unwrap().name(), "foreign");
-    }
-
-    #[tokio::test]
-    async fn concurrent_producers_share_one_immutable_derivative_job() {
-        let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig::default()));
-        let queue = DerivativeQueue::default();
-        let asset_id = AssetId::from_uuid(uuid::Uuid::new_v4());
-        let group_id = FolderGroupId::new();
-        let selection = SelectionToken {
-            library_id: LibraryId::new(),
-            group_id,
-            epoch: 4,
-        };
-        let spec = DerivativeSpec {
-            asset_id,
-            signature: FileSignature {
-                size_bytes: 10,
-                modified_unix_ns: 20,
-                sidecar_modified_unix_ns: None,
-            },
-            orientation: 1,
-            kind: DerivativeKind::ScreenPreview,
-            decoder_version: "decoder".to_owned(),
-            colour_space: "srgb".to_owned(),
-            target: DerivativeTarget::LongEdge(4096),
-        };
-        let pending = PendingDerivative {
-            id: asset_id,
-            source: PathBuf::from("source.jpg"),
-            cached_source: None,
-            spec: spec.clone(),
-            group: group_id,
-            class: DerivativeClass::ScreenPreview,
-            selection,
-            preview_generation: None,
-        };
-
-        let first = queue
-            .enqueue(&scheduler, pending.clone(), JobPriority::NearViewport)
-            .await;
-        let second = queue
-            .enqueue(&scheduler, pending, JobPriority::IdleLibrary)
-            .await;
-        let (_job, key, queued) = queue.next_owned(&scheduler).await.unwrap();
-
-        assert_eq!(queued.id, asset_id);
-        assert!(scheduler.next().await.is_none());
-        assert_eq!(key, DerivativeKey::compute(&spec).as_str());
-        let reference = DerivativeReference {
-            asset_id: asset_id.as_uuid().hyphenated().to_string(),
-            kind: DerivativeClass::ScreenPreview,
-            key: key.clone(),
-        };
-        queue
-            .finish(&key, _job.name(), Some(reference.clone()))
-            .await;
-        assert_eq!(first.await.unwrap(), Some(reference.clone()));
-        assert_eq!(second.await.unwrap(), Some(reference));
-    }
-
-    #[tokio::test]
-    async fn concurrent_workers_take_distinct_jobs_in_priority_order() {
-        let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig::default()));
-        let queue = Arc::new(DerivativeQueue::default());
-        let selection = SelectionToken {
-            library_id: LibraryId::new(),
-            group_id: FolderGroupId::new(),
-            epoch: 1,
-        };
-        let pending = |asset_id| PendingDerivative {
-            id: asset_id,
-            source: PathBuf::from("source.jpg"),
-            cached_source: None,
-            spec: DerivativeSpec {
-                asset_id,
-                signature: photo_domain::FileSignature {
-                    size_bytes: 1,
-                    modified_unix_ns: 1,
-                    sidecar_modified_unix_ns: None,
-                },
-                orientation: 1,
-                kind: DerivativeKind::WallThumbnail,
-                decoder_version: "decoder".to_owned(),
-                colour_space: "srgb".to_owned(),
-                target: DerivativeTarget::LongEdge(1024),
-            },
-            group: selection.group_id,
-            class: DerivativeClass::WallThumbnail,
-            selection,
-            preview_generation: None,
-        };
-        let first_id = AssetId::from_uuid(uuid::Uuid::new_v4());
-        let second_id = AssetId::from_uuid(uuid::Uuid::new_v4());
-        let first = queue
-            .enqueue(&scheduler, pending(first_id), JobPriority::NearViewport)
-            .await;
-        let second = queue
-            .enqueue(&scheduler, pending(second_id), JobPriority::Visible)
-            .await;
-
-        let left = {
-            let queue = queue.clone();
-            let scheduler = scheduler.clone();
-            tokio::spawn(async move { queue.next_owned(&scheduler).await.unwrap() })
-        };
-        let right = {
-            let queue = queue.clone();
-            let scheduler = scheduler.clone();
-            tokio::spawn(async move { queue.next_owned(&scheduler).await.unwrap() })
-        };
-        let left = left.await.unwrap();
-        let right = right.await.unwrap();
-        assert!(
-            (left.0.priority() == JobPriority::Visible
-                && right.0.priority() == JobPriority::NearViewport)
-                || (right.0.priority() == JobPriority::Visible
-                    && left.0.priority() == JobPriority::NearViewport)
-        );
-        assert_ne!(left.2.id, right.2.id);
-        assert_eq!(
-            [left.2.id, right.2.id].into_iter().collect::<HashSet<_>>(),
-            [first_id, second_id].into_iter().collect()
-        );
-        drop(first);
-        drop(second);
-    }
+    use super::DerivativeWorkError;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn healthy_visible_derivative_publishes_before_a_blocked_one() {
@@ -1964,91 +1745,6 @@ mod tests {
         request.await.unwrap().unwrap();
         assert_eq!(std::fs::read(&blocked_path).unwrap(), blocked_before);
         assert_eq!(std::fs::read(&healthy_path).unwrap(), healthy_before);
-    }
-
-    #[tokio::test]
-    async fn stale_in_flight_completion_cannot_consume_replacement_selection_work() {
-        let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig::default()));
-        let queue = DerivativeQueue::default();
-        let asset_id = AssetId::from_uuid(uuid::Uuid::new_v4());
-        let group_id = FolderGroupId::new();
-        let library_id = LibraryId::new();
-        let spec = DerivativeSpec {
-            asset_id,
-            signature: FileSignature {
-                size_bytes: 10,
-                modified_unix_ns: 20,
-                sidecar_modified_unix_ns: None,
-            },
-            orientation: 1,
-            kind: DerivativeKind::ScreenPreview,
-            decoder_version: "decoder".to_owned(),
-            colour_space: "srgb".to_owned(),
-            target: DerivativeTarget::LongEdge(4096),
-        };
-        let pending = |epoch| PendingDerivative {
-            id: asset_id,
-            source: PathBuf::from("source.jpg"),
-            cached_source: None,
-            spec: spec.clone(),
-            group: group_id,
-            class: DerivativeClass::ScreenPreview,
-            selection: SelectionToken {
-                library_id,
-                group_id,
-                epoch,
-            },
-            preview_generation: None,
-        };
-        let stale_receiver = queue
-            .enqueue(&scheduler, pending(1), JobPriority::IdleLibrary)
-            .await;
-        let (stale_job, key, _) = queue.next_owned(&scheduler).await.unwrap();
-        let current_receiver = queue
-            .enqueue(&scheduler, pending(2), JobPriority::Visible)
-            .await;
-
-        queue.finish(&key, stale_job.name(), None).await;
-        assert!(stale_receiver.await.is_err());
-        let (current_job, current_key, _) = queue.next_owned(&scheduler).await.unwrap();
-        let reference = DerivativeReference {
-            asset_id: asset_id.as_uuid().hyphenated().to_string(),
-            kind: DerivativeClass::ScreenPreview,
-            key: current_key.clone(),
-        };
-        queue
-            .finish(&current_key, current_job.name(), Some(reference.clone()))
-            .await;
-        assert_eq!(current_receiver.await.unwrap(), Some(reference));
-    }
-
-    #[test]
-    fn stale_wall_request_guard_cannot_consume_replacement_selection_work() {
-        let temp = tempfile::tempdir().unwrap();
-        let first_source = temp.path().join("first");
-        let second_source = temp.path().join("second");
-        std::fs::create_dir_all(&first_source).unwrap();
-        std::fs::create_dir_all(&second_source).unwrap();
-        let service = AppService::open(AppConfig::new(
-            temp.path().join("data"),
-            temp.path().join("cache"),
-        ))
-        .unwrap();
-        let (_, first_selection) = service.select_recent(&first_source).unwrap();
-        let stale = service.begin_preview_wall_request(first_selection);
-        let (_, replacement_selection) = service.select_recent(&second_source).unwrap();
-        let current = service.begin_preview_wall_request(replacement_selection);
-
-        drop(stale);
-        let gate = service.preview_gate.lock().unwrap();
-        assert_eq!(gate.wall_requests_in_flight, 1);
-        assert_eq!(gate.wall_request_selection, Some(replacement_selection));
-        drop(gate);
-        drop(current);
-        assert_eq!(
-            service.preview_gate.lock().unwrap().wall_requests_in_flight,
-            0
-        );
     }
 
     #[test]
@@ -2162,7 +1858,6 @@ mod tests {
             CacheBudget::from_total_space(1024 * 1024),
             &service.protected_groups,
             stale_selection,
-            None,
             &config.catalog_path(),
         );
 
@@ -2246,7 +1941,6 @@ mod tests {
                     budget,
                     &service.protected_groups,
                     selection,
-                    None,
                     &config.catalog_path(),
                 )
             })
@@ -2337,29 +2031,6 @@ mod tests {
             }
         }
         assert_eq!(cache_warning_updates, 1);
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            while !service.derivative_queue.is_empty().await {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        service.reset_preview_gate();
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let task_running = service
-                    .preview_gate
-                    .lock()
-                    .map(|gate| gate.task_running)
-                    .unwrap_or(true);
-                if !task_running && service.derivative_queue.is_empty().await {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
         assert_eq!(
             photo_catalog::Catalog::open(&config.catalog_path())
                 .unwrap()

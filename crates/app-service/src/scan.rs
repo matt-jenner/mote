@@ -66,7 +66,7 @@ impl AppService {
             state.active_scan = Some(owner);
             (root.clone().join(&selected), root, owner)
         };
-        self.wake_preview_gate();
+        self.wake_derivative_workers();
         let policy = match FolderPolicyEngine::new(Vec::new()) {
             Ok(policy) => policy,
             Err(error) => {
@@ -76,7 +76,7 @@ impl AppService {
                     state.active_scan = None;
                     state.active_cancel = None;
                 }
-                self.wake_preview_gate();
+                self.wake_derivative_workers();
                 return Err(AppServiceError::LibrarySetup(std::io::Error::other(
                     error.to_string(),
                 )));
@@ -100,7 +100,7 @@ impl AppService {
                     state.active_scan = None;
                     state.active_cancel = None;
                     drop(state);
-                    self.wake_preview_gate();
+                    self.wake_derivative_workers();
                     return Err(error);
                 }
                 state.active_scan = None;
@@ -115,7 +115,7 @@ impl AppService {
                         .to_string(),
                 });
                 drop(state);
-                self.wake_preview_gate();
+                self.wake_derivative_workers();
                 return Ok(());
             }
             Err(error) => {
@@ -125,7 +125,7 @@ impl AppService {
                     state.active_scan = None;
                     state.active_cancel = None;
                 }
-                self.wake_preview_gate();
+                self.wake_derivative_workers();
                 return Err(AppServiceError::LibrarySetup(std::io::Error::other(
                     error.to_string(),
                 )));
@@ -195,7 +195,7 @@ impl AppService {
         let Ok((selection_root, library_root, owner)) = details else {
             return;
         };
-        self.wake_preview_gate();
+        self.wake_derivative_workers();
         let indexer = match FolderPolicyEngine::new(Vec::new()) {
             Ok(policy) => Indexer::with_scheduler(
                 self.metadata_reader.clone(),
@@ -209,7 +209,7 @@ impl AppService {
                     state.active_scan = None;
                     state.active_cancel = None;
                 }
-                self.wake_preview_gate();
+                self.wake_derivative_workers();
                 return;
             }
         };
@@ -238,7 +238,7 @@ impl AppService {
                             .to_string(),
                     });
                     drop(state);
-                    self.wake_preview_gate();
+                    self.wake_derivative_workers();
                 }
                 return;
             }
@@ -249,7 +249,7 @@ impl AppService {
                     state.active_scan = None;
                     state.active_cancel = None;
                 }
-                self.wake_preview_gate();
+                self.wake_derivative_workers();
                 return;
             }
         };
@@ -314,7 +314,7 @@ impl AppService {
                 state.active_scan = None;
                 state.active_cancel = None;
                 drop(state);
-                self.wake_preview_gate();
+                self.wake_derivative_workers();
                 return;
             }
             if !shaped.is_empty() {
@@ -357,7 +357,7 @@ impl AppService {
             .await
             .map(|summary| !summary.cancelled)
             .unwrap_or(false);
-        let recent = if let Ok(mut state) = self.state.lock() {
+        let successful_selection = if let Ok(mut state) = self.state.lock() {
             if state.active_scan != Some(owner) {
                 return;
             }
@@ -377,7 +377,7 @@ impl AppService {
                     state.active_scan = None;
                     state.active_cancel = None;
                     drop(state);
-                    self.wake_preview_gate();
+                    self.wake_derivative_workers();
                     return;
                 }
                 let _ = self.updates.send(WallUpdate::MetadataSettled {
@@ -390,16 +390,16 @@ impl AppService {
                         .to_string(),
                     generation: owner.generation,
                 });
-                Some(state.recent_derivative_ids.clone())
+                Some(())
             } else {
                 None
             }
         } else {
             return;
         };
-        self.wake_preview_gate();
-        if let Some(recent) = recent {
-            self.prefetch_screen_previews(recent).await;
+        self.wake_derivative_workers();
+        if successful_selection.is_some() {
+            self.prefetch_screen_previews(Vec::new()).await;
         }
     }
 }

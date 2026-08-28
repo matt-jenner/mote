@@ -868,6 +868,282 @@ async fn screen_preview_request_publishes_wall_thumbnail_before_screen_preview()
     assert!(page.items[0].wall_thumbnail.is_some());
 }
 
+async fn next_derivative_kind(
+    receiver: &mut tokio::sync::broadcast::Receiver<WallUpdate>,
+) -> DerivativeClass {
+    loop {
+        let event = recv_until(receiver, |event| {
+            matches!(event, WallUpdate::DerivativesReady { derivatives, .. }
+                if !derivatives.is_empty())
+        })
+        .await;
+        if let WallUpdate::DerivativesReady { derivatives, .. } = event {
+            return derivatives[0].kind;
+        }
+    }
+}
+
+fn catalog_derivative_kinds(config: &AppConfig) -> Vec<String> {
+    let mut kinds = Catalog::open(&config.catalog_path())
+        .unwrap()
+        .all_derivatives()
+        .unwrap()
+        .into_iter()
+        .map(|record| record.kind)
+        .collect::<Vec<_>>();
+    kinds.sort_by_key(|kind| match kind.as_str() {
+        "wall_thumbnail" => 0,
+        "screen_preview" => 1,
+        _ => 2,
+    });
+    kinds
+}
+
+async fn scanned_asset(fixture: &ProgressiveFixture, service: &AppService) -> String {
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap()
+        .id
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_preview_generates_and_publishes_thumbnail_before_preview() {
+    let fixture = ProgressiveFixture::new(1);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    let asset_id = scanned_asset(&fixture, &service).await;
+    let mut updates = service.subscribe_wall_updates();
+
+    service
+        .request_derivatives(DerivativeRequest::visible_screen_preview(vec![asset_id]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        next_derivative_kind(&mut updates).await,
+        DerivativeClass::WallThumbnail
+    );
+    assert_eq!(
+        next_derivative_kind(&mut updates).await,
+        DerivativeClass::ScreenPreview
+    );
+    assert_eq!(
+        catalog_derivative_kinds(&fixture.config),
+        vec!["wall_thumbnail", "screen_preview"]
+    );
+}
+
+async fn prepare_wall_ready_fixture() -> (ProgressiveFixture, AppService, String) {
+    let fixture = ProgressiveFixture::new(1);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    let asset_id = scanned_asset(&fixture, &service).await;
+    service
+        .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
+        .await
+        .unwrap();
+    (fixture, service, asset_id)
+}
+
+async fn begin_blocked_background_preview(
+    service: &AppService,
+    asset_id: &str,
+    starts: Arc<AtomicUsize>,
+) -> (
+    tokio::task::JoinHandle<Result<(), photo_app_service::AppServiceError>>,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+) {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    service
+        .install_derivative_test_class_gate_with_counter(
+            DerivativeClass::ScreenPreview,
+            entered.clone(),
+            release.clone(),
+            starts,
+        )
+        .await;
+    let background_service = service.clone();
+    let background_asset = asset_id.to_owned();
+    let background = tokio::spawn(async move {
+        background_service
+            .request_derivatives(DerivativeRequest {
+                asset_ids: vec![background_asset],
+                priority: photo_app_service::DerivativePriority::NearViewport,
+                kind: DerivativeClass::ScreenPreview,
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("background preview should reach its deterministic gate");
+    (background, entered, release)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn viewer_request_restarts_once_after_colliding_background_was_invalidated() {
+    let (fixture, service, asset_id) = prepare_wall_ready_fixture().await;
+    service
+        .set_interaction(photo_app_service::InteractionState::Idle)
+        .await;
+    let starts = Arc::new(AtomicUsize::new(0));
+    let (background, _entered, release) =
+        begin_blocked_background_preview(&service, &asset_id, starts.clone()).await;
+
+    service
+        .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
+        .await
+        .unwrap();
+    let foreground_service = service.clone();
+    let foreground_asset = asset_id.clone();
+    let foreground = tokio::spawn(async move {
+        foreground_service
+            .request_derivatives(DerivativeRequest::visible_screen_preview(vec![
+                foreground_asset,
+            ]))
+            .await
+    });
+
+    release.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if starts.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("foreground request should receive a replacement attempt");
+    release.notify_waiters();
+    assert!(foreground.await.unwrap().is_ok());
+    assert!(background.await.unwrap().is_err());
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        Catalog::open(&fixture.config.catalog_path())
+            .unwrap()
+            .all_derivatives()
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.kind == "screen_preview")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn viewer_request_promotes_current_background_encode() {
+    let (fixture, service, asset_id) = prepare_wall_ready_fixture().await;
+    service
+        .set_interaction(photo_app_service::InteractionState::Idle)
+        .await;
+    let starts = Arc::new(AtomicUsize::new(0));
+    let (background, _entered, release) =
+        begin_blocked_background_preview(&service, &asset_id, starts.clone()).await;
+    let foreground_service = service.clone();
+    let foreground_asset = asset_id.clone();
+    let foreground = tokio::spawn(async move {
+        foreground_service
+            .request_derivatives(DerivativeRequest::visible_screen_preview(vec![
+                foreground_asset,
+            ]))
+            .await
+    });
+
+    release.notify_waiters();
+    assert!(foreground.await.unwrap().is_ok());
+    assert!(background.await.unwrap().is_ok());
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        Catalog::open(&fixture.config.catalog_path())
+            .unwrap()
+            .all_derivatives()
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.kind == "screen_preview")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_video_derivative_request_is_rejected_without_work() {
+    let fixture = ProgressiveFixture::video_only();
+    let reader = CountingReader::default();
+    let service =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(reader.clone())).unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    let bootstrap = service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let library_id = LibraryId::from_uuid(
+        uuid::Uuid::parse_str(&bootstrap.active_source.as_ref().unwrap().id).unwrap(),
+    );
+    let video_id = AssetId::for_path(
+        library_id,
+        &RelativePathKey::from_relative_path(Path::new("clip.mp4")).unwrap(),
+    );
+    let reads_before = reader.count();
+    let cache_before = managed_cache_files(fixture.config.cache_dir());
+    let catalog_before = Catalog::open(&fixture.config.catalog_path())
+        .unwrap()
+        .all_derivatives()
+        .unwrap();
+
+    for request in [
+        DerivativeRequest::visible(vec![video_id.as_uuid().hyphenated().to_string()]),
+        DerivativeRequest::visible_screen_preview(vec![
+            video_id.as_uuid().hyphenated().to_string(),
+        ]),
+    ] {
+        assert!(matches!(
+            service.request_derivatives(request).await,
+            Err(photo_app_service::AppServiceError::DerivativeUnavailable)
+        ));
+    }
+    assert_eq!(reader.count(), reads_before);
+    assert_eq!(
+        managed_cache_files(fixture.config.cache_dir()),
+        cache_before
+    );
+    assert_eq!(
+        Catalog::open(&fixture.config.catalog_path())
+            .unwrap()
+            .all_derivatives()
+            .unwrap(),
+        catalog_before
+    );
+    while let Ok(event) = updates.try_recv() {
+        assert!(!matches!(event, WallUpdate::DerivativesReady { .. }));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn legacy_screen_preview_is_repaired_locally_before_prefetching_new_preview_work() {
     let fixture = ProgressiveFixture::new(1);
@@ -1003,13 +1279,10 @@ async fn explicit_visible_screen_preview_does_not_fence_prefetch() {
         .items[0]
         .id
         .clone();
-    let before = service.preview_gate_generation_test();
     service
         .request_derivatives(DerivativeRequest::visible_screen_preview(vec![asset_id]))
         .await
         .unwrap();
-    let after = service.preview_gate_generation_test();
-    assert_eq!(after, before);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1848,7 +2121,7 @@ async fn screen_previews_wait_for_all_overlapping_wall_thumbnail_waves() {
 
 #[cfg(debug_assertions)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn aborted_wall_request_releases_preview_gate_for_later_request() {
+async fn aborted_wall_request_releases_coordinator_for_later_request() {
     let fixture = ProgressiveFixture::new(1);
     let service = AppService::open_with_reader(
         fixture.config.clone(),
@@ -1937,22 +2210,11 @@ async fn visible_request_does_not_allow_screen_prefetch_to_overtake_wall_work() 
     service
         .set_interaction(photo_app_service::InteractionState::Active)
         .await;
-    let gate_generation_before_scan = service.preview_gate_generation_test();
     service.start_scan(&fixture.source).await.unwrap();
     recv_until(&mut updates, |event| {
         matches!(event, WallUpdate::MetadataSettled { .. })
     })
     .await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if service.preview_gate_generation_test() >= gate_generation_before_scan + 2 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("scan completion should schedule the full-group preview pass");
     let ids = service
         .query_wall(query(SortDirection::OldestFirst))
         .await
@@ -2035,54 +2297,6 @@ async fn visible_request_does_not_allow_screen_prefetch_to_overtake_wall_work() 
         .await
         .expect("screen previews should start only after the wall release");
     screen_release.notify_waiters();
-}
-
-#[cfg(debug_assertions)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn blocked_preview_gate_parks_until_interaction_transition() {
-    let fixture = ProgressiveFixture::new(1);
-    let service = AppService::open_with_reader(
-        fixture.config.clone(),
-        Arc::new(photo_indexer::DefaultMetadataReader),
-    )
-    .unwrap();
-    let mut updates = service.subscribe_wall_updates();
-    service.start_scan(&fixture.source).await.unwrap();
-    recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::MetadataSettled { .. })
-    })
-    .await;
-    let asset_id = service
-        .query_wall(query(SortDirection::OldestFirst))
-        .await
-        .unwrap()
-        .items[0]
-        .id
-        .clone();
-
-    service
-        .set_interaction(photo_app_service::InteractionState::Active)
-        .await;
-    service.reset_preview_gate_test_checks();
-    service
-        .request_derivatives(DerivativeRequest::visible(vec![asset_id]))
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(180)).await;
-    let checks_while_active = service.preview_gate_test_checks();
-    assert_eq!(
-        checks_while_active, 1,
-        "a closed gate should park instead of polling on a retry timer"
-    );
-
-    service
-        .set_interaction(photo_app_service::InteractionState::Idle)
-        .await;
-    recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::DerivativesReady { derivatives, .. }
-            if derivatives.iter().any(|item| item.kind == DerivativeClass::ScreenPreview))
-    })
-    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2271,7 +2485,7 @@ async fn video_only_selection_has_an_empty_photo_wall() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn derivative_requests_omit_indexed_video_ids() {
+async fn derivative_requests_reject_indexed_video_ids() {
     let fixture = ProgressiveFixture::video_only();
     let service = AppService::open_with_reader(
         fixture.config.clone(),
@@ -2326,12 +2540,14 @@ async fn derivative_requests_omit_indexed_video_ids() {
         .unwrap();
     drop(catalog);
 
-    service
-        .request_derivatives(DerivativeRequest::visible(vec![
-            video_id.as_uuid().hyphenated().to_string(),
-        ]))
-        .await
-        .expect("video derivative requests should be omitted");
+    assert!(matches!(
+        service
+            .request_derivatives(DerivativeRequest::visible(vec![
+                video_id.as_uuid().hyphenated().to_string(),
+            ]))
+            .await,
+        Err(photo_app_service::AppServiceError::DerivativeUnavailable)
+    ));
 
     assert!(
         Catalog::open(&fixture.config.catalog_path())
