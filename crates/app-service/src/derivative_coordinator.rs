@@ -899,16 +899,22 @@ impl DerivativeCoordinator {
         } = delivery;
         #[cfg(any(test, debug_assertions))]
         if let Some(gate) = self.commit_waiter_snapshot_test_gate.lock().await.take() {
+            let release = gate.release.notified();
+            tokio::pin!(release);
+            release.as_mut().enable();
             gate.entered.notify_one();
-            gate.release.notified().await;
+            release.await;
         }
         for waiter in waiters {
             let _ = waiter.send(result.clone());
         }
         #[cfg(any(test, debug_assertions))]
         if let Some(gate) = self.commit_waiter_delivery_test_gate.lock().await.take() {
+            let release = gate.release.notified();
+            tokio::pin!(release);
+            release.as_mut().enable();
             gate.entered.notify_one();
-            gate.release.notified().await;
+            release.await;
         }
         self.finish_commit(CommitDelivery {
             permit,
@@ -968,8 +974,11 @@ impl DerivativeCoordinator {
                 .await
                 .take()
             {
+                let release = gate.release.notified();
+                tokio::pin!(release);
+                release.as_mut().enable();
                 gate.entered.notify_one();
-                gate.release.notified().await;
+                release.await;
             }
             self.commit_completion_generation
                 .store(completion_generation, AtomicOrdering::Release);

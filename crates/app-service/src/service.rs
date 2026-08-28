@@ -90,6 +90,9 @@ pub(crate) struct DerivativeTestGate {
 #[cfg(any(test, debug_assertions))]
 pub(crate) struct DerivativeTaskTracker {
     active: AtomicUsize,
+    #[cfg(debug_assertions)]
+    waiting: AtomicUsize,
+    #[cfg(debug_assertions)]
     quiesced: Notify,
 }
 
@@ -98,11 +101,19 @@ pub(crate) struct DerivativeTaskGuard {
     tracker: Arc<DerivativeTaskTracker>,
 }
 
+#[cfg(debug_assertions)]
+struct DerivativeQuiescenceWaiter<'a> {
+    tracker: &'a DerivativeTaskTracker,
+}
+
 #[cfg(any(test, debug_assertions))]
 impl DerivativeTaskTracker {
     pub(crate) fn new() -> Self {
         Self {
             active: AtomicUsize::new(0),
+            #[cfg(debug_assertions)]
+            waiting: AtomicUsize::new(0),
+            #[cfg(debug_assertions)]
             quiesced: Notify::new(),
         }
     }
@@ -114,13 +125,31 @@ impl DerivativeTaskTracker {
         }
     }
 
+    #[cfg(debug_assertions)]
     pub(crate) fn active_count(&self) -> usize {
         self.active.load(Ordering::Acquire)
     }
 
+    #[cfg(all(test, debug_assertions))]
+    pub(crate) fn waiting_count(&self) -> usize {
+        self.waiting.load(Ordering::Acquire)
+    }
+
+    #[cfg(debug_assertions)]
     pub(crate) async fn wait_for_zero(&self) {
+        let notified = self.quiesced.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+        let _waiter = DerivativeQuiescenceWaiter { tracker: self };
+        if self.active_count() == 0 {
+            return;
+        }
+        notified.await;
         loop {
             let notified = self.quiesced.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.active_count() == 0 {
                 return;
             }
@@ -129,13 +158,30 @@ impl DerivativeTaskTracker {
     }
 }
 
+#[cfg(debug_assertions)]
+impl Drop for DerivativeQuiescenceWaiter<'_> {
+    fn drop(&mut self) {
+        self.tracker.waiting.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[cfg(any(test, debug_assertions))]
 impl Drop for DerivativeTaskGuard {
     fn drop(&mut self) {
-        self.tracker.active.fetch_sub(1, Ordering::AcqRel);
-        // notify_one stores a permit when the waiter has not registered yet,
-        // closing the check/register race in wait_for_zero.
-        self.tracker.quiesced.notify_one();
+        #[cfg(debug_assertions)]
+        let previous = self.tracker.active.fetch_sub(1, Ordering::AcqRel);
+        #[cfg(not(debug_assertions))]
+        let _ = self.tracker.active.fetch_sub(1, Ordering::AcqRel);
+        #[cfg(debug_assertions)]
+        if previous == 1 {
+            // Broadcast the transition to zero so every concurrent
+            // wait_for_zero caller can finish. Each waiter enables its
+            // notification future before checking the count, so this cannot
+            // be lost between the check and registration.
+            self.tracker.quiesced.notify_waiters();
+        } else {
+            self.tracker.quiesced.notify_one();
+        }
     }
 }
 
@@ -908,7 +954,40 @@ mod tests {
     use photo_domain::{Appearance, MediaKind, RelativePathKey};
     use photo_metadata::{MetadataBundle, MetadataCandidate, MetadataReadWarning, MetadataSource};
 
+    #[cfg(debug_assertions)]
+    use super::DerivativeTaskTracker;
     use super::{AppConfig, AppService, AppServiceError, RecentSourceValidator};
+
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn derivative_task_tracker_broadcasts_quiescence_to_all_waiters() {
+        let tracker = Arc::new(DerivativeTaskTracker::new());
+        let guard = tracker.start();
+        let first_tracker = tracker.clone();
+        let first = tokio::spawn(async move {
+            first_tracker.wait_for_zero().await;
+        });
+        let second_tracker = tracker.clone();
+        let second = tokio::spawn(async move {
+            second_tracker.wait_for_zero().await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while tracker.waiting_count() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both quiescence waiters should start");
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            first.await.unwrap();
+            second.await.unwrap();
+        })
+        .await
+        .expect("all concurrent quiescence waiters should observe zero");
+        assert_eq!(tracker.waiting_count(), 0);
+    }
 
     struct BlockingSourceValidator {
         delegate: Arc<dyn RecentSourceValidator>,

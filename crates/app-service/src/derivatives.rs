@@ -163,9 +163,14 @@ impl AppService {
                 .await;
             #[cfg(debug_assertions)]
             if let Some(hook) = self.derivative_request_test_hook.lock().await.clone() {
-                hook.started.notify_one();
                 if let Some(release) = hook.release {
-                    release.notified().await;
+                    let notified = release.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    hook.started.notify_one();
+                    notified.await;
+                } else {
+                    hook.started.notify_one();
                 }
             }
         }
@@ -1253,12 +1258,15 @@ impl AppService {
     async fn wait_for_test_derivative_gate(&self, asset_id: AssetId, class: DerivativeClass) {
         let gate = self.derivative_test_gate.lock().await.clone();
         if let Some(gate) = gate.filter(|gate| gate.class.is_none_or(|blocked| blocked == class)) {
+            let release = gate.release.notified();
+            tokio::pin!(release);
+            release.as_mut().enable();
             if let Some(starts) = gate.starts {
                 starts.fetch_add(1, Ordering::SeqCst);
             }
             if gate.blocked_asset.is_none() || gate.blocked_asset == Some(asset_id) {
                 gate.entered.notify_one();
-                gate.release.notified().await;
+                release.await;
             }
         }
     }
@@ -1266,16 +1274,22 @@ impl AppService {
     #[cfg(any(test, debug_assertions))]
     async fn wait_for_collection_publish_test_gate(&self) {
         if let Some(gate) = self.collection_publish_test_gate.lock().await.take() {
+            let release = gate.release.notified();
+            tokio::pin!(release);
+            release.as_mut().enable();
             gate.entered.notify_one();
-            gate.release.notified().await;
+            release.await;
         }
     }
 
     #[cfg(any(test, debug_assertions))]
     async fn wait_for_collection_enqueue_test_gate(&self) {
         if let Some(gate) = self.collection_enqueue_test_gate.lock().await.take() {
+            let release = gate.release.notified();
+            tokio::pin!(release);
+            release.as_mut().enable();
             gate.entered.notify_one();
-            gate.release.notified().await;
+            release.await;
         }
     }
 
@@ -1293,8 +1307,11 @@ impl AppService {
             })
             .filter(|gate| gate.blocked_asset.is_none_or(|blocked| blocked == asset_id))
         {
+            let release = gate.release.notified();
+            tokio::pin!(release);
+            release.as_mut().enable();
             gate.entered.notify_one();
-            gate.release.notified().await;
+            release.await;
         }
     }
 
@@ -1312,8 +1329,11 @@ impl AppService {
             })
             .filter(|gate| gate.blocked_asset.is_none_or(|blocked| blocked == asset_id))
         {
+            let release = gate.release.notified();
+            tokio::pin!(release);
+            release.as_mut().enable();
             gate.entered.notify_one();
-            gate.release.notified().await;
+            release.await;
         }
     }
 
