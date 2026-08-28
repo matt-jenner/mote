@@ -4,6 +4,47 @@ fn job(name: &str, priority: JobPriority) -> IndexJob {
     IndexJob::new(name, priority)
 }
 
+async fn dequeue_names<const N: usize>(
+    scheduler: &IndexScheduler,
+    jobs: [IndexJob; N],
+) -> Vec<String> {
+    for queued in jobs {
+        scheduler.enqueue(queued).await;
+    }
+
+    let mut names = Vec::new();
+    while let Some(queued) = scheduler.next().await {
+        names.push(queued.name().to_owned());
+    }
+    names
+}
+
+#[tokio::test(start_paused = true)]
+async fn derivative_lanes_dequeue_in_product_priority_order() {
+    let scheduler = IndexScheduler::new(SchedulerConfig::default());
+
+    assert_eq!(
+        dequeue_names(
+            &scheduler,
+            [
+                job("idle-preview", JobPriority::IdleLibrary),
+                job("idle-wall", JobPriority::OpenCollection),
+                job("near-wall", JobPriority::NearViewport),
+                job("viewer", JobPriority::ViewerPreview),
+                job("visible-wall", JobPriority::Visible),
+            ]
+        )
+        .await,
+        [
+            "visible-wall",
+            "viewer",
+            "near-wall",
+            "idle-wall",
+            "idle-preview"
+        ]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn visible_work_preempts_queued_idle_work() {
     let scheduler = IndexScheduler::new(SchedulerConfig {

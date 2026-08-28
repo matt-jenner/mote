@@ -40,7 +40,7 @@ pub enum OrderState {
     Settled,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DerivativeClass {
     WallThumbnail,

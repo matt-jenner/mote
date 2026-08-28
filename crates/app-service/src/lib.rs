@@ -1,4 +1,5 @@
 mod config;
+pub(crate) mod derivative_coordinator;
 mod derivatives;
 mod dto;
 mod scan;

@@ -10,7 +10,8 @@ pub enum JobPriority {
     IdleLibrary = 0,
     OpenCollection = 1,
     NearViewport = 2,
-    Visible = 3,
+    ViewerPreview = 3,
+    Visible = 4,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

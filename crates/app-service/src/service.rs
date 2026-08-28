@@ -30,7 +30,7 @@ pub(crate) struct ServiceState {
     pub(crate) published_screen_cache_warning: Option<SelectionToken>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SelectionToken {
     pub(crate) library_id: photo_domain::LibraryId,
     pub(crate) group_id: photo_domain::FolderGroupId,
@@ -133,6 +133,8 @@ impl MetadataReader for ReaderAdapter {
 pub struct AppService {
     pub(crate) state: Arc<Mutex<ServiceState>>,
     pub(crate) scheduler: Arc<IndexScheduler>,
+    #[allow(dead_code)]
+    pub(crate) coordinator: Arc<crate::derivative_coordinator::DerivativeCoordinator>,
     pub(crate) updates: tokio::sync::broadcast::Sender<crate::WallUpdate>,
     pub(crate) catalog_path: PathBuf,
     pub(crate) cache_root: PathBuf,
@@ -221,6 +223,10 @@ impl AppService {
         let cache_root = config.cache_dir().to_owned();
         let cache_budget = CacheBudget::automatic(&cache_root)?;
         let catalog_path = config.catalog_path();
+        let scheduler = Arc::new(IndexScheduler::new(Default::default()));
+        let coordinator = Arc::new(crate::derivative_coordinator::DerivativeCoordinator::new(
+            scheduler.clone(),
+        ));
         let service = Self {
             state: Arc::new(Mutex::new(ServiceState {
                 libraries,
@@ -232,7 +238,8 @@ impl AppService {
                 published_wall_cache_warning: None,
                 published_screen_cache_warning: None,
             })),
-            scheduler: Arc::new(IndexScheduler::new(Default::default())),
+            scheduler,
+            coordinator,
             updates,
             catalog_path,
             cache_root,
