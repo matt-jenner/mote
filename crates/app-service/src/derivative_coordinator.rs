@@ -145,8 +145,8 @@ struct CoordinatorState {
     jobs: HashMap<WorkKey, JobState>,
     job_names: HashMap<String, WorkKey>,
     tickets: HashMap<WorkTicket, TicketState>,
-    completed: HashMap<WorkKey, CompletedCommit>,
-    completed_order: VecDeque<WorkKey>,
+    completed: HashMap<WorkKey, VecDeque<CompletedCommit>>,
+    completed_order: VecDeque<(WorkKey, u64)>,
     terminal: HashSet<WorkKey>,
     collection: CollectionState,
 }
@@ -188,6 +188,8 @@ pub(crate) struct DerivativeCoordinator {
     commit_waiter_delivery_test_gate: Arc<Mutex<Option<CommitWaiterDeliveryTestGate>>>,
     #[cfg(any(test, debug_assertions))]
     commit_waiter_snapshot_test_gate: Arc<Mutex<Option<CommitWaiterDeliveryTestGate>>>,
+    #[cfg(any(test, debug_assertions))]
+    commit_outcome_publication_test_gate: Arc<Mutex<Option<CommitWaiterDeliveryTestGate>>>,
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -212,6 +214,8 @@ impl DerivativeCoordinator {
             commit_waiter_delivery_test_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, debug_assertions))]
             commit_waiter_snapshot_test_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, debug_assertions))]
+            commit_outcome_publication_test_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -237,6 +241,8 @@ impl DerivativeCoordinator {
             commit_waiter_delivery_test_gate: Arc::new(Mutex::new(None)),
             #[cfg(any(test, debug_assertions))]
             commit_waiter_snapshot_test_gate: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, debug_assertions))]
+            commit_outcome_publication_test_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -276,12 +282,14 @@ impl DerivativeCoordinator {
                 state.selection = Some(key.selection);
             }
 
-            if !immediate_none && state.terminal.contains(&key) {
-                immediate_none = true;
-            }
-
             if !immediate_none {
-                if state.jobs.contains_key(&key) {
+                if let Some(completed) = observed_completion_generation
+                    .and_then(|observed| completed_after(&state, &key, observed))
+                {
+                    immediate_result = Some(completed.result);
+                } else if state.terminal.contains(&key) {
+                    immediate_none = true;
+                } else if state.jobs.contains_key(&key) {
                     let mut promote = None;
                     {
                         let work = state.jobs.get_mut(&key).expect("job was present");
@@ -332,26 +340,10 @@ impl DerivativeCoordinator {
                             ticket_state.lane = promoted_lane;
                         }
                     }
-                } else if let Some(completed) = completed_for(&state, &key) {
-                    let late_observer = observed_completion_generation
-                        .is_some_and(|observed| observed < completed.completion_generation);
-                    let current_generation =
-                        completed.background_generation == state.background_generation;
-                    if late_observer
-                        || (observed_completion_generation.is_none() && current_generation)
-                    {
-                        immediate_result = Some(completed.result);
-                    } else {
-                        forget_completed(&mut state, &key);
-                        queue_new_job(
-                            &mut state,
-                            key,
-                            lane,
-                            prerequisite_key,
-                            &mut sender,
-                            &mut schedule,
-                        );
-                    }
+                } else if observed_completion_generation.is_none()
+                    && let Some(completed) = current_completed(&state, &key)
+                {
+                    immediate_result = Some(completed.result);
                 } else {
                     queue_new_job(
                         &mut state,
@@ -819,7 +811,7 @@ impl DerivativeCoordinator {
             state.tickets.remove(&ticket);
             let completion_generation = self
                 .commit_completion_generation
-                .fetch_add(1, AtomicOrdering::AcqRel)
+                .load(AtomicOrdering::Acquire)
                 .wrapping_add(1);
             if state.selection == Some(delivery.permit.selection) {
                 remember_completed(
@@ -830,6 +822,18 @@ impl DerivativeCoordinator {
                     delivery.result.clone(),
                 );
             }
+            #[cfg(any(test, debug_assertions))]
+            if let Some(gate) = self
+                .commit_outcome_publication_test_gate
+                .lock()
+                .await
+                .take()
+            {
+                gate.entered.notify_one();
+                gate.release.notified().await;
+            }
+            self.commit_completion_generation
+                .store(completion_generation, AtomicOrdering::Release);
             delivery.completion.notify_waiters();
             true
         };
@@ -1028,6 +1032,11 @@ impl DerivativeCoordinator {
         self.state.lock().await.jobs.len()
     }
 
+    #[cfg(any(test, debug_assertions))]
+    async fn completed_outcome_count(&self) -> usize {
+        self.state.lock().await.completed_order.len()
+    }
+
     pub(crate) fn commit_completion_generation(&self) -> u64 {
         self.commit_completion_generation
             .load(AtomicOrdering::Acquire)
@@ -1096,6 +1105,16 @@ impl DerivativeCoordinator {
         *self.commit_waiter_snapshot_test_gate.lock().await =
             Some(CommitWaiterDeliveryTestGate { entered, release });
     }
+
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) async fn install_commit_outcome_publication_test_gate(
+        &self,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    ) {
+        *self.commit_outcome_publication_test_gate.lock().await =
+            Some(CommitWaiterDeliveryTestGate { entered, release });
+    }
 }
 
 pub(crate) fn scheduler_priority(lane: WorkLane) -> JobPriority {
@@ -1108,15 +1127,27 @@ pub(crate) fn scheduler_priority(lane: WorkLane) -> JobPriority {
     }
 }
 
-fn completed_for(state: &CoordinatorState, key: &WorkKey) -> Option<CompletedCommit> {
-    state.completed.get(key).cloned()
+fn completed_after(
+    state: &CoordinatorState,
+    key: &WorkKey,
+    observed_generation: u64,
+) -> Option<CompletedCommit> {
+    state.completed.get(key).and_then(|history| {
+        history
+            .iter()
+            .find(|completed| completed.completion_generation > observed_generation)
+            .cloned()
+    })
 }
 
-fn forget_completed(state: &mut CoordinatorState, key: &WorkKey) {
-    state.completed.remove(key);
-    if let Some(position) = state.completed_order.iter().position(|entry| entry == key) {
-        state.completed_order.remove(position);
-    }
+fn current_completed(state: &CoordinatorState, key: &WorkKey) -> Option<CompletedCommit> {
+    state.completed.get(key).and_then(|history| {
+        history
+            .iter()
+            .rev()
+            .find(|completed| completed.background_generation == state.background_generation)
+            .cloned()
+    })
 }
 
 fn remember_completed(
@@ -1126,25 +1157,33 @@ fn remember_completed(
     completion_generation: u64,
     result: Option<DerivativeReference>,
 ) {
-    if state
+    state
         .completed
-        .insert(
-            key.clone(),
-            CompletedCommit {
-                background_generation,
-                completion_generation,
-                result,
-            },
-        )
-        .is_none()
-    {
-        state.completed_order.push_back(key);
-    }
+        .entry(key.clone())
+        .or_default()
+        .push_back(CompletedCommit {
+            background_generation,
+            completion_generation,
+            result,
+        });
+    state
+        .completed_order
+        .push_back((key, completion_generation));
     while state.completed_order.len() > RECENT_CAPACITY {
-        let Some(oldest) = state.completed_order.pop_front() else {
+        let Some((oldest_key, oldest_generation)) = state.completed_order.pop_front() else {
             break;
         };
-        state.completed.remove(&oldest);
+        if let Some(history) = state.completed.get_mut(&oldest_key) {
+            if let Some(position) = history
+                .iter()
+                .position(|completed| completed.completion_generation == oldest_generation)
+            {
+                history.remove(position);
+            }
+            if history.is_empty() {
+                state.completed.remove(&oldest_key);
+            }
+        }
     }
 }
 
@@ -2098,6 +2137,245 @@ mod tests {
             assert_eq!(second_late.await.unwrap(), Some(reference()));
             assert_eq!(fixture.coordinator.pending_job_count().await, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn completion_snapshot_is_not_published_before_its_outcome() {
+        for _ in 0..20 {
+            let fixture = fixture();
+            let receiver = fixture.enqueue(screen_key(), WorkLane::IdlePreview).await;
+            let ticket = fixture.coordinator.next_work().await.unwrap();
+            let permit = fixture
+                .coordinator
+                .admit_commit(ticket, fixture.selection, None)
+                .await
+                .unwrap();
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            fixture
+                .coordinator
+                .install_commit_outcome_publication_test_gate(entered.clone(), release.clone())
+                .await;
+            let coordinator = fixture.coordinator.clone();
+            let finisher = tokio::spawn(async move { coordinator.fail_commit(permit).await });
+            entered.notified().await;
+
+            let observed_generation = fixture.coordinator.commit_completion_generation();
+            release.notify_one();
+            finisher.await.unwrap();
+
+            assert_eq!(receiver.await.unwrap(), None);
+            let late = fixture
+                .coordinator
+                .enqueue_with_prerequisite_observed(
+                    screen_key(),
+                    WorkLane::ViewerPreview,
+                    None,
+                    Some(observed_generation),
+                )
+                .await;
+            assert!(fixture.coordinator.next_work().await.is_none());
+            assert_eq!(late.await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn older_failure_observer_keeps_original_outcome_while_retry_runs() {
+        for _ in 0..20 {
+            let fixture = fixture();
+            let old_generation = fixture.coordinator.commit_completion_generation();
+            let initial = fixture.enqueue(screen_key(), WorkLane::IdlePreview).await;
+            let initial_ticket = fixture.coordinator.next_work().await.unwrap();
+            let initial_permit = fixture
+                .coordinator
+                .admit_commit(initial_ticket, fixture.selection, None)
+                .await
+                .unwrap();
+            fixture.coordinator.fail_commit(initial_permit).await;
+            assert_eq!(initial.await.unwrap(), None);
+
+            let retry_generation = fixture.coordinator.commit_completion_generation();
+            let retry = fixture
+                .coordinator
+                .enqueue_with_prerequisite_observed(
+                    screen_key(),
+                    WorkLane::IdlePreview,
+                    None,
+                    Some(retry_generation),
+                )
+                .await;
+            let retry_ticket = fixture.coordinator.next_work().await.unwrap();
+            let retry_permit = fixture
+                .coordinator
+                .admit_commit(retry_ticket, fixture.selection, None)
+                .await
+                .unwrap();
+
+            let mut old_observer = fixture
+                .coordinator
+                .enqueue_with_prerequisite_observed(
+                    screen_key(),
+                    WorkLane::ViewerPreview,
+                    None,
+                    Some(old_generation),
+                )
+                .await;
+            assert_eq!(old_observer.try_recv().unwrap(), None);
+
+            fixture
+                .coordinator
+                .complete_commit(retry_permit, reference())
+                .await;
+            assert_eq!(retry.await.unwrap(), Some(reference()));
+
+            let fresh_observer = fixture
+                .coordinator
+                .enqueue_with_prerequisite_observed(
+                    screen_key(),
+                    WorkLane::ViewerPreview,
+                    None,
+                    Some(retry_generation),
+                )
+                .await;
+            assert_eq!(fresh_observer.await.unwrap(), Some(reference()));
+            assert!(fixture.coordinator.next_work().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn older_success_observer_keeps_original_outcome_while_retry_runs() {
+        for index in 0..20 {
+            let fixture = fixture();
+            let old_generation = fixture.coordinator.commit_completion_generation();
+            let initial = fixture.enqueue(screen_key(), WorkLane::IdlePreview).await;
+            let initial_ticket = fixture.coordinator.next_work().await.unwrap();
+            let initial_permit = fixture
+                .coordinator
+                .admit_commit(initial_ticket, fixture.selection, None)
+                .await
+                .unwrap();
+            let first_reference = reference();
+            fixture
+                .coordinator
+                .complete_commit(initial_permit, first_reference.clone())
+                .await;
+            assert_eq!(initial.await.unwrap(), Some(first_reference.clone()));
+
+            let retry_generation = fixture.coordinator.commit_completion_generation();
+            let retry = fixture
+                .coordinator
+                .enqueue_with_prerequisite_observed(
+                    screen_key(),
+                    WorkLane::IdlePreview,
+                    None,
+                    Some(retry_generation),
+                )
+                .await;
+            let retry_ticket = fixture.coordinator.next_work().await.unwrap();
+            let retry_permit = fixture
+                .coordinator
+                .admit_commit(retry_ticket, fixture.selection, None)
+                .await
+                .unwrap();
+
+            let mut old_observer = fixture
+                .coordinator
+                .enqueue_with_prerequisite_observed(
+                    screen_key(),
+                    WorkLane::ViewerPreview,
+                    None,
+                    Some(old_generation),
+                )
+                .await;
+            assert_eq!(old_observer.try_recv().unwrap(), Some(first_reference));
+
+            let second_reference = reference_for(
+                fixture_id(1),
+                DerivativeClass::ScreenPreview,
+                &format!("screen-v1-retry-{index}"),
+            );
+            fixture
+                .coordinator
+                .complete_commit(retry_permit, second_reference.clone())
+                .await;
+            assert_eq!(retry.await.unwrap(), Some(second_reference.clone()));
+
+            let fresh_observer = fixture
+                .coordinator
+                .enqueue_with_prerequisite_observed(
+                    screen_key(),
+                    WorkLane::ViewerPreview,
+                    None,
+                    Some(retry_generation),
+                )
+                .await;
+            assert_eq!(fresh_observer.await.unwrap(), Some(second_reference));
+            assert!(fixture.coordinator.next_work().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_outcome_history_is_bounded_and_current_keyed() {
+        let fixture = fixture();
+        let mut keys = Vec::new();
+        for index in 0..=super::RECENT_CAPACITY {
+            let cache_key = format!("history-{index}");
+            let key = screen_key_for(
+                fixture.selection,
+                fixture_id((index + 1) as u128),
+                &cache_key,
+            );
+            let receiver = fixture.enqueue(key.clone(), WorkLane::IdlePreview).await;
+            let ticket = fixture.coordinator.next_work().await.unwrap();
+            let permit = fixture
+                .coordinator
+                .admit_commit(ticket, fixture.selection, None)
+                .await
+                .unwrap();
+            let result = reference_for(key.asset_id, key.class, &key.cache_key);
+            fixture
+                .coordinator
+                .complete_commit(permit, result.clone())
+                .await;
+            assert_eq!(receiver.await.unwrap(), Some(result));
+            keys.push(key);
+        }
+
+        assert_eq!(
+            fixture.coordinator.completed_outcome_count().await,
+            super::RECENT_CAPACITY
+        );
+
+        let evicted_receiver = fixture
+            .coordinator
+            .enqueue(keys[0].clone(), WorkLane::IdlePreview)
+            .await;
+        let evicted_ticket = fixture.coordinator.next_work().await.unwrap();
+        fixture.coordinator.discard(evicted_ticket).await;
+        assert_eq!(evicted_receiver.await.unwrap(), None);
+
+        let latest_key = keys.last().unwrap().clone();
+        let mut latest_receiver = fixture
+            .coordinator
+            .enqueue(latest_key.clone(), WorkLane::IdlePreview)
+            .await;
+        assert_eq!(
+            latest_receiver.try_recv().unwrap(),
+            Some(reference_for(
+                latest_key.asset_id,
+                latest_key.class,
+                &latest_key.cache_key
+            ))
+        );
+        assert!(fixture.coordinator.next_work().await.is_none());
+
+        fixture.coordinator.reset_selection(selection(99)).await;
+        let mut reset_receiver = fixture
+            .coordinator
+            .enqueue(latest_key, WorkLane::IdlePreview)
+            .await;
+        assert_eq!(reset_receiver.try_recv().unwrap(), None);
+        assert!(fixture.coordinator.next_work().await.is_none());
     }
 
     #[tokio::test]
