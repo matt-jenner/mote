@@ -519,6 +519,34 @@ This report deliberately records the implementation SHA and the docs-only
 comparison, while the final documentation commit SHA is reported by the
 post-commit `git show` handoff rather than embedded in its own content.
 
+## Final whole-branch collection-driver correction (2026-08-28)
+
+The final collection-driver implementation/test head is
+`aa7a268e2f7fc86d27d682d94f54b049dfdf6780` (`fix: coalesce collection driver
+wakeups`). It replaces one delayed task per interaction/request with a single
+service-owned coalescing admission, keeps recent intent in the bounded
+coordinator window, merges full-group intent monotonically, and proves the
+exit handoff cannot lose a request.
+
+The Task 7 restart/source-safety harness was rerun against this head as part
+of the final workspace run and passed. The direct harness result was:
+
+```text
+cargo test -p photo-app-service --test task7_source_safety -- --test-threads=1
+test result: ok; 1 passed; 0 failed
+```
+
+The controlled demo source tree still has six regular files and identical
+before/after size, mtime, and content-digest snapshots. The final source
+audit from `6d4296b52429d8aa5806492d3e25c8820efad02d` through
+`aa7a268e2f7fc86d27d682d94f54b049dfdf6780` contains two Rust name-status
+lines and zero added-line filesystem/source-path matches. The direct-output
+hashes are `4d1900107842ab4cd6e1c0b4fbb28404c0ff07df4cae4f73917df7357583ece9`
+for name-status and
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` for the
+zero-match audit. The before/after source-safety snapshot hash is
+`7d44d5aa0366d1e2dc63d09486637b3790db056e3fe071edc9cec8055c96c979`.
+
 ## Source files changed
 
 - `Cargo.lock`

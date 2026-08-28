@@ -608,3 +608,29 @@ cache_root_exists=yes
 The native acceptance build was created, but the native demo was intentionally
 not launched here. The controller still owns the required user acceptance
 observations and must leave the `wall-demo` process in the requested state.
+
+## Final whole-branch collection-driver correction (2026-08-28)
+
+The final collection-driver code/test head is
+`aa7a268e2f7fc86d27d682d94f54b049dfdf6780` (`fix: coalesce collection driver
+wakeups`). Collection wakeups now merge into one service-owned admitted
+driver. Its recent intent remains coordinator-bounded at 250 IDs, full-group
+intent is monotonic until consumed, and the deterministic exit gate proves an
+intent arriving during finish is not lost. The 1,000-trigger Active stress
+test records a maximum of one collection driver and drains cleanly after
+Idle.
+
+Final relevant verification passed: app-service unit 66/66, progressive wall
+54/54, catalog wall query 19/19, catalog round trip 12/12, Task 7 source
+safety 1/1, Clippy with `-D warnings`, fmt check, diff check, workspace
+release check, app-service release unit 53/53, and all workspace targets.
+
+The exact source audit compares
+`6d4296b52429d8aa5806492d3e25c8820efad02d` to
+`aa7a268e2f7fc86d27d682d94f54b049dfdf6780`, reports only the two expected
+Rust files, and returns zero added-line filesystem/source-path matches. Its
+name-status and zero-match output hashes are respectively
+`4d1900107842ab4cd6e1c0b4fbb28404c0ff07df4cae4f73917df7357583ece9` and
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+The controlled demo source safety before/after snapshot hash is
+`7d44d5aa0366d1e2dc63d09486637b3790db056e3fe071edc9cec8055c96c979`.
