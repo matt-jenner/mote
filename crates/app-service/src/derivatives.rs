@@ -3670,8 +3670,10 @@ mod tests {
         .unwrap();
         let (_bootstrap, selection) = service.select_recent(&source).unwrap();
         service.coordinator.ensure_selection(selection).await;
-        let mut records = Vec::with_capacity(20_000);
-        let mut asset_ids = Vec::with_capacity(10_000);
+        // Keep fixture construction bounded as well: production collection
+        // work must retain only the current page and its cursor, not all
+        // catalogue IDs.
+        let mut records = Vec::with_capacity(500);
         {
             let mut state = service.state().unwrap();
             for index in 0..10_000 {
@@ -3687,7 +3689,6 @@ mod tests {
                     1,
                 );
                 asset.folder_group_id = Some(selection.group_id);
-                asset_ids.push(asset.id);
                 records.push(CatalogIndexRecord::Discovered(asset.clone()));
                 records.push(CatalogIndexRecord::Shaped(AssetShapeUpdate {
                     asset_id: asset.id,
@@ -3715,18 +3716,17 @@ mod tests {
             }
         }
 
-        let blocked_id = asset_ids[0];
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
+        let wall_entered = Arc::new(tokio::sync::Notify::new());
+        let wall_release = Arc::new(tokio::sync::Notify::new());
+        let wall_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         service
-            .install_derivative_test_gate(
-                blocked_id.as_uuid().hyphenated().to_string(),
+            .install_derivative_test_class_gate_with_counter(
                 DerivativeClass::WallThumbnail,
-                entered.clone(),
-                release.clone(),
+                wall_entered.clone(),
+                wall_release.clone(),
+                wall_starts.clone(),
             )
-            .await
-            .unwrap();
+            .await;
         service
             .scheduler
             .set_interaction_mode(photo_indexer::InteractionMode::Idle)
@@ -3738,11 +3738,47 @@ mod tests {
                 .run_preview_prefetch_until_stable(Vec::new(), true, selection, generation)
                 .await;
         });
-        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        tokio::time::timeout(Duration::from_secs(5), wall_entered.notified())
             .await
-            .expect("collection should schedule its first missing wall job");
+            .expect("collection should start a missing wall job");
 
-        let foreground_id = asset_ids[500];
+        let catalog_count = {
+            let state = service.state().unwrap();
+            state
+                .libraries
+                .catalog()
+                .asset_count(selection.library_id)
+                .unwrap()
+        };
+        assert_eq!(catalog_count, 10_000);
+        assert!(wall_starts.load(Ordering::SeqCst) >= 1);
+
+        // The collection driver enqueues a complete page before starting its
+        // workers.  The class-wide gate holds every wall attempt, so this
+        // exact snapshot proves all 250 page jobs are admitted and still
+        // queued or running rather than allowing workers to drain the page.
+        let collection_snapshot = service.coordinator.test_snapshot().await;
+        assert_eq!(collection_snapshot.largest_loaded_page, 250);
+        assert!(collection_snapshot.recent_len <= 250);
+        assert_eq!(collection_snapshot.queued_jobs, 250);
+
+        let foreground_relative =
+            RelativePathKey::from_relative_path(std::path::Path::new("photo-00500.jpg")).unwrap();
+        let foreground_id = AssetId::for_path(selection.library_id, &foreground_relative);
+        let foreground_entered = Arc::new(tokio::sync::Notify::new());
+        let foreground_release = Arc::new(tokio::sync::Notify::new());
+        // Replace the page-wide gate only after every collection item is
+        // admitted. Existing workers retain the shared gate they observed;
+        // the next (foreground) attempt is held independently by asset ID.
+        service
+            .install_derivative_test_gate(
+                foreground_id.as_uuid().hyphenated().to_string(),
+                DerivativeClass::WallThumbnail,
+                foreground_entered.clone(),
+                foreground_release.clone(),
+            )
+            .await
+            .unwrap();
         let foreground_queued = Arc::new(tokio::sync::Notify::new());
         service
             .install_visible_derivative_queue_test_hook(foreground_queued.clone())
@@ -3761,11 +3797,15 @@ mod tests {
             .await
             .expect("foreground request should be queued while collection is held");
         let snapshot = service.coordinator.test_snapshot().await;
-        assert!(snapshot.largest_loaded_page <= 250);
+        assert_eq!(snapshot.largest_loaded_page, 250);
         assert!(snapshot.recent_len <= 250);
-        assert!(snapshot.queued_jobs <= 251);
+        assert_eq!(snapshot.queued_jobs, 251);
 
-        release.notify_waiters();
+        wall_release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), foreground_entered.notified())
+            .await
+            .expect("foreground wall attempt should reach its separate gate");
+        foreground_release.notify_waiters();
         // The bound is sampled while both collection and foreground work are
         // live.  Stop those deterministic workers after the observation so a
         // 10k fixture does not turn this bound test into a full image crawl.
