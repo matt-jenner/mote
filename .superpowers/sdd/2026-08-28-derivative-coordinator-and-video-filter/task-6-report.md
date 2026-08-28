@@ -47,3 +47,72 @@ Changes are limited to the interface wall/viewer, its browser/contrast tests, an
 ## SHA
 
 - Implementation commit: `08371e2` (`fix: paint thumbnails before opening photos`).
+
+## Fix round 1 — RED
+
+- Fix base: `8eadd0c` (`docs: record Task 6 verification`).
+- The real `<StrictMode>` viewer test was run before the hook fix from the
+  initial render through open: it observed two visible current screen-preview
+  requests instead of one (`expected 1, received 2`). This reproduced the
+  effect-replay cleanup bug.
+- The focused wall/viewer regression additions were kept asynchronous and
+  event-driven; the request assertion no longer uses a fixed sleep.
+
+## Fix round 1 — GREEN
+
+- `npm test` — 16 files, 129 tests passed.
+- `npm run test:browser` — 3 files, 142 tests passed.
+- Exact `PhotoWall.browser.test.tsx` — 47 tests passed.
+- Exact `PhotoViewer.browser.test.tsx` — 85 tests passed.
+- `npm exec --workspace @photo-viewer/interface -- vitest run --project browser-motion` — 1 file, 2 tests passed.
+- `npm exec --workspace @photo-viewer/interface -- vitest run --project browser-contrast` — 1 file, 2 tests passed.
+- `npm run typecheck`, `npm run check`, production build, and `git diff --check` — passed.
+
+The full browser run still emits the one existing non-failing React
+`ViewerStage` `act(...)` warning. The warning count did not increase; the exact
+wall run emitted none.
+
+## Fix round 1 — Browser
+
+- `useViewerPreview` now retains request records through StrictMode effect
+  replay, while active asset/generation/key cleanup still resets stale plans;
+  refs naturally disappear on a genuine unmount, and late completions/retries
+  are mounted-fenced.
+- The StrictMode test counts from initial render, asserts zero before the
+  painted tile click, one visible current request after open, no duplicate
+  after completion, and one new request after close/reopen.
+- Wall coverage now asserts a screen-preview-only colour tile has no request,
+  no button, and no `onOpen`; error and every stale load/decode/transition
+  path likewise stays inert. Cached-complete imagery is driven through its
+  current decode/transition and then opened exactly once.
+- Reduced-motion URL replacement and unmount tests prove pending RAFs are
+  cancelled and stale callbacks cannot expose/open a tile.
+- The combined Escape test uses a `MutationObserver`: continuous wheel zoom
+  leaves the prior `Fit` announcement untouched, while the second Escape
+  itself resets to Fit and produces a discrete live-region mutation before the
+  third Escape closes the viewer.
+
+## Fix round 1 — Appearance
+
+No production appearance changes were made. The existing contrast project
+continued to verify the always-dark viewer surface under system-light
+appearance.
+
+## Fix round 1 — Source boundary
+
+The fix is limited to interface preview lifecycle code and browser tests. No
+backend, Tauri, plan/specification, progress-ledger, source-media, or native
+path files changed; no video request path was added.
+
+## Fix round 1 — Self-review
+
+- Reviewed the hook cleanup against both StrictMode replay and real unmount:
+  in-flight dedupe survives replay, current asset/generation/key changes are
+  still fenced, retries are cancelled, and completion handlers cannot update
+  an unmounted viewer.
+- Confirmed generated browser attachment/screenshot directories were removed
+  before commit and `git diff --check` is clean.
+
+## Fix round 1 — SHA
+
+- Implementation and regression tests: `b7c5748` (`fix: preserve preview dedupe across StrictMode`).
