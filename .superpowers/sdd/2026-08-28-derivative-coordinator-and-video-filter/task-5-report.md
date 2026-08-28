@@ -180,3 +180,78 @@ test result: ok. 53 passed; 0 failed
 ### Commit
 
 Fix-round implementation commit: `57aed3b87d81316572f344c8b0624c39b8a4fb6b` (`fix: guard collection phase transitions and terminal warnings`).
+
+## Fix round 2
+
+### Review findings addressed
+
+- Collection/recent background enqueue now carries the complete `CollectionProgressToken`. The coordinator validates selection, phase, cursor, and background generation in the same lock that inserts a job, so a stale caller cannot enqueue work stamped with the current generation or clear stale terminal state before admission.
+- Cached collection/recent publication now uses a coordinator admission boundary. The small synchronous publication runs while the token is admitted; invalidation before admission suppresses it, while invalidation after admission is ordered after it. Idle preview generation uses the same exact-token enqueue boundary and rechecks the token before catalog completion/phase advancement.
+- Consumed recent IDs are removed only through the same current collection token, preventing a stale recent driver from mutating the rewound window.
+- Visible wall requests restart the full-group driver after a rewind so cached screen references are replayed through the wall-first phases; ordinary near-viewport requests remain recent-only.
+- The 10k bound test now uses a distinct `NearViewport` wall request, which does not invalidate collection work. The first real 250-item missing-wall page remains held at its deterministic gate while the foreground lane is admitted, and the snapshot is taken before release/cancellation.
+
+### RED evidence
+
+The new four interleaving tests were added before the collection admission APIs existed. The focused test compile failed with missing `install_collection_*_test_gate` and coordinator guarded-enqueue methods, which was the expected pre-fix failure. The corrected tests then exercised cached publication and enqueue gaps independently for recent and full-page drivers.
+
+### GREEN evidence
+
+Focused interleavings and bounds:
+
+```text
+$ cargo test -p photo-app-service --lib stale_ -- --test-threads=1
+test result: ok; 8 passed; 0 failed
+
+$ cargo test -p photo-app-service --lib collection_schedules_bounded_missing_work_with_concurrent_foreground_request -- --test-threads=1
+test result: ok; 1 passed; 0 failed
+
+$ stale interleavings repeated 20 times
+all 20 runs passed
+```
+
+Relevant suites and quality gates:
+
+```text
+$ cargo test -p photo-app-service --lib -- --test-threads=1
+test result: ok; 62 passed; 0 failed
+
+$ cargo test -p photo-app-service --test progressive_wall -- --test-threads=1
+test result: ok; 54 passed; 0 failed
+
+$ cargo test -p photo-catalog --test wall_query -- --test-threads=1
+test result: ok; 19 passed; 0 failed
+
+$ cargo test -p photo-catalog --test catalog_round_trip -- --test-threads=1
+test result: ok; 12 passed; 0 failed
+
+$ cargo clippy -p photo-app-service -p photo-catalog --all-targets --all-features -- -D warnings
+Finished successfully
+
+$ cargo fmt --all -- --check
+exit=0
+
+$ git diff --check
+exit=0
+```
+
+Workspace and release gates:
+
+```text
+$ cargo test --workspace --all-targets -- --test-threads=1
+all workspace test targets passed
+
+$ cargo check --workspace --release
+Finished successfully
+
+$ cargo test -p photo-app-service --lib --release -- --test-threads=1
+test result: ok; 53 passed; 0 failed
+```
+
+### Boundedness and source safety
+
+The corrected 10k test schedules the collection's actual first 250-item wall page and a separate near-viewport foreground request, then samples before either deterministic gate is released. It asserts `largest_loaded_page <= 250`, `recent_len <= 250`, and `queued_jobs <= 251` (250 collection slots plus the one foreground request). The collection driver retains only its current page and cursor; recent IDs remain capped at 250. Collection tokens, test snapshots, warnings, and updates contain no native source/cache paths.
+
+### Commit
+
+Fix-round 2 implementation commit: `db56f6e82f8fe625ffa6170fcc9bc8f3c92ca9af` (`fix: guard stale collection admissions`).
