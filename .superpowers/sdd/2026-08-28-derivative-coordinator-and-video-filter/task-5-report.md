@@ -95,3 +95,88 @@ Warnings and updates use opaque selection/library/asset identifiers and path-fre
 ## Commit
 
 Implementation commit: `40baab9bb3d3800bc64d2ee57c52bd9133d8150b` (`feat: run thumbnail-first collection phases`).
+
+## Fix round 1
+
+### Review findings addressed
+
+- Collection advances and phase finishes now use an exact `CollectionProgressToken` containing selection, phase, cursor, and background generation. A stale token is rejected atomically; visible invalidation rewinds even an in-progress thumbnail cursor, and thumbnail/preview completion resets the cursor in the same state transition as the phase change.
+- Recent-only background drivers return without screen work while the collection is dormant or in the thumbnail phase. The full-group driver can therefore acquire the collection mutex after a recent driver without a starvation loop.
+- Terminal-warning clearing now checks both current wall and screen terminal rows for the current asset key and availability before removing the shared warning. Both clear directions are covered.
+- Restart tests open the same catalogue/cache without startup reconciliation, verify zero attempts for an unchanged terminal key/availability, then verify exactly one changed-key attempt and exactly one availability-recovery attempt. Rows and warnings converge after successful recovery.
+- Screen encode instrumentation increments at the encode boundary, before the blocking encoder call. The 301-photo phase test asserts zero starts while the late wall is held.
+- The 10k bound test now runs the collection scheduler with missing wall work held at a deterministic gate while a foreground request is queued, and samples page/recent/queue bounds with the foreground slot included.
+
+### RED evidence
+
+The first token test failed to compile because the exact token API did not exist. After the API was present, the warning regression failed as expected (`left: 0`, `right: 1`) when clearing one class removed the shared warning. The 301 test likewise first failed to compile because the encode-boundary counter API did not exist. These failures preceded their corresponding production changes.
+
+### GREEN evidence
+
+Focused gates:
+
+```text
+$ cargo test -p photo-app-service --test progressive_wall every_photo_page_reaches_wall_outcome_before_background_screens_begin -- --exact
+test result: ok. 1 passed; 0 failed
+
+$ cargo test -p photo-app-service --test progressive_wall terminal_photo_failures_and_videos_do_not_starve_healthy_previews -- --exact
+test result: ok. 1 passed; 0 failed
+
+$ cargo test -p photo-app-service --test progressive_wall terminal_failure_retries_only_after_derivative_key_changes -- --exact
+test result: ok. 1 passed; 0 failed
+
+$ cargo test -p photo-app-service --test progressive_wall terminal_failure_retries_when_availability_changes_without_a_new_key -- --exact
+test result: ok. 1 passed; 0 failed
+
+$ cargo test -p photo-app-service --test progressive_wall terminal_failure_restart_skips_same_key_and_retries_changed_key_once -- --exact
+test result: ok. 1 passed; 0 failed
+
+$ cargo test -p photo-app-service --test progressive_wall terminal_failure_restart_skips_same_availability_and_retries_after_recovery_once -- --exact
+test result: ok. 1 passed; 0 failed
+```
+
+Relevant suites and quality gates:
+
+```text
+$ cargo test -p photo-app-service --lib -- --test-threads=1
+test result: ok. 58 passed; 0 failed
+
+$ cargo test -p photo-app-service --test progressive_wall -- --test-threads=1
+test result: ok. 54 passed; 0 failed
+
+$ cargo test -p photo-catalog --test wall_query -- --test-threads=1
+test result: ok. 19 passed; 0 failed
+
+$ cargo test -p photo-catalog --test catalog_round_trip -- --test-threads=1
+test result: ok. 12 passed; 0 failed
+
+$ cargo clippy -p photo-app-service -p photo-catalog --all-targets --all-features -- -D warnings
+Finished successfully
+
+$ cargo fmt --all -- --check
+exit=0
+
+$ git diff --check
+exit=0
+```
+
+Workspace and release gates:
+
+```text
+$ cargo test --workspace --all-targets -- --test-threads=1
+all workspace test targets passed
+
+$ cargo check --workspace --release
+Finished successfully
+
+$ cargo test -p photo-app-service --lib --release -- --test-threads=1
+test result: ok. 53 passed; 0 failed
+```
+
+### Boundedness and source safety
+
+`collection_schedules_bounded_missing_work_with_concurrent_foreground_request` exercises a real first collection page of missing wall work and queues a concurrent visible request. Its snapshot asserts `largest_loaded_page <= 250`, `recent_len <= 250`, and `queued_jobs <= 251`; the existing 10k pagination test remains green. Collection code retains only the current page and opaque cursor, and the recent window remains capped at 250. No source or cache paths are added to DTOs, test counters, tokens, warnings, or coordinator snapshots.
+
+### Commit
+
+Fix-round implementation commit: `57aed3b87d81316572f344c8b0624c39b8a4fb6b` (`fix: guard collection phase transitions and terminal warnings`).
