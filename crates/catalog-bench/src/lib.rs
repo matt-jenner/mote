@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use photo_cache::{EvictionPlanner, ProtectedGroups};
 use photo_catalog::{
-    AssetMetadataUpdate, Catalog, CatalogIndexRecord, NewAsset, NewDerivative, NewFolderGroup,
-    NewLibrary,
+    AssetMetadataUpdate, AssetShapeUpdate, Catalog, CatalogIndexRecord, NewAsset, NewDerivative,
+    NewFolderGroup, NewLibrary, ShapeStatus, TerminalDerivativeFailure, WallOrder,
 };
 use photo_domain::{
     AssetId, DerivativeId, FileSignature, FolderGroupId, LibraryId, LibraryKind, MediaKind,
@@ -17,6 +17,10 @@ const GROUP_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x7814_b18f_61e0_4a3a_8aa9_55b9_7367_1001);
 const DERIVATIVE_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x7814_b18f_61e0_4a3a_8aa9_55b9_7367_1002);
+const WALL_GROUP_PATH: &str = "benchmark-wall";
+const WALL_PAGE_SIZE: u32 = 100;
+const COORDINATOR_PAGE_SIZE: u32 = 250;
+const VIDEO_PERIOD: u64 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BenchmarkConfig {
@@ -32,6 +36,11 @@ pub struct BenchmarkReport {
     pub insert_ms: f64,
     pub first_page_ms: f64,
     pub first_page_rows: usize,
+    pub second_page_ms: f64,
+    pub second_page_rows: usize,
+    pub coordinator_page_ms: f64,
+    pub coordinator_page_rows: usize,
+    pub terminal_lookup_ms: f64,
     pub unavailable_count_ms: f64,
     pub eviction_plan_ms: f64,
 }
@@ -48,6 +57,12 @@ pub enum BenchmarkError {
     Io(#[from] std::io::Error),
     #[error("benchmark generated {actual} rows instead of {expected}")]
     IncorrectRowCount { expected: u64, actual: u64 },
+    #[error("benchmark wall page did not provide a continuation cursor")]
+    MissingWallCursor,
+    #[error("benchmark terminal failure lookup did not find the current key")]
+    MissingTerminalFailure,
+    #[error("benchmark photo page contained a video result")]
+    UnexpectedVideo,
     #[error("benchmark value is too large for this platform")]
     ValueOutOfRange,
 }
@@ -63,9 +78,11 @@ pub fn run_benchmark(config: BenchmarkConfig) -> Result<BenchmarkReport, Benchma
     let sqlite_version = catalog.sqlite_version()?;
     let library = benchmark_library(&temp.path().join("source-placeholder"));
     catalog.add_library(&library)?;
+    let wall_group = insert_wall_group(&mut catalog, library.id)?;
 
     let insert_started = Instant::now();
     let mut offset = 0_u64;
+    let mut video_count = 0_u64;
     while offset < config.assets {
         let remaining = config.assets - offset;
         let batch_assets = remaining
@@ -73,12 +90,23 @@ pub fn run_benchmark(config: BenchmarkConfig) -> Result<BenchmarkReport, Benchma
         let mut records = Vec::with_capacity(
             usize::try_from(batch_assets)
                 .map_err(|_| BenchmarkError::ValueOutOfRange)?
-                .saturating_mul(2),
+                .saturating_mul(3),
         );
         for index in offset..offset + batch_assets {
-            let asset = benchmark_asset(library.id, index)?;
+            let asset = benchmark_asset(library.id, wall_group, index)?;
             let asset_id = asset.id;
+            if asset.media_kind == MediaKind::Video {
+                video_count += 1;
+            }
             records.push(CatalogIndexRecord::Discovered(asset));
+            records.push(CatalogIndexRecord::Shaped(AssetShapeUpdate {
+                asset_id,
+                width: 4_000,
+                height: 3_000,
+                orientation: Some(1),
+                representative_rgb: Some(0x335577),
+                shape_status: ShapeStatus::Ready,
+            }));
             records.push(CatalogIndexRecord::Metadata(AssetMetadataUpdate {
                 asset_id,
                 captured_at_utc: None,
@@ -89,6 +117,12 @@ pub fn run_benchmark(config: BenchmarkConfig) -> Result<BenchmarkReport, Benchma
         }
         catalog.apply_index_batch(&records)?;
         offset += batch_assets;
+    }
+    if video_count != config.assets.div_ceil(VIDEO_PERIOD) {
+        return Err(BenchmarkError::IncorrectRowCount {
+            expected: config.assets.div_ceil(VIDEO_PERIOD),
+            actual: video_count,
+        });
     }
     insert_cache_groups(&mut catalog, library.id, config)?;
     let insert_ms = elapsed_ms(insert_started);
@@ -102,15 +136,46 @@ pub fn run_benchmark(config: BenchmarkConfig) -> Result<BenchmarkReport, Benchma
     }
 
     let page_started = Instant::now();
-    let first_page = catalog.list_assets_page(library.id, None, 100)?;
+    let first_page = catalog.wall_page(wall_group, WallOrder::Provisional, None, WALL_PAGE_SIZE)?;
     let first_page_ms = elapsed_ms(page_started);
-    let expected_page_rows =
-        usize::try_from(config.assets.min(100)).map_err(|_| BenchmarkError::ValueOutOfRange)?;
-    if first_page.len() != expected_page_rows {
+    ensure_photo_page(&first_page.items, WALL_PAGE_SIZE)?;
+    let second_cursor = first_page
+        .next
+        .clone()
+        .ok_or(BenchmarkError::MissingWallCursor)?;
+    let second_started = Instant::now();
+    let second_page = catalog.wall_page(
+        wall_group,
+        WallOrder::Provisional,
+        Some(second_cursor),
+        WALL_PAGE_SIZE,
+    )?;
+    let second_page_ms = elapsed_ms(second_started);
+    ensure_photo_page(&second_page.items, WALL_PAGE_SIZE)?;
+    let coordinator_started = Instant::now();
+    let coordinator_page = catalog.photo_asset_ids_page(
+        wall_group,
+        WallOrder::Provisional,
+        None,
+        COORDINATOR_PAGE_SIZE,
+    )?;
+    let coordinator_page_ms = elapsed_ms(coordinator_started);
+    if coordinator_page.items.len() != COORDINATOR_PAGE_SIZE as usize {
         return Err(BenchmarkError::IncorrectRowCount {
-            expected: expected_page_rows as u64,
-            actual: first_page.len() as u64,
+            expected: u64::from(COORDINATOR_PAGE_SIZE),
+            actual: coordinator_page.items.len() as u64,
         });
+    }
+    for asset_id in &coordinator_page.items {
+        let asset = catalog
+            .find_asset(*asset_id)?
+            .ok_or(BenchmarkError::IncorrectRowCount {
+                expected: 1,
+                actual: 0,
+            })?;
+        if asset.media_kind == MediaKind::Video {
+            return Err(BenchmarkError::UnexpectedVideo);
+        }
     }
 
     let retained = catalog.mark_root_offline(library.id)?;
@@ -128,6 +193,30 @@ pub fn run_benchmark(config: BenchmarkConfig) -> Result<BenchmarkReport, Benchma
             expected: config.assets,
             actual: unavailable,
         });
+    }
+
+    let terminal_asset = catalog
+        .find_asset(first_page.items[0].id)?
+        .ok_or(BenchmarkError::MissingTerminalFailure)?;
+    let terminal_key = format!("screen-preview-{}", terminal_asset.id.as_uuid().simple());
+    catalog.record_terminal_derivative_failure(&TerminalDerivativeFailure {
+        asset_id: terminal_asset.id,
+        kind: "screen_preview".to_owned(),
+        cache_key: terminal_key.clone(),
+        availability: terminal_asset.availability,
+        failure_code: "benchmark_terminal".to_owned(),
+        occurred_at: 1,
+    })?;
+    let terminal_started = Instant::now();
+    let terminal_failure = catalog.find_terminal_derivative_failure(
+        terminal_asset.id,
+        "screen_preview",
+        &terminal_key,
+        terminal_asset.availability,
+    )?;
+    let terminal_lookup_ms = elapsed_ms(terminal_started);
+    if terminal_failure.is_none() {
+        return Err(BenchmarkError::MissingTerminalFailure);
     }
 
     let eviction_started = Instant::now();
@@ -149,10 +238,31 @@ pub fn run_benchmark(config: BenchmarkConfig) -> Result<BenchmarkReport, Benchma
         database_bytes,
         insert_ms,
         first_page_ms,
-        first_page_rows: first_page.len(),
+        first_page_rows: first_page.items.len(),
+        second_page_ms,
+        second_page_rows: second_page.items.len(),
+        coordinator_page_ms,
+        coordinator_page_rows: coordinator_page.items.len(),
+        terminal_lookup_ms,
         unavailable_count_ms,
         eviction_plan_ms,
     })
+}
+
+fn ensure_photo_page(
+    rows: &[photo_catalog::WallCatalogRecord],
+    expected: u32,
+) -> Result<(), BenchmarkError> {
+    if rows.len() != expected as usize {
+        return Err(BenchmarkError::IncorrectRowCount {
+            expected: u64::from(expected),
+            actual: rows.len() as u64,
+        });
+    }
+    if rows.iter().any(|row| row.media_kind == MediaKind::Video) {
+        return Err(BenchmarkError::UnexpectedVideo);
+    }
+    Ok(())
 }
 
 fn benchmark_library(root: &Path) -> NewLibrary {
@@ -165,7 +275,11 @@ fn benchmark_library(root: &Path) -> NewLibrary {
     }
 }
 
-fn benchmark_asset(library: LibraryId, index: u64) -> Result<NewAsset, BenchmarkError> {
+fn benchmark_asset(
+    library: LibraryId,
+    wall_group: FolderGroupId,
+    index: u64,
+) -> Result<NewAsset, BenchmarkError> {
     let path = benchmark_path(index);
     let relative_path = RelativePathKey::from_relative_path(Path::new(&path))
         .map_err(|_| BenchmarkError::ValueOutOfRange)?;
@@ -180,7 +294,7 @@ fn benchmark_asset(library: LibraryId, index: u64) -> Result<NewAsset, Benchmark
             modified_unix_ns: i128::from(index).saturating_mul(1_000_000_000),
             sidecar_modified_unix_ns: None,
         },
-        folder_group_id: None,
+        folder_group_id: Some(wall_group),
     })
 }
 
@@ -188,7 +302,12 @@ fn benchmark_path(index: u64) -> String {
     let year = 2000 + (index % 27);
     let collection = index % 10_000;
     let rating = rating(index);
-    format!("{year}/Collection-{collection:04}/Processed/{rating} Stars/IMG-{index:07}.jpg")
+    let extension = match media_kind(index) {
+        MediaKind::Raw => "cr2",
+        MediaKind::Video => "mp4",
+        _ => "jpg",
+    };
+    format!("{year}/Collection-{collection:04}/Processed/{rating} Stars/IMG-{index:07}.{extension}")
 }
 
 fn rating(index: u64) -> u8 {
@@ -196,11 +315,31 @@ fn rating(index: u64) -> u8 {
 }
 
 fn media_kind(index: u64) -> MediaKind {
-    match index % 20 {
-        0 => MediaKind::Raw,
-        1 => MediaKind::Video,
-        _ => MediaKind::Jpeg,
+    if index.is_multiple_of(VIDEO_PERIOD) {
+        MediaKind::Video
+    } else if index % 20 == 1 {
+        MediaKind::Raw
+    } else {
+        MediaKind::Jpeg
     }
+}
+
+fn insert_wall_group(
+    catalog: &mut Catalog,
+    library: LibraryId,
+) -> Result<FolderGroupId, BenchmarkError> {
+    let group_uuid = uuid::Uuid::new_v5(&GROUP_NAMESPACE, WALL_GROUP_PATH.as_bytes());
+    let group_id = FolderGroupId::from_uuid(group_uuid);
+    catalog
+        .upsert_folder_group(&NewFolderGroup {
+            id: group_id,
+            library_id: library,
+            relative_path: RelativePathKey::from_relative_path(Path::new(WALL_GROUP_PATH))
+                .map_err(|_| BenchmarkError::ValueOutOfRange)?,
+            display_path: WALL_GROUP_PATH.to_owned(),
+            last_viewed_at: None,
+        })
+        .map_err(BenchmarkError::from)
 }
 
 fn insert_cache_groups(

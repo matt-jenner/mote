@@ -14,6 +14,11 @@ fn ten_thousand_asset_smoke_report_has_all_measurements() {
     assert!(report.insert_ms > 0.0);
     assert!(report.first_page_ms >= 0.0);
     assert_eq!(report.first_page_rows, 100);
+    assert!(report.second_page_ms >= 0.0);
+    assert_eq!(report.second_page_rows, 100);
+    assert!(report.coordinator_page_ms >= 0.0);
+    assert_eq!(report.coordinator_page_rows, 250);
+    assert!(report.terminal_lookup_ms >= 0.0);
     assert!(report.unavailable_count_ms >= 0.0);
     assert!(report.eviction_plan_ms >= 0.0);
 
@@ -25,6 +30,11 @@ fn ten_thousand_asset_smoke_report_has_all_measurements() {
         "insert_ms",
         "first_page_ms",
         "first_page_rows",
+        "second_page_ms",
+        "second_page_rows",
+        "coordinator_page_ms",
+        "coordinator_page_rows",
+        "terminal_lookup_ms",
         "unavailable_count_ms",
         "eviction_plan_ms",
     ] {

@@ -76,12 +76,20 @@ reusing the first catalog or derivative cache. No command in this workflow
 copies, renames, deletes, or otherwise modifies photos in the selected source
 folder.
 
+The catalogue retains indexed videos, but photo surfaces hide them without a
+placeholder or hidden count until cross-platform video playback ships. A wall
+tile becomes openable only after its current thumbnail has painted. Background
+work runs in order: wall thumbnails first, then screen previews. A corrupt
+photo records its failure and does not block healthy photos.
+
 When a wall tile opens the immersive viewer, use Left/Right (or the Previous
 and Next buttons) to move through the loaded order. Select a filmstrip item for
 a direct jump, or swipe horizontally on a fit-to-window photo. Photo
 information opens the read-only metadata drawer, and Back to photos or Escape
+unwinds the viewer state in order: it closes Info, resets zoom to Fit, then
 returns to the wall and restores the selected tile. Ready cached derivatives
-remain usable if the selected source becomes unavailable. In the viewer, use
+remain usable if the selected source becomes unavailable. The viewer stays
+dark when the system appearance is light. In the viewer, use
 Plus/Minus or `+`/`-` to zoom around the viewport centre, `0` or Fit to return
 to the fitted image, and drag a zoomed photo to pan. Double-click or double-tap
 toggles between Fit and the derivative's native 100 percent limit; trackpad
@@ -131,7 +139,14 @@ cargo run -p photo-server
 
 ## Run the catalog benchmark
 
-The benchmark deterministically generates catalog rows in 500-asset transactions, marks the generated root offline while retaining every asset, then measures insertion, the first natural-path page, unavailable-asset counting, and cache-group eviction planning. It records timings without enforcing hardware-dependent limits.
+The benchmark deterministically generates catalog rows in 500-asset
+transactions. The million-asset profile contains 90 percent stills and 10
+percent videos, all shaped in one folder group. Videos stay indexed but are
+filtered from photo pages. The run marks the generated root offline while
+retaining every asset, then measures insertion, the first and second 100-photo
+wall pages, a 250-ID coordinator page, a current terminal-failure lookup,
+unavailable-asset counting, and cache-group eviction planning. It records
+timings without enforcing hardware-dependent limits.
 
 Run the million-asset profile in release mode:
 
@@ -145,7 +160,10 @@ For a quick local smoke run:
 cargo run -p catalog-bench --release -- --assets 10000 --output target/catalog-benchmark-smoke.json
 ```
 
-The JSON report includes `assets`, `sqlite_version`, `database_bytes`, `insert_ms`, `first_page_ms`, `first_page_rows`, `unavailable_count_ms`, and `eviction_plan_ms`.
+The JSON report includes `assets`, `sqlite_version`, `database_bytes`,
+`insert_ms`, `first_page_ms`, `first_page_rows`, `second_page_ms`,
+`second_page_rows`, `coordinator_page_ms`, `coordinator_page_rows`,
+`terminal_lookup_ms`, `unavailable_count_ms`, and `eviction_plan_ms`.
 
 ## Foundation crates
 

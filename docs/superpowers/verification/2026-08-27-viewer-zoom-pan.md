@@ -302,4 +302,235 @@ git status --short
 git show -s --format='%h %s' HEAD
 The exact post-commit SHA and subject are recorded in the companion Task 6 and
 final-fix reports after commit finalization.
+
+## Task 7 automated verification (2026-08-28)
+
+Task 7 extends the catalog benchmark without changing the application
+coordinator. It generates a deterministic 90 percent still and 10 percent
+video catalog, assigns every asset to one shaped wall group, and keeps videos
+indexed while the wall and coordinator projections filter them. The benchmark
+now measures the first and cursor-continuation wall pages, the 250-ID
+coordinator page, and a terminal-failure lookup using the current asset key.
+Insertion, unavailable counting, and eviction planning remain in the report.
+
+### Benchmark RED/GREEN evidence
+
+The smoke test was extended before the implementation. The first run failed at
+compile time because `BenchmarkReport` did not yet have the new page and
+terminal lookup fields:
+
+```text
+cargo test -p catalog-bench --test benchmark_smoke
+error[E0609]: no field `second_page_ms` on type `BenchmarkReport`
+error[E0609]: no field `second_page_rows` on type `BenchmarkReport`
+error[E0609]: no field `coordinator_page_ms` on type `BenchmarkReport`
+error[E0609]: no field `coordinator_page_rows` on type `BenchmarkReport`
+error[E0609]: no field `terminal_lookup_ms` on type `BenchmarkReport`
+```
+
+After the benchmark implementation, the focused smoke test passed:
+
+```text
+cargo test -p catalog-bench --test benchmark_smoke
+test result: ok. 1 passed; 0 failed; 0 ignored
+```
+
+### Million-asset benchmark
+
+The compile-warm release command was:
+
+```text
+cargo run --release -p catalog-bench -- --assets 1000000 --output /tmp/photo-viewer-million-report.json
+```
+
+The report at `/tmp/photo-viewer-million-report.json` has SHA-256
+`85c36fbc4735b8dcbde049a77cf8232cb23837dc63fe7d34cbcb4143cf8f300d` and
+contains:
+
+```json
+{
+  "assets": 1000000,
+  "sqlite_version": "3.53.2",
+  "database_bytes": 789831680,
+  "insert_ms": 421234.77991700004,
+  "first_page_ms": 0.259917,
+  "first_page_rows": 100,
+  "second_page_ms": 0.173375,
+  "second_page_rows": 100,
+  "coordinator_page_ms": 0.24516700000000002,
+  "coordinator_page_rows": 250,
+  "terminal_lookup_ms": 0.033166,
+  "unavailable_count_ms": 332.129875,
+  "eviction_plan_ms": 3.2902500000000003
+}
+```
+
+The previous first-page measurement was 1.08 ms, recorded for the 1,000,000
+asset profile at commit `3186354`. The 20 percent ceiling is 1.296 ms. The
+fresh 0.259917 ms result is 24.066389 percent of that earlier measurement.
+The bounded query pages contain exactly 100, 100, and 250 rows, and every
+returned row is a still. The benchmark does not materialize the collection or
+take a queue snapshot.
+
+Machine context for this run:
+
+```text
+MacBookPro18,1, Apple M1 Pro, 10 cores, 16 GB RAM
+macOS 26.5.2 (Darwin 25.5.0, arm64)
+rustc 1.97.1, cargo 1.97.1
+Node v24.18.0, npm 11.16.0
+```
+
+### Interface gates
+
+```text
+npm test
+Test Files  16 passed (16)
+Tests       129 passed (129)
+
+npm run test:browser
+Test Files  3 passed (3)
+Tests       145 passed (145)
+
+npm exec --workspace @photo-viewer/interface -- vitest run --project browser-motion
+Test Files  1 passed (1)
+Tests       2 passed (2)
+
+npm exec --workspace @photo-viewer/interface -- vitest run --project browser-contrast
+Test Files  1 passed (1)
+Tests       2 passed (2)
+
+npm run typecheck
+exit 0
+
+npm run check
+Checked 69 files in 220ms. No fixes applied.
+
+npm run --workspace @photo-viewer/interface build
+1888 modules transformed
+dist/assets/index-DJKmgDN-.css   21.67 kB, gzip 4.97 kB
+dist/assets/index-CcP2hML6.js   317.79 kB, gzip 97.14 kB
+```
+
+The full browser run emitted the one existing non-failing React `ViewerStage`
+`act(...)` warning. Motion, contrast, unit, typecheck, and Biome runs emitted
+no warnings. No unhandled promise rejection, accessibility violation, or
+screenshot attachment was produced.
+
+### Rust and desktop gates
+
+```text
+cargo test --workspace --all-features
+191 passed; 0 failed; 0 ignored
+
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+Finished `dev` profile; no warnings or errors
+
+cargo fmt --all -- --check
+exit 0
+
+cargo test -p catalog-bench --test benchmark_smoke
+1 passed; 0 failed
+
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+11 passed; 0 failed; 0 doc-test failures
+
+cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+Finished `dev` profile; no warnings or errors
+
+cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all -- --check
+exit 0
+
+npm run desktop:build
+Finished 1 bundle at:
+/Users/jennerm/repos/photo_viewer/.worktrees/viewer-zoom-pan/apps/desktop/src-tauri/target/release/bundle/macos/Photo Viewer.app
+
+git diff --check
+exit 0
+```
+
+The interface build assets are 317,796 bytes of JavaScript and 21,673 bytes
+of CSS. The app bundle contains three files, occupies 23,176 KiB on disk, and
+its native executable is 23,448,864 bytes.
+
+### Source and cache safety audit
+
+The controlled fixture tree was snapshotted before and after clean-profile
+fixture coverage. The before metadata snapshot was:
+
+```text
+apps/interface/public/demo-photos/city.jpg|1787835664|615559
+apps/interface/public/demo-photos/coast.jpg|1787835664|597900
+apps/interface/public/demo-photos/forest.jpg|1787835664|865825
+apps/interface/public/demo-photos/interior.jpg|1787835664|446647
+apps/interface/public/demo-photos/mountain.jpg|1787835664|483651
+apps/interface/public/demo-photos/portrait.jpg|1787835664|319646
+```
+
+The before and after aggregate SHA-256 was
+`a4c522354a075e2a6b6804a31b9df42dcd56b6509cef14ae4667e700227ae3e6`.
+The metadata diff had 0 lines and the per-file hash diff had 0 lines. The
+clean-profile commands used fixture-only temporary state:
+
+```text
+PHOTO_VIEWER_PROFILE=task-7-clean cargo test -p photo-app-service --test progressive_wall
+54 passed; 0 failed
+
+PHOTO_VIEWER_PROFILE=task-7-clean cargo test -p photo-cache --test image_derivative
+10 passed; 0 failed
+
+PHOTO_VIEWER_PROFILE=task-7-clean npm run test:browser
+3 files, 145 passed; 0 failed
+```
+
+The progressive-wall tests cover scanning, thumbnail and preview phase order,
+corrupt-asset isolation, terminal outcomes, sorting-related wall requests,
+and online/offline restart behavior. The cache suite covers legacy preview
+repair and source-preserving derivative generation. The browser suite covers
+wall sorting, viewer opening, and zoom. No desktop development process was
+started by this task.
+
+The feature-range source audit used accepted base
+`14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc` and pre-verification head
+`fd557572cd9dca2214d99f1e0b6a8d8d526794d2`. The targeted diff search was:
+
+```text
+git diff --unified=0 14ca838d1517d0e6bb9e72c40d0a3ab0937d6fdc..fd557572cd9dca2214d99f1e0b6a8d8d526794d2 -- apps/interface/src crates apps/desktop/src-tauri/src | rg -n -i '(writeFile|write_file|rename|removeFile|remove_file|unlink|copyFile|copy_file|setRating|updateRating|deleteAsset|sourcePath|selectedFolder|folderPath|locateFolder)'
+```
+
+It found only these harmless contexts:
+
+- `selectedFolderName: "Video fixture"` in a path-free browser fixture;
+- `std::fs::rename(&fixture.source, &unavailable)` and the reverse operation
+  in temporary progressive-wall fixtures used to simulate source availability;
+- `std::fs::remove_file(fixture.source.join("offline.jpg"))` in a temporary
+  fixture cleanup path.
+
+There were no production source-media write, delete, rename, move, or copy
+calls, and no native source-path DTO fields. The existing managed wall-demo
+cache root was checked without changing it:
+
+```text
+/Users/jennerm/Library/Caches/app.photoviewer.desktop/profiles/wall-demo
+regular_file_count=1566
+symlink_count=0
+resolved_paths_outside_root=0
+cache_root_exists=yes
+```
+
+### Approved behavior and limitations
+
+- Videos remain indexed but stay invisible on photo surfaces until
+  cross-platform playback ships.
+- A wall tile opens only after its current thumbnail paints. Background work
+  runs thumbnails first and previews second.
+- Corrupt photos do not block healthy work.
+- Escape closes Info, then resets zoom, then returns to the wall.
+- The viewer remains dark under system-light appearance.
+- Zoom is cache-only. It does not read or enlarge the original source, and an
+  uncached derivative has no offline recovery path.
+
+The native acceptance build was created, but the native demo was intentionally
+not launched here. The controller still owns the required user acceptance
+observations and must leave the `wall-demo` process in the requested state.
 ```
