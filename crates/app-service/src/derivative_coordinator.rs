@@ -91,10 +91,17 @@ struct JobState {
     ticket: Option<WorkTicket>,
     background_generation: u64,
     commit_background: bool,
+    commit_finishing: bool,
     prerequisite_key: Option<String>,
     foreground_waiters: Vec<oneshot::Sender<Option<DerivativeReference>>>,
     background_waiters: Vec<oneshot::Sender<Option<DerivativeReference>>>,
     completion: Arc<Notify>,
+}
+
+struct CommitDelivery {
+    permit: CommitPermit,
+    completion: Arc<Notify>,
+    waiters: Vec<oneshot::Sender<Option<DerivativeReference>>>,
 }
 
 struct TicketState {
@@ -136,28 +143,39 @@ impl Default for CoordinatorState {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct DerivativeCoordinator {
-    state: Mutex<CoordinatorState>,
+    state: Arc<Mutex<CoordinatorState>>,
     scheduler: Arc<IndexScheduler>,
-    wake: Notify,
-    change_generation: AtomicU64,
+    wake: Arc<Notify>,
+    change_generation: Arc<AtomicU64>,
     #[cfg(test)]
-    wait_test_hook: Mutex<Option<Arc<Notify>>>,
+    wait_test_hook: Arc<Mutex<Option<Arc<Notify>>>>,
     #[cfg(any(test, debug_assertions))]
-    invalidation_wait_test_hook: Mutex<Option<Arc<Notify>>>,
+    invalidation_wait_test_hook: Arc<Mutex<Option<Arc<Notify>>>>,
+    #[cfg(any(test, debug_assertions))]
+    commit_waiter_delivery_test_gate: Arc<Mutex<Option<CommitWaiterDeliveryTestGate>>>,
+}
+
+#[cfg(any(test, debug_assertions))]
+struct CommitWaiterDeliveryTestGate {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
 }
 
 impl DerivativeCoordinator {
     pub(crate) fn new(scheduler: Arc<IndexScheduler>) -> Self {
         Self {
-            state: Mutex::new(CoordinatorState::default()),
+            state: Arc::new(Mutex::new(CoordinatorState::default())),
             scheduler,
-            wake: Notify::new(),
-            change_generation: AtomicU64::new(0),
+            wake: Arc::new(Notify::new()),
+            change_generation: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
-            wait_test_hook: Mutex::new(None),
+            wait_test_hook: Arc::new(Mutex::new(None)),
             #[cfg(any(test, debug_assertions))]
-            invalidation_wait_test_hook: Mutex::new(None),
+            invalidation_wait_test_hook: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, debug_assertions))]
+            commit_waiter_delivery_test_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -170,14 +188,16 @@ impl DerivativeCoordinator {
             ..CoordinatorState::default()
         };
         Self {
-            state: Mutex::new(state),
+            state: Arc::new(Mutex::new(state)),
             scheduler,
-            wake: Notify::new(),
-            change_generation: AtomicU64::new(0),
+            wake: Arc::new(Notify::new()),
+            change_generation: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
-            wait_test_hook: Mutex::new(None),
+            wait_test_hook: Arc::new(Mutex::new(None)),
             #[cfg(any(test, debug_assertions))]
-            invalidation_wait_test_hook: Mutex::new(None),
+            invalidation_wait_test_hook: Arc::new(Mutex::new(None)),
+            #[cfg(any(test, debug_assertions))]
+            commit_waiter_delivery_test_gate: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -280,6 +300,7 @@ impl DerivativeCoordinator {
                             ticket: None,
                             background_generation,
                             commit_background: false,
+                            commit_finishing: false,
                             prerequisite_key,
                             foreground_waiters,
                             background_waiters,
@@ -565,56 +586,154 @@ impl DerivativeCoordinator {
         permit: CommitPermit,
         reference: DerivativeReference,
     ) {
-        let waiters = self.finish_commit(permit).await;
-        for waiter in waiters {
-            let _ = waiter.send(Some(reference.clone()));
-        }
+        let Some(delivery) = self.begin_commit_delivery(permit).await else {
+            return;
+        };
+        let coordinator = self.clone();
+        let delivery_task = tokio::spawn(async move {
+            coordinator.deliver_commit(delivery, Some(reference)).await;
+        });
+        let _ = delivery_task.await;
     }
 
     pub(crate) async fn fail_commit(&self, permit: CommitPermit) {
-        let waiters = self.finish_commit(permit).await;
-        for waiter in waiters {
-            let _ = waiter.send(None);
+        let Some(delivery) = self.begin_commit_delivery(permit).await else {
+            return;
+        };
+        let coordinator = self.clone();
+        let delivery_task = tokio::spawn(async move {
+            coordinator.deliver_commit(delivery, None).await;
+        });
+        let _ = delivery_task.await;
+    }
+
+    pub(crate) async fn abort_attempt(&self, ticket: WorkTicket) {
+        let status = {
+            let state = self.state.lock().await;
+            state
+                .tickets
+                .get(&ticket)
+                .map(|ticket_state| (ticket_state.status, ticket_state.key.selection))
+        };
+        match status {
+            Some((TicketStatus::Running, _)) => {
+                self.discard(ticket).await;
+            }
+            Some((TicketStatus::Committing, selection)) => {
+                let permit = CommitPermit {
+                    job_id: ticket.job_id,
+                    attempt: ticket.attempt,
+                    selection,
+                };
+                self.fail_commit(permit).await;
+            }
+            None => {}
         }
     }
 
-    async fn finish_commit(
+    pub(crate) async fn abort_all_attempts(&self) {
+        let tickets = self
+            .state
+            .lock()
+            .await
+            .tickets
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for ticket in tickets {
+            self.abort_attempt(ticket).await;
+        }
+    }
+
+    async fn begin_commit_delivery(&self, permit: CommitPermit) -> Option<CommitDelivery> {
+        let delivery = {
+            let mut state = self.state.lock().await;
+            let ticket = WorkTicket {
+                job_id: permit.job_id,
+                attempt: permit.attempt,
+            };
+            let ticket_state = state.tickets.get(&ticket)?;
+            if ticket_state.status != TicketStatus::Committing
+                || ticket_state.key.selection != permit.selection
+            {
+                return None;
+            }
+            let key = ticket_state.key.clone();
+            let work = state.jobs.get_mut(&key)?;
+            if work.ticket != Some(ticket)
+                || work.status != JobStatus::Committing
+                || work.commit_finishing
+            {
+                return None;
+            }
+            work.commit_finishing = true;
+            CommitDelivery {
+                permit,
+                completion: work.completion.clone(),
+                waiters: work
+                    .foreground_waiters
+                    .drain(..)
+                    .chain(work.background_waiters.drain(..))
+                    .collect(),
+            }
+        };
+        self.notify_waiters();
+        Some(delivery)
+    }
+
+    async fn deliver_commit(
         &self,
-        permit: CommitPermit,
-    ) -> Vec<oneshot::Sender<Option<DerivativeReference>>> {
-        let waiters = {
+        delivery: CommitDelivery,
+        reference: Option<DerivativeReference>,
+    ) {
+        for waiter in delivery.waiters {
+            let result = reference.clone();
+            let _ = waiter.send(result);
+        }
+        #[cfg(any(test, debug_assertions))]
+        if let Some(gate) = self.commit_waiter_delivery_test_gate.lock().await.take() {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+        self.finish_commit(delivery.permit, delivery.completion)
+            .await;
+    }
+
+    async fn finish_commit(&self, permit: CommitPermit, completion: Arc<Notify>) {
+        let finished = {
             let mut state = self.state.lock().await;
             let ticket = WorkTicket {
                 job_id: permit.job_id,
                 attempt: permit.attempt,
             };
             let Some(ticket_state) = state.tickets.get(&ticket) else {
-                return Vec::new();
+                return;
             };
             if ticket_state.status != TicketStatus::Committing
                 || ticket_state.key.selection != permit.selection
             {
-                return Vec::new();
+                return;
             }
             let key = ticket_state.key.clone();
             let Some(work) = state.jobs.get(&key) else {
                 state.tickets.remove(&ticket);
-                return Vec::new();
+                return;
             };
-            if work.ticket != Some(ticket) || work.status != JobStatus::Committing {
-                return Vec::new();
+            if work.ticket != Some(ticket)
+                || work.status != JobStatus::Committing
+                || !work.commit_finishing
+            {
+                return;
             }
-            work.completion.notify_waiters();
+            completion.notify_waiters();
             let work = state.jobs.remove(&key).expect("job was present");
             state.job_names.remove(&work.job_name);
             state.tickets.remove(&ticket);
-            work.foreground_waiters
-                .into_iter()
-                .chain(work.background_waiters)
-                .collect()
+            true
         };
-        self.notify_waiters();
-        waiters
+        if finished {
+            self.notify_waiters();
+        }
     }
 
     pub(crate) async fn note_recent(&self, asset_id: AssetId) {
@@ -848,6 +967,16 @@ impl DerivativeCoordinator {
     pub(crate) async fn install_invalidation_wait_test_hook(&self, entered: Arc<Notify>) {
         *self.invalidation_wait_test_hook.lock().await = Some(entered);
     }
+
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) async fn install_commit_waiter_delivery_test_gate(
+        &self,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    ) {
+        *self.commit_waiter_delivery_test_gate.lock().await =
+            Some(CommitWaiterDeliveryTestGate { entered, release });
+    }
 }
 
 pub(crate) fn scheduler_priority(lane: WorkLane) -> JobPriority {
@@ -868,6 +997,7 @@ mod tests {
     use photo_catalog::WallCursorKey;
     use photo_domain::{AssetId, FolderGroupId, LibraryId};
     use photo_indexer::{IndexScheduler, SchedulerConfig};
+    use tokio::sync::Notify;
 
     use super::{
         CollectionPhase, DerivativeClass, DerivativeCoordinator, DerivativeReference, WorkKey,
@@ -1554,5 +1684,83 @@ mod tests {
             .await;
         invalidator.await.unwrap();
         assert_eq!(waiter.await.unwrap(), Some(reference()));
+    }
+
+    #[tokio::test]
+    async fn invalidation_waits_until_success_waiters_are_delivered() {
+        let fixture = fixture();
+        let mut waiter = fixture.enqueue(screen_key(), WorkLane::IdlePreview).await;
+        let ticket = fixture.coordinator.next_work().await.unwrap();
+        let permit = fixture
+            .coordinator
+            .admit_commit(ticket, fixture.selection, None)
+            .await
+            .unwrap();
+        let delivery_entered = Arc::new(Notify::new());
+        let delivery_release = Arc::new(Notify::new());
+        fixture
+            .coordinator
+            .install_commit_waiter_delivery_test_gate(
+                delivery_entered.clone(),
+                delivery_release.clone(),
+            )
+            .await;
+
+        let invalidator = {
+            let coordinator = fixture.coordinator.clone();
+            tokio::spawn(async move { coordinator.invalidate_background().await })
+        };
+        let completer = {
+            let coordinator = fixture.coordinator.clone();
+            tokio::spawn(async move { coordinator.complete_commit(permit, reference()).await })
+        };
+        delivery_entered.notified().await;
+
+        assert!(!invalidator.is_finished());
+        assert_eq!(waiter.try_recv().unwrap(), Some(reference()));
+        delivery_release.notify_waiters();
+        completer.await.unwrap();
+        invalidator.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalidation_waits_until_failure_waiters_are_delivered() {
+        let fixture = fixture();
+        let mut waiter = fixture.enqueue(screen_key(), WorkLane::IdlePreview).await;
+        let ticket = fixture.coordinator.next_work().await.unwrap();
+        let permit = fixture
+            .coordinator
+            .admit_commit(ticket, fixture.selection, None)
+            .await
+            .unwrap();
+        let mut foreground = fixture.enqueue(screen_key(), WorkLane::ViewerPreview).await;
+        let delivery_entered = Arc::new(Notify::new());
+        let delivery_release = Arc::new(Notify::new());
+        fixture
+            .coordinator
+            .install_commit_waiter_delivery_test_gate(
+                delivery_entered.clone(),
+                delivery_release.clone(),
+            )
+            .await;
+
+        let invalidator = {
+            let coordinator = fixture.coordinator.clone();
+            tokio::spawn(async move { coordinator.invalidate_background().await })
+        };
+        let failure = {
+            let coordinator = fixture.coordinator.clone();
+            tokio::spawn(async move { coordinator.fail_commit(permit).await })
+        };
+        delivery_entered.notified().await;
+
+        assert!(!invalidator.is_finished());
+        assert_eq!(waiter.try_recv().unwrap(), None);
+        assert_eq!(foreground.try_recv().unwrap(), None);
+        assert!(waiter.try_recv().is_err());
+        assert!(foreground.try_recv().is_err());
+        delivery_release.notify_waiters();
+        failure.await.unwrap();
+        invalidator.await.unwrap();
     }
 }

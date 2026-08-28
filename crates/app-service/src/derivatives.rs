@@ -489,7 +489,9 @@ impl AppService {
             }));
         }
         for worker in workers {
-            let _ = worker.await;
+            if worker.await.is_err() {
+                self.coordinator.abort_all_attempts().await;
+            }
         }
     }
 
@@ -507,46 +509,75 @@ impl AppService {
             let Some(key) = self.coordinator.work_key(ticket).await else {
                 continue;
             };
-            let selection = key.selection;
-            let asset_id = key.asset_id;
-            let class = key.class;
-            let outcome = if self.selection_is_active(selection) {
-                self.generate_derivative(ticket, key).await
-            } else {
-                Err(GenerationFailure {
-                    error: DerivativeWorkError::WorkerUnavailable,
-                    permit: None,
-                })
-            };
-            match outcome {
-                Ok(GeneratedWork { reference, permit }) => {
-                    self.clear_derivative_warnings(selection, asset_id, class);
-                    self.publish_derivatives_if_active(selection, vec![reference.clone()]);
-                    self.coordinator.complete_commit(permit, reference).await;
-                }
-                Err(GenerationFailure { error, permit }) => {
-                    if !matches!(error, DerivativeWorkError::PreviewSuperseded)
-                        && !matches!(error, DerivativeWorkError::WallThumbnailRequired)
-                    {
-                        match error.scope() {
-                            DerivativeFailureScope::Asset => {
-                                self.record_asset_derivative_warning(selection, asset_id);
-                            }
-                            DerivativeFailureScope::CacheWide => {
-                                self.record_cache_derivative_warning(selection, class);
-                            }
+            self.run_derivative_attempt_supervised(ticket, key).await;
+        }
+    }
+
+    async fn run_derivative_attempt_supervised(&self, ticket: WorkTicket, key: WorkKey) {
+        let service = self.clone();
+        let attempt = tokio::spawn(async move {
+            service.process_derivative_attempt(ticket, key).await;
+        });
+        #[cfg(any(test, debug_assertions))]
+        {
+            let attempt_abort_handle = attempt.abort_handle();
+            self.register_derivative_attempt_abort_handle(ticket, attempt_abort_handle)
+                .await;
+        }
+        let monitor_service = self.clone();
+        let monitor = tokio::spawn(async move {
+            let joined = attempt.await;
+            #[cfg(any(test, debug_assertions))]
+            monitor_service
+                .clear_derivative_attempt_abort_handle(ticket)
+                .await;
+            if joined.is_err() {
+                monitor_service.coordinator.abort_attempt(ticket).await;
+            }
+        });
+        let _ = monitor.await;
+    }
+
+    async fn process_derivative_attempt(&self, ticket: WorkTicket, key: WorkKey) {
+        let selection = key.selection;
+        let asset_id = key.asset_id;
+        let class = key.class;
+        let outcome = if self.selection_is_active(selection) {
+            self.generate_derivative(ticket, key).await
+        } else {
+            Err(GenerationFailure {
+                error: DerivativeWorkError::WorkerUnavailable,
+                permit: None,
+            })
+        };
+        match outcome {
+            Ok(GeneratedWork { reference, permit }) => {
+                self.clear_derivative_warnings(selection, asset_id, class);
+                self.publish_derivatives_if_active(selection, vec![reference.clone()]);
+                self.coordinator.complete_commit(permit, reference).await;
+            }
+            Err(GenerationFailure { error, permit }) => {
+                if !matches!(error, DerivativeWorkError::PreviewSuperseded)
+                    && !matches!(error, DerivativeWorkError::WallThumbnailRequired)
+                {
+                    match error.scope() {
+                        DerivativeFailureScope::Asset => {
+                            self.record_asset_derivative_warning(selection, asset_id);
+                        }
+                        DerivativeFailureScope::CacheWide => {
+                            self.record_cache_derivative_warning(selection, class);
                         }
                     }
-                    if let Some(permit) = permit {
-                        self.coordinator.fail_commit(permit).await;
-                    } else {
-                        self.coordinator.discard(ticket).await;
-                    }
+                }
+                if let Some(permit) = permit {
+                    self.coordinator.fail_commit(permit).await;
+                } else {
+                    self.coordinator.discard(ticket).await;
                 }
             }
-            #[cfg(any(test, debug_assertions))]
-            self.notify_derivative_completion_test_hook().await;
         }
+        #[cfg(any(test, debug_assertions))]
+        self.notify_derivative_completion_test_hook().await;
     }
 
     async fn generate_derivative(
@@ -717,6 +748,13 @@ impl AppService {
                 #[cfg(any(test, debug_assertions))]
                 self.wait_for_screen_preview_post_admission_test_gate(id)
                     .await;
+                #[cfg(any(test, debug_assertions))]
+                if self
+                    .consume_derivative_panic_after_admission_test_hook()
+                    .await
+                {
+                    panic!("injected derivative worker panic after commit admission");
+                }
                 let cache_budget = self.cache_budget;
                 let protected = self.protected_groups.clone();
                 let cache_root = self.cache_root.clone();
@@ -928,6 +966,34 @@ impl AppService {
         }
     }
 
+    #[cfg(any(test, debug_assertions))]
+    async fn register_derivative_attempt_abort_handle(
+        &self,
+        ticket: WorkTicket,
+        handle: tokio::task::AbortHandle,
+    ) {
+        *self.derivative_attempt_abort_handle.lock().await = Some((ticket, handle));
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    async fn clear_derivative_attempt_abort_handle(&self, ticket: WorkTicket) {
+        let mut stored = self.derivative_attempt_abort_handle.lock().await;
+        if stored
+            .as_ref()
+            .is_some_and(|(stored_ticket, _)| *stored_ticket == ticket)
+        {
+            *stored = None;
+        }
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    async fn consume_derivative_panic_after_admission_test_hook(&self) -> bool {
+        let mut hook = self.derivative_panic_after_admission_test_hook.lock().await;
+        let panic = *hook;
+        *hook = false;
+        panic
+    }
+
     /// Installs a deterministic derivative boundary for integration tests.
     #[cfg(debug_assertions)]
     #[doc(hidden)]
@@ -1018,6 +1084,35 @@ impl AppService {
     #[doc(hidden)]
     pub async fn install_derivative_completion_test_hook(&self, marker: Arc<tokio::sync::Notify>) {
         *self.derivative_completion_test_hook.lock().await = Some(marker);
+    }
+
+    /// Aborts the currently supervised derivative attempt in deterministic tests.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn abort_derivative_attempt_for_test(&self) {
+        if let Some((_, handle)) = self.derivative_attempt_abort_handle.lock().await.take() {
+            handle.abort();
+        }
+    }
+
+    /// Panics the currently supervised derivative attempt after admission.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_derivative_panic_after_admission_test_hook(&self) {
+        *self.derivative_panic_after_admission_test_hook.lock().await = true;
+    }
+
+    /// Holds commit completion after waiter delivery and before invalidation is released.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_commit_waiter_delivery_test_gate(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) {
+        self.coordinator
+            .install_commit_waiter_delivery_test_gate(entered, release)
+            .await;
     }
 
     /// Installs a cache budget for deterministic managed-cache tests.

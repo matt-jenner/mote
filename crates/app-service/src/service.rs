@@ -144,6 +144,17 @@ pub struct AppService {
     pub(crate) screen_preview_post_admission_test_gate: Arc<TokioMutex<Option<DerivativeTestGate>>>,
     #[cfg(any(test, debug_assertions))]
     pub(crate) derivative_completion_test_hook: Arc<TokioMutex<Option<Arc<Notify>>>>,
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) derivative_attempt_abort_handle: Arc<
+        TokioMutex<
+            Option<(
+                crate::derivative_coordinator::WorkTicket,
+                tokio::task::AbortHandle,
+            )>,
+        >,
+    >,
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) derivative_panic_after_admission_test_hook: Arc<TokioMutex<bool>>,
     #[cfg(debug_assertions)]
     pub(crate) derivative_request_test_hook: Arc<TokioMutex<Option<DerivativeRequestTestHook>>>,
     #[cfg(debug_assertions)]
@@ -251,6 +262,10 @@ impl AppService {
             screen_preview_post_admission_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]
             derivative_completion_test_hook: Arc::new(TokioMutex::new(None)),
+            #[cfg(any(test, debug_assertions))]
+            derivative_attempt_abort_handle: Arc::new(TokioMutex::new(None)),
+            #[cfg(any(test, debug_assertions))]
+            derivative_panic_after_admission_test_hook: Arc::new(TokioMutex::new(false)),
             #[cfg(debug_assertions)]
             derivative_request_test_hook: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]

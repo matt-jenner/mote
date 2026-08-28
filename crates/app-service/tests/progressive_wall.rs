@@ -132,39 +132,69 @@ fn managed_cache_files(root: &Path) -> BTreeSet<PathBuf> {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct CacheCatalogWarningSnapshot {
-    cache_files: BTreeSet<PathBuf>,
-    derivatives: Vec<(String, String, PathBuf, u64, bool)>,
-    source_warnings: Vec<String>,
+struct DerivativeSnapshot {
+    asset_id: String,
+    folder_group_id: String,
+    kind: String,
+    cache_key: String,
+    relative_cache_path: PathBuf,
+    size_bytes: u64,
+    durable: bool,
 }
 
-fn snapshot_cache_catalog_warnings(config: &AppConfig) -> CacheCatalogWarningSnapshot {
+#[derive(Debug, Eq, PartialEq)]
+struct CacheCatalogWarningSnapshot {
+    cache_files: BTreeSet<PathBuf>,
+    derivatives: Vec<DerivativeSnapshot>,
+    source_warnings: Vec<String>,
+    asset_warnings: Vec<String>,
+}
+
+fn snapshot_cache_catalog_warnings(
+    config: &AppConfig,
+    asset_id: &str,
+) -> CacheCatalogWarningSnapshot {
     let catalog = Catalog::open(&config.catalog_path()).unwrap();
     let active_selection = catalog.load_app_state().unwrap().active_selection.unwrap();
+    let asset_id = AssetId::from_uuid(uuid::Uuid::parse_str(asset_id).unwrap());
+    let active_group = catalog
+        .folder_group_for_path(
+            active_selection.library_id,
+            &active_selection.relative_folder,
+        )
+        .unwrap()
+        .unwrap();
     let source_warnings = catalog
         .source_warning_summaries(active_selection.library_id)
         .unwrap()
         .into_iter()
         .map(|warning| warning.code)
         .collect();
+    let asset_warnings = catalog
+        .wall_records_for_assets(active_group, &[asset_id])
+        .unwrap()
+        .into_iter()
+        .filter_map(|record| record.warning_code)
+        .collect();
     let derivatives = catalog
         .all_derivatives()
         .unwrap()
         .into_iter()
-        .map(|record| {
-            (
-                record.kind,
-                record.cache_key,
-                record.relative_cache_path,
-                record.size_bytes,
-                record.durable,
-            )
+        .map(|record| DerivativeSnapshot {
+            asset_id: record.asset_id.as_uuid().hyphenated().to_string(),
+            folder_group_id: record.folder_group_id.as_uuid().hyphenated().to_string(),
+            kind: record.kind,
+            cache_key: record.cache_key,
+            relative_cache_path: record.relative_cache_path,
+            size_bytes: record.size_bytes,
+            durable: record.durable,
         })
         .collect();
     CacheCatalogWarningSnapshot {
         cache_files: managed_cache_files(config.cache_dir()),
         derivatives,
         source_warnings,
+        asset_warnings,
     }
 }
 
@@ -223,28 +253,81 @@ fn seed_evictable_screen_preview_and_warning(fixture: &ProgressiveFixture, asset
             message: "seeded test warning".to_owned(),
         })
         .unwrap();
+    catalog
+        .record_warning_once(&CatalogWarningRecord {
+            library_id: active_selection.library_id,
+            asset_id: Some(asset_id),
+            code: "derivative_generation_failed".to_owned(),
+            message: "seeded asset warning".to_owned(),
+        })
+        .unwrap();
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct WarningClearObservation {
+    selection_id: String,
+    source_id: String,
+    asset_id: Option<String>,
+    code: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DerivativeUpdateObservation {
+    screen_publications: Vec<(String, DerivativeReference)>,
+    warning_count: usize,
+    warning_clears: Vec<WarningClearObservation>,
+}
+
+fn derivative_update_observation(
+    updates: &mut tokio::sync::broadcast::Receiver<WallUpdate>,
+) -> DerivativeUpdateObservation {
+    let mut screen_publications = Vec::new();
+    let mut warning_count = 0;
+    let mut warning_clears = Vec::new();
+    while let Ok(event) = updates.try_recv() {
+        match event {
+            WallUpdate::DerivativesReady {
+                selection_id,
+                derivatives,
+            } => {
+                screen_publications.extend(
+                    derivatives
+                        .into_iter()
+                        .filter(|derivative| derivative.kind == DerivativeClass::ScreenPreview)
+                        .map(|derivative| (selection_id.clone(), derivative)),
+                );
+            }
+            WallUpdate::Warning { .. } => warning_count += 1,
+            WallUpdate::WarningCleared {
+                selection_id,
+                source_id,
+                asset_id,
+                code,
+            } => warning_clears.push(WarningClearObservation {
+                selection_id,
+                source_id,
+                asset_id,
+                code,
+            }),
+            _ => {}
+        }
+    }
+    DerivativeUpdateObservation {
+        screen_publications,
+        warning_count,
+        warning_clears,
+    }
 }
 
 fn derivative_update_counts(
     updates: &mut tokio::sync::broadcast::Receiver<WallUpdate>,
 ) -> (usize, usize, usize) {
-    let mut screen_publications = 0;
-    let mut warnings = 0;
-    let mut warning_clears = 0;
-    while let Ok(event) = updates.try_recv() {
-        match event {
-            WallUpdate::DerivativesReady { derivatives, .. } => {
-                screen_publications += derivatives
-                    .iter()
-                    .filter(|derivative| derivative.kind == DerivativeClass::ScreenPreview)
-                    .count();
-            }
-            WallUpdate::Warning { .. } => warnings += 1,
-            WallUpdate::WarningCleared { .. } => warning_clears += 1,
-            _ => {}
-        }
-    }
-    (screen_publications, warnings, warning_clears)
+    let observation = derivative_update_observation(updates);
+    (
+        observation.screen_publications.len(),
+        observation.warning_count,
+        observation.warning_clears.len(),
+    )
 }
 
 impl ProgressiveFixture {
@@ -2006,7 +2089,7 @@ async fn invalidation_before_commit_admission_has_no_side_effects() {
         let (fixture, mut service, asset_id) = prepare_wall_ready_fixture().await;
         seed_evictable_screen_preview_and_warning(&fixture, &asset_id);
         service.set_derivative_cache_budget_for_test(CacheBudget::from_total_space(1_000_000));
-        let before = snapshot_cache_catalog_warnings(&fixture.config);
+        let before = snapshot_cache_catalog_warnings(&fixture.config, &asset_id);
         let mut updates = service.subscribe_wall_updates();
 
         let post_encode_entered = Arc::new(tokio::sync::Notify::new());
@@ -2057,7 +2140,7 @@ async fn invalidation_before_commit_admission_has_no_side_effects() {
             .await
             .expect("stale worker should finish after admission is rejected");
 
-        let after = snapshot_cache_catalog_warnings(&fixture.config);
+        let after = snapshot_cache_catalog_warnings(&fixture.config, &asset_id);
         assert_eq!(after, before);
         assert_eq!(commits.load(Ordering::SeqCst), 0);
         assert_eq!(derivative_update_counts(&mut updates), (0, 0, 0));
@@ -2071,6 +2154,21 @@ async fn admitted_commit_finishes_before_later_invalidation() {
         let (fixture, mut service, asset_id) = prepare_wall_ready_fixture().await;
         seed_evictable_screen_preview_and_warning(&fixture, &asset_id);
         service.set_derivative_cache_budget_for_test(CacheBudget::from_total_space(1_000_000));
+        let expected_selection_id = service.active_selection_id().unwrap();
+        let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+        let active_selection = catalog.load_app_state().unwrap().active_selection.unwrap();
+        let expected_group = catalog
+            .folder_group_for_path(
+                active_selection.library_id,
+                &active_selection.relative_folder,
+            )
+            .unwrap()
+            .unwrap();
+        let expected_source_id = active_selection
+            .library_id
+            .as_uuid()
+            .hyphenated()
+            .to_string();
         let mut updates = service.subscribe_wall_updates();
         let commits = Arc::new(AtomicUsize::new(0));
         service
@@ -2101,13 +2199,21 @@ async fn admitted_commit_finishes_before_later_invalidation() {
         service
             .install_background_invalidation_wait_test_hook(invalidation_waiting.clone())
             .await;
+        let waiter_delivery_entered = Arc::new(tokio::sync::Notify::new());
+        let waiter_delivery_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_commit_waiter_delivery_test_gate(
+                waiter_delivery_entered.clone(),
+                waiter_delivery_release.clone(),
+            )
+            .await;
 
         service
             .set_interaction(photo_app_service::InteractionState::Idle)
             .await;
         let background_service = service.clone();
         let background_asset = asset_id.clone();
-        let background = tokio::spawn(async move {
+        let mut background = tokio::spawn(async move {
             background_service
                 .request_derivatives(DerivativeRequest {
                     asset_ids: vec![background_asset],
@@ -2140,31 +2246,43 @@ async fn admitted_commit_finishes_before_later_invalidation() {
         assert!(!visible.is_finished());
 
         post_admission_release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), waiter_delivery_entered.notified())
+            .await
+            .expect("admitted worker should deliver its waiter before completion notification");
+        let background_result = tokio::time::timeout(Duration::from_secs(5), &mut background)
+            .await
+            .expect("background waiter should resolve before invalidation is released")
+            .expect("background request task panicked");
+        assert!(background_result.is_ok());
+        assert!(!visible.is_finished());
+        waiter_delivery_release.notify_waiters();
         tokio::time::timeout(Duration::from_secs(5), completed.notified())
             .await
             .expect("admitted worker should finish its complete-commit path");
-        let background_result = background.await.unwrap();
-        assert!(
-            background_result.is_ok(),
-            "background result: {background_result:?}"
-        );
         assert!(visible.await.unwrap().is_ok());
 
-        let snapshot = snapshot_cache_catalog_warnings(&fixture.config);
+        let snapshot = snapshot_cache_catalog_warnings(&fixture.config, &asset_id);
         assert_eq!(commits.load(Ordering::SeqCst), 1);
+        let screen_rows = snapshot
+            .derivatives
+            .iter()
+            .filter(|record| record.kind == "screen_preview")
+            .collect::<Vec<_>>();
+        assert_eq!(screen_rows.len(), 1);
+        let screen_row = screen_rows[0];
+        assert_eq!(screen_row.asset_id, asset_id);
         assert_eq!(
-            snapshot
-                .derivatives
-                .iter()
-                .filter(|(kind, ..)| kind == "screen_preview")
-                .count(),
-            1
+            screen_row.folder_group_id,
+            expected_group.as_uuid().hyphenated().to_string()
         );
+        assert_ne!(screen_row.cache_key, "evictable-screen-preview");
         assert!(
-            snapshot
-                .derivatives
-                .iter()
-                .all(|(_, key, ..)| key != "evictable-screen-preview")
+            snapshot.cache_files.contains(
+                &fixture
+                    .config
+                    .cache_dir()
+                    .join(&screen_row.relative_cache_path)
+            )
         );
         assert!(
             !snapshot
@@ -2173,7 +2291,187 @@ async fn admitted_commit_finishes_before_later_invalidation() {
                 .any(|path| path.ends_with("evictable/old-preview.jpg"))
         );
         assert!(snapshot.source_warnings.is_empty());
-        assert_eq!(derivative_update_counts(&mut updates), (1, 0, 1));
+        assert!(snapshot.asset_warnings.is_empty());
+        let updates_observed = derivative_update_observation(&mut updates);
+        assert_eq!(updates_observed.warning_count, 0);
+        assert_eq!(updates_observed.screen_publications.len(), 1);
+        let (selection_id, publication) = &updates_observed.screen_publications[0];
+        assert_eq!(selection_id, &expected_selection_id);
+        assert_eq!(publication.asset_id, asset_id);
+        assert_eq!(publication.kind, DerivativeClass::ScreenPreview);
+        assert_eq!(publication.key, screen_row.cache_key);
+        assert_eq!(
+            updates_observed.warning_clears,
+            vec![
+                WarningClearObservation {
+                    selection_id: expected_selection_id.clone(),
+                    source_id: expected_source_id.clone(),
+                    asset_id: Some(asset_id.clone()),
+                    code: "derivativeUnavailable".to_owned(),
+                },
+                WarningClearObservation {
+                    selection_id: expected_selection_id,
+                    source_id: expected_source_id,
+                    asset_id: None,
+                    code: "screenPreviewCacheUnavailable".to_owned(),
+                },
+            ]
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admitted_preview_cancellation_fails_waiters_and_releases_invalidation() {
+    for _ in 0..20 {
+        let (fixture, service, asset_id) = prepare_wall_ready_fixture().await;
+        let post_admission_entered = Arc::new(tokio::sync::Notify::new());
+        let post_admission_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_screen_preview_post_admission_test_gate(
+                post_admission_entered.clone(),
+                post_admission_release,
+            )
+            .await;
+        let invalidation_waiting = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_background_invalidation_wait_test_hook(invalidation_waiting.clone())
+            .await;
+
+        service
+            .set_interaction(photo_app_service::InteractionState::Idle)
+            .await;
+        let background_service = service.clone();
+        let background_asset = asset_id.clone();
+        let mut background = tokio::spawn(async move {
+            background_service
+                .request_derivatives(DerivativeRequest {
+                    asset_ids: vec![background_asset],
+                    priority: photo_app_service::DerivativePriority::NearViewport,
+                    kind: DerivativeClass::ScreenPreview,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), post_admission_entered.notified())
+            .await
+            .expect("screen preview should reach the admitted cancellation gate");
+
+        service
+            .set_interaction(photo_app_service::InteractionState::Active)
+            .await;
+        let visible_service = service.clone();
+        let visible_asset = asset_id.clone();
+        let visible = tokio::spawn(async move {
+            visible_service
+                .request_derivatives(DerivativeRequest::visible(vec![visible_asset]))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), invalidation_waiting.notified())
+            .await
+            .expect("visible invalidation should wait on the admitted attempt");
+
+        service.abort_derivative_attempt_for_test().await;
+        let background_result = tokio::time::timeout(Duration::from_secs(5), &mut background)
+            .await
+            .expect("cancellation should resolve the background waiter")
+            .expect("background request task panicked");
+        assert!(background_result.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), visible)
+                .await
+                .expect("invalidation should be released after cancellation")
+                .expect("visible request task panicked")
+                .is_ok()
+        );
+        assert_eq!(
+            Catalog::open(&fixture.config.catalog_path())
+                .unwrap()
+                .all_derivatives()
+                .unwrap()
+                .into_iter()
+                .filter(|record| record.kind == "screen_preview")
+                .count(),
+            0
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admitted_preview_panic_fails_waiters_and_releases_invalidation() {
+    for _ in 0..20 {
+        let (fixture, service, asset_id) = prepare_wall_ready_fixture().await;
+        let post_admission_entered = Arc::new(tokio::sync::Notify::new());
+        let post_admission_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_screen_preview_post_admission_test_gate(
+                post_admission_entered.clone(),
+                post_admission_release.clone(),
+            )
+            .await;
+        let invalidation_waiting = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_background_invalidation_wait_test_hook(invalidation_waiting.clone())
+            .await;
+
+        service
+            .set_interaction(photo_app_service::InteractionState::Idle)
+            .await;
+        let background_service = service.clone();
+        let background_asset = asset_id.clone();
+        let mut background = tokio::spawn(async move {
+            background_service
+                .request_derivatives(DerivativeRequest {
+                    asset_ids: vec![background_asset],
+                    priority: photo_app_service::DerivativePriority::NearViewport,
+                    kind: DerivativeClass::ScreenPreview,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), post_admission_entered.notified())
+            .await
+            .expect("screen preview should reach the admitted panic gate");
+
+        service
+            .set_interaction(photo_app_service::InteractionState::Active)
+            .await;
+        let visible_service = service.clone();
+        let visible_asset = asset_id.clone();
+        let visible = tokio::spawn(async move {
+            visible_service
+                .request_derivatives(DerivativeRequest::visible(vec![visible_asset]))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), invalidation_waiting.notified())
+            .await
+            .expect("visible invalidation should wait on the admitted attempt");
+
+        service
+            .install_derivative_panic_after_admission_test_hook()
+            .await;
+        post_admission_release.notify_waiters();
+        let background_result = tokio::time::timeout(Duration::from_secs(5), &mut background)
+            .await
+            .expect("panic supervision should resolve the background waiter")
+            .expect("background request task panicked");
+        assert!(background_result.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), visible)
+                .await
+                .expect("invalidation should be released after panic")
+                .expect("visible request task panicked")
+                .is_ok()
+        );
+        assert_eq!(
+            Catalog::open(&fixture.config.catalog_path())
+                .unwrap()
+                .all_derivatives()
+                .unwrap()
+                .into_iter()
+                .filter(|record| record.kind == "screen_preview")
+                .count(),
+            0
+        );
     }
 }
 
