@@ -1061,6 +1061,7 @@ describe("progressive photo wall", () => {
 
 	it("reveals a cached image when its load event does not reach React", async () => {
 		const service = new ControlledWallService();
+		const onOpen = vi.fn();
 		service.setDerivativeUrl(
 			"cached-completion",
 			"/demo-photos/coast.jpg?cached-completion=1",
@@ -1085,11 +1086,12 @@ describe("progressive photo wall", () => {
 		const suppressImageLoad = (event: Event) => {
 			event.stopImmediatePropagation();
 		};
+		const restoreReducedMotion = overrideReducedMotion(false);
 		window.addEventListener("load", suppressImageLoad, true);
 		document.addEventListener("load", suppressImageLoad, true);
 		try {
 			const screen = await render(
-				<PhotoTile positioned={positioned} service={service} />,
+				<PhotoTile onOpen={onOpen} positioned={positioned} service={service} />,
 			);
 			const image = screen.getByRole("img", { name: "Coast" });
 			await expect
@@ -1104,15 +1106,35 @@ describe("progressive photo wall", () => {
 			await expect
 				.poll(() => getComputedStyle(image.element()).opacity)
 				.toBe("1");
+			expect(
+				screen.getByRole("button", { name: "Open Coast", exact: true }).query(),
+			).toBeNull();
+			image.element().dispatchEvent(
+				new TransitionEvent("transitionend", {
+					bubbles: true,
+					propertyName: "opacity",
+				}),
+			);
+			await expect
+				.element(
+					screen.getByRole("button", { name: "Open Coast", exact: true }),
+				)
+				.toBeVisible();
+			await screen
+				.getByRole("button", { name: "Open Coast", exact: true })
+				.click();
+			expect(onOpen).toHaveBeenCalledTimes(1);
 			screen.unmount();
 		} finally {
 			window.removeEventListener("load", suppressImageLoad, true);
 			document.removeEventListener("load", suppressImageLoad, true);
+			restoreReducedMotion();
 		}
 	});
 
 	it("keeps a screen-preview-only tile inert until its wall thumbnail is ready", async () => {
 		const service = new ControlledWallService();
+		const onOpen = vi.fn();
 		const positioned = {
 			asset: asset("screen-only", "Screen only", 1, {
 				wallThumbnail: null,
@@ -1128,9 +1150,14 @@ describe("progressive photo wall", () => {
 		};
 
 		const screen = await render(
-			<PhotoTile positioned={positioned} service={service} />,
+			<PhotoTile onOpen={onOpen} positioned={positioned} service={service} />,
 		);
 
+		expect(
+			service.derivativeRequests.filter(
+				(request) => request.kind === "screenPreview",
+			),
+		).toHaveLength(0);
 		expect(
 			screen
 				.getByRole("button", { name: "Open Screen only", exact: true })
@@ -1139,11 +1166,13 @@ describe("progressive photo wall", () => {
 		expect(
 			document.querySelector("[data-asset-id='screen-only']")?.tagName,
 		).toBe("FIGURE");
+		expect(onOpen).not.toHaveBeenCalled();
 		await screen.unmount();
 	});
 
 	it("keeps the current tile inert through decode and fade, then enables it", async () => {
 		const service = new ControlledWallService();
+		const onOpen = vi.fn();
 		service.setDerivativeUrl(
 			"paint-before-open",
 			"/demo-photos/coast.jpg?paint-before-open=1",
@@ -1172,7 +1201,7 @@ describe("progressive photo wall", () => {
 		};
 		try {
 			const screen = await render(
-				<PhotoTile positioned={positioned} service={service} />,
+				<PhotoTile onOpen={onOpen} positioned={positioned} service={service} />,
 			);
 			const image = screen.getByRole("img", { name: "Photo A" });
 			expect(
@@ -1206,6 +1235,7 @@ describe("progressive photo wall", () => {
 				)
 				.toBeVisible();
 			expect(getComputedStyle(image.element()).opacity).toBe("1");
+			expect(onOpen).not.toHaveBeenCalled();
 			screen.unmount();
 		} finally {
 			restoreLoadCapture();
@@ -1216,6 +1246,7 @@ describe("progressive photo wall", () => {
 
 	it("ignores a stale opacity transition after a thumbnail URL replacement", async () => {
 		const service = new ControlledWallService();
+		const onOpen = vi.fn();
 		service.setDerivativeUrl("paint-old", "/demo-photos/coast.jpg?paint-old=1");
 		service.setDerivativeUrl(
 			"paint-new",
@@ -1260,7 +1291,11 @@ describe("progressive photo wall", () => {
 					<button onClick={() => setKey("paint-new")} type="button">
 						Replace thumbnail
 					</button>
-					<PhotoTile positioned={positioned} service={service} />
+					<PhotoTile
+						onOpen={onOpen}
+						positioned={positioned}
+						service={service}
+					/>
 				</>
 			);
 		}
@@ -1276,6 +1311,7 @@ describe("progressive photo wall", () => {
 					.getByRole("button", { name: "Open Photo A", exact: true })
 					.query(),
 			).toBeNull();
+			expect(onOpen).not.toHaveBeenCalled();
 
 			await screen.getByRole("button", { name: "Replace thumbnail" }).click();
 			await expect
@@ -1397,6 +1433,203 @@ describe("progressive photo wall", () => {
 		}
 	});
 
+	it("cancels a stale reduced-motion frame when the thumbnail URL changes", async () => {
+		const service = new ControlledWallService();
+		service.setDerivativeUrl(
+			"reduced-old",
+			"/demo-photos/coast.jpg?reduced-old=1",
+		);
+		service.setDerivativeUrl(
+			"reduced-new",
+			"/demo-photos/forest.jpg?reduced-new=1",
+		);
+		const oldDecode = gate<void>();
+		const newDecode = gate<void>();
+		let oldComplete = false;
+		let newComplete = false;
+		const onOpen = vi.fn();
+		const restoreImageRuntime = overrideImageRuntime({
+			complete: (image) =>
+				image.src.includes("reduced-new") ? newComplete : oldComplete,
+			naturalWidth: (image) =>
+				image.src.includes("reduced-new")
+					? newComplete
+						? 320
+						: 0
+					: oldComplete
+						? 320
+						: 0,
+			decode: (image) =>
+				image.src.includes("reduced-new")
+					? newDecode.promise
+					: oldDecode.promise,
+		});
+		const restoreReducedMotion = overrideReducedMotion(true);
+		const originalRequestAnimationFrame = window.requestAnimationFrame;
+		const originalCancelAnimationFrame = window.cancelAnimationFrame;
+		const frames = new Map<number, FrameRequestCallback>();
+		let nextFrame = 0;
+		let frameRequests = 0;
+		window.requestAnimationFrame = (callback) => {
+			const id = ++nextFrame;
+			frameRequests += 1;
+			frames.set(id, callback);
+			return id;
+		};
+		window.cancelAnimationFrame = (id) => {
+			frames.delete(id);
+		};
+		const restoreLoadCapture = suppressCapture("load");
+		function SwapHarness() {
+			const [key, setKey] = useState("reduced-old");
+			const positioned = {
+				asset: asset("reduced-replacement", "Photo A", 1, {
+					wallThumbnail: {
+						assetId: "reduced-replacement",
+						kind: "wallThumbnail" as const,
+						key,
+					},
+				}),
+				left: 0,
+				width: 320,
+				height: 220,
+			};
+			return (
+				<>
+					<button onClick={() => setKey("reduced-new")} type="button">
+						Replace thumbnail
+					</button>
+					<PhotoTile
+						onOpen={onOpen}
+						positioned={positioned}
+						service={service}
+					/>
+				</>
+			);
+		}
+		try {
+			const screen = await render(<SwapHarness />);
+			const image = screen.getByRole("img", { name: "Photo A" });
+			const initialFrameRequests = frameRequests;
+			oldComplete = true;
+			image.element().dispatchEvent(new Event("load"));
+			oldDecode.resolve();
+			await expect.poll(() => frameRequests).toBe(initialFrameRequests + 1);
+			const oldFrameId = [...frames.keys()].at(-1);
+			if (oldFrameId === undefined)
+				throw new Error("missing stale paint frame");
+			const oldFrame = frames.get(oldFrameId);
+			if (!oldFrame) throw new Error("missing stale paint callback");
+
+			await screen.getByRole("button", { name: "Replace thumbnail" }).click();
+			await expect
+				.poll(() => image.element().getAttribute("src"))
+				.toContain("reduced-new=1");
+			expect(frames.has(oldFrameId)).toBe(false);
+			oldFrame(performance.now());
+			expect(
+				screen
+					.getByRole("button", { name: "Open Photo A", exact: true })
+					.query(),
+			).toBeNull();
+
+			const beforeNewDecode = frameRequests;
+			newComplete = true;
+			newDecode.resolve();
+			await expect.poll(() => frameRequests).toBe(beforeNewDecode + 1);
+			const newFrameId = [...frames.keys()].at(-1);
+			if (newFrameId === undefined)
+				throw new Error("missing current paint frame");
+			const newFrame = frames.get(newFrameId);
+			if (!newFrame) throw new Error("missing current paint callback");
+			frames.delete(newFrameId);
+			newFrame(performance.now());
+			await expect
+				.element(
+					screen.getByRole("button", { name: "Open Photo A", exact: true }),
+				)
+				.toBeVisible();
+			expect(onOpen).not.toHaveBeenCalled();
+			screen.unmount();
+		} finally {
+			frames.clear();
+			window.requestAnimationFrame = originalRequestAnimationFrame;
+			window.cancelAnimationFrame = originalCancelAnimationFrame;
+			restoreLoadCapture();
+			restoreImageRuntime();
+			restoreReducedMotion();
+		}
+	});
+
+	it("cancels a pending reduced-motion frame when the tile unmounts", async () => {
+		const service = new ControlledWallService();
+		service.setDerivativeUrl(
+			"reduced-unmount",
+			"/demo-photos/coast.jpg?reduced-unmount=1",
+		);
+		const decodeGate = gate<void>();
+		let complete = false;
+		let naturalWidth = 0;
+		const onOpen = vi.fn();
+		const restoreImageRuntime = overrideImageRuntime({
+			complete: () => complete,
+			naturalWidth: () => naturalWidth,
+			decode: () => decodeGate.promise,
+		});
+		const restoreReducedMotion = overrideReducedMotion(true);
+		const originalRequestAnimationFrame = window.requestAnimationFrame;
+		const originalCancelAnimationFrame = window.cancelAnimationFrame;
+		const frames = new Map<number, FrameRequestCallback>();
+		let nextFrame = 0;
+		window.requestAnimationFrame = (callback) => {
+			const id = ++nextFrame;
+			frames.set(id, callback);
+			return id;
+		};
+		window.cancelAnimationFrame = (id) => {
+			frames.delete(id);
+		};
+		const restoreLoadCapture = suppressCapture("load");
+		const positioned = {
+			asset: asset("reduced-unmount", "Photo A", 1, {
+				wallThumbnail: {
+					assetId: "reduced-unmount",
+					kind: "wallThumbnail" as const,
+					key: "reduced-unmount",
+				},
+			}),
+			left: 0,
+			width: 320,
+			height: 220,
+		};
+		try {
+			const screen = await render(
+				<PhotoTile onOpen={onOpen} positioned={positioned} service={service} />,
+			);
+			const image = screen.getByRole("img", { name: "Photo A" });
+			complete = true;
+			naturalWidth = 320;
+			image.element().dispatchEvent(new Event("load"));
+			decodeGate.resolve();
+			await expect.poll(() => frames.size).toBe(2);
+			const frameId = [...frames.keys()].at(-1);
+			if (frameId === undefined) throw new Error("missing unmount paint frame");
+			const frame = frames.get(frameId);
+			if (!frame) throw new Error("missing unmount paint callback");
+			screen.unmount();
+			expect(frames.has(frameId)).toBe(false);
+			frame(performance.now());
+			expect(onOpen).not.toHaveBeenCalled();
+		} finally {
+			frames.clear();
+			window.requestAnimationFrame = originalRequestAnimationFrame;
+			window.cancelAnimationFrame = originalCancelAnimationFrame;
+			restoreLoadCapture();
+			restoreImageRuntime();
+			restoreReducedMotion();
+		}
+	});
+
 	it("keeps a published wall thumbnail inert until its image is decoded", async () => {
 		const service = new ControlledWallService();
 		service.setDerivativeUrl(
@@ -1483,6 +1716,7 @@ describe("progressive photo wall", () => {
 
 	it("keeps a wall thumbnail tile inert after its image fails to load", async () => {
 		const service = new ControlledWallService();
+		const onOpen = vi.fn();
 		service.setDerivativeUrl(
 			"screen-only-failure",
 			"/demo-photos/missing-screen-only.jpg?screen-only-failure=1",
@@ -1508,7 +1742,11 @@ describe("progressive photo wall", () => {
 					<button onClick={() => setPublished(true)} type="button">
 						Publish wall thumbnail
 					</button>
-					<PhotoTile positioned={positioned} service={service} />
+					<PhotoTile
+						onOpen={onOpen}
+						positioned={positioned}
+						service={service}
+					/>
 				</>
 			);
 		}
@@ -1531,6 +1769,7 @@ describe("progressive photo wall", () => {
 		expect(
 			document.querySelector("[data-asset-id='screen-only']")?.tagName,
 		).toBe("FIGURE");
+		expect(onOpen).not.toHaveBeenCalled();
 		screen.unmount();
 	});
 
@@ -1621,6 +1860,7 @@ describe("progressive photo wall", () => {
 
 	it("does not let an old decode reveal a replacement thumbnail", async () => {
 		const service = new ControlledWallService();
+		const onOpen = vi.fn();
 		service.setDerivativeUrl("fenced-old", "/demo-photos/coast.jpg");
 		service.setDerivativeUrl(
 			"fenced-new",
@@ -1664,7 +1904,11 @@ describe("progressive photo wall", () => {
 					<button onClick={() => setKey("fenced-new")} type="button">
 						Swap thumbnail
 					</button>
-					<PhotoTile positioned={positioned} service={service} />
+					<PhotoTile
+						onOpen={onOpen}
+						positioned={positioned}
+						service={service}
+					/>
 				</div>
 			);
 		}
@@ -1686,6 +1930,9 @@ describe("progressive photo wall", () => {
 				.poll(() => image.element().getAttribute("src"))
 				.toContain("fenced-replacement=1");
 			expect(getComputedStyle(image.element()).opacity).toBe("0");
+			expect(
+				screen.getByRole("button", { name: "Open Coast", exact: true }).query(),
+			).toBeNull();
 			await new Promise((resolve) =>
 				window.requestAnimationFrame(() => resolve(undefined)),
 			);
@@ -1707,6 +1954,7 @@ describe("progressive photo wall", () => {
 						).opacity,
 				)
 				.toBe("1");
+			expect(onOpen).not.toHaveBeenCalled();
 			tile?.removeEventListener("load", suppressReplacementLoad, true);
 			screen.unmount();
 		} finally {
@@ -1717,6 +1965,7 @@ describe("progressive photo wall", () => {
 
 	it("resets a replacement thumbnail until its own load event", async () => {
 		const service = new ControlledWallService();
+		const onOpen = vi.fn();
 		service.setDerivativeUrl("swap-old", "/demo-photos/coast.jpg");
 		service.setDerivativeUrl("swap-new", "/demo-photos/forest.jpg?swap=1");
 		function SwapHarness() {
@@ -1738,7 +1987,11 @@ describe("progressive photo wall", () => {
 					<button onClick={() => setKey("swap-new")} type="button">
 						Swap thumbnail
 					</button>
-					<PhotoTile positioned={positioned} service={service} />
+					<PhotoTile
+						onOpen={onOpen}
+						positioned={positioned}
+						service={service}
+					/>
 				</div>
 			);
 		}
@@ -1750,10 +2003,14 @@ describe("progressive photo wall", () => {
 		const image = screen.getByRole("img", { name: "Coast" }).element();
 		await expect.poll(() => image.getAttribute("src")).toContain("swap=1");
 		expect(getComputedStyle(image).opacity).toBe("0");
+		expect(
+			screen.getByRole("button", { name: "Open Coast", exact: true }).query(),
+		).toBeNull();
 		image.dispatchEvent(new Event("load"));
 		await expect
 			.element(screen.getByRole("button", { name: "Open Coast", exact: true }))
 			.toBeVisible();
+		expect(onOpen).not.toHaveBeenCalled();
 		screen.unmount();
 	});
 

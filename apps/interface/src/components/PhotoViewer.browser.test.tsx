@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import axe from "axe-core";
-import { useRef, useState } from "react";
+import { StrictMode, useRef, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
@@ -27,6 +27,19 @@ import { PhotoViewerOverlay } from "./PhotoViewerOverlay";
 import { ViewerFilmstrip } from "./ViewerFilmstrip";
 import { ViewerNavigator } from "./ViewerNavigator";
 import { ViewerStage } from "./ViewerStage";
+
+interface Gate<T> {
+	promise: Promise<T>;
+	resolve: (value: T) => void;
+}
+
+function gate<T>(): Gate<T> {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((nextResolve) => {
+		resolve = nextResolve;
+	});
+	return { promise, resolve };
+}
 
 function asset(id: string, displayName: string, order: number): WallAsset {
 	return {
@@ -256,6 +269,21 @@ function renderViewerWall(service: InMemoryPhotoService) {
 				<AppShell />
 			</PhotoServiceProvider>
 		</QueryClientProvider>,
+	);
+}
+
+function renderStrictViewerWall(service: InMemoryPhotoService) {
+	const queryClient = new QueryClient({
+		defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+	});
+	return render(
+		<StrictMode>
+			<QueryClientProvider client={queryClient}>
+				<PhotoServiceProvider service={service}>
+					<AppShell />
+				</PhotoServiceProvider>
+			</QueryClientProvider>
+		</StrictMode>,
 	);
 }
 
@@ -1915,10 +1943,6 @@ describe("immersive photo viewer checkpoint", () => {
 
 	it("requests the visible photo as a screen preview", async () => {
 		const { service, view, tile } = await openAsset("Coast");
-		(tile.element() as HTMLButtonElement).click();
-		await expect
-			.element(view.getByRole("dialog", { name: "Photo viewer" }))
-			.toBeVisible();
 		const visibleCurrentRequests = () =>
 			service.derivativeRequests.filter(
 				(request) =>
@@ -1927,9 +1951,73 @@ describe("immersive photo viewer checkpoint", () => {
 					request.assetIds.length === 1 &&
 					request.assetIds[0] === "coast",
 			).length;
+		expect(visibleCurrentRequests()).toBe(0);
+		(tile.element() as HTMLButtonElement).click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
 		await expect.poll(visibleCurrentRequests).toBe(1);
-		await new Promise((resolve) => window.setTimeout(resolve, 25));
 		expect(visibleCurrentRequests()).toBe(1);
+	});
+
+	it("deduplicates the current preview across StrictMode effect replay", async () => {
+		const service = serviceWithReadyPhotos(false, 1, false);
+		const currentRequests: DerivativeRequest[] = [];
+		const releaseFirst = gate<void>();
+		const firstComplete = gate<void>();
+		let holdFirst = true;
+		const originalRequestDerivatives = service.requestDerivatives.bind(service);
+		service.requestDerivatives = async (request) => {
+			const isCurrent =
+				request.kind === "screenPreview" &&
+				request.priority === "visible" &&
+				request.assetIds.length === 1 &&
+				request.assetIds[0] === "coast";
+			if (isCurrent) {
+				currentRequests.push({ ...request, assetIds: [...request.assetIds] });
+				if (holdFirst) {
+					holdFirst = false;
+					await releaseFirst.promise;
+				}
+			}
+			await originalRequestDerivatives(request);
+			if (isCurrent && currentRequests.length === 1) firstComplete.resolve();
+		};
+
+		const visibleCurrentRequests = () =>
+			currentRequests.filter(
+				(request) =>
+					request.kind === "screenPreview" &&
+					request.priority === "visible" &&
+					request.assetIds.length === 1 &&
+					request.assetIds[0] === "coast",
+			).length;
+		const view = await renderStrictViewerWall(service);
+		await view.getByRole("button", { name: "Choose Folder" }).click();
+		await service.finishFixtureScan();
+		const tile = view.getByRole("button", { name: "Open Coast", exact: true });
+		await expect.element(tile).toBeVisible();
+		expect(visibleCurrentRequests()).toBe(0);
+
+		await tile.click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		await expect.poll(visibleCurrentRequests).toBe(1);
+		expect(visibleCurrentRequests()).toBe(1);
+		releaseFirst.resolve();
+		await firstComplete.promise;
+		expect(visibleCurrentRequests()).toBe(1);
+
+		await view.getByRole("button", { name: "Back to photos" }).click();
+		await expect.element(tile).toBeVisible();
+		await tile.click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		await expect.poll(visibleCurrentRequests).toBe(2);
+		expect(visibleCurrentRequests()).toBe(2);
+		await view.unmount();
 	});
 
 	it("does not request screen previews for a defensive video asset", async () => {
@@ -3663,30 +3751,72 @@ describe("immersive photo viewer checkpoint", () => {
 	it("unwinds the information drawer, zoom, and viewer in Escape order", async () => {
 		const { view, tile } = await openAsset("Coast");
 		(tile.element() as HTMLButtonElement).click();
-		const stage = view.getByTestId("viewer-stage");
-		await view.getByRole("button", { name: "Zoom in" }).click();
-		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
-		await view.getByRole("button", { name: "Photo information" }).click();
-		await expect
-			.element(view.getByRole("complementary", { name: "Photo information" }))
-			.toBeVisible();
-
-		await userEvent.keyboard("{Escape}");
-		expect(
-			view.getByRole("complementary", { name: "Photo information" }).query(),
-		).toBeNull();
-		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
-
-		await userEvent.keyboard("{Escape}");
-		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
 		await expect
 			.element(view.getByRole("dialog", { name: "Photo viewer" }))
 			.toBeVisible();
+		const stage = view.getByTestId("viewer-stage");
+		await view.getByRole("button", { name: "Zoom in" }).click();
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+		await view.getByRole("button", { name: "Reset zoom" }).click();
+		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+		const status = view.getByTestId("viewer-status").element();
+		const mutations: MutationRecord[] = [];
+		const observer = new MutationObserver((records) =>
+			mutations.push(...records),
+		);
+		observer.observe(status, {
+			characterData: true,
+			childList: true,
+			subtree: true,
+		});
+		const flush = () =>
+			new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+		try {
+			stage.element().dispatchEvent(
+				new WheelEvent("wheel", {
+					bubbles: true,
+					cancelable: true,
+					ctrlKey: true,
+					deltaY: -24,
+					clientX: 720,
+					clientY: 400,
+				}),
+			);
+			await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+			await flush();
+			expect(status.textContent).toContain("Fit");
+			expect(mutations).toHaveLength(0);
 
-		await userEvent.keyboard("{Escape}");
-		expect(
-			view.getByRole("dialog", { name: "Photo viewer" }).query(),
-		).toBeNull();
+			await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+			await view.getByRole("button", { name: "Photo information" }).click();
+			await expect
+				.element(view.getByRole("complementary", { name: "Photo information" }))
+				.toBeVisible();
+
+			mutations.splice(0, mutations.length);
+			await userEvent.keyboard("{Escape}");
+			expect(
+				view.getByRole("complementary", { name: "Photo information" }).query(),
+			).toBeNull();
+			await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
+
+			mutations.splice(0, mutations.length);
+			await userEvent.keyboard("{Escape}");
+			await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
+			await expect
+				.element(view.getByRole("dialog", { name: "Photo viewer" }))
+				.toBeVisible();
+			await expect.poll(() => mutations.length).toBeGreaterThan(0);
+			expect(status.textContent).toContain("Fit");
+
+			await userEvent.keyboard("{Escape}");
+			expect(
+				view.getByRole("dialog", { name: "Photo viewer" }).query(),
+			).toBeNull();
+		} finally {
+			observer.disconnect();
+			await view.unmount();
+		}
 	});
 
 	it("announces the current position and loads more when pagination remains", async () => {

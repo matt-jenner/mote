@@ -121,6 +121,7 @@ export function useViewerPreview({
 	const retryTimers = useRef(new Set<number>());
 	const interactionActive = useRef(false);
 	const interactionTimer = useRef<number | null>(null);
+	const mountedRef = useRef(false);
 
 	const reportInteraction = useCallback(() => {
 		interactionActive.current = true;
@@ -217,6 +218,7 @@ export function useViewerPreview({
 					kind: "screenPreview",
 				})
 				.then(() => {
+					if (!mountedRef.current) return;
 					for (const [key, record] of attempts) {
 						if (requestRecords.current.get(key) !== record) continue;
 						record.status = "completed";
@@ -229,6 +231,7 @@ export function useViewerPreview({
 					}
 				})
 				.catch(() => {
+					if (!mountedRef.current) return;
 					for (const assetId of ids) {
 						const asset = assets.find((candidate) => candidate.id === assetId);
 						if (!asset) continue;
@@ -249,6 +252,7 @@ export function useViewerPreview({
 							viewerIdleFallbackDelayMs;
 						const timer = window.setTimeout(() => {
 							retryTimers.current.delete(timer);
+							if (!mountedRef.current) return;
 							if (requestRecords.current.get(key) !== record) return;
 							record.retryTimer = null;
 							requestRecords.current.delete(key);
@@ -273,16 +277,21 @@ export function useViewerPreview({
 		return () => scheduled?.cancel();
 	}, [assets, currentIndex, previewGeneration, retryTick, service]);
 
-	useEffect(
-		() => () => {
+	useEffect(() => {
+		mountedRef.current = true;
+		return () => {
+			mountedRef.current = false;
 			if (interactionTimer.current !== null)
 				window.clearTimeout(interactionTimer.current);
 			for (const timer of retryTimers.current) window.clearTimeout(timer);
-			requestRecords.current.clear();
+			for (const record of requestRecords.current.values())
+				record.retryTimer = null;
 			retryTimers.current.clear();
-		},
-		[],
-	);
+			// Keep request records through StrictMode's effect replay so an
+			// in-flight request cannot be duplicated. A real unmount drops
+			// these refs with the hook instance.
+		};
+	}, []);
 
 	const current = assets[Math.trunc(currentIndex)];
 	const isPhoto = current?.mediaKind !== "video";
