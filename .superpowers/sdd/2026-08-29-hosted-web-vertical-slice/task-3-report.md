@@ -62,7 +62,7 @@ Round 3 implementation commit: `b30a481` (`fix: preserve hosted runtime ownershi
 
 ## Fix round 4 evidence
 
-RED/GREEN evidence: the settled offline regression was observed RED when a completed catalog skipped source inspection and is GREEN after `ensure_running` performs a cheap availability check and publishes one path-free `SourceUnavailable` while cached wall rows remain queryable. The live source-root symlink retarget regression was observed RED when display-path fallback rebound the old library and is GREEN after canonical roots are preferred whenever the configured source currently resolves. The progressive desktop refresh regression was observed RED when a same-folder refresh reused settled runtime state and is GREEN after desktop epochs create an explicit fresh runtime. The desktop wrapper, replay, lag, scope-filtering, drop-order, stream-survival, admission, and scan-count regressions all pass with deterministic notifications/barriers; the former 1 ms cleanup poll is replaced by a runtime `Notify` completion signal.
+RED/GREEN evidence: the settled offline regression was observed RED when a completed catalog skipped source inspection and is GREEN after `ensure_running` performs a cheap availability check and publishes one path-free `SourceUnavailable` while cached wall rows remain queryable. The live source-root symlink retarget regression was observed RED when display-path fallback rebound the old library and is GREEN after canonical roots are preferred whenever the configured source currently resolves. The progressive desktop refresh regression was observed RED when a same-folder refresh reused settled runtime state and is GREEN after desktop epochs create an explicit fresh runtime. The desktop wrapper, replay, lag, scope-filtering, drop-order, stream-survival, admission, and scan-count regressions all pass with deterministic notifications/barriers; the former 1 ms cleanup poll is replaced by an observable runtime lifecycle signal (now a `watch` state channel).
 
 Round 4 changes extract desktop scanning/reconciliation into the shared `GalleryEngine` and `SelectionRuntime` without a second catalog or coordinator state. `AppService` now injects its existing state, scheduler, metadata reader, and derivative coordinator into the engine; desktop scan, wall query, scope interaction, cancellation, and runtime-count paths use that wrapper. Runtime completion and offline termination clear the legacy active marker through an observable signal. Replay snapshots remain publication-serialized, and lag resync watermarks are monotonic. New deterministic coverage includes same/different-selection scan starts, mixed-scope catalog/derivative/warning/clear filtering, retained replay edges plus backlog/live boundaries, broadcast lag, registry ownership in both drop orders, primary-scan survival after stream drop, cross-selection admission, settled offline reporting, current-folder in-root symlink walls, and the desktop wrapper.
 
@@ -79,3 +79,24 @@ Round 4 focused verification passed:
 - `cargo fmt --all -- --check` and `git diff --check`.
 
 The round-4 implementation and report are intentionally separate commits so this report records the immutable implementation SHA; the report-only commit is the branch HEAD after this append.
+
+## Fix round 5 evidence
+
+Round 5 closes the remaining desktop admission and hosted-runtime lifecycle races. The scan control is now a synchronous, short critical-section state machine with a `watch` lifecycle signal. Admission, cancellation, cancellation-sender installation, and terminal completion are coordinated atomically; cancellation no longer uses `try_lock`, and every canceled scan publishes `Cancelled` so bridges and cleanup watchers can terminate and release their runtime. Desktop bridge installation and forwarding are serialized with persisted active-selection, protected-group, and `selection_epoch` changes. Existing hosted subscriptions receive an authoritative scope watch, so filtering and aggregate demand change together when client interaction changes from `CurrentFolder` to `IncludeSubfolders` or back.
+
+Regression coverage added in this round includes the deterministic stale async token barrier (`stale_async_scan_token_is_rejected_before_bridge_or_scan_admission`), cancellation under scan-control lock contention, multiple lifecycle waiters for both cancellation and completion, exact-once concurrent scan admission, canceled desktop bridge termination/runtime release, both runtime-registry drop orderings, mutable-scope filtering for catalog/derivative/warning/clear events, and a bounded progressive flush assertion. The progressive test has a 250 ms timeout and no wall-clock sleep; the implementation's progressive batch deadline remains 50 ms.
+
+Fix round 5 implementation commit: `c5a7055` (`fix: close hosted runtime lifecycle races`).
+
+Fix round 5 focused verification passed:
+
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-app-service service::tests:: -- --nocapture` (6/6).
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-app-service hosted_runtime::tests:: -- --nocapture` (6/6).
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-indexer --test scheduler_priority` (11/11).
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-app-service --test hosted_selections --test hosted_runtime --test desktop_gallery_wrapper` (6 + 12 + 1).
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-app-service --test progressive_wall` (57/57).
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-app-service` (85 unit tests and all app-service integration/doc tests).
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test --workspace` (all workspace tests and doc tests).
+- `cargo fmt --all -- --check` and `git diff --check`.
+
+The report remains separate from the implementation commit; the report-only commit is the branch HEAD after this append.
