@@ -3052,6 +3052,8 @@ fn reference(id: AssetId, kind: DerivativeClass, key: String) -> DerivativeRefer
 
 #[cfg(test)]
 mod tests {
+    #[cfg(debug_assertions)]
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::Path;
     #[cfg(debug_assertions)]
     use std::sync::atomic::Ordering;
@@ -3084,6 +3086,8 @@ mod tests {
     use crate::service::{CollectionDriverControl, CollectionDriverTake, SelectionToken};
     use crate::{AppConfig, AppService, DerivativeClass, WallUpdate};
 
+    #[cfg(debug_assertions)]
+    use super::CollectionDriverLifecycleOwner;
     use super::DerivativeWorkError;
     #[cfg(debug_assertions)]
     use super::PreviewPrefetchOutcome;
@@ -3646,6 +3650,38 @@ mod tests {
         )
         .await
         .expect("newer pending intent should transfer during cancellation");
+        assert_eq!(service.collection_driver_active_count_test(), 0);
+        assert_eq!(
+            service.coordinator.collection_phase().await,
+            crate::derivative_coordinator::CollectionPhase::Complete
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn collection_driver_panic_transfers_pending_newer_full_group_once() {
+        let (_temp, service, older, _asset_id, _derivative_count) =
+            collection_gap_fixture(false).await;
+        let old_admission = service.collection_driver.request(older, false).unwrap();
+        let owner = CollectionDriverLifecycleOwner::new(service.clone(), old_admission);
+        let source = _temp.path().join("photos");
+        let (_, newer) = service
+            .select_recent(&source)
+            .expect("same source should produce a newer selection epoch");
+        service.coordinator.reset_selection(newer).await;
+        assert!(service.collection_driver.request(newer, true).is_none());
+
+        let panic_result = catch_unwind(AssertUnwindSafe(|| {
+            let _owner = owner;
+            panic!("injected collection driver panic");
+        }));
+        assert!(panic_result.is_err());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            service.wait_for_collection_drivers_quiescent_test(),
+        )
+        .await
+        .expect("newer full-group intent should transfer during panic cleanup");
         assert_eq!(service.collection_driver_active_count_test(), 0);
         assert_eq!(
             service.coordinator.collection_phase().await,
