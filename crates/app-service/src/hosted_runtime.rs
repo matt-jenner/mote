@@ -10,10 +10,12 @@ use crate::{GalleryEngine, GallerySelection, InteractionState, WallUpdate};
 pub(crate) struct SelectionRuntime {
     pub(crate) selection: GallerySelection,
     pub(crate) scan_cancel: tokio::sync::Mutex<Option<watch::Sender<bool>>>,
+    #[allow(dead_code)]
     pub(crate) coordinator: Arc<crate::derivative_coordinator::DerivativeCoordinator>,
     pub(crate) updates: broadcast::Sender<SequencedWallUpdate>,
     pub(crate) history: Mutex<VecDeque<SequencedWallUpdate>>,
     pub(crate) next_event_id: AtomicU64,
+    pub(crate) next_client_token: AtomicU64,
     pub(crate) client_demand: Mutex<HashMap<String, ClientDemand>>,
 }
 
@@ -22,6 +24,7 @@ pub(crate) struct ClientDemand {
     pub(crate) scope: GalleryScope,
     pub(crate) interaction: InteractionState,
     pub(crate) lease_until: tokio::time::Instant,
+    pub(crate) token: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +51,7 @@ impl SelectionRuntime {
             updates,
             history: Mutex::new(VecDeque::with_capacity(256)),
             next_event_id: AtomicU64::new(0),
+            next_client_token: AtomicU64::new(1),
             client_demand: Mutex::new(HashMap::new()),
         })
     }
@@ -62,12 +66,13 @@ impl SelectionRuntime {
             history.pop_front();
         }
         history.push_back(event.clone());
-        drop(history);
         let _ = self.updates.send(event.clone());
+        drop(history);
         event
     }
 
-    pub(crate) fn register(&self, client_id: String, scope: GalleryScope) {
+    pub(crate) fn register(&self, client_id: String, scope: GalleryScope) -> u64 {
+        let token = self.next_client_token.fetch_add(1, Ordering::AcqRel);
         let mut demand = self.client_demand.lock().expect("client demand poisoned");
         demand.insert(
             client_id,
@@ -75,15 +80,20 @@ impl SelectionRuntime {
                 scope,
                 interaction: InteractionState::Active,
                 lease_until: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                token,
             },
         );
+        token
     }
 
-    pub(crate) fn remove(&self, client_id: &str) {
-        self.client_demand
-            .lock()
-            .expect("client demand poisoned")
-            .remove(client_id);
+    pub(crate) fn remove(&self, client_id: &str, token: u64) {
+        let mut demand = self.client_demand.lock().expect("client demand poisoned");
+        if demand
+            .get(client_id)
+            .is_some_and(|value| value.token == token)
+        {
+            demand.remove(client_id);
+        }
     }
 
     pub(crate) fn aggregate_scope(&self) -> GalleryScope {
@@ -127,6 +137,7 @@ pub struct SelectionEventSubscription {
     pub(crate) receiver: broadcast::Receiver<SequencedWallUpdate>,
     pub(crate) runtime: Arc<SelectionRuntime>,
     pub(crate) client_id: String,
+    pub(crate) client_token: u64,
     pub(crate) scope: GalleryScope,
     pub(crate) lagged: bool,
     pub(crate) engine: GalleryEngine,
@@ -140,7 +151,7 @@ impl SelectionEventSubscription {
             } else if self.lagged {
                 self.lagged = false;
                 return Some(SequencedWallUpdate {
-                    id: self.runtime.next_event_id.fetch_add(1, Ordering::AcqRel) + 1,
+                    id: self.runtime.next_event_id.load(Ordering::Acquire),
                     update: WallUpdate::ResyncRequired {
                         selection_id: self.runtime.selection.id().to_owned(),
                     },
@@ -246,6 +257,6 @@ impl SelectionEventSubscription {
 
 impl Drop for SelectionEventSubscription {
     fn drop(&mut self) {
-        self.runtime.remove(&self.client_id);
+        self.runtime.remove(&self.client_id, self.client_token);
     }
 }

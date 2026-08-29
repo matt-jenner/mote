@@ -74,3 +74,32 @@ fn write_jpeg(path: &Path) {
     let image = image::ImageBuffer::from_pixel(3, 2, image::Rgb([220_u8, 180_u8, 80_u8]));
     image.save(path).unwrap();
 }
+
+#[tokio::test]
+async fn an_old_subscription_drop_cannot_remove_a_reconnected_client_demand() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config, source).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    let old = engine.subscribe(
+        &selection,
+        "same-client".into(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    let replacement = engine.subscribe(
+        &selection,
+        "same-client".into(),
+        GalleryScope::IncludeSubfolders,
+        None,
+    );
+    drop(old);
+    assert_eq!(
+        engine.aggregate_scope_for_test(&selection).await,
+        GalleryScope::IncludeSubfolders
+    );
+    drop(replacement);
+}

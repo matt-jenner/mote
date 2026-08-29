@@ -38,3 +38,16 @@ async fn selection_ids_are_stable_across_reopen_and_are_not_paths() {
         child_id
     );
 }
+
+#[tokio::test]
+async fn selection_id_aliases_are_rejected_before_runtime_creation() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config, source).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let uuid = summary.id.strip_prefix("selection-").unwrap();
+    let uppercase = format!("selection-{}", uuid.to_uppercase());
+    assert!(engine.resolve_selection(&uppercase).is_err());
+}

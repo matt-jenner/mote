@@ -69,6 +69,7 @@ pub(crate) struct GalleryState {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct GalleryEngine {
     pub(crate) state: Arc<Mutex<GalleryState>>,
     pub(crate) scheduler: Arc<photo_indexer::IndexScheduler>,
@@ -217,6 +218,10 @@ impl GalleryEngine {
             .strip_prefix("selection-")
             .ok_or(AppServiceError::UnknownAsset)
             .and_then(|s| uuid::Uuid::parse_str(s).map_err(|_| AppServiceError::UnknownAsset))?;
+        let canonical_id = format!("selection-{}", uuid.hyphenated());
+        if id != canonical_id {
+            return Err(AppServiceError::UnknownAsset);
+        }
         let group = FolderGroupId::from_uuid(uuid);
         let state = self
             .state
@@ -292,6 +297,7 @@ impl GalleryEngine {
 
     fn runtime(&self, selection: &GallerySelection) -> Arc<SelectionRuntime> {
         let mut runtimes = self.runtimes.lock().expect("runtime registry poisoned");
+        runtimes.retain(|_, runtime| runtime.strong_count() > 0);
         if let Some(runtime) = runtimes.get(&selection.group_id).and_then(Weak::upgrade) {
             return runtime;
         }
@@ -388,7 +394,7 @@ impl GalleryEngine {
     ) -> SelectionEventSubscription {
         let runtime = self.runtime(selection);
         let receiver = runtime.updates.subscribe();
-        runtime.register(client_id.clone(), scope);
+        let client_token = runtime.register(client_id.clone(), scope);
         let history = runtime
             .history
             .lock()
@@ -416,6 +422,7 @@ impl GalleryEngine {
             receiver,
             runtime,
             client_id,
+            client_token,
             scope,
             lagged,
             engine: self.clone(),
@@ -519,6 +526,7 @@ impl GalleryEngine {
                     .for_folder_group(runtime.selection.group_id),
             )
             .map_err(|e| AppServiceError::LibrarySetup(std::io::Error::other(e.to_string())))?;
+        *runtime.scan_cancel.lock().await = Some(handle.cancellation_sender());
         let engine = self.clone();
         tokio::spawn(async move {
             engine.drain_runtime_scan(runtime, handle, generation).await;
@@ -548,25 +556,43 @@ impl GalleryEngine {
         generation: u64,
     ) {
         let mut batch = Vec::new();
-        while let Some(event) = handle.events.recv().await {
-            batch.push(event);
-            if batch.len() < 200 {
-                continue;
+        let mut persistence_failed = false;
+        let mut stream_open = true;
+        while stream_open {
+            let Some(first) = handle.events.recv().await else {
+                break;
+            };
+            batch.push(first);
+            let deadline = tokio::time::sleep(std::time::Duration::from_millis(50));
+            tokio::pin!(deadline);
+            while batch.len() < 200 {
+                tokio::select! {
+                    _ = &mut deadline => break,
+                    event = handle.events.recv() => match event {
+                        Some(event) => batch.push(event),
+                        None => { stream_open = false; break; }
+                    }
+                }
             }
-            self.apply_runtime_batch(&runtime, generation, &batch).await;
+            if self
+                .apply_runtime_batch(&runtime, generation, &batch)
+                .await
+                .is_err()
+            {
+                persistence_failed = true;
+                let _ = handle.cancel();
+                break;
+            }
             batch.clear();
-        }
-        if !batch.is_empty() {
-            self.apply_runtime_batch(&runtime, generation, &batch).await;
         }
         let successful = handle
             .join()
             .await
             .map(|summary| !summary.cancelled)
             .unwrap_or(false);
-        if successful {
-            if let Ok(mut state) = self.state.lock() {
-                if state
+        if successful && !persistence_failed {
+            let completed = if let Ok(mut state) = self.state.lock() {
+                state
                     .libraries
                     .catalog_mut()
                     .complete_generation_for_group(
@@ -575,10 +601,29 @@ impl GalleryEngine {
                         generation,
                     )
                     .is_ok()
-                {}
+            } else {
+                false
+            };
+            if completed {
+                let _ = runtime
+                    .publish(WallUpdate::MetadataSettled {
+                        selection_id: runtime.selection.id().to_owned(),
+                        source_id: runtime
+                            .selection
+                            .library_id
+                            .as_uuid()
+                            .hyphenated()
+                            .to_string(),
+                        generation,
+                    })
+                    .await;
+            } else {
+                persistence_failed = true;
             }
+        }
+        if persistence_failed {
             let _ = runtime
-                .publish(WallUpdate::MetadataSettled {
+                .publish(WallUpdate::Warning {
                     selection_id: runtime.selection.id().to_owned(),
                     source_id: runtime
                         .selection
@@ -586,7 +631,11 @@ impl GalleryEngine {
                         .as_uuid()
                         .hyphenated()
                         .to_string(),
-                    generation,
+                    asset_id: None,
+                    warning: crate::WallWarningState {
+                        code: "catalogUnavailable".to_owned(),
+                        retryable: true,
+                    },
                 })
                 .await;
         }
@@ -598,7 +647,7 @@ impl GalleryEngine {
         runtime: &Arc<SelectionRuntime>,
         generation: u64,
         events: &[IndexEvent],
-    ) {
+    ) -> Result<(), AppServiceError> {
         let progress = events
             .iter()
             .filter_map(|e| {
@@ -617,15 +666,21 @@ impl GalleryEngine {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let mut updates = Vec::new();
-        if let Ok(mut state) = self.state.lock() {
+        let updates = {
+            let mut updates = Vec::new();
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| AppServiceError::StatePoisoned)?;
             let mut writer = photo_indexer::CatalogWriter::new(
                 state.libraries.catalog_mut(),
                 runtime.selection.library_id,
                 generation,
             );
-            if writer.apply_batch(events).is_err() {
-                return;
+            if let Err(error) = writer.apply_batch(events) {
+                return Err(AppServiceError::Catalog(CatalogError::InvalidData(
+                    format!("hosted scan batch could not be persisted: {error}"),
+                )));
             }
             let progress_update = progress.map(|progress| WallUpdate::Progress {
                 selection_id: runtime.selection.id().to_owned(),
@@ -656,10 +711,11 @@ impl GalleryEngine {
                     }
                 }
             }
-            drop(state);
-        }
+            updates
+        };
         for update in updates {
             let _ = runtime.publish(update).await;
         }
+        Ok(())
     }
 }

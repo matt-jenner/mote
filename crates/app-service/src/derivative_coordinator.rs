@@ -218,6 +218,7 @@ impl Default for CoordinatorState {
 pub(crate) struct DerivativeCoordinator {
     state: Arc<Mutex<CoordinatorState>>,
     scheduler: Arc<IndexScheduler>,
+    owner_prefix: String,
     wake: Arc<Notify>,
     change_generation: Arc<AtomicU64>,
     commit_completion_generation: Arc<AtomicU64>,
@@ -246,6 +247,7 @@ impl DerivativeCoordinator {
         Self {
             state: Arc::new(Mutex::new(CoordinatorState::default())),
             scheduler,
+            owner_prefix: SCHEDULER_OWNER_PREFIX.to_owned(),
             wake: Arc::new(Notify::new()),
             change_generation: Arc::new(AtomicU64::new(0)),
             commit_completion_generation: Arc::new(AtomicU64::new(0)),
@@ -275,6 +277,10 @@ impl DerivativeCoordinator {
         Self {
             state: Arc::new(Mutex::new(state)),
             scheduler,
+            owner_prefix: format!(
+                "{SCHEDULER_OWNER_PREFIX}selection-{}:",
+                selection.group_id.as_uuid().hyphenated()
+            ),
             wake: Arc::new(Notify::new()),
             change_generation: Arc::new(AtomicU64::new(0)),
             commit_completion_generation: Arc::new(AtomicU64::new(0)),
@@ -446,6 +452,7 @@ impl DerivativeCoordinator {
                         prerequisite_key,
                         &mut sender,
                         &mut schedule,
+                        &self.owner_prefix,
                     );
                 }
             }
@@ -472,7 +479,7 @@ impl DerivativeCoordinator {
 
     pub(crate) async fn next_work(&self) -> Option<WorkTicket> {
         loop {
-            let job = self.scheduler.next_owned(SCHEDULER_OWNER_PREFIX).await?;
+            let job = self.scheduler.next_owned(&self.owner_prefix).await?;
             let result = {
                 let mut state = self.state.lock().await;
                 match state.job_names.get(job.name()).cloned() {
@@ -1508,10 +1515,11 @@ fn queue_new_job(
     prerequisite_key: Option<String>,
     sender: &mut Option<oneshot::Sender<Option<DerivativeReference>>>,
     schedule: &mut Option<(String, JobPriority)>,
+    owner_prefix: &str,
 ) {
     let job_id = state.next_job_id;
     state.next_job_id = state.next_job_id.wrapping_add(1).max(1);
-    let job_name = format!("{SCHEDULER_OWNER_PREFIX}{job_id}");
+    let job_name = format!("{owner_prefix}{job_id}");
     let (foreground_waiters, background_waiters) = if lane.is_foreground() {
         (
             vec![sender.take().expect("waiter was not consumed")],
@@ -2000,6 +2008,41 @@ mod tests {
         fixture.coordinator.complete(ticket, reference()).await;
         assert_eq!(first.await.unwrap(), Some(reference()));
         assert_eq!(second.await.unwrap(), Some(reference()));
+    }
+
+    #[tokio::test]
+    async fn separate_selection_coordinators_have_isolated_scheduler_namespaces() {
+        let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig::default()));
+        let left_selection = SelectionToken {
+            library_id: LibraryId::new(),
+            group_id: FolderGroupId::new(),
+            epoch: 0,
+        };
+        let right_selection = SelectionToken {
+            library_id: LibraryId::new(),
+            group_id: FolderGroupId::new(),
+            epoch: 0,
+        };
+        let left = DerivativeCoordinator::with_selection(scheduler.clone(), left_selection);
+        let right = DerivativeCoordinator::with_selection(scheduler, right_selection);
+        let left_key = WorkKey {
+            selection: left_selection,
+            asset_id: AssetId::from_uuid(uuid::Uuid::new_v4()),
+            class: DerivativeClass::WallThumbnail,
+            cache_key: "left".into(),
+            availability: Availability::Available,
+        };
+        let right_key = WorkKey {
+            selection: right_selection,
+            asset_id: AssetId::from_uuid(uuid::Uuid::new_v4()),
+            class: DerivativeClass::WallThumbnail,
+            cache_key: "right".into(),
+            availability: Availability::Available,
+        };
+        let _left_waiter = left.enqueue(left_key, WorkLane::VisibleWall).await;
+        let _right_waiter = right.enqueue(right_key, WorkLane::VisibleWall).await;
+        assert!(left.next_work().await.is_some());
+        assert!(right.next_work().await.is_some());
     }
 
     #[tokio::test]
