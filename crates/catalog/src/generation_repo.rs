@@ -154,6 +154,14 @@ impl Catalog {
                     library.as_uuid().as_bytes()
                 ],
             )?;
+            if let Some(group) = asset.folder_group_id {
+                crate::selection_repo::add_asset_membership_on(
+                    &transaction,
+                    group,
+                    asset.id,
+                    generation,
+                )?;
+            }
         }
         transaction.commit()?;
         Ok(())
@@ -187,6 +195,12 @@ impl Catalog {
                     folder_group.as_uuid().as_bytes()
                 ],
             )?;
+            crate::selection_repo::add_asset_membership_on(
+                &transaction,
+                folder_group,
+                asset.id,
+                generation,
+            )?;
         }
         transaction.commit()?;
         Ok(())
@@ -215,73 +229,60 @@ impl Catalog {
         folder_group: Option<FolderGroupId>,
         generation: u64,
     ) -> Result<GenerationCompletion, CatalogError> {
+        if let Some(folder_group) = folder_group {
+            let marked_missing =
+                self.finish_group_generation_count(library, folder_group, generation)?;
+            return Ok(GenerationCompletion { marked_missing });
+        }
         let generation = i64::try_from(generation).map_err(|_| CatalogError::ValueOutOfRange)?;
         let transaction = self.connection.transaction()?;
-        if let Some(folder_group) = folder_group {
-            ensure_generation_group(&transaction, library, folder_group, generation)?;
-        }
-        let marked_missing = if let Some(folder_group) = folder_group {
-            transaction.execute(
-                "UPDATE assets SET availability = 'available' \
-                 WHERE library_id = ?1 AND folder_group_id = ?2 AND last_seen_generation = ?3",
-                params![
-                    library.as_uuid().as_bytes(),
-                    folder_group.as_uuid().as_bytes(),
-                    generation
-                ],
-            )?;
-            transaction.execute(
-                "UPDATE assets SET availability = 'missing' \
-                 WHERE library_id = ?1 AND folder_group_id = ?2 \
-                   AND last_seen_generation <> ?3 AND availability <> 'missing'",
-                params![
-                    library.as_uuid().as_bytes(),
-                    folder_group.as_uuid().as_bytes(),
-                    generation
-                ],
-            )?
-        } else {
+        let source_online: i64 = transaction
+            .query_row(
+                "SELECT source_was_online FROM scan_generations
+                 WHERE library_id = ?1 AND folder_group_id IS NULL AND generation = ?2",
+                params![library.as_uuid().as_bytes(), generation],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                CatalogError::InvalidData(format!("scan generation {generation} is missing"))
+            })?;
+        let marked_missing = if source_online != 0 {
             transaction.execute(
                 "UPDATE assets SET availability = 'available' \
                  WHERE library_id = ?1 AND last_seen_generation = ?2",
                 params![library.as_uuid().as_bytes(), generation],
             )?;
             transaction.execute(
-                "UPDATE assets SET availability = 'missing' \
-                 WHERE library_id = ?1 AND last_seen_generation <> ?2 \
-                   AND availability <> 'missing'",
-                params![library.as_uuid().as_bytes(), generation],
-            )?
-        };
-        let completed = if let Some(folder_group) = folder_group {
-            transaction.execute(
-                "UPDATE scan_generations SET completed_at = unixepoch() \
-                 WHERE library_id = ?1 AND folder_group_id = ?2 \
-                   AND generation = ?3 AND completed_at IS NULL",
-                params![
-                    library.as_uuid().as_bytes(),
-                    folder_group.as_uuid().as_bytes(),
-                    generation
-                ],
+                "UPDATE assets SET availability = 'missing'
+                 WHERE library_id = ?1 AND availability <> 'missing'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM folder_group_assets fga
+                     WHERE fga.asset_id = assets.id
+                   )",
+                [library.as_uuid().as_bytes()],
             )?
         } else {
-            transaction.execute(
-                "UPDATE scan_generations SET completed_at = unixepoch() \
-                 WHERE library_id = ?1 AND folder_group_id IS NULL \
-                   AND generation = ?2 AND completed_at IS NULL",
-                params![library.as_uuid().as_bytes(), generation],
-            )?
+            0
         };
+        let completed = transaction.execute(
+            "UPDATE scan_generations SET completed_at = unixepoch() \
+             WHERE library_id = ?1 AND folder_group_id IS NULL \
+               AND generation = ?2 AND completed_at IS NULL",
+            params![library.as_uuid().as_bytes(), generation],
+        )?;
         if completed != 1 {
             return Err(CatalogError::InvalidData(format!(
                 "scan generation {generation} is missing or already complete"
             )));
         }
-        transaction.execute(
-            "UPDATE library_roots SET availability = 'available', last_seen_at = unixepoch() \
-             WHERE id = ?1",
-            [library.as_uuid().as_bytes()],
-        )?;
+        if source_online != 0 {
+            transaction.execute(
+                "UPDATE library_roots SET availability = 'available', last_seen_at = unixepoch() \
+                 WHERE id = ?1",
+                [library.as_uuid().as_bytes()],
+            )?;
+        }
         transaction.commit()?;
         Ok(GenerationCompletion {
             marked_missing: marked_missing as u64,
@@ -298,6 +299,11 @@ impl Catalog {
             "UPDATE assets SET availability = 'root_offline' WHERE library_id = ?1",
             [library.as_uuid().as_bytes()],
         )?;
+        transaction.execute(
+            "UPDATE scan_generations SET source_was_online = 0
+             WHERE library_id = ?1 AND completed_at IS NULL",
+            [library.as_uuid().as_bytes()],
+        )?;
         transaction.commit()?;
         Ok(retained as u64)
     }
@@ -310,8 +316,19 @@ impl Catalog {
         let transaction = self.connection.transaction()?;
         ensure_group_belongs_to_library(&transaction, library, folder_group)?;
         let retained = transaction.execute(
-            "UPDATE assets SET availability = 'root_offline' \
-             WHERE library_id = ?1 AND folder_group_id = ?2",
+            "UPDATE assets SET availability = 'root_offline'
+             WHERE library_id = ?1 AND EXISTS (
+               SELECT 1 FROM folder_group_assets fga
+               WHERE fga.asset_id = assets.id AND fga.folder_group_id = ?2
+             )",
+            params![
+                library.as_uuid().as_bytes(),
+                folder_group.as_uuid().as_bytes()
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE scan_generations SET source_was_online = 0
+             WHERE library_id = ?1 AND folder_group_id = ?2 AND completed_at IS NULL",
             params![
                 library.as_uuid().as_bytes(),
                 folder_group.as_uuid().as_bytes()

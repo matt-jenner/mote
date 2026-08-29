@@ -187,9 +187,18 @@ fn apply_record(
                     "UPDATE assets SET last_seen_generation = ?2, availability = 'available' WHERE id = ?1",
                     params![asset.id.as_uuid().as_bytes(), generation],
                 )?;
+                if let Some(group) = asset.folder_group_id {
+                    crate::selection_repo::add_asset_membership_on(
+                        connection, group, asset.id, generation,
+                    )?;
+                }
                 Ok(())
             } else {
-                upsert_asset_on(connection, asset)
+                upsert_asset_on(connection, asset)?;
+                if let Some(group) = asset.folder_group_id {
+                    crate::selection_repo::add_asset_membership_on(connection, group, asset.id, 0)?;
+                }
+                Ok(())
             }
         }
         CatalogIndexRecord::Shaped(shape) => {

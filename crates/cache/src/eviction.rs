@@ -91,12 +91,13 @@ impl EvictionPlanner {
         }
         let protection = protected.lock()?;
         let mut plan = EvictionPlan::default();
-        for group in catalog.cache_eviction_groups()? {
-            if protection.protected.contains_key(&group.id)
-                || protection.active_writes.contains_key(&group.id)
-            {
-                continue;
-            }
+        let blocked = protection
+            .protected
+            .keys()
+            .chain(protection.active_writes.keys())
+            .copied()
+            .collect::<Vec<_>>();
+        for group in catalog.cache_eviction_groups_excluding(&blocked)? {
             plan.groups.push(group.id);
             plan.reclaimable_bytes = plan
                 .reclaimable_bytes
@@ -122,22 +123,30 @@ impl EvictionPlanner {
             return Err(CacheError::GroupBecameProtected);
         }
         let derivatives = catalog.non_durable_derivatives(&plan.groups)?;
+        let reclaimable = catalog.reclaimable_derivatives_for_groups(&plan.groups)?;
+        let reclaimable_ids = reclaimable
+            .iter()
+            .map(|derivative| derivative.id)
+            .collect::<std::collections::HashSet<_>>();
         let writer = CacheWriter::new(cache_root)?;
         for derivative in &derivatives {
             writer.resolve_checked(&derivative.relative_cache_path)?;
         }
-        for derivative in &derivatives {
+        for derivative in &reclaimable {
             writer.remove_relative_file(&derivative.relative_cache_path)?;
         }
         let ids = derivatives
             .iter()
             .map(|derivative| derivative.id)
             .collect::<Vec<_>>();
-        catalog.delete_derivatives(&ids)?;
-        derivatives.iter().try_fold(0_u64, |total, item| {
-            total
-                .checked_add(item.size_bytes)
-                .ok_or(CacheError::SizeOutOfRange)
-        })
+        catalog.remove_derivative_group_links(&ids, &plan.groups)?;
+        derivatives
+            .iter()
+            .filter(|derivative| reclaimable_ids.contains(&derivative.id))
+            .try_fold(0_u64, |total, item| {
+                total
+                    .checked_add(item.size_bytes)
+                    .ok_or(CacheError::SizeOutOfRange)
+            })
     }
 }

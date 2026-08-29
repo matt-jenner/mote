@@ -102,7 +102,8 @@ impl Catalog {
             "SELECT id, display_path, media_kind, provisional_order, captured_at_utc, width, height, representative_rgb, availability, shape_status, rating, \
                     EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id), \
                     (SELECT code FROM warnings WHERE warnings.asset_id = assets.id ORDER BY CASE code WHEN 'derivative_generation_failed' THEN 0 ELSE 1 END, occurred_at DESC, id DESC LIMIT 1) \
-             FROM assets WHERE folder_group_id = ?1 AND id = ?2 \
+             FROM assets JOIN folder_group_assets fga ON fga.asset_id = assets.id \
+             WHERE fga.folder_group_id = ?1 AND assets.id = ?2 \
                AND media_kind <> 'video' \
                AND shape_status IN ('ready','fallback') AND width IS NOT NULL AND height IS NOT NULL",
         );
@@ -161,7 +162,8 @@ impl Catalog {
             "SELECT id, display_path, media_kind, provisional_order, captured_at_utc, width, height, representative_rgb, availability, shape_status, rating, \
                     EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id), \
                     (SELECT code FROM warnings WHERE warnings.asset_id = assets.id ORDER BY CASE code WHEN 'derivative_generation_failed' THEN 0 ELSE 1 END, occurred_at DESC, id DESC LIMIT 1) \
-             FROM assets WHERE folder_group_id = ?1 AND media_kind <> 'video' \
+             FROM assets JOIN folder_group_assets fga ON fga.asset_id = assets.id \
+             WHERE fga.folder_group_id = ?1 AND media_kind <> 'video' \
                AND shape_status IN ('ready','fallback') AND width IS NOT NULL AND height IS NOT NULL",
         );
         if scope == GalleryScope::CurrentFolder {

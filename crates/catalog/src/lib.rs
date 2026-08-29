@@ -8,6 +8,7 @@ mod index_repo;
 mod library_repo;
 mod migrate;
 mod policy_repo;
+mod selection_repo;
 mod settings_repo;
 mod wall_repo;
 
@@ -25,6 +26,7 @@ pub use index_repo::{
 };
 pub use library_repo::{LibraryRootRecord, NewLibrary};
 use rusqlite::Connection;
+pub use selection_repo::FolderGroupRecord;
 pub use settings_repo::{AppStateRecord, StoredSourceSelection};
 use thiserror::Error;
 pub use wall_repo::{

@@ -143,7 +143,6 @@ impl Catalog {
             [&value.cache_key], decode_derivative,
         )?;
         if existing.asset_id != value.asset_id
-            || existing.folder_group_id != value.folder_group_id
             || existing.kind != value.kind
             || existing.relative_cache_path != value.relative_cache_path
             || existing.size_bytes != value.size_bytes
@@ -153,6 +152,14 @@ impl Catalog {
                 "cache key already identifies a different immutable derivative".to_owned(),
             ));
         }
+        transaction.execute(
+            "INSERT INTO derivative_folder_groups (derivative_id, folder_group_id)
+             VALUES (?1, ?2) ON CONFLICT(derivative_id, folder_group_id) DO NOTHING",
+            params![
+                existing.id.as_uuid().as_bytes(),
+                value.folder_group_id.as_uuid().as_bytes()
+            ],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -162,15 +169,40 @@ impl Catalog {
     }
 
     pub fn cache_eviction_groups(&self) -> Result<Vec<CacheEvictionGroup>, CatalogError> {
-        let mut statement = self.connection.prepare(
-            "SELECT g.id, SUM(d.size_bytes), g.last_viewed_at \
-             FROM folder_groups g \
-             JOIN derivatives d ON d.folder_group_id = g.id AND d.durable = 0 \
-             GROUP BY g.id, g.last_viewed_at \
-             ORDER BY g.last_viewed_at IS NOT NULL, g.last_viewed_at, g.id",
-        )?;
+        self.cache_eviction_groups_excluding(&[])
+    }
+
+    pub fn cache_eviction_groups_excluding(
+        &self,
+        protected_groups: &[FolderGroupId],
+    ) -> Result<Vec<CacheEvictionGroup>, CatalogError> {
+        let placeholders = std::iter::repeat_n("?", protected_groups.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let protected_clause = if protected_groups.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " WHERE NOT EXISTS (SELECT 1 FROM derivative_folder_groups protected_link
+                   WHERE protected_link.derivative_id = d.id
+                     AND protected_link.folder_group_id IN ({placeholders}))"
+            )
+        };
+        let sql = format!(
+            "SELECT g.id, SUM(d.size_bytes), g.last_viewed_at
+             FROM folder_groups g
+             JOIN derivative_folder_groups dfg ON dfg.folder_group_id = g.id
+             JOIN derivatives d ON d.id = dfg.derivative_id AND d.durable = 0
+             {protected_clause}
+             GROUP BY g.id, g.last_viewed_at
+             ORDER BY g.last_viewed_at IS NOT NULL, g.last_viewed_at, g.id"
+        );
+        let values = protected_groups
+            .iter()
+            .map(|group| rusqlite::types::Value::Blob(group.as_uuid().as_bytes().to_vec()));
+        let mut statement = self.connection.prepare(&sql)?;
         statement
-            .query_map([], |row| {
+            .query_map(rusqlite::params_from_iter(values), |row| {
                 let id: Vec<u8> = row.get(0)?;
                 let bytes: i64 = row.get(1)?;
                 Ok(CacheEvictionGroup {
@@ -187,6 +219,67 @@ impl Catalog {
             })?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// Lists non-durable derivatives linked to these groups whose physical files are not
+    /// protected by a link outside the selected groups.
+    pub fn reclaimable_derivatives_for_groups(
+        &self,
+        groups: &[FolderGroupId],
+    ) -> Result<Vec<DerivativeRecord>, CatalogError> {
+        if groups.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", groups.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT DISTINCT d.id, d.asset_id, d.folder_group_id, d.kind, d.cache_key,
+                    d.relative_cache_path, d.size_bytes, d.durable
+             FROM derivatives d
+             JOIN derivative_folder_groups selected_link ON selected_link.derivative_id = d.id
+             WHERE selected_link.folder_group_id IN ({placeholders}) AND d.durable = 0
+               AND NOT EXISTS (
+                 SELECT 1 FROM derivative_folder_groups other_link
+                 WHERE other_link.derivative_id = d.id
+                   AND other_link.folder_group_id NOT IN ({placeholders})
+               )
+             ORDER BY d.id"
+        );
+        let values = groups
+            .iter()
+            .chain(groups.iter())
+            .map(|group| rusqlite::types::Value::Blob(group.as_uuid().as_bytes().to_vec()));
+        let mut statement = self.connection.prepare(&sql)?;
+        let records = statement
+            .query_map(rusqlite::params_from_iter(values), decode_derivative)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    pub fn remove_derivative_group_links(
+        &mut self,
+        derivatives: &[DerivativeId],
+        groups: &[FolderGroupId],
+    ) -> Result<usize, CatalogError> {
+        let transaction = self.connection.transaction()?;
+        let mut removed = 0;
+        for derivative in derivatives {
+            for group in groups {
+                removed += transaction.execute(
+                    "DELETE FROM derivative_folder_groups
+                     WHERE derivative_id = ?1 AND folder_group_id = ?2",
+                    params![derivative.as_uuid().as_bytes(), group.as_uuid().as_bytes()],
+                )?;
+            }
+            transaction.execute(
+                "DELETE FROM derivatives WHERE id = ?1
+                 AND NOT EXISTS (SELECT 1 FROM derivative_folder_groups WHERE derivative_id = ?1)",
+                [derivative.as_uuid().as_bytes()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(removed)
     }
 
     /// Returns the aggregate size of non-durable derivatives without materializing every row.
@@ -220,8 +313,9 @@ impl Catalog {
     ) -> Result<Vec<DerivativeRecord>, CatalogError> {
         let mut records = Vec::new();
         let mut statement = self.connection.prepare(
-            "SELECT id, asset_id, folder_group_id, kind, cache_key, relative_cache_path, size_bytes, durable \
-             FROM derivatives WHERE folder_group_id = ?1 AND durable = 0 ORDER BY id",
+            "SELECT DISTINCT d.id, d.asset_id, d.folder_group_id, d.kind, d.cache_key, d.relative_cache_path, d.size_bytes, d.durable \
+             FROM derivatives d JOIN derivative_folder_groups dfg ON dfg.derivative_id = d.id \
+             WHERE dfg.folder_group_id = ?1 AND d.durable = 0 ORDER BY d.id",
         )?;
         for group in groups {
             let rows = statement.query_map([group.as_uuid().as_bytes()], decode_derivative)?;
@@ -289,7 +383,9 @@ impl Catalog {
         durable: bool,
     ) -> Result<u64, CatalogError> {
         let count: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM derivatives WHERE folder_group_id = ?1 AND durable = ?2",
+            "SELECT COUNT(*) FROM derivative_folder_groups dfg
+             JOIN derivatives d ON d.id = dfg.derivative_id
+             WHERE dfg.folder_group_id = ?1 AND d.durable = ?2",
             params![group.as_uuid().as_bytes(), durable],
             |row| row.get(0),
         )?;
@@ -315,7 +411,9 @@ impl Catalog {
     }
 }
 
-fn decode_derivative(row: &rusqlite::Row<'_>) -> Result<DerivativeRecord, rusqlite::Error> {
+pub(crate) fn decode_derivative(
+    row: &rusqlite::Row<'_>,
+) -> Result<DerivativeRecord, rusqlite::Error> {
     let id: Vec<u8> = row.get(0)?;
     let asset: Vec<u8> = row.get(1)?;
     let group: Vec<u8> = row.get(2)?;

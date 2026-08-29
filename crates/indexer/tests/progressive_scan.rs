@@ -3,9 +3,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use photo_catalog::{Catalog, NewAsset, NewLibrary};
+use photo_catalog::{Catalog, NewAsset, NewFolderGroup, NewLibrary, ShapeStatus, WallOrder};
 use photo_core::FolderPolicyEngine;
-use photo_domain::{MediaKind, RelativePathKey};
+use photo_domain::{FolderGroupId, GalleryScope, MediaKind, RelativePathKey};
 use photo_indexer::{
     CatalogWriter, DefaultMetadataReader, IndexEvent, IndexScheduler, Indexer, InteractionMode,
     MetadataReader, ScanProgress, ScanRequest, ScanStage, SchedulerConfig,
@@ -447,6 +447,70 @@ async fn cancellation_joins_before_blocked_metadata_gate_is_released() {
     assert!(summary.cancelled);
     assert!(summary.discovered < 160);
     release.release();
+}
+
+#[test]
+fn catalog_writer_records_discovered_asset_in_its_selection_membership() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured("Pictures", Path::new("/Pictures")))
+        .unwrap();
+    let group = catalog
+        .upsert_folder_group(&NewFolderGroup {
+            id: FolderGroupId::new(),
+            library_id: library.id,
+            relative_path: RelativePathKey::from_relative_path(Path::new("selected")).unwrap(),
+            display_path: "selected".to_owned(),
+            last_viewed_at: None,
+        })
+        .unwrap();
+    let generation = catalog
+        .begin_generation_for_group(library.id, group)
+        .unwrap();
+    let asset = NewAsset {
+        folder_group_id: Some(group),
+        ..NewAsset::minimal(
+            library.id,
+            RelativePathKey::from_relative_path(Path::new("selected/photo.jpg")).unwrap(),
+            "selected/photo.jpg",
+            MediaKind::Jpeg,
+            3,
+        )
+    };
+    CatalogWriter::new(&mut catalog, library.id, generation)
+        .apply_batch(&[
+            IndexEvent::Discovered {
+                asset: asset.clone(),
+            },
+            IndexEvent::ShapeReady {
+                asset_id: asset.id,
+                width: 16,
+                height: 9,
+                orientation: 1,
+            },
+        ])
+        .unwrap();
+
+    assert_eq!(
+        catalog
+            .wall_page_scoped(
+                group,
+                GalleryScope::CurrentFolder,
+                WallOrder::Provisional,
+                None,
+                10,
+            )
+            .unwrap()
+            .items
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec![asset.id]
+    );
+    assert_eq!(
+        catalog.find_asset(asset.id).unwrap().unwrap().shape_status,
+        ShapeStatus::Ready
+    );
 }
 
 #[tokio::test]

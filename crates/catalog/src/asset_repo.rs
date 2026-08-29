@@ -63,7 +63,11 @@ pub struct AssetRecord {
 
 impl Catalog {
     pub fn upsert_asset(&mut self, value: &NewAsset) -> Result<(), CatalogError> {
-        upsert_asset_on(&self.connection, value)
+        upsert_asset_on(&self.connection, value)?;
+        if let Some(group) = value.folder_group_id {
+            crate::selection_repo::add_asset_membership_on(&self.connection, group, value.id, 0)?;
+        }
+        Ok(())
     }
 
     pub fn find_asset(&self, id: AssetId) -> Result<Option<AssetRecord>, CatalogError> {
