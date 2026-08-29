@@ -84,7 +84,7 @@ The round-4 implementation and report are intentionally separate commits so this
 
 Round 5 closes the remaining desktop admission and hosted-runtime lifecycle races. The scan control is now a synchronous, short critical-section state machine with a `watch` lifecycle signal. Admission, cancellation, cancellation-sender installation, and terminal completion are coordinated atomically; cancellation no longer uses `try_lock`, and every canceled scan publishes `Cancelled` so bridges and cleanup watchers can terminate and release their runtime. Desktop bridge installation and forwarding are serialized with persisted active-selection, protected-group, and `selection_epoch` changes. Existing hosted subscriptions receive an authoritative scope watch, so filtering and aggregate demand change together when client interaction changes from `CurrentFolder` to `IncludeSubfolders` or back.
 
-Regression coverage added in this round includes the deterministic stale async token barrier (`stale_async_scan_token_is_rejected_before_bridge_or_scan_admission`), cancellation under scan-control lock contention, multiple lifecycle waiters for both cancellation and completion, exact-once concurrent scan admission, canceled desktop bridge termination/runtime release, both runtime-registry drop orderings, mutable-scope filtering for catalog/derivative/warning/clear events, and a bounded progressive flush assertion. The progressive test has a 250 ms timeout and no wall-clock sleep; the implementation's progressive batch deadline remains 50 ms.
+Regression coverage added in this round includes the stale-token ordering check (`stale_scan_token_is_rejected_before_bridge_or_scan_admission`), cancellation under scan-control lock contention, multiple lifecycle waiters for both cancellation and completion, exact-once concurrent scan admission, canceled desktop bridge termination/runtime release, both runtime-registry drop orderings, mutable-scope filtering for catalog/derivative/warning/clear events, and a bounded progressive flush assertion. The stale-token check sequences an older token after a newer selection but does not claim a scheduling barrier. The cancellation-contention test uses a notification from the worker before asserting that it remains blocked on the held scan-control lock. The progressive test has a 250 ms timeout and no wall-clock sleep; the implementation's progressive batch deadline remains 50 ms.
 
 Fix round 5 implementation commit: `c5a7055` (`fix: close hosted runtime lifecycle races`).
 
@@ -100,3 +100,24 @@ Fix round 5 focused verification passed:
 - `cargo fmt --all -- --check` and `git diff --check`.
 
 The report remains separate from the implementation commit; the report-only commit is the branch HEAD after this append.
+
+## Fix round 6 evidence
+
+RED/GREEN evidence: the startup and persistence bridge regressions were observed RED against the round-5 implementation because a failed scan left the desktop runtime/bridge alive; they are GREEN after failed lifecycle handling and bridge ownership cleanup. Round 6 adds a direct preflight source-check failure regression as well. The new deterministic runtime interleavings hold the scan-control lock through `Starting` publication and notify when a cancellation worker attempts the contested lock, so the old unsynchronized publication and `try_lock` behavior cannot satisfy the tests.
+
+Round 6 makes scan-control state mutation and lifecycle `watch` publication one lock-held transition, stamps each admitted scan generation, and rejects stale sender installation and terminal completion. Desktop bridges now own registry entries with abort handles, forward only while they own the current token, and remove their entry and active-scan marker on every terminal path, including `Failed`. Failed-generation desktop retries subscribe after the current event head, preserving one path-free `catalogUnavailable` warning and preventing old-generation replay or duplicate bridge delivery.
+
+The stale-token test is an ordering check, not a scheduling-barrier test. The cancellation-contention regression has an explicit attempted-lock notification and completion assertion while the lock is held.
+
+Fix round 6 focused verification passed:
+
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-app-service service::tests:: -- --nocapture` (10/10).
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-app-service hosted_runtime::tests:: -- --nocapture` (9/9).
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-indexer --test scheduler_priority` (11/11).
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-app-service --test hosted_selections --test hosted_runtime --test desktop_gallery_wrapper` (6 + 12 + 1).
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-app-service --test progressive_wall` (57/57).
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-app-service` passed, including 91 unit tests and all app-service integration/doc tests.
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test --workspace` passed all workspace tests and doc tests.
+- `cargo fmt --all -- --check` and `git diff --check` passed.
+
+The round-6 implementation and report remain separate commits; this report-only commit is the branch HEAD after the implementation commit.
