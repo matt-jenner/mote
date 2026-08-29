@@ -229,7 +229,11 @@ impl IndexScheduler {
     }
 
     pub(crate) fn try_admit_enrichment(&self) -> bool {
-        let limit = self.available_background_permits().clamp(1, 2);
+        // This is shared by every scanner using the scheduler.  The scanner
+        // still limits its own worker count, while this admission count keeps
+        // combined shape and metadata work within the configured global
+        // interaction budget.
+        let limit = self.available_background_permits().max(1);
         let mut current = self.active_enrichment.load(AtomicOrdering::Acquire);
         loop {
             if current >= limit {

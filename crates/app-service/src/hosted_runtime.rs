@@ -100,6 +100,28 @@ impl SelectionRuntime {
         demand.remove(&token);
     }
 
+    /// Cancel an idle scan as soon as the last live subscription goes away.
+    ///
+    /// The scan task owns the runtime while it drains its indexer handle, so
+    /// this is deliberately best-effort and synchronous: the sender is the
+    /// actual handle-owned cancellation channel and the task will finish its
+    /// normal cleanup path after observing it.
+    pub(crate) fn cancel_if_idle(&self) {
+        let demand_empty = self.client_demand.lock().is_ok_and(|mut demand| {
+            let now = tokio::time::Instant::now();
+            demand.retain(|_, value| value.lease_until > now);
+            demand.is_empty()
+        });
+        if !demand_empty {
+            return;
+        }
+        if let Ok(cancel) = self.scan_cancel.try_lock()
+            && let Some(sender) = cancel.as_ref()
+        {
+            let _ = sender.send(true);
+        }
+    }
+
     pub(crate) fn aggregate_scope(&self) -> GalleryScope {
         let mut demand = self.client_demand.lock().expect("client demand poisoned");
         let now = tokio::time::Instant::now();
@@ -274,5 +296,82 @@ impl SelectionEventSubscription {
 impl Drop for SelectionEventSubscription {
     fn drop(&mut self) {
         self.runtime.remove(&self.client_id, self.client_token);
+        self.runtime.cancel_if_idle();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use photo_domain::{FolderGroupId, LibraryId, RelativePathKey};
+    use std::path::Path;
+
+    fn selection() -> GallerySelection {
+        GallerySelection {
+            id: "selection-00000000-0000-0000-0000-000000000001".to_owned(),
+            library_id: LibraryId::new(),
+            group_id: FolderGroupId::new(),
+            relative_folder: RelativePathKey::from_relative_path(Path::new(".")).unwrap(),
+        }
+    }
+
+    fn progress(selection_id: &str, generation: u64) -> WallUpdate {
+        WallUpdate::Progress {
+            selection_id: selection_id.to_owned(),
+            generation,
+            progress: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn final_demand_drop_cancels_the_actual_scan_sender() {
+        let runtime = SelectionRuntime::new(
+            selection(),
+            Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
+        );
+        let (sender, mut receiver) = watch::channel(false);
+        *runtime.scan_cancel.lock().await = Some(sender);
+        let token = runtime.register("client".to_owned(), GalleryScope::CurrentFolder);
+
+        runtime.remove("client", token);
+        runtime.cancel_if_idle();
+
+        assert!(receiver.changed().await.is_ok());
+        assert!(*receiver.borrow());
+    }
+
+    #[tokio::test]
+    async fn concurrent_publication_keeps_history_and_broadcast_order_identical() {
+        let runtime = SelectionRuntime::new(
+            selection(),
+            Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
+        );
+        let mut receiver = runtime.updates.subscribe();
+        let mut tasks = Vec::new();
+        for generation in 0..32 {
+            let runtime = runtime.clone();
+            tasks.push(tokio::spawn(async move {
+                runtime
+                    .publish(progress(runtime.selection.id(), generation))
+                    .await
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let mut broadcast_ids = Vec::new();
+        for _ in 0..32 {
+            broadcast_ids.push(receiver.recv().await.unwrap().id);
+        }
+        let history_ids = runtime
+            .history
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event.id)
+            .collect::<Vec<_>>();
+        assert_eq!(broadcast_ids, history_ids);
+        assert_eq!(broadcast_ids, (1..=32).collect::<Vec<_>>());
     }
 }

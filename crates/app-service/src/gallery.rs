@@ -312,6 +312,17 @@ impl GalleryEngine {
         runtime
     }
 
+    fn remove_runtime_if_dead(&self, group_id: FolderGroupId, runtime: &Arc<SelectionRuntime>) {
+        let mut runtimes = self.runtimes.lock().expect("runtime registry poisoned");
+        let remove = runtimes.get(&group_id).is_some_and(|weak| {
+            weak.upgrade()
+                .is_none_or(|current| Arc::ptr_eq(&current, runtime))
+        });
+        if remove && Arc::strong_count(runtime) <= 1 {
+            runtimes.remove(&group_id);
+        }
+    }
+
     pub async fn ensure_running(
         &self,
         selection: &GallerySelection,
@@ -496,7 +507,18 @@ impl GalleryEngine {
                 .to_path_buf()
                 .map_err(|e| CatalogError::InvalidData(e.to_string()))?;
             let selection_root = root.join(&selected);
-            if !selection_root.is_dir() {
+            let canonical_root = std::fs::canonicalize(&root).map_err(|_| {
+                AppServiceError::OpenRecent(photo_core::AddLibraryError::NotDirectory(root.clone()))
+            })?;
+            let canonical_selection_root =
+                std::fs::canonicalize(&selection_root).map_err(|_| {
+                    AppServiceError::OpenRecent(photo_core::AddLibraryError::NotDirectory(
+                        selection_root.clone(),
+                    ))
+                })?;
+            if !canonical_selection_root.starts_with(&canonical_root)
+                || !canonical_selection_root.is_dir()
+            {
                 if root.is_dir() {
                     state.libraries.catalog_mut().mark_group_offline(
                         runtime.selection.library_id,
@@ -521,6 +543,7 @@ impl GalleryEngine {
                     })
                     .await;
                 *runtime.scan_cancel.lock().await = None;
+                self.remove_runtime_if_dead(runtime.selection.group_id, &runtime);
                 return Ok(());
             }
             let generation = state.libraries.catalog_mut().begin_generation_for_group(
@@ -661,6 +684,7 @@ impl GalleryEngine {
                 .await;
         }
         *runtime.scan_cancel.lock().await = None;
+        self.remove_runtime_if_dead(runtime.selection.group_id, &runtime);
     }
 
     async fn apply_runtime_batch(
