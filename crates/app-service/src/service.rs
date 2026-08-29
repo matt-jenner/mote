@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(any(test, debug_assertions))]
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::Notify;
 use tokio::sync::watch;
@@ -430,6 +429,7 @@ pub struct AppService {
     pub(crate) protected_groups: ProtectedGroups,
     pub(crate) derivative_driver: Arc<tokio::sync::Mutex<()>>,
     pub(crate) collection_driver: Arc<CollectionDriverControl>,
+    gallery_scope_update: Arc<TokioMutex<()>>,
     #[cfg(any(test, debug_assertions))]
     pub(crate) derivative_test_gate: Arc<TokioMutex<Option<DerivativeTestGate>>>,
     #[cfg(any(test, debug_assertions))]
@@ -565,6 +565,7 @@ impl AppService {
             protected_groups: ProtectedGroups::default(),
             derivative_driver: Arc::new(tokio::sync::Mutex::new(())),
             collection_driver: Arc::new(CollectionDriverControl::new()),
+            gallery_scope_update: Arc::new(TokioMutex::new(())),
             #[cfg(any(test, debug_assertions))]
             derivative_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]
@@ -981,6 +982,7 @@ impl AppService {
         &self,
         scope: GalleryScope,
     ) -> Result<BootstrapState, AppServiceError> {
+        let _scope_update = self.gallery_scope_update.lock().await;
         let (changed, has_selection) = {
             let mut state = self.state()?;
             let stored = state.libraries.catalog().load_app_state()?;

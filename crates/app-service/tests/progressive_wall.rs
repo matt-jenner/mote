@@ -2710,13 +2710,27 @@ async fn scope_update_returns_bootstrap_refreshed_after_invalidation_waits() {
     tokio::time::timeout(Duration::from_secs(5), invalidation_waiting.notified())
         .await
         .expect("scope update should wait for the admitted background commit");
+    let duplicate_service = service.clone();
+    let mut duplicate_update = tokio::spawn(async move {
+        duplicate_service
+            .update_gallery_scope(GalleryScope::CurrentFolder)
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut duplicate_update)
+            .await
+            .is_err(),
+        "an identical scope update must wait for the in-flight refresh"
+    );
     service.update_appearance(Appearance::Dark).unwrap();
 
     post_admission_release.notify_waiters();
     assert!(background.await.unwrap().is_ok());
     let returned = scope_update.await.unwrap().unwrap();
+    let duplicate_returned = duplicate_update.await.unwrap().unwrap();
 
     assert_eq!(returned.settings.appearance, Appearance::Dark);
+    assert_eq!(duplicate_returned.settings.appearance, Appearance::Dark);
 }
 
 #[cfg(debug_assertions)]
