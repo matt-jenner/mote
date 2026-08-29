@@ -16,6 +16,25 @@ use crate::{
     WallQueryRequest, WallUpdate,
 };
 
+fn canonicalize_for_identity(path: &Path) -> PathBuf {
+    let mut unresolved = Vec::new();
+    let mut existing = path.to_owned();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            break;
+        };
+        unresolved.push(name.to_owned());
+        if !existing.pop() {
+            break;
+        }
+    }
+    let mut canonical = std::fs::canonicalize(&existing).unwrap_or(existing);
+    for component in unresolved.iter().rev() {
+        canonical.push(component);
+    }
+    canonical
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct GallerySelection {
     pub(crate) id: String,
@@ -102,7 +121,7 @@ impl GalleryEngine {
             vec![config.data_dir().to_owned(), config.cache_dir().to_owned()],
         )
         .map_err(AppServiceError::LibrarySetup)?;
-        let canonical = std::fs::canonicalize(&source_root).unwrap_or_else(|_| source_root.clone());
+        let canonical = canonicalize_for_identity(&source_root);
         let hosted_library_id = if let Some(library) = libraries
             .catalog()
             .list_libraries()?
@@ -110,6 +129,7 @@ impl GalleryEngine {
             .find(|library| {
                 library.canonical_root_key.to_path_buf().ok().as_deref()
                     == Some(canonical.as_path())
+                    || Path::new(&library.display_path) == source_root.as_path()
             }) {
             library.id
         } else {
@@ -160,8 +180,6 @@ impl GalleryEngine {
                 photo_core::AddLibraryError::InvalidSelection,
             ));
         }
-        let key = RelativePathKey::from_relative_path(relative)
-            .map_err(|_| photo_core::AddLibraryError::InvalidSelection)?;
         let mut state = self
             .state
             .lock()
@@ -186,7 +204,12 @@ impl GalleryEngine {
                 photo_core::AddLibraryError::InvalidSelection,
             ));
         }
-        let display_name = relative
+        let canonical_relative = selected_canonical
+            .strip_prefix(&root)
+            .unwrap_or_else(|_| Path::new("."));
+        let key = RelativePathKey::from_relative_path(canonical_relative)
+            .map_err(|_| photo_core::AddLibraryError::InvalidSelection)?;
+        let display_name = canonical_relative
             .file_name()
             .map(|v| v.to_string_lossy().into_owned())
             .unwrap_or_else(|| library.display_name.clone());
@@ -307,12 +330,28 @@ impl GalleryEngine {
         if let Some(runtime) = runtimes.get(&selection.group_id).and_then(Weak::upgrade) {
             return runtime;
         }
-        let runtime = SelectionRuntime::new(selection.clone(), self.scheduler.clone());
+        let settled = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .libraries
+                    .catalog()
+                    .has_completed_generation_for_group(selection.library_id, selection.group_id)
+                    .ok()
+            })
+            .unwrap_or(false);
+        let runtime = SelectionRuntime::new(selection.clone(), self.scheduler.clone(), settled);
         runtimes.insert(selection.group_id, Arc::downgrade(&runtime));
         runtime
     }
 
-    fn remove_runtime_if_dead(&self, group_id: FolderGroupId, runtime: &Arc<SelectionRuntime>) {
+    pub(crate) fn remove_runtime_if_dead(
+        &self,
+        group_id: FolderGroupId,
+        runtime: &Arc<SelectionRuntime>,
+    ) {
         let mut runtimes = self.runtimes.lock().expect("runtime registry poisoned");
         let remove = runtimes.get(&group_id).is_some_and(|weak| {
             weak.upgrade()
@@ -473,10 +512,6 @@ impl GalleryEngine {
             return Ok(false);
         };
         let value = demand.get_mut(&token).expect("demand token was present");
-        if value.lease_until <= tokio::time::Instant::now() {
-            demand.remove(&token);
-            return Ok(false);
-        }
         value.scope = scope;
         value.interaction = interaction;
         value.lease_until = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -507,18 +542,11 @@ impl GalleryEngine {
                 .to_path_buf()
                 .map_err(|e| CatalogError::InvalidData(e.to_string()))?;
             let selection_root = root.join(&selected);
-            let canonical_root = std::fs::canonicalize(&root).map_err(|_| {
-                AppServiceError::OpenRecent(photo_core::AddLibraryError::NotDirectory(root.clone()))
-            })?;
-            let canonical_selection_root =
-                std::fs::canonicalize(&selection_root).map_err(|_| {
-                    AppServiceError::OpenRecent(photo_core::AddLibraryError::NotDirectory(
-                        selection_root.clone(),
-                    ))
-                })?;
-            if !canonical_selection_root.starts_with(&canonical_root)
-                || !canonical_selection_root.is_dir()
-            {
+            // An unavailable source is a normal cached-browsing state. Check
+            // lexical existence before canonicalization so a missing root can
+            // still publish SourceUnavailable and leave cached wall rows
+            // readable.
+            if !root.is_dir() || !selection_root.is_dir() {
                 if root.is_dir() {
                     state.libraries.catalog_mut().mark_group_offline(
                         runtime.selection.library_id,
@@ -545,6 +573,20 @@ impl GalleryEngine {
                 *runtime.scan_cancel.lock().await = None;
                 self.remove_runtime_if_dead(runtime.selection.group_id, &runtime);
                 return Ok(());
+            }
+            let canonical_root = std::fs::canonicalize(&root).map_err(|_| {
+                AppServiceError::OpenRecent(photo_core::AddLibraryError::NotDirectory(root.clone()))
+            })?;
+            let canonical_selection_root =
+                std::fs::canonicalize(&selection_root).map_err(|_| {
+                    AppServiceError::OpenRecent(photo_core::AddLibraryError::NotDirectory(
+                        selection_root.clone(),
+                    ))
+                })?;
+            if !canonical_selection_root.starts_with(&canonical_root) {
+                return Err(AppServiceError::OpenRecent(
+                    photo_core::AddLibraryError::InvalidSelection,
+                ));
             }
             let generation = state.libraries.catalog_mut().begin_generation_for_group(
                 runtime.selection.library_id,

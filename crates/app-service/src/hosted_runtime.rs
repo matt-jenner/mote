@@ -39,6 +39,7 @@ impl SelectionRuntime {
     pub(crate) fn new(
         selection: GallerySelection,
         scheduler: Arc<photo_indexer::IndexScheduler>,
+        settled: bool,
     ) -> Arc<Self> {
         let (updates, _) = broadcast::channel(256);
         Arc::new(Self {
@@ -55,7 +56,7 @@ impl SelectionRuntime {
             history: Mutex::new(VecDeque::with_capacity(256)),
             next_event_id: AtomicU64::new(0),
             next_client_token: AtomicU64::new(1),
-            settled: std::sync::atomic::AtomicBool::new(false),
+            settled: std::sync::atomic::AtomicBool::new(settled),
             client_demand: Mutex::new(HashMap::new()),
         })
     }
@@ -100,32 +101,8 @@ impl SelectionRuntime {
         demand.remove(&token);
     }
 
-    /// Cancel an idle scan as soon as the last live subscription goes away.
-    ///
-    /// The scan task owns the runtime while it drains its indexer handle, so
-    /// this is deliberately best-effort and synchronous: the sender is the
-    /// actual handle-owned cancellation channel and the task will finish its
-    /// normal cleanup path after observing it.
-    pub(crate) fn cancel_if_idle(&self) {
-        let demand_empty = self.client_demand.lock().is_ok_and(|mut demand| {
-            let now = tokio::time::Instant::now();
-            demand.retain(|_, value| value.lease_until > now);
-            demand.is_empty()
-        });
-        if !demand_empty {
-            return;
-        }
-        if let Ok(cancel) = self.scan_cancel.try_lock()
-            && let Some(sender) = cancel.as_ref()
-        {
-            let _ = sender.send(true);
-        }
-    }
-
     pub(crate) fn aggregate_scope(&self) -> GalleryScope {
-        let mut demand = self.client_demand.lock().expect("client demand poisoned");
-        let now = tokio::time::Instant::now();
-        demand.retain(|_, value| value.lease_until > now);
+        let demand = self.client_demand.lock().expect("client demand poisoned");
         if demand
             .values()
             .any(|value| value.scope == GalleryScope::IncludeSubfolders)
@@ -296,7 +273,8 @@ impl SelectionEventSubscription {
 impl Drop for SelectionEventSubscription {
     fn drop(&mut self) {
         self.runtime.remove(&self.client_id, self.client_token);
-        self.runtime.cancel_if_idle();
+        self.engine
+            .remove_runtime_if_dead(self.runtime.selection.group_id, &self.runtime);
     }
 }
 
@@ -324,27 +302,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_demand_drop_cancels_the_actual_scan_sender() {
-        let runtime = SelectionRuntime::new(
-            selection(),
-            Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
-        );
-        let (sender, mut receiver) = watch::channel(false);
-        *runtime.scan_cancel.lock().await = Some(sender);
-        let token = runtime.register("client".to_owned(), GalleryScope::CurrentFolder);
-
-        runtime.remove("client", token);
-        runtime.cancel_if_idle();
-
-        assert!(receiver.changed().await.is_ok());
-        assert!(*receiver.borrow());
-    }
-
-    #[tokio::test]
     async fn concurrent_publication_keeps_history_and_broadcast_order_identical() {
         let runtime = SelectionRuntime::new(
             selection(),
             Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
+            false,
         );
         let mut receiver = runtime.updates.subscribe();
         let mut tasks = Vec::new();
@@ -373,5 +335,26 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(broadcast_ids, history_ids);
         assert_eq!(broadcast_ids, (1..=32).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn expired_interaction_lease_keeps_connected_scope_demand() {
+        let runtime = SelectionRuntime::new(
+            selection(),
+            Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
+            false,
+        );
+        let token = runtime.register("client".to_owned(), GalleryScope::IncludeSubfolders);
+        runtime
+            .client_demand
+            .lock()
+            .unwrap()
+            .get_mut(&token)
+            .unwrap()
+            .lease_until = tokio::time::Instant::now() - std::time::Duration::from_secs(1);
+
+        assert_eq!(runtime.aggregate_scope(), GalleryScope::IncludeSubfolders);
+        runtime.remove("client", token);
+        assert_eq!(runtime.aggregate_scope(), GalleryScope::CurrentFolder);
     }
 }
