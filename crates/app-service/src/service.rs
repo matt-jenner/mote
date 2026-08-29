@@ -74,6 +74,11 @@ pub(crate) struct ScanOwner {
     pub(crate) generation: u64,
 }
 
+pub(crate) struct DesktopBridgeEntry {
+    pub(crate) id: u64,
+    pub(crate) abort: tokio::task::AbortHandle,
+}
+
 #[cfg(any(test, debug_assertions))]
 #[derive(Clone)]
 pub(crate) struct DerivativeTestGate {
@@ -479,6 +484,8 @@ pub struct AppService {
     pub(crate) derivative_visible_queue_test_hook: Arc<TokioMutex<Option<Arc<Notify>>>>,
     #[cfg(test)]
     pub(crate) scan_completion_wake_test_hook: Arc<Mutex<Option<ScanCompletionWakeTestHook>>>,
+    pub(crate) desktop_bridges: Arc<Mutex<HashMap<SelectionToken, DesktopBridgeEntry>>>,
+    pub(crate) next_bridge_id: Arc<AtomicU64>,
     source_validator: Arc<dyn RecentSourceValidator>,
     pub(crate) selection_transition: Arc<Mutex<()>>,
     selection_request_sequence: Arc<AtomicU64>,
@@ -619,6 +626,8 @@ impl AppService {
             derivative_visible_queue_test_hook: Arc::new(TokioMutex::new(None)),
             #[cfg(test)]
             scan_completion_wake_test_hook: Arc::new(Mutex::new(None)),
+            desktop_bridges: Arc::new(Mutex::new(HashMap::new())),
+            next_bridge_id: Arc::new(AtomicU64::new(0)),
             source_validator,
             selection_transition: Arc::new(Mutex::new(())),
             selection_request_sequence: Arc::new(AtomicU64::new(0)),
@@ -1174,6 +1183,7 @@ mod tests {
     #[cfg(debug_assertions)]
     use super::DerivativeTaskTracker;
     use super::{AppConfig, AppService, AppServiceError, RecentSourceValidator};
+    use crate::WallUpdate;
 
     #[cfg(debug_assertions)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1497,7 +1507,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn stale_async_scan_token_is_rejected_before_bridge_or_scan_admission() {
+    async fn stale_scan_token_is_rejected_before_bridge_or_scan_admission() {
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first");
         let second = temp.path().join("second");
@@ -1608,6 +1618,206 @@ mod tests {
                 .is_err(),
             "cancelled desktop bridge forwarded a stale update"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_startup_bridge_exits_and_same_token_retry_has_one_bridge() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(&source).unwrap();
+        ImageBuffer::from_pixel(2, 2, Rgb([10_u8, 20, 30]))
+            .save(source.join("photo.jpg"))
+            .unwrap();
+        let service = AppService::open(AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let token = service.select_recent(&source).unwrap().1;
+        service.gallery.fail_next_start_for_test();
+        let mut updates = service.subscribe_wall_updates();
+
+        assert!(service.start_selected_scan(token).await.is_err());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while service.runtime_count_for_test() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed startup bridge did not release its runtime");
+        assert_eq!(service.desktop_bridge_count_for_test(), 0);
+        assert!(service.state().unwrap().active_scan.is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), updates.recv())
+                .await
+                .is_err(),
+            "failed startup must not forward a later event"
+        );
+
+        service.start_selected_scan(token).await.unwrap();
+        let settled = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if matches!(
+                    updates.recv().await.unwrap(),
+                    WallUpdate::MetadataSettled { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(settled.is_ok(), "retry did not settle");
+        let mut settled_count = 1;
+        while let Ok(Ok(update)) =
+            tokio::time::timeout(Duration::from_millis(150), updates.recv()).await
+        {
+            if matches!(update, WallUpdate::MetadataSettled { .. }) {
+                settled_count += 1;
+            }
+        }
+        assert_eq!(settled_count, 1, "retry left a duplicate desktop bridge");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while service.desktop_bridge_count_for_test() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful retry bridge did not clean up");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_source_check_bridge_exits_before_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(&source).unwrap();
+        ImageBuffer::from_pixel(2, 2, Rgb([10_u8, 20, 30]))
+            .save(source.join("photo.jpg"))
+            .unwrap();
+        let service = AppService::open(AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let token = service.select_recent(&source).unwrap().1;
+        service.gallery.fail_next_source_check_for_test();
+        let mut updates = service.subscribe_wall_updates();
+
+        assert!(service.start_selected_scan(token).await.is_err());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while service.desktop_bridge_count_for_test() != 0
+                || service.runtime_count_for_test() != 0
+                || service.state().unwrap().active_scan.is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("source-check failure did not release desktop state");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), updates.recv())
+                .await
+                .is_err(),
+            "source-check failure must not forward a later event"
+        );
+
+        service.start_selected_scan(token).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if matches!(
+                    updates.recv().await.unwrap(),
+                    WallUpdate::MetadataSettled { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("retry after source-check failure did not settle");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_persistence_bridge_forwards_one_terminal_warning_and_retry_is_clean() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(&source).unwrap();
+        ImageBuffer::from_pixel(2, 2, Rgb([10_u8, 20, 30]))
+            .save(source.join("photo.jpg"))
+            .unwrap();
+        let service = AppService::open(AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let token = service.select_recent(&source).unwrap().1;
+        service.gallery.fail_next_batch_for_test();
+        let mut updates = service.subscribe_wall_updates();
+
+        service.start_selected_scan(token).await.unwrap();
+        let warning = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let WallUpdate::Warning {
+                    asset_id: None,
+                    warning,
+                    ..
+                } = updates.recv().await.unwrap()
+                {
+                    break warning;
+                }
+            }
+        })
+        .await
+        .expect("failed persistence did not forward terminal warning");
+        assert_eq!(warning.code, "catalogUnavailable");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while service.state().unwrap().active_scan.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed persistence cleanup did not clear the active scan");
+
+        service.start_selected_scan(token).await.unwrap();
+        let mut warning_count = 1;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let update = updates.recv().await.unwrap();
+                if matches!(update, WallUpdate::Warning { .. }) {
+                    warning_count += 1;
+                }
+                if matches!(update, WallUpdate::MetadataSettled { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("persistence retry did not settle");
+        assert_eq!(
+            warning_count, 1,
+            "terminal persistence warning was duplicated"
+        );
+        let mut settled_count = 1;
+        while let Ok(Ok(update)) =
+            tokio::time::timeout(Duration::from_millis(150), updates.recv()).await
+        {
+            if matches!(update, WallUpdate::MetadataSettled { .. }) {
+                settled_count += 1;
+            }
+        }
+        assert_eq!(settled_count, 1, "retry left a duplicate desktop bridge");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while service.desktop_bridge_count_for_test() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful retry bridge did not clean up");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while service.runtime_count_for_test() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed persistence bridge did not release its runtime");
     }
 
     fn seed_wall_asset(service: &AppService, selection: super::SelectionToken, name: &str) {

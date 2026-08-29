@@ -65,14 +65,22 @@ impl AppService {
         scope: GalleryScope,
         selection_token: SelectionToken,
     ) {
+        let after_event_id = self.gallery.current_event_id(selection);
         let mut subscription = self.gallery.subscribe(
             selection,
             format!("desktop-{}", selection.id()),
             scope,
-            None,
+            Some(after_event_id),
         );
+        let bridge_id = self
+            .next_bridge_id
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .wrapping_add(1)
+            .max(1);
+        let bridges = self.desktop_bridges.clone();
         let service = self.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
+            tokio::task::yield_now().await;
             while let Some(event) = subscription.recv().await {
                 let update = event.update;
                 let settled = matches!(&update, WallUpdate::MetadataSettled { .. });
@@ -80,7 +88,7 @@ impl AppService {
                     &update,
                     WallUpdate::MetadataSettled { .. } | WallUpdate::SourceUnavailable { .. }
                 );
-                if !service.forward_desktop_update(selection_token, update) {
+                if !service.forward_desktop_update(selection_token, bridge_id, update) {
                     break;
                 }
                 if terminal {
@@ -96,7 +104,46 @@ impl AppService {
                     break;
                 }
             }
+            let owns_bridge = bridges
+                .lock()
+                .ok()
+                .and_then(|mut bridges| {
+                    bridges
+                        .get(&selection_token)
+                        .is_some_and(|entry| entry.id == bridge_id)
+                        .then(|| bridges.remove(&selection_token).is_some())
+                })
+                .unwrap_or(false);
+            if owns_bridge {
+                service.clear_desktop_scan(selection_token);
+                service.coordinator.wake();
+            }
         });
+        let abort = task.abort_handle();
+        let previous = {
+            let mut bridges = self
+                .desktop_bridges
+                .lock()
+                .expect("desktop bridge registry poisoned");
+            bridges.insert(
+                selection_token,
+                crate::service::DesktopBridgeEntry {
+                    id: bridge_id,
+                    abort,
+                },
+            )
+        };
+        if let Some(previous) = previous {
+            previous.abort.abort();
+        }
+        if task.is_finished()
+            && let Ok(mut bridges) = self.desktop_bridges.lock()
+            && bridges
+                .get(&selection_token)
+                .is_some_and(|entry| entry.id == bridge_id)
+        {
+            bridges.remove(&selection_token);
+        }
     }
 
     fn admit_desktop_scan(&self, selection: SelectionToken) -> Result<bool, AppServiceError> {
@@ -158,10 +205,23 @@ impl AppService {
             && state.protected_group == Some(selection.group_id)
     }
 
-    fn forward_desktop_update(&self, selection: SelectionToken, update: WallUpdate) -> bool {
+    fn forward_desktop_update(
+        &self,
+        selection: SelectionToken,
+        bridge_id: u64,
+        update: WallUpdate,
+    ) -> bool {
         let Ok(_transition) = self.selection_transition.lock() else {
             return false;
         };
+        let owns_bridge = self.desktop_bridges.lock().ok().is_some_and(|bridges| {
+            bridges
+                .get(&selection)
+                .is_some_and(|bridge| bridge.id == bridge_id)
+        });
+        if !owns_bridge {
+            return false;
+        }
         if !self.desktop_selection_is_current_locked(selection) {
             return false;
         }
@@ -201,6 +261,14 @@ impl AppService {
                 }
             }
         });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn desktop_bridge_count_for_test(&self) -> usize {
+        self.desktop_bridges
+            .lock()
+            .expect("desktop bridge registry poisoned")
+            .len()
     }
 
     #[cfg(test)]

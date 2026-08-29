@@ -29,14 +29,23 @@ impl ScanLifecycle {
 
 struct ScanControl {
     state: ScanLifecycle,
+    generation: u64,
     cancel_requested: bool,
     sender: Option<watch::Sender<bool>>,
+}
+
+#[cfg(test)]
+pub(crate) struct LifecyclePublishTestGate {
+    pub(crate) state: ScanLifecycle,
+    pub(crate) entered: std::sync::mpsc::Sender<()>,
+    pub(crate) gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
 }
 
 impl ScanControl {
     fn new(state: ScanLifecycle) -> Self {
         Self {
             state,
+            generation: 0,
             cancel_requested: false,
             sender: None,
         }
@@ -52,10 +61,15 @@ pub(crate) struct SelectionRuntime {
     pub(crate) publication: Mutex<()>,
     pub(crate) history: Mutex<VecDeque<SequencedWallUpdate>>,
     pub(crate) next_event_id: AtomicU64,
+    pub(crate) terminal_event_id: AtomicU64,
     pub(crate) next_client_token: AtomicU64,
     pub(crate) settled: std::sync::atomic::AtomicBool,
     pub(crate) source_unavailable_reported: std::sync::atomic::AtomicBool,
     pub(crate) client_demand: Mutex<HashMap<u64, ClientDemand>>,
+    #[cfg(test)]
+    pub(crate) cancel_attempt_test_hook: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
+    pub(crate) lifecycle_publish_test_gate: Mutex<Option<LifecyclePublishTestGate>>,
 }
 
 #[derive(Clone)]
@@ -112,10 +126,15 @@ impl SelectionRuntime {
             publication: Mutex::new(()),
             history: Mutex::new(VecDeque::with_capacity(256)),
             next_event_id: AtomicU64::new(0),
+            terminal_event_id: AtomicU64::new(0),
             next_client_token: AtomicU64::new(1),
             settled: std::sync::atomic::AtomicBool::new(settled),
             source_unavailable_reported: std::sync::atomic::AtomicBool::new(false),
             client_demand: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            cancel_attempt_test_hook: Mutex::new(None),
+            #[cfg(test)]
+            lifecycle_publish_test_gate: Mutex::new(None),
         })
     }
 
@@ -123,36 +142,67 @@ impl SelectionRuntime {
         self.scan_lifecycle.subscribe()
     }
 
-    pub(crate) fn admit_scan(&self) -> bool {
-        let admitted = {
-            let mut control = self.scan_cancel.lock().expect("scan control poisoned");
-            if !matches!(
-                control.state,
-                ScanLifecycle::Idle | ScanLifecycle::SourceUnavailable | ScanLifecycle::Failed
-            ) {
-                false
+    #[cfg(test)]
+    fn wait_lifecycle_publish_test_gate(&self, state: ScanLifecycle) {
+        let gate = {
+            let mut configured = self
+                .lifecycle_publish_test_gate
+                .lock()
+                .expect("lifecycle publish test gate poisoned");
+            if configured
+                .as_ref()
+                .is_some_and(|configured| configured.state == state)
+            {
+                configured.take()
             } else {
-                control.state = ScanLifecycle::Starting;
-                control.cancel_requested = false;
-                control.sender = None;
-                true
+                None
             }
         };
-        if admitted {
-            self.scan_lifecycle.send_replace(ScanLifecycle::Starting);
+        let Some(gate) = gate else {
+            return;
+        };
+        gate.entered.send(()).unwrap();
+        let (released, changed) = &*gate.gate;
+        let mut released = released.lock().unwrap();
+        while !*released {
+            released = changed.wait(released).unwrap();
         }
-        admitted
+    }
+
+    pub(crate) fn admit_scan(&self) -> Option<u64> {
+        let mut control = self.scan_cancel.lock().expect("scan control poisoned");
+        if !matches!(
+            control.state,
+            ScanLifecycle::Idle | ScanLifecycle::SourceUnavailable | ScanLifecycle::Failed
+        ) {
+            return None;
+        }
+        control.generation = control.generation.wrapping_add(1).max(1);
+        control.state = ScanLifecycle::Starting;
+        control.cancel_requested = false;
+        control.sender = None;
+        self.terminal_event_id.store(0, Ordering::Release);
+        #[cfg(test)]
+        self.wait_lifecycle_publish_test_gate(ScanLifecycle::Starting);
+        self.scan_lifecycle.send_replace(ScanLifecycle::Starting);
+        Some(control.generation)
     }
 
     /// Installs the indexer's cancellation sender after scan admission. A
     /// cancellation can race this handoff, so the sender is cancelled before
     /// it is published when the control state has already been terminated.
-    pub(crate) fn install_scan_sender(&self, sender: watch::Sender<bool>) -> bool {
+    pub(crate) fn install_scan_sender(&self, generation: u64, sender: watch::Sender<bool>) -> bool {
         let cancel_now = {
             let mut control = self.scan_cancel.lock().expect("scan control poisoned");
-            if control.state == ScanLifecycle::Starting && !control.cancel_requested {
+            if control.generation == generation
+                && control.state == ScanLifecycle::Starting
+                && !control.cancel_requested
+            {
                 control.state = ScanLifecycle::Running;
                 control.sender = Some(sender.clone());
+                #[cfg(test)]
+                self.wait_lifecycle_publish_test_gate(ScanLifecycle::Running);
+                self.scan_lifecycle.send_replace(ScanLifecycle::Running);
                 false
             } else {
                 true
@@ -160,8 +210,6 @@ impl SelectionRuntime {
         };
         if cancel_now {
             let _ = sender.send(true);
-        } else {
-            self.scan_lifecycle.send_replace(ScanLifecycle::Running);
         }
         cancel_now
     }
@@ -170,31 +218,59 @@ impl SelectionRuntime {
     /// sender handoff and cancellation flag share one short synchronous lock,
     /// so a replacement cannot miss a sender installed concurrently.
     pub(crate) fn request_cancel(&self) {
+        #[cfg(test)]
+        if let Some(hook) = self
+            .cancel_attempt_test_hook
+            .lock()
+            .expect("cancel test hook poisoned")
+            .take()
+        {
+            let _ = hook.send(());
+        }
         let sender = {
             let mut control = self.scan_cancel.lock().expect("scan control poisoned");
+            if control.state.is_terminal() {
+                return;
+            }
             control.cancel_requested = true;
             control.state = ScanLifecycle::Cancelled;
+            self.terminal_event_id.store(
+                self.next_event_id.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+            #[cfg(test)]
+            self.wait_lifecycle_publish_test_gate(ScanLifecycle::Cancelled);
+            self.scan_lifecycle.send_replace(ScanLifecycle::Cancelled);
             control.sender.take()
         };
-        self.scan_lifecycle.send_replace(ScanLifecycle::Cancelled);
         if let Some(sender) = sender {
             let _ = sender.send(true);
         }
     }
 
-    pub(crate) fn finish_scan(&self, requested_state: ScanLifecycle) -> ScanLifecycle {
-        let state = {
-            let mut control = self.scan_cancel.lock().expect("scan control poisoned");
-            let state = if control.cancel_requested || control.state == ScanLifecycle::Cancelled {
-                ScanLifecycle::Cancelled
-            } else {
-                requested_state
-            };
-            control.state = state;
-            control.cancel_requested = state == ScanLifecycle::Cancelled;
-            control.sender = None;
-            state
+    pub(crate) fn finish_scan(
+        &self,
+        generation: u64,
+        requested_state: ScanLifecycle,
+    ) -> ScanLifecycle {
+        let mut control = self.scan_cancel.lock().expect("scan control poisoned");
+        if control.generation != generation || control.state.is_terminal() {
+            return control.state;
+        }
+        let state = if control.cancel_requested || control.state == ScanLifecycle::Cancelled {
+            ScanLifecycle::Cancelled
+        } else {
+            requested_state
         };
+        control.state = state;
+        control.cancel_requested = state == ScanLifecycle::Cancelled;
+        control.sender = None;
+        self.terminal_event_id.store(
+            self.next_event_id.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        #[cfg(test)]
+        self.wait_lifecycle_publish_test_gate(state);
         self.scan_lifecycle.send_replace(state);
         state
     }
@@ -202,6 +278,13 @@ impl SelectionRuntime {
     pub(crate) fn cancellation_requested(&self) -> bool {
         let control = self.scan_cancel.lock().expect("scan control poisoned");
         control.cancel_requested || control.state == ScanLifecycle::Cancelled
+    }
+
+    pub(crate) fn current_generation(&self) -> u64 {
+        self.scan_cancel
+            .lock()
+            .expect("scan control poisoned")
+            .generation
     }
 
     pub(crate) async fn publish(&self, update: WallUpdate) -> SequencedWallUpdate {
@@ -266,7 +349,25 @@ impl SelectionRuntime {
         self: &Arc<Self>,
         engine: GalleryEngine,
     ) -> Result<(), crate::AppServiceError> {
-        if !engine.ensure_runtime_source(self).await? {
+        let admitted_generation = if self.settled.load(Ordering::Acquire) {
+            None
+        } else {
+            self.admit_scan()
+        };
+        let Some(generation) = admitted_generation else {
+            if !engine.ensure_runtime_source(self).await? {
+                return Ok(());
+            }
+            return Ok(());
+        };
+        let source_available = match engine.ensure_runtime_source(self).await {
+            Ok(source_available) => source_available,
+            Err(error) => {
+                self.finish_scan(generation, ScanLifecycle::Failed);
+                return Err(error);
+            }
+        };
+        if !source_available {
             return Ok(());
         }
         // Keep the derivative lifecycle attached to this selection runtime.
@@ -275,16 +376,10 @@ impl SelectionRuntime {
         self.coordinator
             .ensure_selection(self.selection.token())
             .await;
-        if self.settled.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        if !self.admit_scan() {
-            return Ok(());
-        }
-        match engine.start_runtime_scan(self.clone()).await {
+        match engine.start_runtime_scan(self.clone(), generation).await {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.finish_scan(ScanLifecycle::Failed);
+                self.finish_scan(generation, ScanLifecycle::Failed);
                 Err(error)
             }
         }
@@ -304,19 +399,32 @@ pub struct SelectionEventSubscription {
     pub(crate) resume_after: Option<u64>,
     pub(crate) engine: GalleryEngine,
     pub(crate) terminal: Option<ScanLifecycle>,
+    pub(crate) terminal_event_id: Option<u64>,
+    pub(crate) last_seen_event_id: u64,
 }
 
 impl SelectionEventSubscription {
     pub async fn recv(&mut self) -> Option<SequencedWallUpdate> {
         loop {
-            if *self.lifecycle.borrow() == ScanLifecycle::Cancelled {
-                self.terminal = Some(ScanLifecycle::Cancelled);
+            if self.terminal.is_none() {
+                let lifecycle = *self.lifecycle.borrow();
+                if matches!(lifecycle, ScanLifecycle::Cancelled | ScanLifecycle::Failed) {
+                    self.terminal = Some(lifecycle);
+                    self.terminal_event_id =
+                        Some(self.runtime.terminal_event_id.load(Ordering::Acquire));
+                }
+            }
+            if self.terminal == Some(ScanLifecycle::Cancelled) {
                 return None;
             }
             let next = if let Some(event) = self.backlog.pop_front() {
                 Ok(event)
-            } else if self.terminal == Some(ScanLifecycle::Cancelled) {
-                return None;
+            } else if self.terminal == Some(ScanLifecycle::Failed) {
+                let watermark = self.terminal_event_id.unwrap_or_default();
+                if self.last_seen_event_id >= watermark {
+                    return None;
+                }
+                self.receiver.recv().await
             } else if self.lagged {
                 self.lagged = false;
                 let head = self.runtime.next_event_id.load(Ordering::Acquire);
@@ -335,9 +443,13 @@ impl SelectionEventSubscription {
                         match changed {
                             Ok(()) => {
                                 let state = *self.lifecycle.borrow();
-                                if state == ScanLifecycle::Cancelled {
+                                if matches!(state, ScanLifecycle::Cancelled | ScanLifecycle::Failed) {
                                     self.terminal = Some(state);
-                                    return None;
+                                    self.terminal_event_id = Some(
+                                        self.runtime
+                                            .terminal_event_id
+                                            .load(Ordering::Acquire),
+                                    );
                                 }
                                 continue;
                             }
@@ -354,12 +466,18 @@ impl SelectionEventSubscription {
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
             };
+            self.last_seen_event_id = self.last_seen_event_id.max(event.id);
             if self
                 .terminal
                 .is_some_and(|terminal| terminal == ScanLifecycle::Cancelled)
                 || *self.lifecycle.borrow() == ScanLifecycle::Cancelled
             {
                 return None;
+            }
+            if self.terminal == Some(ScanLifecycle::Failed)
+                && event.id > self.terminal_event_id.unwrap_or_default()
+            {
+                continue;
             }
             if self
                 .resume_after
@@ -549,7 +667,7 @@ mod tests {
         );
         let mut first = runtime.lifecycle_receiver();
         let mut second = runtime.lifecycle_receiver();
-        assert!(runtime.admit_scan());
+        assert!(runtime.admit_scan().is_some());
         runtime.request_cancel();
 
         tokio::time::timeout(Duration::from_secs(1), first.changed())
@@ -586,7 +704,117 @@ mod tests {
         });
         barrier.wait();
         let admitted = [first.join().unwrap(), second.join().unwrap()];
-        assert_eq!(admitted.iter().filter(|admitted| **admitted).count(), 1);
+        assert_eq!(
+            admitted
+                .iter()
+                .filter(|admitted| admitted.is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn stale_transition_writers_cannot_regress_a_newer_terminal_state() {
+        let runtime = SelectionRuntime::new(
+            selection(),
+            Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
+            false,
+        );
+        let generation = runtime.admit_scan().expect("scan should be admitted");
+        let (sender, _receiver) = watch::channel(false);
+        assert!(!runtime.install_scan_sender(generation, sender));
+
+        runtime.request_cancel();
+
+        let (stale_sender, _stale_receiver) = watch::channel(false);
+        assert!(runtime.install_scan_sender(generation, stale_sender));
+        assert_eq!(
+            runtime.finish_scan(generation, ScanLifecycle::Completed),
+            ScanLifecycle::Cancelled
+        );
+        assert_eq!(
+            *runtime.lifecycle_receiver().borrow(),
+            ScanLifecycle::Cancelled
+        );
+    }
+
+    #[test]
+    fn stale_generation_writers_cannot_regress_a_newer_failed_or_completed_state() {
+        let runtime = SelectionRuntime::new(
+            selection(),
+            Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
+            false,
+        );
+        let older_generation = runtime.admit_scan().expect("first scan should be admitted");
+        assert_eq!(
+            runtime.finish_scan(older_generation, ScanLifecycle::Failed),
+            ScanLifecycle::Failed
+        );
+        let newer_generation = runtime.admit_scan().expect("retry should be admitted");
+        let (sender, _receiver) = watch::channel(false);
+        assert!(!runtime.install_scan_sender(newer_generation, sender));
+        assert_eq!(
+            runtime.finish_scan(newer_generation, ScanLifecycle::Completed),
+            ScanLifecycle::Completed
+        );
+
+        let (stale_sender, _stale_receiver) = watch::channel(false);
+        assert!(runtime.install_scan_sender(older_generation, stale_sender));
+        assert_eq!(
+            runtime.finish_scan(older_generation, ScanLifecycle::Failed),
+            ScanLifecycle::Completed
+        );
+        assert_eq!(
+            *runtime.lifecycle_receiver().borrow(),
+            ScanLifecycle::Completed
+        );
+    }
+
+    #[test]
+    fn cancellation_waits_for_the_admitted_starting_publication() {
+        let runtime = SelectionRuntime::new(
+            selection(),
+            Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
+            false,
+        );
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (entered_send, entered_receive) = std::sync::mpsc::channel();
+        *runtime.lifecycle_publish_test_gate.lock().unwrap() = Some(LifecyclePublishTestGate {
+            state: ScanLifecycle::Starting,
+            entered: entered_send,
+            gate: gate.clone(),
+        });
+        let starting_runtime = runtime.clone();
+        let starting = std::thread::spawn(move || starting_runtime.admit_scan());
+        entered_receive
+            .recv_timeout(Duration::from_secs(1))
+            .expect("starting publication did not reach the interleaving gate");
+
+        let (finished_send, finished_receive) = std::sync::mpsc::channel();
+        let cancelling_runtime = runtime.clone();
+        let cancelling = std::thread::spawn(move || {
+            cancelling_runtime.request_cancel();
+            finished_send.send(()).unwrap();
+        });
+        assert!(
+            finished_receive
+                .recv_timeout(Duration::from_millis(20))
+                .is_err(),
+            "cancellation must wait until Starting is published"
+        );
+
+        let (released, changed) = &*gate;
+        *released.lock().unwrap() = true;
+        changed.notify_all();
+        assert!(starting.join().unwrap().is_some());
+        finished_receive
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancellation did not finish after Starting publication");
+        cancelling.join().unwrap();
+        assert_eq!(
+            *runtime.lifecycle_receiver().borrow(),
+            ScanLifecycle::Cancelled
+        );
     }
 
     #[test]
@@ -596,13 +824,31 @@ mod tests {
             Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
             false,
         );
-        assert!(runtime.admit_scan());
+        assert!(runtime.admit_scan().is_some());
+        let (attempted_send, attempted_receive) = std::sync::mpsc::channel();
+        *runtime.cancel_attempt_test_hook.lock().unwrap() = Some(attempted_send);
         let guard = runtime.scan_cancel.lock().unwrap();
+        let (finished_send, finished_receive) = std::sync::mpsc::channel();
         let worker = {
             let runtime = runtime.clone();
-            std::thread::spawn(move || runtime.request_cancel())
+            std::thread::spawn(move || {
+                runtime.request_cancel();
+                finished_send.send(()).unwrap();
+            })
         };
+        attempted_receive
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelling worker did not attempt the contested path");
+        assert!(
+            finished_receive
+                .recv_timeout(Duration::from_millis(20))
+                .is_err(),
+            "cancellation must wait for the scan-control lock"
+        );
         drop(guard);
+        finished_receive
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancellation worker did not complete after lock release");
         worker.join().unwrap();
         assert_eq!(
             *runtime.lifecycle_receiver().borrow(),
@@ -619,8 +865,8 @@ mod tests {
         );
         let mut first = runtime.lifecycle_receiver();
         let mut second = runtime.lifecycle_receiver();
-        assert!(runtime.admit_scan());
-        runtime.finish_scan(ScanLifecycle::Completed);
+        let generation = runtime.admit_scan().expect("scan should be admitted");
+        runtime.finish_scan(generation, ScanLifecycle::Completed);
 
         tokio::time::timeout(Duration::from_secs(1), first.changed())
             .await

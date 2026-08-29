@@ -1,5 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -92,6 +94,12 @@ pub struct GalleryEngine {
     hosted_library_id: Option<LibraryId>,
     pub(crate) shared_coordinator:
         Option<Arc<crate::derivative_coordinator::DerivativeCoordinator>>,
+    #[cfg(test)]
+    fail_next_start: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_next_source_check: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_next_batch: Arc<AtomicBool>,
 }
 
 impl GalleryEngine {
@@ -161,6 +169,12 @@ impl GalleryEngine {
             metadata_reader: ReaderAdapter::new(reader),
             hosted_library_id: Some(hosted_library_id),
             shared_coordinator: None,
+            #[cfg(test)]
+            fail_next_start: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_source_check: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_batch: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -177,6 +191,12 @@ impl GalleryEngine {
             metadata_reader,
             hosted_library_id: None,
             shared_coordinator: Some(shared_coordinator),
+            #[cfg(test)]
+            fail_next_start: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_source_check: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_batch: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -586,6 +606,8 @@ impl GalleryEngine {
             resume_after: None,
             engine: self.clone(),
             terminal: None,
+            terminal_event_id: None,
+            last_seen_event_id: after_event_id.unwrap_or_default(),
         }
     }
 
@@ -620,9 +642,19 @@ impl GalleryEngine {
     pub(crate) async fn start_runtime_scan(
         &self,
         runtime: Arc<SelectionRuntime>,
+        scan_generation: u64,
     ) -> Result<(), AppServiceError> {
+        #[cfg(test)]
+        if self.fail_next_start.swap(false, Ordering::AcqRel) {
+            return Err(AppServiceError::Catalog(CatalogError::InvalidData(
+                "test startup failure".to_owned(),
+            )));
+        }
         if runtime.cancellation_requested() {
-            runtime.finish_scan(crate::hosted_runtime::ScanLifecycle::Cancelled);
+            runtime.finish_scan(
+                scan_generation,
+                crate::hosted_runtime::ScanLifecycle::Cancelled,
+            );
             return Ok(());
         }
         if !self.ensure_runtime_source(&runtime).await? {
@@ -657,7 +689,10 @@ impl GalleryEngine {
             return Ok(());
         }
         if runtime.cancellation_requested() {
-            runtime.finish_scan(crate::hosted_runtime::ScanLifecycle::Cancelled);
+            runtime.finish_scan(
+                scan_generation,
+                crate::hosted_runtime::ScanLifecycle::Cancelled,
+            );
             return Ok(());
         }
         let generation = {
@@ -694,7 +729,10 @@ impl GalleryEngine {
         );
         let selection_root = root.join(&selected);
         if runtime.cancellation_requested() {
-            runtime.finish_scan(crate::hosted_runtime::ScanLifecycle::Cancelled);
+            runtime.finish_scan(
+                scan_generation,
+                crate::hosted_runtime::ScanLifecycle::Cancelled,
+            );
             return Ok(());
         }
         let handle = indexer
@@ -705,10 +743,12 @@ impl GalleryEngine {
                     .for_folder_group(runtime.selection.group_id),
             )
             .map_err(|e| AppServiceError::LibrarySetup(std::io::Error::other(e.to_string())))?;
-        runtime.install_scan_sender(handle.cancellation_sender());
+        runtime.install_scan_sender(scan_generation, handle.cancellation_sender());
         let engine = self.clone();
         tokio::spawn(async move {
-            engine.drain_runtime_scan(runtime, handle, generation).await;
+            engine
+                .drain_runtime_scan(runtime, handle, generation, scan_generation)
+                .await;
         });
         Ok(())
     }
@@ -720,6 +760,12 @@ impl GalleryEngine {
         &self,
         runtime: &Arc<SelectionRuntime>,
     ) -> Result<bool, AppServiceError> {
+        #[cfg(test)]
+        if self.fail_next_source_check.swap(false, Ordering::AcqRel) {
+            return Err(AppServiceError::Catalog(CatalogError::InvalidData(
+                "test source check failure".to_owned(),
+            )));
+        }
         let available = {
             let state = self
                 .state
@@ -756,7 +802,10 @@ impl GalleryEngine {
         runtime: &Arc<SelectionRuntime>,
     ) -> Result<(), AppServiceError> {
         if runtime.cancellation_requested() {
-            runtime.finish_scan(crate::hosted_runtime::ScanLifecycle::Cancelled);
+            runtime.finish_scan(
+                runtime.current_generation(),
+                crate::hosted_runtime::ScanLifecycle::Cancelled,
+            );
             return Ok(());
         }
         let should_publish = {
@@ -802,7 +851,10 @@ impl GalleryEngine {
                 })
                 .await;
         }
-        runtime.finish_scan(crate::hosted_runtime::ScanLifecycle::SourceUnavailable);
+        runtime.finish_scan(
+            runtime.current_generation(),
+            crate::hosted_runtime::ScanLifecycle::SourceUnavailable,
+        );
         self.remove_runtime_if_dead(runtime.selection.group_id, runtime);
         Ok(())
     }
@@ -815,6 +867,12 @@ impl GalleryEngine {
             .values()
             .filter(|runtime| runtime.upgrade().is_some())
             .count()
+    }
+
+    pub(crate) fn current_event_id(&self, selection: &GallerySelection) -> u64 {
+        self.runtime(selection)
+            .next_event_id
+            .load(Ordering::Acquire)
     }
 
     pub(crate) fn runtime_scan_state(
@@ -855,11 +913,27 @@ impl GalleryEngine {
         self.runtime(selection).aggregate_scope()
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_start_for_test(&self) {
+        self.fail_next_start.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_source_check_for_test(&self) {
+        self.fail_next_source_check.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_batch_for_test(&self) {
+        self.fail_next_batch.store(true, Ordering::Release);
+    }
+
     async fn drain_runtime_scan(
         &self,
         runtime: Arc<SelectionRuntime>,
         mut handle: photo_indexer::ScanHandle,
         generation: u64,
+        scan_generation: u64,
     ) {
         let mut batch = Vec::new();
         let mut persistence_failed = false;
@@ -961,7 +1035,7 @@ impl GalleryEngine {
         } else {
             crate::hosted_runtime::ScanLifecycle::Failed
         };
-        runtime.finish_scan(terminal);
+        runtime.finish_scan(scan_generation, terminal);
         self.remove_runtime_if_dead(runtime.selection.group_id, &runtime);
     }
 
@@ -971,6 +1045,12 @@ impl GalleryEngine {
         generation: u64,
         events: &[IndexEvent],
     ) -> Result<(), AppServiceError> {
+        #[cfg(test)]
+        if self.fail_next_batch.swap(false, Ordering::AcqRel) {
+            return Err(AppServiceError::Catalog(CatalogError::InvalidData(
+                "test persistence failure".to_owned(),
+            )));
+        }
         if runtime.cancellation_requested() {
             return Ok(());
         }
