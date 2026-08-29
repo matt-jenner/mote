@@ -51,3 +51,11 @@ Additional regression verification passed: the blocking foreground/indexing desk
 Remaining architectural concern: the existing desktop `AppService` still owns its historical active-selection coordinator/scanner path; fully replacing it with `GalleryEngine` requires moving its extensive derivative test hooks and reconciliation lifecycle together. The public desktop regression suite remains green, but this extraction is not represented as a completed change in this round.
 
 Final HEAD semantics: after the verified implementation commits above, the final report commit is the branch HEAD and contains this report; `3cdb520` is the latest implementation commit.
+
+## Fix round 3 evidence
+
+RED/GREEN evidence: the offline reopen regression first failed because `GalleryEngine::open` rejected the missing `/var` alias before resolving the cataloged root; it passes after canonicalizing the nearest existing ancestor. The in-root symlink identity regression passes after selection persistence uses the canonical root-relative target. The expired-lease unit regression passes after connected demand was decoupled from the interaction lease. Runtime publication and scheduler regressions remain green.
+
+Round 3 changes derive newly-created runtime settlement from authoritative catalog generation state, preserve cached wall access while the source is offline, canonicalize missing-root identities and in-root selections, retain connected scope demand after lease expiry, and remove the runtime registry entry on the final subscription drop without cancelling the primary scan. The primary scan cancellation sender remains available for persistence failure handling; final subscriber drop does not cancel admitted generation work.
+
+Round 3 implementation commit: `b30a481` (`fix: preserve hosted runtime ownership across restart`). The desktop extraction remains blocked by the existing `AppService`'s coupled historical scanner/coordinator/derivative/reconciliation state and requires a coherent cross-module migration to avoid duplicating catalog connections or breaking the public desktop lifecycle. This blocker is recorded explicitly for fresh-agent escalation; no contradictory desktop-completion claim is made.
