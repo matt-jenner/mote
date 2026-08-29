@@ -489,6 +489,7 @@ async fn gallery_scope_filters_cached_pages_and_progressive_batches_without_resc
         AppService::open_with_reader(fixture.config.clone(), Arc::new(reader.clone())).unwrap();
     service
         .update_gallery_scope(GalleryScope::CurrentFolder)
+        .await
         .unwrap();
     let mut updates = service.subscribe_wall_updates();
     service.start_scan(&fixture.source).await.unwrap();
@@ -520,6 +521,7 @@ async fn gallery_scope_filters_cached_pages_and_progressive_batches_without_resc
 
     service
         .update_gallery_scope(GalleryScope::IncludeSubfolders)
+        .await
         .unwrap();
     let recursive = service
         .query_wall(query(SortDirection::OldestFirst))

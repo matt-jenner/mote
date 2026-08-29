@@ -14,7 +14,9 @@ use photo_cache::{
     ImageDerivativeGenerator,
 };
 use photo_catalog::{Catalog, NewDerivative, TerminalDerivativeFailure, WallOrder};
-use photo_domain::{AssetId, Availability, DerivativeId, FolderGroupId, MediaKind};
+use photo_domain::{
+    AssetId, Availability, DerivativeId, FolderGroupId, GalleryScope, MediaKind, RelativePathKey,
+};
 use photo_indexer::{InteractionMode, JobPriority};
 
 use crate::derivative_coordinator::{
@@ -225,7 +227,19 @@ impl AppService {
         let request_selection = self.active_selection_token()?;
         let ids = {
             let state = self.state()?;
-            validate_requested_assets(state.libraries.catalog(), request_selection.group_id, &ids)?
+            let catalog = state.libraries.catalog();
+            let stored = catalog.load_app_state()?;
+            let selected_folder = stored
+                .active_selection
+                .ok_or(AppServiceError::UnknownAsset)?
+                .relative_folder;
+            validate_requested_assets(
+                catalog,
+                request_selection.group_id,
+                stored.gallery_scope,
+                &selected_folder,
+                &ids,
+            )?
         };
         if ids.is_empty() {
             return Ok(());
@@ -1785,7 +1799,7 @@ impl AppService {
         self.start_collection_driver(full_group, selection);
     }
 
-    fn start_collection_driver(&self, full_group: bool, selection: SelectionToken) {
+    pub(crate) fn start_collection_driver(&self, full_group: bool, selection: SelectionToken) {
         #[cfg(any(test, debug_assertions))]
         let task_guard = self.collection_driver_tracker.start();
         if let Some(admission) = self.collection_driver.request(selection, full_group) {
@@ -2647,7 +2661,7 @@ impl AppService {
         ))
     }
 
-    fn active_selection_token(&self) -> Result<SelectionToken, AppServiceError> {
+    pub(crate) fn active_selection_token(&self) -> Result<SelectionToken, AppServiceError> {
         let state = self.state()?;
         let selection = state
             .libraries
@@ -2943,8 +2957,13 @@ fn parse_ids(raw_ids: Vec<String>) -> Result<Vec<AssetId>, AppServiceError> {
 fn validate_requested_assets(
     catalog: &Catalog,
     group: FolderGroupId,
+    scope: GalleryScope,
+    selected_folder: &RelativePathKey,
     ids: &[AssetId],
 ) -> Result<Vec<AssetId>, AppServiceError> {
+    let selected_folder = selected_folder
+        .to_path_buf()
+        .map_err(|_| AppServiceError::ForeignAsset)?;
     let mut photo_ids = Vec::with_capacity(ids.len());
     for id in ids {
         let asset = catalog
@@ -2955,6 +2974,15 @@ fn validate_requested_assets(
         }
         if asset.media_kind == MediaKind::Video {
             return Err(AppServiceError::DerivativeUnavailable);
+        }
+        if scope == GalleryScope::CurrentFolder {
+            let asset_path = asset
+                .relative_path
+                .to_path_buf()
+                .map_err(|_| AppServiceError::ForeignAsset)?;
+            if asset_path.parent() != Some(selected_folder.as_path()) {
+                return Err(AppServiceError::ForeignAsset);
+            }
         }
         photo_ids.push(*id);
     }
@@ -3087,7 +3115,10 @@ mod tests {
     use crate::service::DerivativeTestGate;
     #[cfg(debug_assertions)]
     use crate::service::{CollectionDriverControl, CollectionDriverTake, SelectionToken};
-    use crate::{AppConfig, AppService, DerivativeClass, WallUpdate};
+    use crate::{
+        AppConfig, AppService, AppServiceError, DerivativeClass, DerivativePriority,
+        DerivativeRequest, WallUpdate,
+    };
 
     #[cfg(debug_assertions)]
     use super::CollectionDriverLifecycleOwner;
@@ -3100,8 +3131,8 @@ mod tests {
         entered: Arc<tokio::sync::Notify>,
     }
 
-    #[test]
-    fn collection_prefetch_page_honors_current_folder_scope() {
+    #[tokio::test]
+    async fn collection_prefetch_page_honors_current_folder_scope() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("photos");
         std::fs::create_dir_all(source.join("child")).unwrap();
@@ -3136,12 +3167,104 @@ mod tests {
         }
         service
             .update_gallery_scope(GalleryScope::CurrentFolder)
+            .await
             .unwrap();
 
         let (_, page, next) = service.remaining_group_ids_page(None, None).unwrap();
 
         assert_eq!(page, [ids[0]]);
         assert!(next.is_some());
+    }
+
+    #[tokio::test]
+    async fn gallery_scope_change_invalidates_old_collection_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(&source).unwrap();
+        let service = AppService::open(AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let (_, selection) = service.select_recent(&source).unwrap();
+        service.coordinator.reset_selection(selection).await;
+        service.coordinator.begin_collection(selection).await;
+        let old_progress = service
+            .coordinator
+            .collection_progress_token(selection)
+            .await
+            .unwrap();
+
+        service
+            .update_gallery_scope(GalleryScope::CurrentFolder)
+            .await
+            .unwrap();
+
+        assert!(
+            !service
+                .coordinator
+                .collection_progress_token_is_current(&old_progress)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn current_folder_scope_rejects_a_nested_foreground_derivative_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(source.join("child")).unwrap();
+        let service = AppService::open(AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let (_, selection) = service.select_recent(&source).unwrap();
+        let nested_id = {
+            let relative =
+                RelativePathKey::from_relative_path(Path::new("child/nested.jpg")).unwrap();
+            let mut asset = NewAsset::minimal(
+                selection.library_id,
+                relative,
+                "child/nested.jpg",
+                MediaKind::Jpeg,
+                1,
+            );
+            asset.folder_group_id = Some(selection.group_id);
+            let id = asset.id;
+            service
+                .state()
+                .unwrap()
+                .libraries
+                .catalog_mut()
+                .apply_index_batch(&[
+                    CatalogIndexRecord::Discovered(asset),
+                    CatalogIndexRecord::Shaped(AssetShapeUpdate {
+                        asset_id: id,
+                        width: 16,
+                        height: 9,
+                        orientation: Some(1),
+                        representative_rgb: None,
+                        shape_status: ShapeStatus::Ready,
+                    }),
+                ])
+                .unwrap();
+            id
+        };
+        service
+            .update_gallery_scope(GalleryScope::CurrentFolder)
+            .await
+            .unwrap();
+
+        let error = service
+            .request_derivatives(DerivativeRequest {
+                asset_ids: vec![nested_id.as_uuid().hyphenated().to_string()],
+                kind: DerivativeClass::WallThumbnail,
+                priority: DerivativePriority::Visible,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AppServiceError::ForeignAsset));
     }
 
     impl MetadataReader for BlockingReader {

@@ -69,6 +69,7 @@ pub(crate) fn apply_migrations(
         }
         if version == 8 {
             backfill_relative_parent_keys(&transaction)?;
+            create_gallery_scope_indexes(&transaction)?;
         }
         transaction.commit()?;
     }
@@ -78,28 +79,80 @@ pub(crate) fn apply_migrations(
 fn backfill_relative_parent_keys(
     connection: &rusqlite::Transaction<'_>,
 ) -> Result<(), CatalogError> {
-    let mut statement = connection.prepare("SELECT id, relative_path_key FROM assets")?;
-    let values = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(statement);
+    const BATCH_SIZE: i64 = 500;
+    let mut first =
+        connection.prepare("SELECT id, relative_path_key FROM assets ORDER BY id LIMIT ?1")?;
+    let mut next = connection
+        .prepare("SELECT id, relative_path_key FROM assets WHERE id > ?1 ORDER BY id LIMIT ?2")?;
+    let mut update =
+        connection.prepare("UPDATE assets SET relative_parent_key = ?2 WHERE id = ?1")?;
+    let mut after: Option<Vec<u8>> = None;
 
-    for (id, relative_path) in values {
-        let relative = photo_domain::RelativePathKey::from_bytes(relative_path)
-            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
-        let path = relative
-            .to_path_buf()
-            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
-        let parent = path.parent().unwrap_or_else(|| Path::new(""));
-        let parent_key = photo_domain::RelativePathKey::from_relative_path(parent)
-            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
-        connection.execute(
-            "UPDATE assets SET relative_parent_key = ?2 WHERE id = ?1",
-            rusqlite::params![id, parent_key.as_bytes()],
-        )?;
+    loop {
+        let values = match after.as_deref() {
+            None => first
+                .query_map([BATCH_SIZE], decode_parent_backfill_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(after) => next
+                .query_map(
+                    rusqlite::params![after, BATCH_SIZE],
+                    decode_parent_backfill_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        let Some((last_id, _)) = values.last() else {
+            break;
+        };
+        after = Some(last_id.clone());
+
+        for (id, relative_path) in values {
+            let relative = photo_domain::RelativePathKey::from_bytes(relative_path)
+                .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+            let path = relative
+                .to_path_buf()
+                .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+            let parent = path.parent().unwrap_or_else(|| Path::new(""));
+            let parent_key = photo_domain::RelativePathKey::from_relative_path(parent)
+                .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+            update.execute(rusqlite::params![id, parent_key.as_bytes()])?;
+        }
     }
+    Ok(())
+}
+
+fn decode_parent_backfill_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<(Vec<u8>, Vec<u8>), rusqlite::Error> {
+    Ok((row.get(0)?, row.get(1)?))
+}
+
+fn create_gallery_scope_indexes(
+    connection: &rusqlite::Transaction<'_>,
+) -> Result<(), CatalogError> {
+    connection.execute_batch(
+        "CREATE INDEX assets_group_parent_provisional_photo
+           ON assets(folder_group_id, relative_parent_key, provisional_order, id)
+           WHERE media_kind <> 'video'
+             AND shape_status IN ('ready', 'fallback')
+             AND width IS NOT NULL
+             AND height IS NOT NULL;
+
+         CREATE INDEX assets_group_parent_capture_photo
+           ON assets(folder_group_id, relative_parent_key, captured_at_utc, display_path, id)
+           WHERE media_kind <> 'video'
+             AND shape_status IN ('ready', 'fallback')
+             AND width IS NOT NULL
+             AND height IS NOT NULL
+             AND captured_at_utc IS NOT NULL;
+
+         CREATE INDEX assets_group_parent_capture_desc_photo
+           ON assets(folder_group_id, relative_parent_key, captured_at_utc DESC, display_path, id)
+           WHERE media_kind <> 'video'
+             AND shape_status IN ('ready', 'fallback')
+             AND width IS NOT NULL
+             AND height IS NOT NULL
+             AND captured_at_utc IS NOT NULL;",
+    )?;
     Ok(())
 }
 

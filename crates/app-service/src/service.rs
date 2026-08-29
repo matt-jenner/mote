@@ -977,13 +977,29 @@ impl AppService {
         Self::bootstrap_locked(&state)
     }
 
-    pub fn update_gallery_scope(
+    pub async fn update_gallery_scope(
         &self,
         scope: GalleryScope,
     ) -> Result<BootstrapState, AppServiceError> {
-        let mut state = self.state()?;
-        state.libraries.catalog_mut().set_gallery_scope(scope)?;
-        Self::bootstrap_locked(&state)
+        let (bootstrap, has_selection) = {
+            let mut state = self.state()?;
+            let stored = state.libraries.catalog().load_app_state()?;
+            if stored.gallery_scope != scope {
+                state.libraries.catalog_mut().set_gallery_scope(scope)?;
+            }
+            (
+                Self::bootstrap_locked(&state)?,
+                stored.active_selection.is_some(),
+            )
+        };
+        if has_selection {
+            let selection = self.active_selection_token()?;
+            self.coordinator.ensure_selection(selection).await;
+            self.coordinator.invalidate_background().await;
+            self.coordinator.reset_collection_for_scope(selection).await;
+            self.start_collection_driver(true, selection);
+        }
+        Ok(bootstrap)
     }
 }
 

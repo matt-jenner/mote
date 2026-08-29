@@ -1131,6 +1131,25 @@ impl DerivativeCoordinator {
         }
     }
 
+    pub(crate) async fn reset_collection_for_scope(&self, selection: SelectionToken) {
+        let changed = {
+            let mut state = self.state.lock().await;
+            if state.selection != Some(selection) {
+                false
+            } else {
+                state.recent.clear();
+                state.collection = CollectionState {
+                    phase: CollectionPhase::Thumbnails,
+                    cursor: None,
+                };
+                true
+            }
+        };
+        if changed {
+            self.notify_waiters();
+        }
+    }
+
     pub(crate) async fn collection_progress_token(
         &self,
         selection: SelectionToken,

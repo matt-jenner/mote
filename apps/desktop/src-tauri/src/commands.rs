@@ -59,13 +59,14 @@ pub fn update_appearance(
 }
 
 #[tauri::command]
-pub fn update_gallery_scope(
+pub async fn update_gallery_scope(
     scope: GalleryScope,
     state: State<'_, DesktopState>,
 ) -> Result<BootstrapState, CommandError> {
     state
         .service
         .update_gallery_scope(scope)
+        .await
         .map_err(map_service_error)
 }
 

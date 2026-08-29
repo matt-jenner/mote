@@ -20,8 +20,8 @@ fn source_and_appearance_restore_from_the_same_profile() {
     assert_eq!(state.active_source.unwrap().display_name, "Iceland 2025");
 }
 
-#[test]
-fn gallery_scope_updates_bootstrap_and_restores_from_the_same_profile() {
+#[tokio::test]
+async fn gallery_scope_updates_bootstrap_and_restores_from_the_same_profile() {
     let temp = tempfile::tempdir().unwrap();
     let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
     let first = AppService::open(config.clone()).unwrap();
@@ -32,6 +32,7 @@ fn gallery_scope_updates_bootstrap_and_restores_from_the_same_profile() {
     );
     let updated = first
         .update_gallery_scope(GalleryScope::CurrentFolder)
+        .await
         .unwrap();
     assert_eq!(updated.settings.gallery_scope, GalleryScope::CurrentFolder);
     drop(first);

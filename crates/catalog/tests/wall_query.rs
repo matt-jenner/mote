@@ -875,6 +875,88 @@ fn opening_a_v4_catalog_adds_group_generation_support() {
 }
 
 #[test]
+fn v8_backfills_parent_keys_before_building_scoped_indexes() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("catalog.sqlite");
+    let connection = Connection::open(&path).unwrap();
+    for migration in [
+        include_str!("../migrations/0001_catalog.sql"),
+        include_str!("../migrations/0002_unavailable_assets.sql"),
+        include_str!("../migrations/0003_app_state.sql"),
+        include_str!("../migrations/0004_wall_projection.sql"),
+        include_str!("../migrations/0005_group_scoped_generations.sql"),
+        include_str!("../migrations/0006_wall_state_indexes.sql"),
+        include_str!("../migrations/0007_derivative_coordinator.sql"),
+    ] {
+        connection.execute_batch(migration).unwrap();
+    }
+    let library = [7_u8; 16];
+    let group = [8_u8; 16];
+    let asset = [9_u8; 16];
+    let group_path = RelativePathKey::from_relative_path(Path::new("selected")).unwrap();
+    let asset_path =
+        RelativePathKey::from_relative_path(Path::new("selected/child/photo.jpg")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO library_roots (
+                id, kind, display_name, canonical_root_key, display_path,
+                availability, last_seen_at
+             ) VALUES (?1, 'recent', 'Library', ?2, '/photos', 'available', 1)",
+            rusqlite::params![library.as_slice(), b"/photos"],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO folder_groups (id, library_id, relative_path_key, display_path)
+             VALUES (?1, ?2, ?3, 'selected')",
+            rusqlite::params![group.as_slice(), library.as_slice(), group_path.as_bytes()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO assets (
+                id, library_id, relative_path_key, display_path, media_kind,
+                size_bytes, modified_unix_ns, availability, folder_group_id,
+                provisional_order, shape_status, width, height
+             ) VALUES (?1, ?2, ?3, 'selected/child/photo.jpg', 'jpeg', 1, '0',
+                       'available', ?4, 1, 'ready', 16, 9)",
+            rusqlite::params![
+                asset.as_slice(),
+                library.as_slice(),
+                asset_path.as_bytes(),
+                group.as_slice()
+            ],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_indexed_parent_backfill
+             BEFORE UPDATE OF relative_parent_key ON assets
+             WHEN EXISTS (
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'index' AND name = 'assets_group_parent_provisional_photo'
+             )
+             BEGIN
+                 SELECT RAISE(ABORT, 'scoped indexes built before parent backfill');
+             END;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let catalog = Catalog::open(&path).unwrap();
+    let page = catalog
+        .wall_page_scoped(
+            photo_domain::FolderGroupId::from_uuid(uuid::Uuid::from_bytes(group)),
+            GalleryScope::CurrentFolder,
+            WallOrder::Provisional,
+            None,
+            10,
+        )
+        .unwrap();
+    assert!(page.items.is_empty());
+}
+
+#[test]
 fn opening_a_populated_v4_catalog_backfills_settled_groups_offline() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("catalog.sqlite");
