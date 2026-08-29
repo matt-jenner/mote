@@ -92,13 +92,31 @@ pub(crate) struct CollectionDriverIntent {
     pub(crate) full_group: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CollectionDriverOwnerId(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CollectionDriverAdmission {
+    pub(crate) owner_id: CollectionDriverOwnerId,
+    pub(crate) initial_request_generation: u64,
+}
+
+pub(crate) enum CollectionDriverTake {
+    Pending(CollectionDriverIntent),
+    Released,
+    Stale,
+}
+
 struct CollectionDriverControlState {
     pending: Option<CollectionDriverIntent>,
+    pending_request_generation: Option<u64>,
     // Selection epochs are issued monotonically. Retain the latest one even
     // after its intent has been taken so a delayed older caller cannot regress
     // the driver's work while it is between batches.
     latest_selection: Option<SelectionToken>,
-    admitted: bool,
+    next_owner_id: u64,
+    next_request_generation: u64,
+    admitted: Option<CollectionDriverAdmission>,
 }
 
 pub(crate) struct CollectionDriverControl {
@@ -111,15 +129,22 @@ impl CollectionDriverControl {
         Self {
             state: Mutex::new(CollectionDriverControlState {
                 pending: None,
+                pending_request_generation: None,
                 latest_selection: None,
-                admitted: false,
+                next_owner_id: 1,
+                next_request_generation: 1,
+                admitted: None,
             }),
             wake: Notify::new(),
         }
     }
 
-    pub(crate) fn request(&self, selection: SelectionToken, full_group: bool) -> bool {
-        let should_admit = {
+    pub(crate) fn request(
+        &self,
+        selection: SelectionToken,
+        full_group: bool,
+    ) -> Option<CollectionDriverAdmission> {
+        let admission = {
             let mut state = self
                 .state
                 .lock()
@@ -131,8 +156,13 @@ impl CollectionDriverControl {
                 .latest_selection
                 .is_some_and(|current| selection.epoch > current.epoch);
             let accepted = state.latest_selection.is_none() || is_current || is_newer;
-            if accepted {
+            if !accepted {
+                None
+            } else {
                 state.latest_selection = Some(selection);
+                let request_generation = state.next_request_generation;
+                state.next_request_generation =
+                    state.next_request_generation.wrapping_add(1).max(1);
                 match state.pending.as_mut() {
                     Some(intent) if intent.selection == selection => {
                         intent.full_group |= full_group;
@@ -144,54 +174,97 @@ impl CollectionDriverControl {
                         });
                     }
                 }
-            }
-            if !accepted || state.admitted {
-                false
-            } else {
-                state.admitted = true;
-                true
+                state.pending_request_generation = Some(request_generation);
+                if state.admitted.is_some() {
+                    None
+                } else {
+                    let admission = CollectionDriverAdmission {
+                        owner_id: CollectionDriverOwnerId(state.next_owner_id),
+                        initial_request_generation: request_generation,
+                    };
+                    state.next_owner_id = state.next_owner_id.wrapping_add(1).max(1);
+                    state.admitted = Some(admission);
+                    Some(admission)
+                }
             }
         };
         self.wake.notify_waiters();
-        should_admit
+        admission
     }
 
-    pub(crate) fn take_pending_or_release(&self) -> Option<CollectionDriverIntent> {
+    pub(crate) fn take_pending_or_release(
+        &self,
+        owner_id: CollectionDriverOwnerId,
+    ) -> CollectionDriverTake {
         let mut state = self
             .state
             .lock()
             .expect("collection driver control state poisoned");
+        if state
+            .admitted
+            .is_none_or(|admission| admission.owner_id != owner_id)
+        {
+            return CollectionDriverTake::Stale;
+        }
         if let Some(intent) = state.pending.take() {
-            return Some(intent);
+            state.pending_request_generation = None;
+            return CollectionDriverTake::Pending(intent);
         }
-        state.admitted = false;
-        None
+        state.admitted = None;
+        CollectionDriverTake::Released
     }
 
-    pub(crate) fn release_after_task(&self) -> bool {
+    pub(crate) fn abort_owner(
+        &self,
+        admission: CollectionDriverAdmission,
+        intent_consumed: bool,
+    ) -> Option<CollectionDriverAdmission> {
         let mut state = self
             .state
             .lock()
             .expect("collection driver control state poisoned");
-        if !state.admitted {
-            return false;
+        if state.admitted != Some(admission) {
+            return None;
         }
-        state.admitted = false;
-        if state.pending.is_some() {
-            state.admitted = true;
-            true
+        let preserve_pending = intent_consumed
+            || state.pending_request_generation != Some(admission.initial_request_generation);
+        if preserve_pending && state.pending.is_some() {
+            let successor = CollectionDriverAdmission {
+                owner_id: CollectionDriverOwnerId(state.next_owner_id),
+                initial_request_generation: state
+                    .pending_request_generation
+                    .expect("pending collection intent has a request generation"),
+            };
+            state.next_owner_id = state.next_owner_id.wrapping_add(1).max(1);
+            state.admitted = Some(successor);
+            Some(successor)
         } else {
-            false
+            state.pending = None;
+            state.pending_request_generation = None;
+            state.admitted = None;
+            None
         }
     }
 
-    pub(crate) fn abandon(&self) {
+    pub(crate) fn abandon_owner(&self, admission: CollectionDriverAdmission) {
         let mut state = self
             .state
             .lock()
             .expect("collection driver control state poisoned");
-        state.pending = None;
-        state.admitted = false;
+        if state.admitted == Some(admission) {
+            state.pending = None;
+            state.pending_request_generation = None;
+            state.admitted = None;
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.state
+            .lock()
+            .expect("collection driver control state poisoned")
+            .admitted
+            .is_some()
     }
 }
 

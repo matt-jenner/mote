@@ -2,10 +2,12 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+#[cfg(debug_assertions)]
 use std::sync::Arc;
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(test, debug_assertions))]
+use std::sync::atomic::Ordering;
 
 use photo_cache::{
     DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget, ImageDerivativeError,
@@ -18,7 +20,9 @@ use photo_indexer::{InteractionMode, JobPriority};
 use crate::derivative_coordinator::{
     CollectionProgressToken, CommitPermit, RECENT_CAPACITY, WorkKey, WorkTicket,
 };
-use crate::service::{CollectionDriverIntent, SelectionToken};
+use crate::service::{
+    CollectionDriverAdmission, CollectionDriverOwnerId, CollectionDriverTake, SelectionToken,
+};
 use crate::{
     AppService, AppServiceError, DerivativeClass, DerivativePriority, DerivativeReference,
     DerivativeRequest, WallUpdate,
@@ -108,27 +112,77 @@ pub(crate) struct PendingDerivative {
     completion_generation: u64,
 }
 
-struct CollectionDriverTaskGuard {
+struct CollectionDriverLifecycleOwner {
     service: AppService,
-    // This distinguishes a future dropped before its first poll from a task
-    // that entered the driver loop and may need to hand off pending intent.
-    started: Arc<AtomicBool>,
+    admission: CollectionDriverAdmission,
+    intent_consumed: bool,
+    disarmed: bool,
+    #[cfg(any(test, debug_assertions))]
+    _task_guard: crate::service::DerivativeTaskGuard,
 }
 
-impl CollectionDriverTaskGuard {
-    fn mark_started(&self) {
-        self.started.store(true, Ordering::Release);
+impl CollectionDriverLifecycleOwner {
+    #[cfg(any(test, debug_assertions))]
+    fn new_with_task_guard(
+        service: AppService,
+        admission: CollectionDriverAdmission,
+        task_guard: crate::service::DerivativeTaskGuard,
+    ) -> Self {
+        Self {
+            _task_guard: task_guard,
+            service,
+            admission,
+            intent_consumed: false,
+            disarmed: false,
+        }
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn new(service: AppService, admission: CollectionDriverAdmission) -> Self {
+        let task_guard = service.collection_driver_tracker.start();
+        Self::new_with_task_guard(service, admission, task_guard)
+    }
+
+    #[cfg(not(any(test, debug_assertions)))]
+    fn new(service: AppService, admission: CollectionDriverAdmission) -> Self {
+        Self {
+            service,
+            admission,
+            intent_consumed: false,
+            disarmed: false,
+        }
+    }
+
+    fn owner_id(&self) -> CollectionDriverOwnerId {
+        self.admission.owner_id
+    }
+
+    fn take_pending_or_release(&mut self) -> CollectionDriverTake {
+        let transition = self
+            .service
+            .collection_driver
+            .take_pending_or_release(self.owner_id());
+        match transition {
+            CollectionDriverTake::Pending(_) => self.intent_consumed = true,
+            CollectionDriverTake::Released | CollectionDriverTake::Stale => {
+                self.disarmed = true;
+            }
+        }
+        transition
     }
 }
 
-impl Drop for CollectionDriverTaskGuard {
+impl Drop for CollectionDriverLifecycleOwner {
     fn drop(&mut self) {
-        if !self.started.load(Ordering::Acquire) {
-            self.service.collection_driver.abandon();
+        if self.disarmed {
             return;
         }
-        if self.service.collection_driver.release_after_task() {
-            let _ = self.service.spawn_collection_driver_task();
+        if let Some(successor) = self
+            .service
+            .collection_driver
+            .abort_owner(self.admission, self.intent_consumed)
+        {
+            let _ = self.service.spawn_collection_driver_task(successor);
         }
     }
 }
@@ -1508,6 +1562,12 @@ impl AppService {
 
     #[cfg(debug_assertions)]
     #[doc(hidden)]
+    pub fn collection_driver_admitted_test(&self) -> bool {
+        self.collection_driver.is_admitted()
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
     pub async fn install_collection_driver_exit_test_gate(
         &self,
         entered: Arc<tokio::sync::Notify>,
@@ -1726,8 +1786,16 @@ impl AppService {
     }
 
     fn start_collection_driver(&self, full_group: bool, selection: SelectionToken) {
-        if self.collection_driver.request(selection, full_group) {
-            let _ = self.spawn_collection_driver_task();
+        #[cfg(any(test, debug_assertions))]
+        let task_guard = self.collection_driver_tracker.start();
+        if let Some(admission) = self.collection_driver.request(selection, full_group) {
+            #[cfg(any(test, debug_assertions))]
+            let _ = self.spawn_collection_driver_task_with_task_guard(admission, task_guard);
+            #[cfg(not(any(test, debug_assertions)))]
+            let _ = self.spawn_collection_driver_task(admission);
+        } else {
+            #[cfg(any(test, debug_assertions))]
+            drop(task_guard);
         }
         // A recent request may be the only event that reaches this path.  Wake
         // the driver's generation wait after recording the coalesced intent so
@@ -1735,35 +1803,61 @@ impl AppService {
         self.coordinator.wake();
     }
 
-    fn spawn_collection_driver_task(&self) -> Option<tokio::task::JoinHandle<()>> {
+    fn spawn_collection_driver_task(
+        &self,
+        admission: CollectionDriverAdmission,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         if tokio::runtime::Handle::try_current().is_err() {
-            self.collection_driver.abandon();
+            self.collection_driver.abandon_owner(admission);
             return None;
         }
         let service = self.clone();
-        let started = Arc::new(AtomicBool::new(false));
-        let admission_guard = CollectionDriverTaskGuard {
-            service: service.clone(),
-            started: started.clone(),
-        };
-        #[cfg(any(test, debug_assertions))]
-        let task_guard = self.collection_driver_tracker.start();
+        let owner = CollectionDriverLifecycleOwner::new(service.clone(), admission);
+        self.spawn_collection_driver_task_owner(owner, service)
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn spawn_collection_driver_task_with_task_guard(
+        &self,
+        admission: CollectionDriverAdmission,
+        task_guard: crate::service::DerivativeTaskGuard,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.collection_driver.abandon_owner(admission);
+            drop(task_guard);
+            return None;
+        }
+        let service = self.clone();
+        let owner = CollectionDriverLifecycleOwner::new_with_task_guard(
+            service.clone(),
+            admission,
+            task_guard,
+        );
+        self.spawn_collection_driver_task_owner(owner, service)
+    }
+
+    fn spawn_collection_driver_task_owner(
+        &self,
+        owner: CollectionDriverLifecycleOwner,
+        service: AppService,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         Some(tokio::spawn(async move {
-            #[cfg(any(test, debug_assertions))]
-            let _task_guard = task_guard;
-            let _admission_guard = admission_guard;
-            _admission_guard.mark_started();
+            let mut owner = owner;
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            service.run_collection_driver().await;
+            service.run_collection_driver(&mut owner).await;
         }))
     }
 
-    async fn run_collection_driver(&self) {
+    async fn run_collection_driver(&self, owner: &mut CollectionDriverLifecycleOwner) {
         loop {
-            let Some(intent) = self.next_collection_driver_intent().await else {
-                #[cfg(debug_assertions)]
-                self.wait_for_collection_driver_exit_test_gate().await;
-                return;
+            let intent = match owner.take_pending_or_release() {
+                CollectionDriverTake::Pending(intent) => intent,
+                CollectionDriverTake::Released => {
+                    #[cfg(debug_assertions)]
+                    self.wait_for_collection_driver_exit_test_gate().await;
+                    return;
+                }
+                CollectionDriverTake::Stale => return,
             };
             let generation = self.coordinator.background_generation().await;
             self.run_preview_prefetch_until_stable(
@@ -1774,10 +1868,6 @@ impl AppService {
             )
             .await;
         }
-    }
-
-    async fn next_collection_driver_intent(&self) -> Option<CollectionDriverIntent> {
-        self.collection_driver.take_pending_or_release()
     }
 
     #[cfg(debug_assertions)]
@@ -2991,7 +3081,7 @@ mod tests {
 
     use crate::service::DerivativeTestGate;
     #[cfg(debug_assertions)]
-    use crate::service::{CollectionDriverControl, SelectionToken};
+    use crate::service::{CollectionDriverControl, CollectionDriverTake, SelectionToken};
     use crate::{AppConfig, AppService, DerivativeClass, WallUpdate};
 
     use super::DerivativeWorkError;
@@ -3416,17 +3506,20 @@ mod tests {
             epoch: 8,
         };
 
-        assert!(control.request(newer, false));
-        assert!(!control.request(newer, true));
-        assert!(!control.request(older, false));
-        assert!(!control.request(older, true));
+        let admission = control.request(newer, false).unwrap();
+        assert!(control.request(newer, true).is_none());
+        assert!(control.request(older, false).is_none());
+        assert!(control.request(older, true).is_none());
 
-        let intent = control
-            .take_pending_or_release()
-            .expect("newer collection intent should remain pending");
+        let intent = match control.take_pending_or_release(admission.owner_id) {
+            CollectionDriverTake::Pending(intent) => intent,
+            CollectionDriverTake::Released | CollectionDriverTake::Stale => {
+                panic!("newer collection intent should remain pending")
+            }
+        };
         assert_eq!(intent.selection, newer);
         assert!(intent.full_group);
-        assert!(!control.request(older, true));
+        assert!(control.request(older, true).is_none());
     }
 
     #[cfg(debug_assertions)]
@@ -3440,9 +3533,9 @@ mod tests {
             .expect("same source should produce a newer selection epoch");
         service.coordinator.reset_selection(newer).await;
 
-        assert!(service.collection_driver.request(newer, true));
-        assert!(!service.collection_driver.request(older, true));
-        let _ = service.spawn_collection_driver_task();
+        let admission = service.collection_driver.request(newer, true).unwrap();
+        assert!(service.collection_driver.request(older, true).is_none());
+        let _ = service.spawn_collection_driver_task(admission);
         tokio::time::timeout(
             Duration::from_secs(5),
             service.wait_for_collection_drivers_quiescent_test(),
@@ -3460,9 +3553,9 @@ mod tests {
     async fn collection_driver_abort_before_first_poll_releases_admission_and_tracking() {
         let (_temp, service, selection, _asset_id, _derivative_count) =
             collection_gap_fixture(false).await;
-        assert!(service.collection_driver.request(selection, true));
+        let admission = service.collection_driver.request(selection, true).unwrap();
         let handle = service
-            .spawn_collection_driver_task()
+            .spawn_collection_driver_task(admission)
             .expect("collection driver should spawn inside the test runtime");
         assert_eq!(service.collection_driver_active_count_test(), 1);
 
@@ -3484,6 +3577,80 @@ mod tests {
         .await
         .expect("a later request should admit and drain a new driver");
         assert_eq!(service.collection_driver_active_count_test(), 0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn collection_driver_quiescence_waiter_submits_only_after_pre_poll_cleanup() {
+        let (_temp, service, selection, _asset_id, _derivative_count) =
+            collection_gap_fixture(false).await;
+        let admission = service.collection_driver.request(selection, true).unwrap();
+        let handle = service
+            .spawn_collection_driver_task(admission)
+            .expect("collection driver should spawn inside the test runtime");
+        let waiter_service = service.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_service
+                .wait_for_collection_drivers_quiescent_test()
+                .await;
+            assert!(
+                !waiter_service.collection_driver_admitted_test(),
+                "quiescence must follow owner admission cleanup"
+            );
+            waiter_service.start_collection_driver(true, selection);
+        });
+        while service.collection_driver_tracker.waiting_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        handle.abort();
+        let _ = handle.await;
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("quiescence waiter should be released after owner cleanup")
+            .expect("quiescence waiter should not panic");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            service.wait_for_collection_drivers_quiescent_test(),
+        )
+        .await
+        .expect("the one successor should drain");
+        assert_eq!(service.collection_driver_active_count_test(), 0);
+        assert_eq!(
+            service.coordinator.collection_phase().await,
+            crate::derivative_coordinator::CollectionPhase::Complete
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn collection_driver_cancel_transfers_pending_newer_selection_once() {
+        let (_temp, service, older, _asset_id, _derivative_count) =
+            collection_gap_fixture(false).await;
+        let old_admission = service.collection_driver.request(older, true).unwrap();
+        let handle = service
+            .spawn_collection_driver_task(old_admission)
+            .expect("collection driver should spawn inside the test runtime");
+        let source = _temp.path().join("photos");
+        let (_, newer) = service
+            .select_recent(&source)
+            .expect("same source should produce a newer selection epoch");
+        service.coordinator.reset_selection(newer).await;
+        assert!(service.collection_driver.request(newer, true).is_none());
+
+        handle.abort();
+        let _ = handle.await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            service.wait_for_collection_drivers_quiescent_test(),
+        )
+        .await
+        .expect("newer pending intent should transfer during cancellation");
+        assert_eq!(service.collection_driver_active_count_test(), 0);
+        assert_eq!(
+            service.coordinator.collection_phase().await,
+            crate::derivative_coordinator::CollectionPhase::Complete
+        );
     }
 
     #[cfg(debug_assertions)]
@@ -3568,11 +3735,24 @@ mod tests {
                 .is_err()
         );
         service.prefetch_screen_previews(Vec::new()).await;
+        assert!(service.collection_driver_admitted_test());
         assert_eq!(
             service.collection_driver_active_count_test(),
             2,
             "post-take request must admit the successor while the old task is tracked"
         );
+        let mut maximum_active = service.collection_driver_active_count_test();
+        let mut maximum_admitted = usize::from(service.collection_driver_admitted_test());
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+            service.prefetch_screen_previews(Vec::new()).await;
+            maximum_active = maximum_active.max(service.collection_driver_active_count_test());
+            maximum_admitted =
+                maximum_admitted.max(usize::from(service.collection_driver_admitted_test()));
+            assert!(service.collection_driver_admitted_test());
+        }
+        assert_eq!(maximum_active, 2, "one successor must not be duplicated");
+        assert_eq!(maximum_admitted, 1, "only one owner may be admitted");
         assert!(
             tokio::time::timeout(Duration::from_millis(0), &mut quiescence)
                 .await
