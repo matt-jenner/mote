@@ -4,6 +4,7 @@ import type {
 	DerivativeClass,
 	DerivativeReference,
 	DerivativeRequest,
+	GalleryScope,
 	PhotoService,
 	ScanProgressDto,
 	WallAsset,
@@ -69,7 +70,7 @@ export function createInMemoryPhotoService(
 	const derivativeRequests: DerivativeRequest[] = [];
 	const interactionCalls: boolean[] = [];
 	let state: BootstrapState = {
-		settings: { appearance: "system" },
+		settings: { appearance: "system", galleryScope: "includeSubfolders" },
 		activeSource: null,
 	};
 	let assets: WallAsset[] = fixtures.map(
@@ -135,7 +136,11 @@ export function createInMemoryPhotoService(
 			return { kind: "selected", state: clone(state) };
 		},
 		async updateAppearance(appearance: Appearance) {
-			state = { ...state, settings: { appearance } };
+			state = { ...state, settings: { ...state.settings, appearance } };
+			return clone(state);
+		},
+		async updateGalleryScope(galleryScope: GalleryScope) {
+			state = { ...state, settings: { ...state.settings, galleryScope } };
 			return clone(state);
 		},
 		async queryWall(request: WallQueryRequest): Promise<WallPage> {

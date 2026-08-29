@@ -88,6 +88,12 @@ tile becomes openable only after its current thumbnail has painted. Background
 work runs in order: wall thumbnails first, then screen previews. A corrupt
 photo records its failure and does not block healthy photos.
 
+The gallery initially includes photos from the selected folder and every
+subfolder. Use **Include subfolders** in the wall toolbar to switch to photos
+stored directly in the selected folder; the choice persists across restarts.
+Changing the scope reprojects the local catalogue and cached derivatives, so it
+does not rescan the source or wait for a mounted network share.
+
 When a wall tile opens the immersive viewer, use Left/Right (or the Previous
 and Next buttons) to move through the loaded order. Select a filmstrip item for
 a direct jump, or swipe horizontally on a fit-to-window photo. Photo

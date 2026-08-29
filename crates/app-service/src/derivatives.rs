@@ -2617,10 +2617,13 @@ impl AppService {
         } else {
             WallOrder::Provisional
         };
-        let page = state
-            .libraries
-            .catalog()
-            .photo_asset_ids_page(group, order, cursor, 250)?;
+        let page = state.libraries.catalog().photo_asset_ids_page_scoped(
+            group,
+            stored.gallery_scope,
+            order,
+            cursor,
+            250,
+        )?;
         #[cfg(debug_assertions)]
         let page_size = page.items.len();
         #[cfg(debug_assertions)]
@@ -3075,7 +3078,7 @@ mod tests {
         TerminalDerivativeFailure,
     };
     use photo_catalog::{Catalog, NewAsset};
-    use photo_domain::{AssetId, FileSignature, MediaKind, RelativePathKey};
+    use photo_domain::{AssetId, FileSignature, GalleryScope, MediaKind, RelativePathKey};
     #[cfg(debug_assertions)]
     use photo_domain::{FolderGroupId, LibraryId};
     use photo_indexer::{JobPriority, MetadataReader};
@@ -3095,6 +3098,50 @@ mod tests {
     struct BlockingReader {
         gate: Arc<(Mutex<bool>, Condvar)>,
         entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[test]
+    fn collection_prefetch_page_honors_current_folder_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(source.join("child")).unwrap();
+        let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+        let service = AppService::open(config).unwrap();
+        let (_, selection) = service.select_recent(&source).unwrap();
+        let mut ids = Vec::new();
+        {
+            let mut state = service.state().unwrap();
+            for path in ["direct.jpg", "child/nested.jpg"] {
+                let relative = RelativePathKey::from_relative_path(Path::new(path)).unwrap();
+                let mut asset =
+                    NewAsset::minimal(selection.library_id, relative, path, MediaKind::Jpeg, 1);
+                asset.folder_group_id = Some(selection.group_id);
+                ids.push(asset.id);
+                state
+                    .libraries
+                    .catalog_mut()
+                    .apply_index_batch(&[
+                        CatalogIndexRecord::Discovered(asset.clone()),
+                        CatalogIndexRecord::Shaped(AssetShapeUpdate {
+                            asset_id: asset.id,
+                            width: 16,
+                            height: 9,
+                            orientation: Some(1),
+                            representative_rgb: None,
+                            shape_status: ShapeStatus::Ready,
+                        }),
+                    ])
+                    .unwrap();
+            }
+        }
+        service
+            .update_gallery_scope(GalleryScope::CurrentFolder)
+            .unwrap();
+
+        let (_, page, next) = service.remaining_group_ids_page(None, None).unwrap();
+
+        assert_eq!(page, [ids[0]]);
+        assert!(next.is_some());
     }
 
     impl MetadataReader for BlockingReader {

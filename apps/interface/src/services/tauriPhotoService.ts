@@ -5,6 +5,7 @@ import {
 	type ChooseFolderResult,
 	type DerivativeReference,
 	type DerivativeRequest,
+	type GalleryScope,
 	type PhotoService,
 	PhotoServiceError,
 	type WallQueryRequest,
@@ -69,6 +70,14 @@ export function createTauriPhotoService(
 			invokePhotoCommand<BootstrapState>(invokeCommand, "update_appearance", {
 				appearance,
 			}),
+		updateGalleryScope: (scope: GalleryScope) =>
+			invokePhotoCommand<BootstrapState>(
+				invokeCommand,
+				"update_gallery_scope",
+				{
+					scope,
+				},
+			),
 		queryWall: (request: WallQueryRequest) =>
 			invokePhotoCommand(invokeCommand, "query_wall", { request }),
 		requestDerivatives: (request: DerivativeRequest) =>

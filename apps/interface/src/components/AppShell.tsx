@@ -38,7 +38,9 @@ export function AppShell() {
 	const drawerCloseRef = useRef<HTMLButtonElement>(null);
 	const drawerWasOpen = useRef(false);
 	const source = controller.state?.activeSource ?? null;
-	const wall = usePhotoWall(source?.selectionId ?? null);
+	const galleryScope =
+		controller.state?.settings.galleryScope ?? "includeSubfolders";
+	const wall = usePhotoWall(source?.selectionId ?? null, galleryScope);
 	const appearance = controller.state?.settings.appearance ?? "system";
 	const chooseFolder = () => controller.chooseFolder();
 	const handleOpenViewer = useCallback(
@@ -217,6 +219,8 @@ export function AppShell() {
 					{source ? (
 						<WallToolbar
 							direction={wall.state.direction}
+							galleryScope={galleryScope}
+							onGalleryScopeChange={controller.updateGalleryScope}
 							onDirectionChange={wall.setDirection}
 							onRetry={wall.retry}
 							progress={wall.progress}

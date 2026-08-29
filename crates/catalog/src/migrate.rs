@@ -15,6 +15,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0005_group_scoped_generations.sql"),
     include_str!("../migrations/0006_wall_state_indexes.sql"),
     include_str!("../migrations/0007_derivative_coordinator.sql"),
+    include_str!("../migrations/0008_gallery_scope.sql"),
 ];
 
 pub(crate) fn migrate_with(path: &Path, migrations: &[&str]) -> Result<Connection, CatalogError> {
@@ -66,7 +67,38 @@ pub(crate) fn apply_migrations(
         if version == 4 {
             normalize_legacy_capture_dates(&transaction)?;
         }
+        if version == 8 {
+            backfill_relative_parent_keys(&transaction)?;
+        }
         transaction.commit()?;
+    }
+    Ok(())
+}
+
+fn backfill_relative_parent_keys(
+    connection: &rusqlite::Transaction<'_>,
+) -> Result<(), CatalogError> {
+    let mut statement = connection.prepare("SELECT id, relative_path_key FROM assets")?;
+    let values = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    for (id, relative_path) in values {
+        let relative = photo_domain::RelativePathKey::from_bytes(relative_path)
+            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+        let path = relative
+            .to_path_buf()
+            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        let parent_key = photo_domain::RelativePathKey::from_relative_path(parent)
+            .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+        connection.execute(
+            "UPDATE assets SET relative_parent_key = ?2 WHERE id = ?1",
+            rusqlite::params![id, parent_key.as_bytes()],
+        )?;
     }
     Ok(())
 }

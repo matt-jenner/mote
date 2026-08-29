@@ -128,12 +128,22 @@ pub(crate) fn upsert_asset_on(
 ) -> Result<(), CatalogError> {
     let size_bytes =
         i64::try_from(value.signature.size_bytes).map_err(|_| CatalogError::ValueOutOfRange)?;
+    let relative_path = value
+        .relative_path
+        .to_path_buf()
+        .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
+    let relative_parent = RelativePathKey::from_relative_path(
+        relative_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("")),
+    )
+    .map_err(|error| CatalogError::InvalidData(error.to_string()))?;
     connection.execute(
         "INSERT INTO assets (\
                 id, library_id, relative_path_key, display_path, media_kind, size_bytes, \
-                modified_unix_ns, sidecar_modified_unix_ns, availability, folder_group_id, provisional_order \
+                modified_unix_ns, sidecar_modified_unix_ns, availability, folder_group_id, provisional_order, relative_parent_key \
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'available', ?9, \
-                COALESCE((SELECT MAX(provisional_order) + 1 FROM assets WHERE library_id = ?2), 1)) \
+                COALESCE((SELECT MAX(provisional_order) + 1 FROM assets WHERE library_id = ?2), 1), ?10) \
              ON CONFLICT(id) DO UPDATE SET \
                 display_path = excluded.display_path, \
                 media_kind = excluded.media_kind, \
@@ -141,6 +151,7 @@ pub(crate) fn upsert_asset_on(
                 modified_unix_ns = excluded.modified_unix_ns, \
                 sidecar_modified_unix_ns = excluded.sidecar_modified_unix_ns, \
                 folder_group_id = COALESCE(excluded.folder_group_id, assets.folder_group_id), \
+                relative_parent_key = excluded.relative_parent_key, \
                 availability = excluded.availability",
         params![
             value.id.as_uuid().as_bytes(),
@@ -155,6 +166,7 @@ pub(crate) fn upsert_asset_on(
                 .sidecar_modified_unix_ns
                 .map(|timestamp| timestamp.to_string()),
             value.folder_group_id.map(|id| id.as_uuid().as_bytes().to_vec()),
+            relative_parent.as_bytes(),
         ],
     )?;
     Ok(())

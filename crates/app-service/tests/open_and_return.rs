@@ -1,5 +1,5 @@
 use photo_app_service::{AppConfig, AppService};
-use photo_domain::Appearance;
+use photo_domain::{Appearance, GalleryScope};
 
 #[test]
 fn source_and_appearance_restore_from_the_same_profile() {
@@ -18,6 +18,29 @@ fn source_and_appearance_restore_from_the_same_profile() {
     let state = reopened.bootstrap().unwrap();
     assert_eq!(state.settings.appearance, Appearance::Dark);
     assert_eq!(state.active_source.unwrap().display_name, "Iceland 2025");
+}
+
+#[test]
+fn gallery_scope_updates_bootstrap_and_restores_from_the_same_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let first = AppService::open(config.clone()).unwrap();
+
+    assert_eq!(
+        first.bootstrap().unwrap().settings.gallery_scope,
+        GalleryScope::IncludeSubfolders
+    );
+    let updated = first
+        .update_gallery_scope(GalleryScope::CurrentFolder)
+        .unwrap();
+    assert_eq!(updated.settings.gallery_scope, GalleryScope::CurrentFolder);
+    drop(first);
+
+    let reopened = AppService::open(config).unwrap();
+    assert_eq!(
+        reopened.bootstrap().unwrap().settings.gallery_scope,
+        GalleryScope::CurrentFolder
+    );
 }
 
 #[test]

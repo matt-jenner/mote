@@ -68,6 +68,7 @@ pub fn run() {
             commands::get_bootstrap_state,
             commands::choose_folder,
             commands::update_appearance,
+            commands::update_gallery_scope,
             commands::query_wall,
             commands::request_derivatives,
             commands::set_wall_interaction,

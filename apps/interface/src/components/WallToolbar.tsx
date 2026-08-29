@@ -1,11 +1,13 @@
-import { ArrowDownAZ, ArrowUpAZ } from "lucide-react";
+import { ArrowDownAZ, ArrowUpAZ, FolderTree } from "lucide-react";
 import type { WallProgress } from "../app/usePhotoWall";
-import type { SortDirection } from "../services/photoService";
+import type { GalleryScope, SortDirection } from "../services/photoService";
 import styles from "../styles/photoWall.module.css";
 
 interface WallToolbarProps {
 	direction: SortDirection;
 	onDirectionChange: (direction: SortDirection) => void;
+	galleryScope: GalleryScope;
+	onGalleryScopeChange: (scope: GalleryScope) => void;
 	status: string;
 	progress?: WallProgress;
 	onRetry?: () => void;
@@ -15,6 +17,8 @@ interface WallToolbarProps {
 export function WallToolbar({
 	direction,
 	onDirectionChange,
+	galleryScope,
+	onGalleryScopeChange,
 	status,
 	progress,
 	onRetry,
@@ -38,6 +42,21 @@ export function WallToolbar({
 					Retry
 				</button>
 			) : null}
+			<button
+				aria-pressed={galleryScope === "includeSubfolders"}
+				className={styles.scopeButton}
+				onClick={() =>
+					onGalleryScopeChange(
+						galleryScope === "includeSubfolders"
+							? "currentFolder"
+							: "includeSubfolders",
+					)
+				}
+				type="button"
+			>
+				<FolderTree aria-hidden="true" size={16} strokeWidth={1.7} />
+				Include subfolders
+			</button>
 			<fieldset aria-label="Photo order" className={styles.sortControls}>
 				<button
 					aria-pressed={direction === "oldestFirst"}

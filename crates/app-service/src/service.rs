@@ -7,7 +7,7 @@ use photo_core::{
     AddLibraryError, LibraryService, LocalStateError, RealSourceFs, SourceFs, SourceValidator,
     ValidatedSourceFolder,
 };
-use photo_domain::{Appearance, AssetId, Availability, MediaKind};
+use photo_domain::{Appearance, AssetId, Availability, GalleryScope, MediaKind};
 use photo_indexer::{DefaultMetadataReader, IndexScheduler, MetadataReader};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -699,6 +699,7 @@ impl AppService {
         Ok(BootstrapState {
             settings: SettingsState {
                 appearance: stored.appearance,
+                gallery_scope: stored.gallery_scope,
             },
             active_source,
         })
@@ -923,10 +924,13 @@ impl AppService {
             .as_deref()
             .map(|v| crate::wall::decode_cursor(v, request.direction, group, order))
             .transpose()?;
-        let page = state
-            .libraries
-            .catalog()
-            .wall_page(group, order, cursor, request.limit)?;
+        let page = state.libraries.catalog().wall_page_scoped(
+            group,
+            stored.gallery_scope,
+            order,
+            cursor,
+            request.limit,
+        )?;
         let date_state = if settled {
             crate::OrderState::Settled
         } else {
@@ -970,6 +974,15 @@ impl AppService {
     ) -> Result<BootstrapState, AppServiceError> {
         let mut state = self.state()?;
         state.libraries.catalog_mut().set_appearance(appearance)?;
+        Self::bootstrap_locked(&state)
+    }
+
+    pub fn update_gallery_scope(
+        &self,
+        scope: GalleryScope,
+    ) -> Result<BootstrapState, AppServiceError> {
+        let mut state = self.state()?;
+        state.libraries.catalog_mut().set_gallery_scope(scope)?;
         Self::bootstrap_locked(&state)
     }
 }

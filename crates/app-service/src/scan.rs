@@ -338,10 +338,20 @@ impl AppService {
                 return;
             }
             if !shaped.is_empty() {
+                let gallery_scope = state
+                    .libraries
+                    .catalog()
+                    .load_app_state()
+                    .map(|stored| stored.gallery_scope)
+                    .unwrap_or_default();
                 let assets = state
                     .libraries
                     .catalog()
-                    .wall_records_for_assets(owner.selection.group_id, &shaped)
+                    .wall_records_for_assets_scoped(
+                        owner.selection.group_id,
+                        gallery_scope,
+                        &shaped,
+                    )
                     .ok()
                     .and_then(|records| {
                         crate::service::wall_assets_with_derivatives(

@@ -12,6 +12,7 @@ import type {
 	ChooseFolderResult,
 	DerivativeReference,
 	DerivativeRequest,
+	GalleryScope,
 	PhotoService,
 	WallAsset,
 	WallPage,
@@ -148,7 +149,7 @@ class ControlledWallService implements PhotoService {
 
 	constructor(sourceId = "source-a") {
 		this.sourceState = {
-			settings: { appearance: "system" },
+			settings: { appearance: "system", galleryScope: "includeSubfolders" },
 			activeSource: {
 				id: sourceId,
 				selectionId: sourceId,
@@ -164,7 +165,11 @@ class ControlledWallService implements PhotoService {
 	});
 	updateAppearance = async (appearance: Appearance) => ({
 		...this.sourceState,
-		settings: { appearance },
+		settings: { ...this.sourceState.settings, appearance },
+	});
+	updateGalleryScope = async (galleryScope: GalleryScope) => ({
+		...this.sourceState,
+		settings: { ...this.sourceState.settings, galleryScope },
 	});
 	queryWall = (request: WallQueryRequest) => {
 		this.queryRequests.push(request);
@@ -934,6 +939,57 @@ describe("progressive photo wall", () => {
 			priority: "visible",
 			kind: "wallThumbnail",
 		});
+	});
+
+	it("persists the subfolder toggle and reloads the wall from the new scope", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(
+			0,
+			pageOf([asset("recursive", "Recursive", 1)], "settled"),
+		);
+		const toggle = screen.getByRole("button", { name: "Include subfolders" });
+		await expect.element(toggle).toHaveAttribute("aria-pressed", "true");
+
+		await toggle.click();
+
+		await expect.element(toggle).toHaveAttribute("aria-pressed", "false");
+		await expect.poll(() => service.queryRequests.length).toBe(2);
+		service.releaseQuery(1, pageOf([asset("direct", "Direct", 1)], "settled"));
+		const wall = screen.getByRole("region", { name: "Photos" }).element();
+		await expect
+			.poll(() => wall.querySelector("[data-asset-id='direct']"))
+			.not.toBeNull();
+		expect(wall.querySelector("[data-asset-id='recursive']")).toBeNull();
+	});
+
+	it("keeps gallery controls inside a phone-width header", async () => {
+		await page.viewport(390, 844);
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(0, pageOf([]));
+
+		for (const name of [
+			"Include subfolders",
+			"Oldest first",
+			"Newest first",
+			"Appearance",
+		]) {
+			const bounds = screen
+				.getByRole("button", { name })
+				.element()
+				.getBoundingClientRect();
+			expect(
+				bounds.left,
+				`${name} starts outside the viewport`,
+			).toBeGreaterThanOrEqual(0);
+			expect(
+				bounds.right,
+				`${name} ends outside the viewport`,
+			).toBeLessThanOrEqual(390);
+		}
 	});
 
 	it("retries a rejected visible thumbnail request and reports the retry", async () => {

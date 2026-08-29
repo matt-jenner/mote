@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
 import type {
 	DerivativePriority,
+	GalleryScope,
 	SortDirection,
 	WallUpdate,
 } from "../services/photoService";
@@ -128,13 +129,18 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 	};
 }
 
-export function usePhotoWall(sourceId: string | null): PhotoWallController {
+export function usePhotoWall(
+	sourceId: string | null,
+	galleryScope: GalleryScope = "includeSubfolders",
+): PhotoWallController {
 	const service = usePhotoService();
 	const [state, dispatch] = useReducer(wallReducer, initialWallState);
 	const stateRef = useRef(state);
 	stateRef.current = state;
 	const requestNumber = useRef(0);
 	const sourceIdRef = useRef(sourceId);
+	const galleryScopeRef = useRef(galleryScope);
+	galleryScopeRef.current = galleryScope;
 	const sourceGeneration = useRef(0);
 	const ownerRef = useRef<RequestOwner | null>(null);
 	const settlementPending = useRef<number | null>(null);
@@ -285,6 +291,7 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 
 	useEffect(() => {
 		const expectedSourceId = sourceId;
+		const expectedGalleryScope = galleryScope;
 		const generation = sourceGeneration.current + 1;
 		sourceGeneration.current = generation;
 		sourceIdRef.current = expectedSourceId;
@@ -309,6 +316,7 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 		});
 		if (!expectedSourceId) return;
 		const stop = service.watchWallUpdates((update: WallUpdate) => {
+			if (galleryScopeRef.current !== expectedGalleryScope) return;
 			if (!isLive(generation, expectedSourceId)) return;
 			if (
 				"selectionId" in update &&
@@ -398,7 +406,10 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 		});
 		void (service as ScanCapableService).startFixtureScan?.();
 		queueMicrotask(() => {
-			if (isLive(generation, expectedSourceId))
+			if (
+				galleryScopeRef.current === expectedGalleryScope &&
+				isLive(generation, expectedSourceId)
+			)
 				loadPage(null, false, generation, true);
 		});
 		return () => {
@@ -410,7 +421,14 @@ export function usePhotoWall(sourceId: string | null): PhotoWallController {
 				settlementPending.current = null;
 			}
 		};
-	}, [cancelDerivativeRetry, isLive, loadPage, service, sourceId]);
+	}, [
+		cancelDerivativeRetry,
+		galleryScope,
+		isLive,
+		loadPage,
+		service,
+		sourceId,
+	]);
 
 	useEffect(() => {
 		if (

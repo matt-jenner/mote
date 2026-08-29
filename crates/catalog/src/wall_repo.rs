@@ -1,4 +1,4 @@
-use photo_domain::{AssetId, Availability, FolderGroupId, MediaKind};
+use photo_domain::{AssetId, Availability, FolderGroupId, GalleryScope, MediaKind};
 use rusqlite::{OptionalExtension, params};
 
 use crate::{Catalog, CatalogError};
@@ -89,14 +89,29 @@ impl Catalog {
         group: FolderGroupId,
         assets: &[AssetId],
     ) -> Result<Vec<WallCatalogRecord>, CatalogError> {
-        let mut statement = self.connection.prepare(
+        self.wall_records_for_assets_scoped(group, GalleryScope::IncludeSubfolders, assets)
+    }
+
+    pub fn wall_records_for_assets_scoped(
+        &self,
+        group: FolderGroupId,
+        scope: GalleryScope,
+        assets: &[AssetId],
+    ) -> Result<Vec<WallCatalogRecord>, CatalogError> {
+        let mut sql = String::from(
             "SELECT id, display_path, media_kind, provisional_order, captured_at_utc, width, height, representative_rgb, availability, shape_status, rating, \
                     EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id), \
                     (SELECT code FROM warnings WHERE warnings.asset_id = assets.id ORDER BY CASE code WHEN 'derivative_generation_failed' THEN 0 ELSE 1 END, occurred_at DESC, id DESC LIMIT 1) \
              FROM assets WHERE folder_group_id = ?1 AND id = ?2 \
                AND media_kind <> 'video' \
                AND shape_status IN ('ready','fallback') AND width IS NOT NULL AND height IS NOT NULL",
-        )?;
+        );
+        if scope == GalleryScope::CurrentFolder {
+            sql.push_str(
+                " AND relative_parent_key = (SELECT relative_path_key FROM folder_groups WHERE id = ?1)",
+            );
+        }
+        let mut statement = self.connection.prepare(&sql)?;
         let mut records = Vec::with_capacity(assets.len());
         for asset in assets {
             let record = statement
@@ -115,6 +130,17 @@ impl Catalog {
     pub fn wall_page(
         &self,
         group: FolderGroupId,
+        order: WallOrder,
+        cursor: Option<WallCursorKey>,
+        limit: u32,
+    ) -> Result<WallCatalogPage, CatalogError> {
+        self.wall_page_scoped(group, GalleryScope::IncludeSubfolders, order, cursor, limit)
+    }
+
+    pub fn wall_page_scoped(
+        &self,
+        group: FolderGroupId,
+        scope: GalleryScope,
         order: WallOrder,
         cursor: Option<WallCursorKey>,
         limit: u32,
@@ -138,6 +164,11 @@ impl Catalog {
              FROM assets WHERE folder_group_id = ?1 AND media_kind <> 'video' \
                AND shape_status IN ('ready','fallback') AND width IS NOT NULL AND height IS NOT NULL",
         );
+        if scope == GalleryScope::CurrentFolder {
+            sql.push_str(
+                " AND relative_parent_key = (SELECT relative_path_key FROM folder_groups WHERE id = ?1)",
+            );
+        }
         match order {
             WallOrder::Provisional => {
                 if cursor.is_some() {
@@ -215,7 +246,24 @@ impl Catalog {
         cursor: Option<WallCursorKey>,
         limit: u32,
     ) -> Result<PhotoAssetIdPage, CatalogError> {
-        let page = self.wall_page(group, order, cursor, limit)?;
+        self.photo_asset_ids_page_scoped(
+            group,
+            GalleryScope::IncludeSubfolders,
+            order,
+            cursor,
+            limit,
+        )
+    }
+
+    pub fn photo_asset_ids_page_scoped(
+        &self,
+        group: FolderGroupId,
+        scope: GalleryScope,
+        order: WallOrder,
+        cursor: Option<WallCursorKey>,
+        limit: u32,
+    ) -> Result<PhotoAssetIdPage, CatalogError> {
+        let page = self.wall_page_scoped(group, scope, order, cursor, limit)?;
         Ok(PhotoAssetIdPage {
             items: page.items.into_iter().map(|row| row.id).collect(),
             next: page.next,

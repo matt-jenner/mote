@@ -1,4 +1,5 @@
 export type Appearance = "system" | "light" | "dark";
+export type GalleryScope = "currentFolder" | "includeSubfolders";
 export type SourceAvailability =
 	| "available"
 	| "rootOffline"
@@ -7,6 +8,7 @@ export type SourceAvailability =
 
 export interface SettingsState {
 	appearance: Appearance;
+	galleryScope: GalleryScope;
 }
 
 export interface SourceSummary {
@@ -157,6 +159,7 @@ export interface PhotoService {
 	getBootstrapState(): Promise<BootstrapState>;
 	chooseFolder(): Promise<ChooseFolderResult>;
 	updateAppearance(appearance: Appearance): Promise<BootstrapState>;
+	updateGalleryScope(scope: GalleryScope): Promise<BootstrapState>;
 	queryWall(request: WallQueryRequest): Promise<WallPage>;
 	requestDerivatives(request: DerivativeRequest): Promise<void>;
 	setWallInteraction(active: boolean): Promise<void>;

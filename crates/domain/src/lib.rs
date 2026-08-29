@@ -8,4 +8,4 @@ pub use folder_policy::{FolderPolicy, PathRatingRule, PolicyBehavior, StructureM
 pub use ids::{AssetId, DerivativeId, FolderGroupId, LibraryId};
 pub use media::{Availability, FileSignature, LibraryKind, MediaKind};
 pub use path_key::{NativePathKey, PathKeyError, RelativePathKey};
-pub use settings::Appearance;
+pub use settings::{Appearance, GalleryScope};

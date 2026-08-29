@@ -14,7 +14,9 @@ use photo_app_service::{
 };
 use photo_cache::CacheBudget;
 use photo_catalog::{Catalog, CatalogWarningRecord, NewDerivative, NewFolderGroup};
-use photo_domain::{AssetId, DerivativeId, FolderGroupId, LibraryId, RelativePathKey};
+use photo_domain::{
+    AssetId, DerivativeId, FolderGroupId, GalleryScope, LibraryId, RelativePathKey,
+};
 use photo_metadata::{MetadataBundle, MetadataCandidate, MetadataReadWarning, MetadataSource};
 
 #[derive(Clone)]
@@ -472,6 +474,65 @@ fn same_library_parent_and_child_have_distinct_opaque_selection_identity() {
     assert_ne!(parent_source.selection_id, child_source.selection_id);
     assert!(!child_source.selection_id.contains("child"));
     assert!(!child_source.selection_id.contains('/'));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gallery_scope_filters_cached_pages_and_progressive_batches_without_rescanning() {
+    let fixture = ProgressiveFixture::new(1);
+    let child = fixture.source.join("child");
+    std::fs::create_dir(&child).unwrap();
+    ImageBuffer::from_pixel(16, 12, Rgb([80_u8, 40, 20]))
+        .save(child.join("nested.jpg"))
+        .unwrap();
+    let reader = CountingReader::default();
+    let service =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(reader.clone())).unwrap();
+    service
+        .update_gallery_scope(GalleryScope::CurrentFolder)
+        .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+
+    let mut published = Vec::new();
+    loop {
+        match recv_until(&mut updates, |_| true).await {
+            WallUpdate::CatalogBatch { assets, .. } => {
+                published.extend(assets.into_iter().map(|asset| asset.display_name));
+            }
+            WallUpdate::MetadataSettled { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(published, ["photo-000.jpg"]);
+    let current = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    assert_eq!(
+        current
+            .items
+            .iter()
+            .map(|asset| asset.display_name.as_str())
+            .collect::<Vec<_>>(),
+        ["photo-000.jpg"]
+    );
+    let reads_after_scan = reader.count();
+
+    service
+        .update_gallery_scope(GalleryScope::IncludeSubfolders)
+        .unwrap();
+    let recursive = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    let mut recursive_names = recursive
+        .items
+        .iter()
+        .map(|asset| asset.display_name.as_str())
+        .collect::<Vec<_>>();
+    recursive_names.sort_unstable();
+    assert_eq!(recursive_names, ["nested.jpg", "photo-000.jpg"]);
+    assert_eq!(reader.count(), reads_after_scan);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -307,12 +307,16 @@ function previewService(
 	return {
 		capabilities: { chooseFolder: false, locateFolder: false },
 		getBootstrapState: async () => ({
-			settings: { appearance: "system" },
+			settings: { appearance: "system", galleryScope: "includeSubfolders" },
 			activeSource: null,
 		}),
 		chooseFolder: async () => ({ kind: "cancelled" }),
 		updateAppearance: async (appearance) => ({
-			settings: { appearance },
+			settings: { appearance, galleryScope: "includeSubfolders" },
+			activeSource: null,
+		}),
+		updateGalleryScope: async (galleryScope) => ({
+			settings: { appearance: "system", galleryScope },
 			activeSource: null,
 		}),
 		queryWall: async (): Promise<WallPage> => ({
@@ -4682,7 +4686,10 @@ describe("immersive photo viewer checkpoint", () => {
 		await expect.element(back).toBeVisible();
 		const previous = view.getByRole("button", { name: "Previous photo" });
 		const next = view.getByRole("button", { name: "Next photo" });
-		const folders = view.getByRole("button", { name: "Folders" });
+		const folders = view.getByRole("button", {
+			name: "Folders",
+			exact: true,
+		});
 		const firstThumb = view
 			.getByRole("group", { name: "Photo filmstrip" })
 			.getByRole("button", { name: "Coast", exact: true });

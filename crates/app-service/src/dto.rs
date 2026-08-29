@@ -1,4 +1,4 @@
-use photo_domain::Appearance;
+use photo_domain::{Appearance, GalleryScope};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -235,6 +235,7 @@ pub struct BootstrapState {
 #[serde(rename_all = "camelCase")]
 pub struct SettingsState {
     pub appearance: Appearance,
+    pub gallery_scope: GalleryScope,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

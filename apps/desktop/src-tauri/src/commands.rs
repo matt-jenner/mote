@@ -3,7 +3,7 @@ use photo_app_service::{
     WallUpdate,
 };
 use photo_core::AddLibraryError;
-use photo_domain::Appearance;
+use photo_domain::{Appearance, GalleryScope};
 use tauri::{AppHandle, State, Theme, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 
@@ -56,6 +56,17 @@ pub fn update_appearance(
         CommandError::internal()
     })?;
     Ok(bootstrap)
+}
+
+#[tauri::command]
+pub fn update_gallery_scope(
+    scope: GalleryScope,
+    state: State<'_, DesktopState>,
+) -> Result<BootstrapState, CommandError> {
+    state
+        .service
+        .update_gallery_scope(scope)
+        .map_err(map_service_error)
 }
 
 #[tauri::command]

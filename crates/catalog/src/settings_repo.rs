@@ -1,4 +1,4 @@
-use photo_domain::{Appearance, LibraryId, RelativePathKey};
+use photo_domain::{Appearance, GalleryScope, LibraryId, RelativePathKey};
 use rusqlite::params;
 
 use crate::library_repo::decode_uuid;
@@ -13,26 +13,32 @@ pub struct StoredSourceSelection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppStateRecord {
     pub appearance: Appearance,
+    pub gallery_scope: GalleryScope,
     pub active_selection: Option<StoredSourceSelection>,
 }
 
 impl Catalog {
     pub fn load_app_state(&self) -> Result<AppStateRecord, CatalogError> {
-        let (appearance, library_id, relative_folder): (String, Option<Vec<u8>>, Option<Vec<u8>>) =
-            self.connection.query_row(
-                "SELECT app_state.appearance, active.library_id, active.relative_folder_key \
+        let (appearance, gallery_scope, library_id, relative_folder): (
+            String,
+            String,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        ) = self.connection.query_row(
+                "SELECT app_state.appearance, app_state.gallery_scope, active.library_id, active.relative_folder_key \
                  FROM app_state \
                  LEFT JOIN active_source_selection AS active USING (singleton) \
                  WHERE app_state.singleton = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?;
 
         let appearance = decode_appearance(&appearance)?;
+        let gallery_scope = decode_gallery_scope(&gallery_scope)?;
         let active_selection = match (library_id, relative_folder) {
             (None, None) => None,
             (Some(library_id), Some(relative_folder)) => Some(StoredSourceSelection {
-                library_id: LibraryId::from_uuid(decode_uuid(library_id, 1)?),
+                library_id: LibraryId::from_uuid(decode_uuid(library_id, 2)?),
                 relative_folder: RelativePathKey::from_bytes(relative_folder).map_err(|error| {
                     CatalogError::InvalidData(format!("invalid active folder key: {error}"))
                 })?,
@@ -46,6 +52,7 @@ impl Catalog {
 
         Ok(AppStateRecord {
             appearance,
+            gallery_scope,
             active_selection,
         })
     }
@@ -54,6 +61,14 @@ impl Catalog {
         let changed = self.connection.execute(
             "UPDATE app_state SET appearance = ?1 WHERE singleton = 1",
             [encode_appearance(appearance)],
+        )?;
+        require_singleton(changed)
+    }
+
+    pub fn set_gallery_scope(&mut self, scope: GalleryScope) -> Result<(), CatalogError> {
+        let changed = self.connection.execute(
+            "UPDATE app_state SET gallery_scope = ?1 WHERE singleton = 1",
+            [encode_gallery_scope(scope)],
         )?;
         require_singleton(changed)
     }
@@ -101,6 +116,23 @@ fn decode_appearance(value: &str) -> Result<Appearance, CatalogError> {
     }
 }
 
+fn encode_gallery_scope(scope: GalleryScope) -> &'static str {
+    match scope {
+        GalleryScope::CurrentFolder => "current_folder",
+        GalleryScope::IncludeSubfolders => "include_subfolders",
+    }
+}
+
+fn decode_gallery_scope(value: &str) -> Result<GalleryScope, CatalogError> {
+    match value {
+        "current_folder" => Ok(GalleryScope::CurrentFolder),
+        "include_subfolders" => Ok(GalleryScope::IncludeSubfolders),
+        other => Err(CatalogError::InvalidData(format!(
+            "unknown gallery scope {other}"
+        ))),
+    }
+}
+
 fn require_singleton(changed: usize) -> Result<(), CatalogError> {
     if changed == 1 {
         Ok(())
@@ -141,5 +173,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(catalog.load_app_state().unwrap().active_selection, None);
+    }
+
+    #[test]
+    fn a_new_catalog_defaults_to_including_subfolders() {
+        let catalog = Catalog::open_in_memory().unwrap();
+        let scope: String = catalog
+            .connection
+            .query_row(
+                "SELECT gallery_scope FROM app_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(scope, "include_subfolders");
     }
 }

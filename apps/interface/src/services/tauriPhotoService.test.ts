@@ -75,11 +75,24 @@ const recordingInvoke =
 	};
 
 describe("Tauri PhotoService", () => {
-	it("uses only the three checkpoint commands", async () => {
+	it("maps persisted settings to their native commands", async () => {
 		const responses: unknown[] = [
-			{ settings: { appearance: "system" }, activeSource: null },
+			{
+				settings: {
+					appearance: "system",
+					galleryScope: "includeSubfolders",
+				},
+				activeSource: null,
+			},
 			{ kind: "cancelled" },
-			{ settings: { appearance: "dark" }, activeSource: null },
+			{
+				settings: { appearance: "dark", galleryScope: "includeSubfolders" },
+				activeSource: null,
+			},
+			{
+				settings: { appearance: "dark", galleryScope: "currentFolder" },
+				activeSource: null,
+			},
 		];
 		const calls: Array<[string, Record<string, unknown> | undefined]> = [];
 		const invoke: InvokeCommand = async <T>(
@@ -94,11 +107,13 @@ describe("Tauri PhotoService", () => {
 		await service.getBootstrapState();
 		await service.chooseFolder();
 		await service.updateAppearance("dark");
+		await service.updateGalleryScope("currentFolder");
 
 		expect(calls).toEqual([
 			["get_bootstrap_state", undefined],
 			["choose_folder", undefined],
 			["update_appearance", { appearance: "dark" }],
+			["update_gallery_scope", { scope: "currentFolder" }],
 		]);
 	});
 

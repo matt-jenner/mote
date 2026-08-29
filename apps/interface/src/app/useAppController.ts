@@ -1,6 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
-import type { Appearance, BootstrapState } from "../services/photoService";
+import type {
+	Appearance,
+	BootstrapState,
+	GalleryScope,
+} from "../services/photoService";
 import { applyAppearance } from "../theme/applyAppearance";
 import { usePhotoService } from "./PhotoServiceContext";
 
@@ -33,13 +37,21 @@ export function useAppController() {
 			applyAppearance(state.settings.appearance);
 		},
 	});
+	const galleryScope = useMutation({
+		mutationFn: (value: GalleryScope) => service.updateGalleryScope(value),
+		onSuccess(state) {
+			queryClient.setQueryData<BootstrapState>(bootstrapKey, state);
+		},
+	});
 
 	return {
 		state: bootstrap.data,
 		loading: bootstrap.isPending,
-		error: bootstrap.error ?? folder.error ?? appearance.error,
+		error:
+			bootstrap.error ?? folder.error ?? appearance.error ?? galleryScope.error,
 		capabilities: service.capabilities,
 		chooseFolder: folder.mutate,
 		updateAppearance: appearance.mutate,
+		updateGalleryScope: galleryScope.mutate,
 	};
 }

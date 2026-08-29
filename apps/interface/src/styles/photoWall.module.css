@@ -76,7 +76,8 @@
 	border: 0;
 }
 
-.sortButton {
+.sortButton,
+.scopeButton {
 	display: inline-flex;
 	align-items: center;
 	gap: 6px;
@@ -90,10 +91,15 @@
 	cursor: pointer;
 }
 
-.sortButton[aria-pressed="true"] {
+.sortButton[aria-pressed="true"],
+.scopeButton[aria-pressed="true"] {
 	color: var(--text-primary);
 	background: var(--selection);
 	border-color: var(--separator);
+}
+
+.scopeButton {
+	white-space: nowrap;
 }
 
 .wallRegion {

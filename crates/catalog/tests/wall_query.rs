@@ -4,7 +4,7 @@ use photo_catalog::{
     AssetMetadataUpdate, AssetShapeUpdate, Catalog, CatalogError, CatalogIndexRecord, NewAsset,
     NewFolderGroup, NewLibrary, ShapeStatus, WallCursorKey, WallOrder,
 };
-use photo_domain::{AssetId, FolderGroupId, MediaKind, RelativePathKey};
+use photo_domain::{AssetId, FolderGroupId, GalleryScope, MediaKind, RelativePathKey};
 use rusqlite::Connection;
 
 fn id_key(id: photo_domain::AssetId) -> [u8; 16] {
@@ -105,6 +105,52 @@ fn provisional_pages_paginate_with_stable_order() {
         tail.items.iter().map(|item| item.id).collect::<Vec<_>>(),
         [third]
     );
+}
+
+#[test]
+fn current_folder_scope_excludes_nested_assets_without_breaking_recursive_pagination() {
+    let mut fixture = WallFixture::new();
+    fixture.group = ready_group_at(&mut fixture.catalog, fixture.library, "selected");
+    let direct = fixture.shaped("selected/direct.jpg", ShapeStatus::Ready, 16, 9);
+    let nested = fixture.shaped("selected/child/nested.jpg", ShapeStatus::Ready, 16, 9);
+
+    let current = fixture
+        .catalog
+        .wall_page_scoped(
+            fixture.group,
+            GalleryScope::CurrentFolder,
+            WallOrder::Provisional,
+            None,
+            10,
+        )
+        .unwrap();
+    assert_eq!(
+        current.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+        [direct]
+    );
+
+    let first_recursive = fixture
+        .catalog
+        .wall_page_scoped(
+            fixture.group,
+            GalleryScope::IncludeSubfolders,
+            WallOrder::Provisional,
+            None,
+            1,
+        )
+        .unwrap();
+    assert_eq!(first_recursive.items[0].id, direct);
+    let second_recursive = fixture
+        .catalog
+        .wall_page_scoped(
+            fixture.group,
+            GalleryScope::IncludeSubfolders,
+            WallOrder::Provisional,
+            first_recursive.next,
+            1,
+        )
+        .unwrap();
+    assert_eq!(second_recursive.items[0].id, nested);
 }
 
 #[test]
@@ -221,6 +267,39 @@ fn wall_records_for_assets_omit_video_ids() {
         rows.iter().map(|row| row.id).collect::<Vec<_>>(),
         [fixture.photo]
     );
+}
+
+#[test]
+fn scoped_wall_records_and_prefetch_ids_exclude_nested_assets() {
+    let mut fixture = WallFixture::new();
+    fixture.group = ready_group_at(&mut fixture.catalog, fixture.library, "selected");
+    let direct = fixture.shaped("selected/direct.jpg", ShapeStatus::Ready, 16, 9);
+    let nested = fixture.shaped("selected/child/nested.jpg", ShapeStatus::Ready, 16, 9);
+
+    let records = fixture
+        .catalog
+        .wall_records_for_assets_scoped(
+            fixture.group,
+            GalleryScope::CurrentFolder,
+            &[direct, nested],
+        )
+        .unwrap();
+    assert_eq!(
+        records.iter().map(|record| record.id).collect::<Vec<_>>(),
+        [direct]
+    );
+
+    let ids = fixture
+        .catalog
+        .photo_asset_ids_page_scoped(
+            fixture.group,
+            GalleryScope::CurrentFolder,
+            WallOrder::Provisional,
+            None,
+            10,
+        )
+        .unwrap();
+    assert_eq!(ids.items, [direct]);
 }
 
 #[test]
@@ -826,12 +905,13 @@ fn opening_a_populated_v4_catalog_backfills_settled_groups_offline() {
         )
         .unwrap();
     for (id, path) in [(first_group, "first"), (second_group, "second")] {
+        let relative = RelativePathKey::from_relative_path(Path::new(path)).unwrap();
         connection
             .execute(
                 "INSERT INTO folder_groups
                     (id, library_id, relative_path_key, display_path)
                  VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![id.as_slice(), library.as_slice(), path.as_bytes(), path],
+                rusqlite::params![id.as_slice(), library.as_slice(), relative.as_bytes(), path],
             )
             .unwrap();
     }
@@ -873,6 +953,7 @@ fn opening_a_populated_v4_catalog_backfills_settled_groups_offline() {
             "2024-01-03T00:00:00Z",
         ),
     ] {
+        let relative = RelativePathKey::from_relative_path(Path::new(path)).unwrap();
         connection
             .execute(
                 "INSERT INTO assets
@@ -885,7 +966,7 @@ fn opening_a_populated_v4_catalog_backfills_settled_groups_offline() {
                     id.as_slice(),
                     library.as_slice(),
                     group.as_slice(),
-                    path.as_bytes(),
+                    relative.as_bytes(),
                     path,
                     captured,
                     provisional,
@@ -1115,4 +1196,14 @@ fn opening_a_populated_v3_catalog_upgrades_shapes_and_normalizes_legacy_dates_of
             .iter()
             .all(|item| { item.availability == photo_domain::Availability::RootOffline })
     );
+    let current_folder = catalog
+        .wall_page_scoped(
+            group_id,
+            GalleryScope::CurrentFolder,
+            WallOrder::CapturedAscending,
+            None,
+            10,
+        )
+        .unwrap();
+    assert_eq!(current_folder.items.len(), 3);
 }

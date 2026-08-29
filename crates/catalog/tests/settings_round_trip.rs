@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use photo_catalog::{Catalog, NewLibrary, StoredSourceSelection};
-use photo_domain::{Appearance, RelativePathKey};
+use photo_domain::{Appearance, GalleryScope, RelativePathKey};
 
 #[test]
 fn appearance_and_active_selection_survive_reopen() {
@@ -29,9 +29,26 @@ fn appearance_and_active_selection_survive_reopen() {
 #[test]
 fn a_new_catalog_defaults_to_system_without_a_selection() {
     let catalog = Catalog::open_in_memory().unwrap();
+    let state = catalog.load_app_state().unwrap();
+    assert_eq!(state.appearance, Appearance::System);
+    assert_eq!(state.gallery_scope, GalleryScope::IncludeSubfolders);
+    assert_eq!(state.active_selection, None);
+}
+
+#[test]
+fn gallery_scope_survives_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("catalog.sqlite");
+    let mut catalog = Catalog::open(&path).unwrap();
+
+    catalog
+        .set_gallery_scope(GalleryScope::CurrentFolder)
+        .unwrap();
+    drop(catalog);
+
+    let catalog = Catalog::open(&path).unwrap();
     assert_eq!(
-        catalog.load_app_state().unwrap().appearance,
-        Appearance::System
+        catalog.load_app_state().unwrap().gallery_scope,
+        GalleryScope::CurrentFolder
     );
-    assert_eq!(catalog.load_app_state().unwrap().active_selection, None);
 }
