@@ -54,6 +54,12 @@ impl ContainedFolderRoot {
     }
 
     pub fn resolve(&self, relative: &str) -> Result<PathBuf, FolderError> {
+        let canonical = self.resolve_path(relative)?;
+        fs::read_dir(&canonical).map_err(map_read_error)?;
+        Ok(canonical)
+    }
+
+    fn resolve_path(&self, relative: &str) -> Result<PathBuf, FolderError> {
         validate_relative(relative)?;
         let joined = if relative.is_empty() {
             self.root.clone()
@@ -67,14 +73,11 @@ impl ContainedFolderRoot {
         if !canonical.is_dir() {
             return Err(FolderError::NotDirectory);
         }
-        if !directory_is_readable(&canonical) {
-            return Err(FolderError::Unreadable);
-        }
         Ok(canonical)
     }
 
     pub fn list(&self, relative: &str) -> Result<FolderListing, FolderError> {
-        let directory = self.resolve(relative)?;
+        let directory = self.resolve_path(relative)?;
         let mut entries = Vec::new();
         let read_dir = fs::read_dir(&directory).map_err(map_read_error)?;
         for entry in read_dir {
@@ -84,7 +87,7 @@ impl ContainedFolderRoot {
             };
             let name = entry.file_name().to_string_lossy().into_owned();
             let child_relative = join_relative(relative, &name);
-            let child = match self.resolve(&child_relative) {
+            let child = match self.resolve_path(&child_relative) {
                 Ok(child) => child,
                 Err(FolderError::OutsideRoot) => continue,
                 Err(
@@ -113,9 +116,7 @@ impl ContainedFolderRoot {
     }
 
     pub(crate) fn is_available(&self) -> bool {
-        fs::metadata(&self.root)
-            .map(|metadata| metadata.is_dir() && directory_is_readable(&self.root))
-            .unwrap_or(false)
+        fs::read_dir(&self.root).is_ok()
     }
 }
 
@@ -180,20 +181,5 @@ fn map_read_error(error: std::io::Error) -> FolderError {
         std::io::ErrorKind::PermissionDenied => FolderError::Unreadable,
         std::io::ErrorKind::NotFound => FolderError::Unavailable,
         _ => FolderError::Unreadable,
-    }
-}
-
-fn directory_is_readable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::metadata(path)
-            .map(|metadata| metadata.permissions().mode() & 0o444 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        true
     }
 }

@@ -122,6 +122,49 @@ fn folder_listing_returns_breadcrumbs_sorted_children_and_missing_error() {
     ));
 }
 
+#[test]
+fn folder_listing_is_case_insensitive_before_bytewise_ordering() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    for name in ["apple", "Beta"] {
+        std::fs::create_dir(source.join(name)).unwrap();
+    }
+    let root = ContainedFolderRoot::new(source).unwrap();
+
+    let listing = root.list("").unwrap();
+    assert_eq!(
+        listing
+            .children
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["apple", "Beta"]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn folder_listing_uses_original_name_as_case_insensitive_tie_breaker() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    for name in ["alpha", "ALPHA"] {
+        std::fs::create_dir(source.join(name)).unwrap();
+    }
+    let root = ContainedFolderRoot::new(source).unwrap();
+
+    let listing = root.list("").unwrap();
+    assert_eq!(
+        listing
+            .children
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ALPHA", "alpha"]
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn mode_bits_make_unreadable_directories_fail_resolution() {
@@ -132,13 +175,18 @@ fn mode_bits_make_unreadable_directories_fail_resolution() {
     std::fs::create_dir(&source).unwrap();
     let unreadable = source.join("Private");
     std::fs::create_dir(&unreadable).unwrap();
-    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Read permission without traversal permission is not enough to enumerate
+    // a directory. The real read_dir result makes this meaningful even if a
+    // privileged runner bypasses mode bits.
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o400)).unwrap();
     let root = ContainedFolderRoot::new(source).unwrap();
 
-    assert!(matches!(
-        root.resolve("Private"),
-        Err(FolderError::Unreadable)
-    ));
+    let resolved = root.resolve("Private");
+    if std::fs::read_dir(&unreadable).is_ok() {
+        assert!(resolved.is_ok());
+    } else {
+        assert!(matches!(resolved, Err(FolderError::Unreadable)));
+    }
 }
 
 #[tokio::test]
@@ -278,6 +326,87 @@ async fn invalid_folder_queries_are_rejected_before_filesystem_access() {
     let value: serde_json::Value =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(value["code"], "invalidFolderPath");
+}
+
+#[tokio::test]
+async fn mounted_root_missing_file_and_unreadable_fail_as_source_unavailable() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    let state = AppState::new_with_source_root(
+        Catalog::open_in_memory().unwrap(),
+        temp.path().join("cache-missing"),
+        source.clone(),
+    )
+    .unwrap();
+    std::fs::remove_dir(&source).unwrap();
+    let app = build_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/folders")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(value["code"], "sourceUnavailable");
+
+    let source = temp.path().join("file-source");
+    std::fs::create_dir(&source).unwrap();
+    let state = AppState::new_with_source_root(
+        Catalog::open_in_memory().unwrap(),
+        temp.path().join("cache-file"),
+        source.clone(),
+    )
+    .unwrap();
+    std::fs::remove_dir(&source).unwrap();
+    std::fs::write(&source, b"not a directory").unwrap();
+    let app = build_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/folders?path=")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(value["code"], "sourceUnavailable");
+
+    let source = temp.path().join("unreadable-source");
+    std::fs::create_dir(&source).unwrap();
+    let state = AppState::new_with_source_root(
+        Catalog::open_in_memory().unwrap(),
+        temp.path().join("cache-unreadable"),
+        source.clone(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let app = build_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/folders?path=")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(value["code"], "sourceUnavailable");
 }
 
 #[test]

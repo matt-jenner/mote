@@ -111,11 +111,15 @@ fn invalid_folder_path() -> ApiError {
 fn map_folder_error(error: FolderError, mounted_root: bool) -> ApiError {
     match error {
         FolderError::InvalidPath | FolderError::OutsideRoot => invalid_folder_path(),
-        FolderError::Unavailable if mounted_root => ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "sourceUnavailable",
-            "The photo source is unavailable.",
-        ),
+        FolderError::Unavailable | FolderError::NotDirectory | FolderError::Unreadable
+            if mounted_root =>
+        {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "sourceUnavailable",
+                "The photo source is unavailable.",
+            )
+        }
         FolderError::Unavailable | FolderError::NotDirectory => ApiError::new(
             StatusCode::NOT_FOUND,
             "folderUnavailable",
