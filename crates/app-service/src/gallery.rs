@@ -3,14 +3,14 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, Weak};
 
-use photo_cache::{CacheBudget, CacheWriter, ProtectedGroups};
+use photo_cache::CacheWriter;
 use photo_catalog::{Catalog, CatalogError, NewFolderGroup, WallOrder};
 use photo_core::{LibraryService, RealSourceFs};
 use photo_domain::{FolderGroupId, GalleryScope, LibraryId, RelativePathKey};
 use photo_indexer::{DefaultMetadataReader, IndexEvent, Indexer, MetadataReader, ScanRequest};
 
 use crate::hosted_runtime::{SelectionEventSubscription, SelectionRuntime};
-use crate::service::ReaderAdapter;
+use crate::service::{ReaderAdapter, ServiceState};
 use crate::{
     AppConfig, AppServiceError, InteractionState, OrderState, SourceAvailability, WallPage,
     WallQueryRequest, WallUpdate,
@@ -41,6 +41,7 @@ pub struct GallerySelection {
     pub(crate) library_id: LibraryId,
     pub(crate) group_id: FolderGroupId,
     pub(crate) relative_folder: RelativePathKey,
+    pub(crate) epoch: u64,
 }
 
 impl GallerySelection {
@@ -60,7 +61,7 @@ impl GallerySelection {
         crate::service::SelectionToken {
             library_id: self.library_id,
             group_id: self.group_id,
-            epoch: 0,
+            epoch: self.epoch,
         }
     }
 }
@@ -82,22 +83,15 @@ pub struct FolderBreadcrumb {
     pub path: String,
 }
 
-pub(crate) struct GalleryState {
-    pub(crate) libraries: LibraryService<RealSourceFs>,
-    pub(crate) hosted_library_id: LibraryId,
-}
-
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct GalleryEngine {
-    pub(crate) state: Arc<Mutex<GalleryState>>,
+    pub(crate) state: Arc<Mutex<ServiceState>>,
     pub(crate) scheduler: Arc<photo_indexer::IndexScheduler>,
     pub(crate) runtimes: Arc<Mutex<HashMap<FolderGroupId, Weak<SelectionRuntime>>>>,
-    pub(crate) catalog_path: PathBuf,
-    pub(crate) cache_root: PathBuf,
-    pub(crate) cache_budget: CacheBudget,
-    pub(crate) protected_groups: ProtectedGroups,
     pub(crate) metadata_reader: ReaderAdapter,
+    hosted_library_id: Option<LibraryId>,
+    pub(crate) shared_coordinator:
+        Option<Arc<crate::derivative_coordinator::DerivativeCoordinator>>,
 }
 
 impl GalleryEngine {
@@ -121,7 +115,10 @@ impl GalleryEngine {
             vec![config.data_dir().to_owned(), config.cache_dir().to_owned()],
         )
         .map_err(AppServiceError::LibrarySetup)?;
-        let canonical = canonicalize_for_identity(&source_root);
+        let current_canonical = std::fs::canonicalize(&source_root).ok();
+        let canonical = current_canonical
+            .clone()
+            .unwrap_or_else(|| canonicalize_for_identity(&source_root));
         let hosted_library_id = if let Some(library) = libraries
             .catalog()
             .list_libraries()?
@@ -129,7 +126,8 @@ impl GalleryEngine {
             .find(|library| {
                 library.canonical_root_key.to_path_buf().ok().as_deref()
                     == Some(canonical.as_path())
-                    || Path::new(&library.display_path) == source_root.as_path()
+                    || current_canonical.is_none()
+                        && Path::new(&library.display_path) == source_root.as_path()
             }) {
             library.id
         } else {
@@ -150,18 +148,36 @@ impl GalleryEngine {
                 .id
         };
         Ok(Self {
-            state: Arc::new(Mutex::new(GalleryState {
+            state: Arc::new(Mutex::new(ServiceState {
                 libraries,
-                hosted_library_id,
+                active_scan: None,
+                protected_group: None,
+                selection_epoch: 0,
+                published_wall_cache_warning: None,
+                published_screen_cache_warning: None,
             })),
             scheduler: Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
             runtimes: Arc::new(Mutex::new(HashMap::new())),
-            catalog_path: config.catalog_path(),
-            cache_root: config.cache_dir().to_owned(),
-            cache_budget: CacheBudget::automatic(config.cache_dir())?,
-            protected_groups: ProtectedGroups::default(),
             metadata_reader: ReaderAdapter::new(reader),
+            hosted_library_id: Some(hosted_library_id),
+            shared_coordinator: None,
         })
+    }
+
+    pub(crate) fn from_shared_state(
+        state: Arc<Mutex<ServiceState>>,
+        scheduler: Arc<photo_indexer::IndexScheduler>,
+        metadata_reader: ReaderAdapter,
+        shared_coordinator: Arc<crate::derivative_coordinator::DerivativeCoordinator>,
+    ) -> Self {
+        Self {
+            state,
+            scheduler,
+            runtimes: Arc::new(Mutex::new(HashMap::new())),
+            metadata_reader,
+            hosted_library_id: None,
+            shared_coordinator: Some(shared_coordinator),
+        }
     }
 
     pub async fn select_relative(
@@ -184,10 +200,13 @@ impl GalleryEngine {
             .state
             .lock()
             .map_err(|_| AppServiceError::StatePoisoned)?;
+        let hosted_library_id = self
+            .hosted_library_id
+            .ok_or(AppServiceError::UnknownAsset)?;
         let library = state
             .libraries
             .catalog()
-            .find_library(state.hosted_library_id)?
+            .find_library(hosted_library_id)?
             .ok_or(AppServiceError::StatePoisoned)?;
         let root = library
             .canonical_root_key
@@ -213,7 +232,6 @@ impl GalleryEngine {
             .file_name()
             .map(|v| v.to_string_lossy().into_owned())
             .unwrap_or_else(|| library.display_name.clone());
-        let hosted_library_id = state.hosted_library_id;
         let group = state
             .libraries
             .catalog_mut()
@@ -226,7 +244,7 @@ impl GalleryEngine {
             })?;
         let selection = GallerySelection {
             id: format!("selection-{}", group.as_uuid().hyphenated()),
-            library_id: state.hosted_library_id,
+            library_id: hosted_library_id,
             group_id: group,
             relative_folder: state
                 .libraries
@@ -234,6 +252,7 @@ impl GalleryEngine {
                 .folder_group(group)?
                 .ok_or(AppServiceError::StatePoisoned)?
                 .relative_path,
+            epoch: 0,
         };
         drop(state);
         self.selection_summary(&selection).map(|mut summary| {
@@ -261,7 +280,10 @@ impl GalleryEngine {
             .catalog()
             .folder_group(group)?
             .ok_or(AppServiceError::UnknownAsset)?;
-        if record.library_id != state.hosted_library_id {
+        if self
+            .hosted_library_id
+            .is_some_and(|library_id| record.library_id != library_id)
+        {
             return Err(AppServiceError::UnknownAsset);
         }
         Ok(GallerySelection {
@@ -269,6 +291,32 @@ impl GalleryEngine {
             library_id: record.library_id,
             group_id: record.id,
             relative_folder: record.relative_path,
+            epoch: 0,
+        })
+    }
+
+    pub(crate) fn selection_from_token(
+        &self,
+        token: crate::service::SelectionToken,
+    ) -> Result<GallerySelection, AppServiceError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| AppServiceError::StatePoisoned)?;
+        let record = state
+            .libraries
+            .catalog()
+            .folder_group(token.group_id)?
+            .ok_or(AppServiceError::UnknownAsset)?;
+        if record.library_id != token.library_id {
+            return Err(AppServiceError::UnknownAsset);
+        }
+        Ok(GallerySelection {
+            id: token.selection_id(),
+            library_id: record.library_id,
+            group_id: record.id,
+            relative_folder: record.relative_path,
+            epoch: token.epoch,
         })
     }
 
@@ -285,7 +333,9 @@ impl GalleryEngine {
             .catalog()
             .folder_group(selection.group_id)?
             .ok_or(AppServiceError::UnknownAsset)?;
-        if group.library_id != state.hosted_library_id
+        if self
+            .hosted_library_id
+            .is_some_and(|library_id| group.library_id != library_id)
             || group.library_id != selection.library_id
             || group.relative_path != selection.relative_folder
         {
@@ -328,21 +378,53 @@ impl GalleryEngine {
         let mut runtimes = self.runtimes.lock().expect("runtime registry poisoned");
         runtimes.retain(|_, runtime| runtime.strong_count() > 0);
         if let Some(runtime) = runtimes.get(&selection.group_id).and_then(Weak::upgrade) {
-            return runtime;
+            if runtime.selection == *selection {
+                return runtime;
+            }
+            // The desktop adapter advances its epoch when the same folder is
+            // selected again. A retained bridge may still keep the previous
+            // runtime alive, but it must not leak that stale selection ID into
+            // the new desktop stream.
+            if self.shared_coordinator.is_some() {
+                if let Ok(mut cancel) = runtime.scan_cancel.try_lock()
+                    && let Some(sender) = cancel.take()
+                {
+                    let _ = sender.send(true);
+                }
+                runtimes.remove(&selection.group_id);
+            } else {
+                return runtime;
+            }
         }
-        let settled = self
-            .state
-            .lock()
-            .ok()
-            .and_then(|state| {
-                state
-                    .libraries
-                    .catalog()
-                    .has_completed_generation_for_group(selection.library_id, selection.group_id)
-                    .ok()
-            })
-            .unwrap_or(false);
-        let runtime = SelectionRuntime::new(selection.clone(), self.scheduler.clone(), settled);
+        // A desktop `start_scan` is an explicit refresh even when the
+        // previous generation is complete. Hosted `ensure_running` keeps its
+        // restart-idempotent catalog settlement semantics at epoch zero.
+        let settled = if self.shared_coordinator.is_some() && selection.epoch != 0 {
+            false
+        } else {
+            self.state
+                .lock()
+                .ok()
+                .and_then(|state| {
+                    state
+                        .libraries
+                        .catalog()
+                        .has_completed_generation_for_group(
+                            selection.library_id,
+                            selection.group_id,
+                        )
+                        .ok()
+                })
+                .unwrap_or(false)
+        };
+        let runtime = match &self.shared_coordinator {
+            Some(coordinator) => SelectionRuntime::new_with_coordinator(
+                selection.clone(),
+                coordinator.clone(),
+                settled,
+            ),
+            None => SelectionRuntime::new(selection.clone(), self.scheduler.clone(), settled),
+        };
         runtimes.insert(selection.group_id, Arc::downgrade(&runtime));
         runtime
     }
@@ -359,6 +441,25 @@ impl GalleryEngine {
         });
         if remove && Arc::strong_count(runtime) <= 1 {
             runtimes.remove(&group_id);
+        }
+    }
+
+    /// Requests cancellation of the admitted scan for a desktop selection.
+    /// The runtime remains responsible for draining and persisting any events
+    /// already in flight; this only replaces the old AppService-owned sender.
+    pub(crate) fn cancel_runtime_scan(&self, group_id: FolderGroupId) {
+        let runtime = self
+            .runtimes
+            .lock()
+            .ok()
+            .and_then(|runtimes| runtimes.get(&group_id).and_then(Weak::upgrade));
+        let Some(runtime) = runtime else {
+            return;
+        };
+        if let Ok(mut cancel) = runtime.scan_cancel.try_lock()
+            && let Some(sender) = cancel.take()
+        {
+            let _ = sender.send(true);
         }
     }
 
@@ -462,12 +563,12 @@ impl GalleryEngine {
             .clone();
         let head = runtime.next_event_id.load(Ordering::Acquire);
         let oldest = history.front().map(|event| event.id);
-        let (backlog, lagged) = match after_event_id {
-            None => (history.into(), false),
+        let (backlog, lagged, resync_after) = match after_event_id {
+            None => (history.into(), false, None),
             Some(after)
                 if after > head || oldest.is_some_and(|first| after.saturating_add(1) < first) =>
             {
-                (VecDeque::new(), true)
+                (VecDeque::new(), true, Some(after))
             }
             Some(after) => (
                 history
@@ -475,6 +576,7 @@ impl GalleryEngine {
                     .filter(|event| event.id > after)
                     .collect(),
                 false,
+                None,
             ),
         };
         drop(_publication);
@@ -486,6 +588,7 @@ impl GalleryEngine {
             client_token,
             scope,
             lagged,
+            resync_after,
             resume_after: None,
             engine: self.clone(),
         }
@@ -522,8 +625,11 @@ impl GalleryEngine {
         &self,
         runtime: Arc<SelectionRuntime>,
     ) -> Result<(), AppServiceError> {
-        let (root, selected, generation) = {
-            let mut state = self
+        if !self.ensure_runtime_source(&runtime).await? {
+            return Ok(());
+        }
+        let (root, selected) = {
+            let state = self
                 .state
                 .lock()
                 .map_err(|_| AppServiceError::StatePoisoned)?;
@@ -541,39 +647,21 @@ impl GalleryEngine {
                 .relative_folder
                 .to_path_buf()
                 .map_err(|e| CatalogError::InvalidData(e.to_string()))?;
+            (root, selected)
+        };
+        // An unavailable source is a normal cached-browsing state. Check
+        // lexical existence before canonicalization so a missing root can
+        // still publish SourceUnavailable and leave cached wall rows readable.
+        if !root.is_dir() || !root.join(&selected).is_dir() {
+            self.mark_runtime_source_unavailable(&runtime).await?;
+            return Ok(());
+        }
+        let generation = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| AppServiceError::StatePoisoned)?;
             let selection_root = root.join(&selected);
-            // An unavailable source is a normal cached-browsing state. Check
-            // lexical existence before canonicalization so a missing root can
-            // still publish SourceUnavailable and leave cached wall rows
-            // readable.
-            if !root.is_dir() || !selection_root.is_dir() {
-                if root.is_dir() {
-                    state.libraries.catalog_mut().mark_group_offline(
-                        runtime.selection.library_id,
-                        runtime.selection.group_id,
-                    )?;
-                } else {
-                    state
-                        .libraries
-                        .catalog_mut()
-                        .mark_root_offline(runtime.selection.library_id)?;
-                }
-                drop(state);
-                runtime
-                    .publish(WallUpdate::SourceUnavailable {
-                        selection_id: runtime.selection.id().to_owned(),
-                        source_id: runtime
-                            .selection
-                            .library_id
-                            .as_uuid()
-                            .hyphenated()
-                            .to_string(),
-                    })
-                    .await;
-                *runtime.scan_cancel.lock().await = None;
-                self.remove_runtime_if_dead(runtime.selection.group_id, &runtime);
-                return Ok(());
-            }
             let canonical_root = std::fs::canonicalize(&root).map_err(|_| {
                 AppServiceError::OpenRecent(photo_core::AddLibraryError::NotDirectory(root.clone()))
             })?;
@@ -592,7 +680,7 @@ impl GalleryEngine {
                 runtime.selection.library_id,
                 runtime.selection.group_id,
             )?;
-            (root, selected, generation)
+            generation
         };
         let indexer = Indexer::with_scheduler(
             self.metadata_reader.clone(),
@@ -609,11 +697,105 @@ impl GalleryEngine {
                     .for_folder_group(runtime.selection.group_id),
             )
             .map_err(|e| AppServiceError::LibrarySetup(std::io::Error::other(e.to_string())))?;
+        runtime
+            .scan_active
+            .store(true, std::sync::atomic::Ordering::Release);
         *runtime.scan_cancel.lock().await = Some(handle.cancellation_sender());
         let engine = self.clone();
         tokio::spawn(async move {
             engine.drain_runtime_scan(runtime, handle, generation).await;
         });
+        Ok(())
+    }
+
+    /// Checks source availability even when a completed catalog means no scan
+    /// is needed. This is intentionally a cheap filesystem check so cached
+    /// wall rows remain queryable while an offline source is reported once.
+    pub(crate) async fn ensure_runtime_source(
+        &self,
+        runtime: &Arc<SelectionRuntime>,
+    ) -> Result<bool, AppServiceError> {
+        let available = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| AppServiceError::StatePoisoned)?;
+            let library = state
+                .libraries
+                .catalog()
+                .find_library(runtime.selection.library_id)?
+                .ok_or(AppServiceError::UnknownAsset)?;
+            let root = library
+                .canonical_root_key
+                .to_path_buf()
+                .map_err(|e| CatalogError::InvalidData(e.to_string()))?;
+            let selected = runtime
+                .selection
+                .relative_folder
+                .to_path_buf()
+                .map_err(|e| CatalogError::InvalidData(e.to_string()))?;
+            root.is_dir() && root.join(selected).is_dir()
+        };
+        if available {
+            runtime
+                .source_unavailable_reported
+                .store(false, Ordering::Release);
+            return Ok(true);
+        }
+        self.mark_runtime_source_unavailable(runtime).await?;
+        Ok(false)
+    }
+
+    async fn mark_runtime_source_unavailable(
+        &self,
+        runtime: &Arc<SelectionRuntime>,
+    ) -> Result<(), AppServiceError> {
+        let should_publish = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| AppServiceError::StatePoisoned)?;
+            let library = state
+                .libraries
+                .catalog()
+                .find_library(runtime.selection.library_id)?
+                .ok_or(AppServiceError::UnknownAsset)?;
+            let root = library
+                .canonical_root_key
+                .to_path_buf()
+                .map_err(|e| CatalogError::InvalidData(e.to_string()))?;
+            if root.is_dir() {
+                state
+                    .libraries
+                    .catalog_mut()
+                    .mark_group_offline(runtime.selection.library_id, runtime.selection.group_id)?;
+            } else {
+                state
+                    .libraries
+                    .catalog_mut()
+                    .mark_root_offline(runtime.selection.library_id)?;
+            }
+            runtime
+                .source_unavailable_reported
+                .swap(true, Ordering::AcqRel)
+                == false
+        };
+        if should_publish {
+            runtime
+                .publish(WallUpdate::SourceUnavailable {
+                    selection_id: runtime.selection.id().to_owned(),
+                    source_id: runtime
+                        .selection
+                        .library_id
+                        .as_uuid()
+                        .hyphenated()
+                        .to_string(),
+                })
+                .await;
+        }
+        *runtime.scan_cancel.lock().await = None;
+        runtime.scan_finished.notify_one();
+        self.remove_runtime_if_dead(runtime.selection.group_id, runtime);
         Ok(())
     }
 
@@ -625,6 +807,46 @@ impl GalleryEngine {
             .values()
             .filter(|runtime| runtime.upgrade().is_some())
             .count()
+    }
+
+    pub(crate) fn runtime_scan_state(
+        &self,
+        selection: &GallerySelection,
+    ) -> Option<(Arc<tokio::sync::Notify>, bool)> {
+        self.runtimes
+            .lock()
+            .ok()
+            .and_then(|runtimes| runtimes.get(&selection.group_id).and_then(Weak::upgrade))
+            .filter(|runtime| runtime.selection == *selection)
+            .map(|runtime| {
+                (
+                    runtime.scan_finished.clone(),
+                    runtime
+                        .scan_active
+                        .load(std::sync::atomic::Ordering::Acquire),
+                )
+            })
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn publish_update_for_test(
+        &self,
+        selection: &GallerySelection,
+        update: WallUpdate,
+    ) -> crate::SequencedWallUpdate {
+        self.runtime(selection).publish(update).await
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn set_interaction_for_test(&self, state: InteractionState) {
+        self.scheduler
+            .set_interaction_mode(match state {
+                InteractionState::Idle => photo_indexer::InteractionMode::Idle,
+                InteractionState::Active => photo_indexer::InteractionMode::Active,
+            })
+            .await;
     }
 
     #[doc(hidden)]
@@ -725,6 +947,10 @@ impl GalleryEngine {
                 })
                 .await;
         }
+        runtime
+            .scan_active
+            .store(false, std::sync::atomic::Ordering::Release);
+        runtime.scan_finished.notify_one();
         *runtime.scan_cancel.lock().await = None;
         self.remove_runtime_if_dead(runtime.selection.group_id, &runtime);
     }

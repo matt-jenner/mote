@@ -1,8 +1,9 @@
 use crate::{
-    AppConfig, BootstrapState, DerivativeClass, SettingsState, SourceAvailability, SourceSummary,
+    AppConfig, BootstrapState, DerivativeClass, InteractionState, SettingsState,
+    SourceAvailability, SourceSummary,
 };
 use photo_cache::{CacheBudget, CacheError, CacheWriter, ProtectedGroups};
-use photo_catalog::{Catalog, CatalogError, NewFolderGroup, StoredSourceSelection, WallOrder};
+use photo_catalog::{Catalog, CatalogError, NewFolderGroup, StoredSourceSelection};
 use photo_core::{
     AddLibraryError, LibraryService, LocalStateError, RealSourceFs, SourceFs, SourceValidator,
     ValidatedSourceFolder,
@@ -17,12 +18,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::Notify;
-use tokio::sync::watch;
 
 pub(crate) struct ServiceState {
     pub(crate) libraries: LibraryService<RealSourceFs>,
     pub(crate) active_scan: Option<ScanOwner>,
-    pub(crate) active_cancel: Option<watch::Sender<bool>>,
     pub(crate) protected_group: Option<photo_domain::FolderGroupId>,
     pub(crate) selection_epoch: u64,
     pub(crate) published_wall_cache_warning: Option<SelectionToken>,
@@ -424,6 +423,7 @@ impl MetadataReader for ReaderAdapter {
 
 #[derive(Clone)]
 pub struct AppService {
+    pub(crate) gallery: crate::GalleryEngine,
     pub(crate) state: Arc<Mutex<ServiceState>>,
     pub(crate) scheduler: Arc<IndexScheduler>,
     #[allow(dead_code)]
@@ -479,7 +479,6 @@ pub struct AppService {
     pub(crate) derivative_visible_queue_test_hook: Arc<TokioMutex<Option<Arc<Notify>>>>,
     #[cfg(test)]
     pub(crate) scan_completion_wake_test_hook: Arc<Mutex<Option<ScanCompletionWakeTestHook>>>,
-    pub(crate) metadata_reader: ReaderAdapter,
     source_validator: Arc<dyn RecentSourceValidator>,
     selection_request_sequence: Arc<AtomicU64>,
     latest_validated_selection: Arc<AtomicU64>,
@@ -552,23 +551,32 @@ impl AppService {
         let coordinator = Arc::new(crate::derivative_coordinator::DerivativeCoordinator::new(
             scheduler.clone(),
         ));
+        let state = Arc::new(Mutex::new(ServiceState {
+            libraries,
+            active_scan: None,
+            protected_group: None,
+            selection_epoch: u64::from(should_reconcile),
+            published_wall_cache_warning: None,
+            published_screen_cache_warning: None,
+        }));
+        let protected_groups = ProtectedGroups::default();
+        let metadata_reader = ReaderAdapter::new(reader);
+        let gallery = crate::GalleryEngine::from_shared_state(
+            state.clone(),
+            scheduler.clone(),
+            metadata_reader.clone(),
+            coordinator.clone(),
+        );
         let service = Self {
-            state: Arc::new(Mutex::new(ServiceState {
-                libraries,
-                active_scan: None,
-                active_cancel: None,
-                protected_group: None,
-                selection_epoch: u64::from(should_reconcile),
-                published_wall_cache_warning: None,
-                published_screen_cache_warning: None,
-            })),
+            gallery,
+            state,
             scheduler,
             coordinator,
             updates,
             catalog_path,
             cache_root,
             cache_budget,
-            protected_groups: ProtectedGroups::default(),
+            protected_groups,
             derivative_driver: Arc::new(tokio::sync::Mutex::new(())),
             collection_driver: Arc::new(CollectionDriverControl::new()),
             gallery_scope_update: Arc::new(TokioMutex::new(())),
@@ -610,7 +618,6 @@ impl AppService {
             derivative_visible_queue_test_hook: Arc::new(TokioMutex::new(None)),
             #[cfg(test)]
             scan_completion_wake_test_hook: Arc::new(Mutex::new(None)),
-            metadata_reader: ReaderAdapter(reader),
             source_validator,
             selection_request_sequence: Arc::new(AtomicU64::new(0)),
             latest_validated_selection: Arc::new(AtomicU64::new(0)),
@@ -717,6 +724,11 @@ impl AppService {
         Self::bootstrap_locked(&state)
     }
 
+    #[doc(hidden)]
+    pub fn runtime_count_for_test(&self) -> usize {
+        self.gallery.runtime_count_for_test()
+    }
+
     /// Synchronous host compatibility entry point. It persists the selection everywhere, but it
     /// can launch reconciliation only when the caller already runs inside a Tokio runtime. Async
     /// hosts should prefer `start_scan`, which reports scan-start failures to the caller.
@@ -781,9 +793,7 @@ impl AppService {
             }
             return Err(error.into());
         }
-        if let Some(cancel) = state.active_cancel.take() {
-            let _ = cancel.send(true);
-        }
+        let cancelled_group = state.active_scan.map(|owner| owner.selection.group_id);
         state.active_scan = None;
         state.published_wall_cache_warning = None;
         state.published_screen_cache_warning = None;
@@ -801,6 +811,9 @@ impl AppService {
         };
         let bootstrap = Self::bootstrap_locked(&state)?;
         drop(state);
+        if let Some(group) = cancelled_group {
+            self.gallery.cancel_runtime_scan(group);
+        }
         let coordinator = self.coordinator.clone();
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(async move {
@@ -899,100 +912,36 @@ impl AppService {
         &self,
         request: crate::WallQueryRequest,
     ) -> Result<crate::WallPage, AppServiceError> {
-        if !(1..=250).contains(&request.limit) {
-            return Err(AppServiceError::InvalidLimit);
-        }
-        let state = self.state()?;
-        let stored = state.libraries.catalog().load_app_state()?;
-        let Some(selection) = stored.active_selection else {
-            return Ok(empty_page());
+        let (selection, scope) = {
+            let state = self.state()?;
+            let stored = state.libraries.catalog().load_app_state()?;
+            let Some(selection) = stored.active_selection else {
+                return Ok(empty_page());
+            };
+            let group = state
+                .libraries
+                .catalog()
+                .folder_group_for_path(selection.library_id, &selection.relative_folder)?;
+            let Some(group) = group else {
+                return Ok(empty_page());
+            };
+            (
+                crate::GallerySelection {
+                    id: SelectionToken {
+                        library_id: selection.library_id,
+                        group_id: group,
+                        epoch: state.selection_epoch,
+                    }
+                    .selection_id(),
+                    library_id: selection.library_id,
+                    group_id: group,
+                    relative_folder: selection.relative_folder,
+                    epoch: state.selection_epoch,
+                },
+                stored.gallery_scope,
+            )
         };
-        let Some(group) = state
-            .libraries
-            .catalog()
-            .folder_group_for_path(selection.library_id, &selection.relative_folder)?
-        else {
-            return Ok(empty_page());
-        };
-        let explicit_selection = crate::GallerySelection {
-            id: SelectionToken {
-                library_id: selection.library_id,
-                group_id: group,
-                epoch: state.selection_epoch,
-            }
-            .selection_id(),
-            library_id: selection.library_id,
-            group_id: group,
-            relative_folder: selection.relative_folder.clone(),
-        };
-        let settled = state
-            .libraries
-            .catalog()
-            .has_completed_generation_for_group(selection.library_id, group)?;
-        let order = if settled {
-            match request.direction {
-                crate::SortDirection::OldestFirst => WallOrder::CapturedAscending,
-                crate::SortDirection::NewestFirst => WallOrder::CapturedDescending,
-            }
-        } else {
-            WallOrder::Provisional
-        };
-        let cursor = request
-            .cursor
-            .as_deref()
-            .map(|v| {
-                crate::wall::decode_cursor(
-                    v,
-                    request.direction,
-                    stored.gallery_scope,
-                    &explicit_selection,
-                    order,
-                )
-            })
-            .transpose()?;
-        let page = state.libraries.catalog().wall_page_scoped(
-            group,
-            stored.gallery_scope,
-            order,
-            cursor,
-            request.limit,
-        )?;
-        let date_state = if settled {
-            crate::OrderState::Settled
-        } else {
-            crate::OrderState::Provisional
-        };
-        let items =
-            wall_assets_with_derivatives(state.libraries.catalog(), &page.items, date_state)?;
-        let source_warnings = state
-            .libraries
-            .catalog()
-            .source_warning_summaries(selection.library_id)?
-            .into_iter()
-            .map(|warning| map_source_warning_code(&warning.code))
-            .collect::<Vec<_>>();
-        let next_cursor = page
-            .next
-            .as_ref()
-            .map(|k| {
-                crate::wall::encode_cursor(
-                    request.direction,
-                    stored.gallery_scope,
-                    &explicit_selection,
-                    k,
-                )
-            })
-            .transpose()?;
-        Ok(crate::WallPage {
-            items,
-            next_cursor,
-            order_state: if settled {
-                crate::OrderState::Settled
-            } else {
-                crate::OrderState::Provisional
-            },
-            source_warnings,
-        })
+        self.gallery.query_wall(&selection, scope, request).await
     }
 
     #[cfg(debug_assertions)]
@@ -1026,6 +975,17 @@ impl AppService {
         };
         if changed && has_selection {
             let selection = self.active_selection_token()?;
+            if let Ok(selection_value) = self.gallery.selection_from_token(selection) {
+                let _ = self
+                    .gallery
+                    .update_client_interaction(
+                        &selection_value,
+                        &format!("desktop-{}", selection_value.id()),
+                        scope,
+                        InteractionState::Active,
+                    )
+                    .await?;
+            }
             self.coordinator.ensure_selection(selection).await;
             self.coordinator.invalidate_background().await;
             self.coordinator.reset_collection_for_scope(selection).await;

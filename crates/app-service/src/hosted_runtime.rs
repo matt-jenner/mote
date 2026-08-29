@@ -3,14 +3,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use photo_domain::GalleryScope;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{Notify, broadcast, watch};
 
 use crate::{GalleryEngine, GallerySelection, InteractionState, WallUpdate};
 
 pub(crate) struct SelectionRuntime {
     pub(crate) selection: GallerySelection,
     pub(crate) scan_cancel: tokio::sync::Mutex<Option<watch::Sender<bool>>>,
-    #[allow(dead_code)]
     pub(crate) coordinator: Arc<crate::derivative_coordinator::DerivativeCoordinator>,
     pub(crate) updates: broadcast::Sender<SequencedWallUpdate>,
     pub(crate) publication: Mutex<()>,
@@ -18,6 +17,9 @@ pub(crate) struct SelectionRuntime {
     pub(crate) next_event_id: AtomicU64,
     pub(crate) next_client_token: AtomicU64,
     pub(crate) settled: std::sync::atomic::AtomicBool,
+    pub(crate) scan_active: std::sync::atomic::AtomicBool,
+    pub(crate) scan_finished: Arc<Notify>,
+    pub(crate) source_unavailable_reported: std::sync::atomic::AtomicBool,
     pub(crate) client_demand: Mutex<HashMap<u64, ClientDemand>>,
 }
 
@@ -41,22 +43,37 @@ impl SelectionRuntime {
         scheduler: Arc<photo_indexer::IndexScheduler>,
         settled: bool,
     ) -> Arc<Self> {
-        let (updates, _) = broadcast::channel(256);
-        Arc::new(Self {
-            selection: selection.clone(),
-            scan_cancel: tokio::sync::Mutex::new(None),
-            coordinator: Arc::new(
+        Self::new_with_coordinator(
+            selection.clone(),
+            Arc::new(
                 crate::derivative_coordinator::DerivativeCoordinator::with_selection(
                     scheduler,
                     selection.token(),
                 ),
             ),
+            settled,
+        )
+    }
+
+    pub(crate) fn new_with_coordinator(
+        selection: GallerySelection,
+        coordinator: Arc<crate::derivative_coordinator::DerivativeCoordinator>,
+        settled: bool,
+    ) -> Arc<Self> {
+        let (updates, _) = broadcast::channel(256);
+        Arc::new(Self {
+            selection: selection.clone(),
+            scan_cancel: tokio::sync::Mutex::new(None),
+            coordinator,
             updates,
             publication: Mutex::new(()),
             history: Mutex::new(VecDeque::with_capacity(256)),
             next_event_id: AtomicU64::new(0),
             next_client_token: AtomicU64::new(1),
             settled: std::sync::atomic::AtomicBool::new(settled),
+            scan_active: std::sync::atomic::AtomicBool::new(false),
+            scan_finished: Arc::new(Notify::new()),
+            source_unavailable_reported: std::sync::atomic::AtomicBool::new(false),
             client_demand: Mutex::new(HashMap::new()),
         })
     }
@@ -117,6 +134,15 @@ impl SelectionRuntime {
         self: &Arc<Self>,
         engine: GalleryEngine,
     ) -> Result<(), crate::AppServiceError> {
+        if !engine.ensure_runtime_source(self).await? {
+            return Ok(());
+        }
+        // Keep the derivative lifecycle attached to this selection runtime.
+        // Desktop shares this coordinator with AppService; hosted selections
+        // retain their own coordinator namespace.
+        self.coordinator
+            .ensure_selection(self.selection.token())
+            .await;
         if self.settled.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -146,6 +172,7 @@ pub struct SelectionEventSubscription {
     pub(crate) client_token: u64,
     pub(crate) scope: GalleryScope,
     pub(crate) lagged: bool,
+    pub(crate) resync_after: Option<u64>,
     pub(crate) resume_after: Option<u64>,
     pub(crate) engine: GalleryEngine,
 }
@@ -157,9 +184,11 @@ impl SelectionEventSubscription {
                 Ok(event)
             } else if self.lagged {
                 self.lagged = false;
-                self.resume_after = Some(self.runtime.next_event_id.load(Ordering::Acquire));
+                let head = self.runtime.next_event_id.load(Ordering::Acquire);
+                let watermark = head.max(self.resync_after.take().unwrap_or_default());
+                self.resume_after = Some(watermark);
                 return Some(SequencedWallUpdate {
-                    id: self.resume_after.unwrap_or_default(),
+                    id: watermark,
                     update: WallUpdate::ResyncRequired {
                         selection_id: self.runtime.selection.id().to_owned(),
                     },
@@ -290,6 +319,7 @@ mod tests {
             library_id: LibraryId::new(),
             group_id: FolderGroupId::new(),
             relative_folder: RelativePathKey::from_relative_path(Path::new(".")).unwrap(),
+            epoch: 0,
         }
     }
 
