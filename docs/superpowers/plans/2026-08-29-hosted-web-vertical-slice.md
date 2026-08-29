@@ -20,6 +20,7 @@
 - Desktop behavior and Tauri commands remain compatible. Hosted selection-explicit methods must not silently mutate the desktop active selection.
 - Scans are recursive. `GalleryScope` affects SQLite queries and derivative demand, never SMB traversal.
 - Wall pages accept 1 to 250 rows and use keyset cursors bound to selection ID, direction, and scope.
+- HTTP request targets accept at most 8 KiB of query text and 8 decoded query parameters. Singleton parameters may not repeat. Folder paths accept at most 4096 bytes, cursors 2048 bytes, opaque selection IDs 128 ASCII bytes, opaque derivative IDs 512 bytes after decoding, client IDs 128 ASCII bytes, and event IDs 20 ASCII decimal bytes.
 - Hosted derivative responses resolve an opaque identifier through SQLite and managed cache containment. They never fall back to source media.
 - SSE queues are bounded. Lag produces `resyncRequired`, not unbounded buffering.
 - All static, API, event, and derivative URLs are origin-relative. Do not add `PHOTO_VIEWER_PUBLIC_URL` or trust forwarded hosts for security decisions.
@@ -43,6 +44,7 @@
 - `crates/server/src/static_host.rs` serves the Vite bundle with interface-route fallback and security/cache headers.
 - `apps/interface/src/services/httpPhotoService.ts` maps HTTP/SSE to `PhotoService`.
 - `apps/interface/src/services/browserPreferences.ts` owns versioned local and session storage.
+- `apps/interface/src/wall/wallReducer.ts` preserves the browser-owned sort direction across selection and resync resets.
 - `apps/interface/src/components/HostedFolderBrowser.tsx` is the responsive contained folder dialog/sheet.
 - `Containerfile`, `deploy/compose.yaml`, `deploy/nginx.conf.example`, and `docs/deployment/hosted.md` define the production contract.
 - `tests/hosted/hosted.spec.ts` and `scripts/hosted-smoke.sh` verify two-browser independence, restart, offline cache, traversal rejection, and source safety.
@@ -142,6 +144,8 @@ assert!(!serde_json::to_string(&root.list("Trips").unwrap()).unwrap().contains(s
 
 On Unix, create one symlink to a child inside the root and one to an outside directory. Assert that the in-root link lists successfully after canonical validation and the escaping link returns `FolderError::OutsideRoot`.
 
+At the HTTP layer, assert a decoded `path` of 4097 bytes and a repeated `path` parameter return the fixed `invalidFolderPath` response before `read_dir` runs.
+
 - [ ] **Step 2: Run the focused tests and confirm RED**
 
 Run: `cargo test -p photo-server --test folder_api --test health_api`
@@ -153,6 +157,8 @@ Expected: compilation fails because `ContainedFolderRoot`, `FolderError`, and th
 Read `PHOTO_VIEWER_SOURCE_ROOT` as required, `PHOTO_VIEWER_DATA_DIR` and `PHOTO_VIEWER_CACHE_DIR` as required, `PHOTO_VIEWER_BIND` as optional with the current default, and `PHOTO_VIEWER_WEB_ROOT` as optional with `/app/web` as its default. Canonicalize the existing source root before local-state preparation and reject a missing root, non-directory root, and any canonical or symlink-alias overlap with data/cache.
 
 In `ContainedFolderRoot::resolve`, accept the empty string as the mounted root. Reject NUL bytes, absolute paths, `.` and `..`, and empty interior components such as `Trips//Processed`. Canonicalize the joined result, require a readable directory, and verify `canonical.starts_with(&self.root)`. In `list`, call exactly one `std::fs::read_dir`, keep directories only, validate each child through the same containment check, omit symlinks that escape the root, sort case-insensitively by display name with the original name as a tie-breaker, and return mount-relative slash-separated paths. A direct request for an escaping symlink returns `invalidFolderPath`.
+
+Reject a decoded folder `path` over 4096 bytes or a repeated `path` parameter before calling `ContainedFolderRoot`. Task 4 adds the shared 8 KiB request-target and 8-parameter guard when the full API router exists.
 
 Map failures to fixed responses:
 
@@ -333,8 +339,15 @@ pub struct SelectionSummary {
     pub id: String,
     pub source_id: String,
     pub display_name: String,
-    pub breadcrumbs: Vec<String>,
+    pub breadcrumbs: Vec<FolderBreadcrumb>,
     pub availability: SourceAvailability,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderBreadcrumb {
+    pub name: String,
+    pub path: String,
 }
 
 #[derive(Clone)]
@@ -371,16 +384,25 @@ struct ClientDemand {
 }
 
 pub struct SelectionEventSubscription {
-    pub backlog: VecDeque<SequencedWallUpdate>,
-    pub receiver: broadcast::Receiver<SequencedWallUpdate>,
+    backlog: VecDeque<SequencedWallUpdate>,
+    receiver: broadcast::Receiver<SequencedWallUpdate>,
     runtime: Arc<SelectionRuntime>,
     client_id: String,
+    scope: GalleryScope,
+}
+
+impl SelectionEventSubscription {
+    pub async fn recv(&mut self) -> Option<SequencedWallUpdate>;
 }
 
 impl GalleryEngine {
     pub fn open(config: AppConfig, source_root: PathBuf) -> Result<Self, AppServiceError>;
     pub async fn select_relative(&self, relative: &Path) -> Result<SelectionSummary, AppServiceError>;
     pub fn resolve_selection(&self, id: &str) -> Result<GallerySelection, AppServiceError>;
+    pub fn selection_summary(
+        &self,
+        selection: &GallerySelection,
+    ) -> Result<SelectionSummary, AppServiceError>;
     pub async fn query_wall(
         &self,
         selection: &GallerySelection,
@@ -392,8 +414,16 @@ impl GalleryEngine {
         &self,
         selection: &GallerySelection,
         client_id: String,
+        scope: GalleryScope,
         after_event_id: Option<u64>,
     ) -> SelectionEventSubscription;
+    pub async fn update_client_interaction(
+        &self,
+        selection: &GallerySelection,
+        client_id: &str,
+        scope: GalleryScope,
+        state: InteractionState,
+    ) -> Result<bool, AppServiceError>;
 }
 ```
 
@@ -435,7 +465,9 @@ assert_eq!(engine.runtime_count_for_test(), 1);
 assert_eq!(reader.scan_starts(), 1);
 ```
 
-Add a regression test proving `AppService::start_scan`, `query_wall`, `update_gallery_scope`, and its existing update subscription still behave through the desktop active-selection wrapper.
+Add a same-selection mixed-scope test. Subscribe client A with `CurrentFolder` and client B with `IncludeSubfolders`; assert A never receives the child asset in `catalogBatch`, derivative-ready, or asset-warning events, B does receive it, and the runtime reports `IncludeSubfolders` as the aggregate background demand. Drop B and assert the aggregate returns to `CurrentFolder` after its admitted work drains.
+
+Add replay tests for both sides of the retained interval. An ID older than history and an ID greater than the current head each produce one fresh `resyncRequired`; an ID inside retained history replays only later events. Add a regression test proving `AppService::start_scan`, `query_wall`, `update_gallery_scope`, and its existing update subscription still behave through the desktop active-selection wrapper.
 
 - [ ] **Step 2: Run focused tests and confirm RED**
 
@@ -445,7 +477,13 @@ Expected: compilation fails because `GalleryEngine`, `GallerySelection`, and `Se
 
 - [ ] **Step 3: Extract selection-explicit operations**
 
-Move selection-independent catalogue, scheduler, cache, scan, and derivative state behind a shared `GalleryEngine`. On first open, add or resolve one configured library whose canonical root is the configured hosted source. Reopening the same catalog must reuse its library ID. A `SelectionRuntime` owns one scan cancellation sender, one derivative coordinator state, a `broadcast::Sender<SequencedWallUpdate>` of capacity 256, a 256-entry `VecDeque` replay history, and client demand. Store runtimes in `Arc<TokioMutex<HashMap<FolderGroupId, Weak<SelectionRuntime>>>>` so identical folders share work and unused runtimes can drain and disappear. `subscribe` copies history entries newer than `after_event_id`; if that ID predates retained history, its backlog is one fresh `resyncRequired`. The subscription keeps the runtime alive and its `Drop` removes the client lease. After the last subscriber drops, let admitted work finish, cancel idle prefetch, persist all completed catalogue/cache work, and remove the registry entry when no strong runtime owner remains.
+Move selection-independent catalogue, scheduler, cache, scan, and derivative state behind a shared `GalleryEngine`. On first open, add or resolve one configured library whose canonical root is the configured hosted source. Reopening the same catalog must reuse its library ID. `SelectionSummary` uses the structured `FolderBreadcrumb { name, path }` shape also exposed by the folder API; paths are mount-relative and never contain the configured native root. `selection_summary` is the sole operation used to summarize a resolved ID, so `GET /selections/{id}` can return exactly the same wire shape as selection creation.
+
+A `SelectionRuntime` owns one scan cancellation sender, one derivative coordinator state, a `broadcast::Sender<SequencedWallUpdate>` of capacity 256, a 256-entry `VecDeque` replay history, and client demand. Store runtimes in `Arc<TokioMutex<HashMap<FolderGroupId, Weak<SelectionRuntime>>>>` so identical folders share work and unused runtimes can drain and disappear. `subscribe` copies history entries newer than `after_event_id`; if that ID predates retained history or is greater than the current event head, its backlog is one fresh `resyncRequired`. The subscription keeps the runtime alive, registers the client's requested scope as the authoritative connected-client background demand, and its `Drop` removes the client lease and demand entry. `IncludeSubfolders` dominates the aggregate while any live subscription requests it. After the last subscriber drops, let admitted work finish, cancel idle prefetch, persist all completed catalogue/cache work, and remove the registry entry when no strong runtime owner remains.
+
+`SelectionEventSubscription::recv` drains filtered replay entries first and then live entries. Before an asset-bearing update leaves that method, filter it through Task 2 membership and the subscription's scope. This applies to `catalogBatch`, `derivativesReady`, and asset-specific warning/clear events. Selection-wide progress, settlement, source availability, and resync events remain shared. On broadcast lag, `recv` returns one fresh `resyncRequired` before resuming live entries. Do not expose the raw receiver or rely on the HTTP adapter to filter: `WallAsset` intentionally contains no native or relative path.
+
+`update_client_interaction` refreshes state, scope, and the 30-second deadline only when `client_id` has a live subscription, returning `true` when it updated that client and `false` for an unknown or already-dropped client. This makes subscription drop authoritative when a heartbeat races with disconnect.
 
 Use one shared `IndexScheduler` for every runtime. Keep the first-visible, near-viewport, and idle-background priorities already used by the desktop service. Scan the selected directory recursively regardless of scope. Publish each `WallUpdate` through:
 
@@ -456,7 +494,7 @@ pub struct SequencedWallUpdate {
 }
 ```
 
-with a per-runtime `AtomicU64`. On `broadcast::error::RecvError::Lagged(_)`, emit one `WallUpdate::ResyncRequired` with the current selection ID before resuming live updates.
+with a per-runtime `AtomicU64`.
 
 Make current desktop methods thin wrappers that resolve the persisted desktop selection and persisted desktop gallery scope, then call the explicit engine operation. Do not change Tauri command names or DTO casing.
 
@@ -514,7 +552,16 @@ struct WallParams {
 #[serde(rename_all = "camelCase")]
 struct InteractionRequest {
     client_id: String,
+    scope: GalleryScope,
     state: InteractionState,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EventsParams {
+    client_id: String,
+    scope: GalleryScope,
+    after_event_id: Option<u64>,
 }
 ```
 
@@ -528,7 +575,10 @@ Use `tower::ServiceExt::oneshot` to assert:
 - Unknown selection IDs return a path-free 404.
 - SSE sets `Content-Type: text/event-stream`, `Cache-Control: no-cache`, and `X-Accel-Buffering: no`.
 - Reconnecting with `Last-Event-ID` continues after that ID; a lagged ID receives `resyncRequired`.
+- `Last-Event-ID` takes precedence over `afterEventId` when both are present; a replay ID newer than the runtime's current head also receives `resyncRequired`.
+- Two clients on the same selection but different scopes receive only events allowed by their own scope, while the runtime demand uses `includeSubfolders` until the broader subscription closes.
 - An active lease from client A keeps the shared scheduler active even if client B posts idle. Closing A’s subscription or advancing paused Tokio time past 30 seconds expires the lease and resumes idle background work.
+- A total query string over 8192 bytes, more than 8 decoded query parameters, repeated singleton parameters, a cursor over 2048 bytes, a selection ID over 128 ASCII bytes, a client ID over 128 ASCII bytes, or an event ID over 20 ASCII decimal bytes fails with a fixed `invalidRequest` response before database or filesystem access. Unit-test the shared identifier guard with a derivative ID over 512 decoded bytes; Task 5 asserts that guard through the derivative route after the route exists.
 
 - [ ] **Step 2: Run server tests and confirm RED**
 
@@ -548,11 +598,13 @@ POST /selections/{id}/interaction
 GET  /selections/{id}/events
 ```
 
-The create-selection handler calls `GalleryEngine::ensure_running` after it resolves or creates the stable selection. A wall or event request also calls it idempotently, so restoring a saved browser selection resumes work without requiring another folder selection.
+Once `photo-server` depends on `photo-app-service`, replace the Task 1 server-local breadcrumb definition with `pub use photo_app_service::FolderBreadcrumb` from `api/types.rs`. Folder listings and selection summaries must serialize the same `{ name, path }` wire shape.
 
-Reject JSON bodies over 64 KiB, folder strings over 4096 bytes, client IDs over 128 ASCII bytes, and derivative asset lists over 250. Never serialize an internal `AppServiceError`; map each public failure to a stable code and fixed user-safe message.
+The create-selection handler calls `GalleryEngine::ensure_running` after it resolves or creates the stable selection. `GET /selections/{id}` resolves the opaque ID and calls `GalleryEngine::selection_summary`; it never rebuilds breadcrumbs from an ID or native path. A wall or event request also calls `ensure_running` idempotently, so restoring a saved browser selection resumes work without requiring another folder selection.
 
-Format SSE as named `wallUpdate` events with monotonic `id:` values and JSON `data:` equal to the existing `WallUpdate`. Send a comment heartbeat every 15 seconds. A subscription drop removes that client’s lease. Track lease deadlines using Tokio time and compute scheduler interaction as active when any non-expired client lease is active.
+Add one request-target guard shared by the folder, gallery, event, and derivative routers. Reject query text over 8192 bytes, more than 8 decoded parameters, repeated singleton parameters, folder strings over 4096 bytes, cursors over 2048 bytes, selection IDs over 128 ASCII bytes, derivative IDs over 512 decoded bytes, client IDs over 128 ASCII bytes, and event IDs over 20 ASCII decimal bytes. Reject JSON bodies over 64 KiB. Task 5 enforces derivative asset lists of 1 to 250 when that route is introduced. Apply these checks before UUID parsing, cursor decoding, catalogue lookup, or filesystem access. Never serialize an internal `AppServiceError`; map each public failure to `ApiError::new(StatusCode::BAD_REQUEST, "invalidRequest", "That request is not valid.")` or the more specific existing `invalidFolderPath`, `invalidCursor`, and `invalidLimit` codes.
+
+Format SSE as named `wallUpdate` events with monotonic `id:` values and JSON `data:` equal to the existing `WallUpdate`. Accept `scope` and `clientId` on every event request. Accept replay position from either standard `Last-Event-ID` or browser-compatible `afterEventId`, with the header taking precedence. The handler consumes only `SelectionEventSubscription::recv`, never its internal broadcast receiver. Send a comment heartbeat every 15 seconds. A subscription drop removes that client's lease and demand entry even if an interaction heartbeat races with disconnect. The interaction handler calls `update_client_interaction`; both a refreshed live client and an unknown client return 204 so a connection-opening race does not become a user-visible error. Track deadlines using Tokio time and compute scheduler interaction as active when any non-expired client lease is active.
 
 - [ ] **Step 4: Verify transport isolation and bounded behavior**
 
@@ -619,7 +671,7 @@ impl CacheWriter {
 
 - [ ] **Step 1: Write failing derivative authorization and containment tests**
 
-Assert that a request rejects foreign assets outside the supplied selection/scope, generates wall thumbnails before screen previews, coalesces the same asset/class/cache-key across two clients, and publishes ready updates to both subscribers of the same selection.
+Assert that a request rejects foreign assets outside the supplied selection/scope, rejects empty or over-250 asset lists, generates wall thumbnails before screen previews, coalesces the same asset/class/cache-key across two clients, and publishes ready updates only to subscribers whose scope admits the asset. A current-folder subscriber must not receive a ready reference for a child asset requested by an include-subfolders subscriber.
 
 At the HTTP layer assert:
 
@@ -631,7 +683,7 @@ assert!(response.headers()[ETAG].to_str().unwrap().starts_with('"'));
 assert_eq!(response.headers()["x-content-type-options"], "nosniff");
 ```
 
-Insert a catalogue row whose relative cache path contains `..`, one whose file is missing, and a symlink escaping the cache root. Each must fail closed with 404 and must not read source media.
+Insert a catalogue row whose relative cache path contains `..`, one whose file is missing, and a symlink escaping the cache root. Each must fail closed with 404 and must not read source media. Assert an opaque derivative ID over 512 decoded bytes and a request target over 8192 query bytes fail with `invalidRequest` before catalogue lookup.
 
 - [ ] **Step 2: Run focused derivative tests and confirm RED**
 
@@ -641,7 +693,7 @@ Expected: missing method/route failures.
 
 - [ ] **Step 3: Implement explicit derivative demand and managed streaming**
 
-Validate all requested asset IDs against Task 2 membership and the requested `GalleryScope`. Aggregate background demand per runtime so `IncludeSubfolders` dominates while any connected client asks for it. Preserve visible over near-viewport over background scheduling and wall-thumbnail-before-screen-preview ordering.
+Validate all requested asset IDs against Task 2 membership and the requested `GalleryScope`; accept 1 to 250 IDs. The Task 4 event subscription is the authoritative source of connected-client background scope, so a foreground derivative request does not create or retain a client-demand entry. Aggregate background demand per runtime so `IncludeSubfolders` dominates while any connected event subscription asks for it. Preserve visible over near-viewport over background scheduling and wall-thumbnail-before-screen-preview ordering.
 
 Resolve the route ID through `Catalog::find_derivative_by_cache_key`, then pass only the stored relative path to `CacheWriter::open_checked`. Recheck file metadata, derive content type from the stored derivative kind plus file signature, and stream the managed file. Never accept a source path, never use request range headers, and never fall back to the original.
 
@@ -663,7 +715,7 @@ Expected: PASS. The source snapshot test shows identical bytes, lengths, and mod
 - [ ] **Step 5: Commit the derivative checkpoint**
 
 ```bash
-git add crates/app-service crates/catalog crates/server
+git add crates/cache crates/app-service crates/catalog crates/server
 git commit -m "feat: serve managed hosted photo derivatives"
 ```
 
@@ -683,6 +735,9 @@ git commit -m "feat: serve managed hosted photo derivatives"
 - Modify: `apps/interface/src/services/tauriPhotoService.ts`
 - Modify: `apps/interface/src/services/tauriPhotoService.test.ts`
 - Modify: `apps/interface/src/app/usePhotoWall.ts`
+- Modify: `apps/interface/src/components/PhotoWall.browser.test.tsx`
+- Modify: `apps/interface/src/wall/wallReducer.ts`
+- Modify: `apps/interface/src/wall/wallReducer.test.ts`
 - Modify: `apps/interface/src/main.tsx`
 - Modify: `apps/interface/vite.config.ts`
 
@@ -697,6 +752,11 @@ export interface FolderListing {
 	path: string;
 	breadcrumbs: FolderBreadcrumb[];
 	children: FolderEntry[];
+}
+
+export interface FolderBrowserState {
+	breadcrumbs: FolderBreadcrumb[];
+	initialPath: string;
 }
 
 export interface PhotoServiceCapabilities {
@@ -718,6 +778,7 @@ export interface PhotoService {
 	derivativeUrl(reference: DerivativeReference): string;
 	listFolders(path: string): Promise<FolderListing>;
 	selectFolder(path: string): Promise<ChooseFolderResult>;
+	folderBrowserState(): FolderBrowserState;
 	initialSortDirection(): SortDirection;
 	rememberSortDirection(direction: SortDirection): void;
 }
@@ -739,23 +800,31 @@ Use injected `Storage`, `fetch`, `EventSource`, and UUID factories. Assert local
 
 Assert session key `photo-viewer.client.v1` is reused within a tab and differs across injected session stores. Test malformed JSON and unknown enum values falling back to system/include-subfolders/oldest-first without throwing.
 
-For the adapter, assert origin-relative calls, encoded paths, fixed public error mapping, selection IDs on every wall/derivative/interaction/event request, `Last-Event-ID` reconnection, one authoritative wall resync on `resyncRequired`, and `derivativeUrl({ assetId: "asset-a", kind: "wallThumbnail", key: "cache/key" }) === "/api/v1/derivatives/cache%2Fkey"`.
+For the adapter, assert origin-relative calls, encoded paths, fixed public error mapping, selection IDs and scope on every wall/derivative/interaction/event request, `afterEventId` reconnection, one authoritative wall resync on `resyncRequired`, and `derivativeUrl({ assetId: "asset-a", kind: "wallThumbnail", key: "cache/key" }) === "/api/v1/derivatives/cache%2Fkey"`.
+
+Return selection summaries with structured `{ name, path }` breadcrumbs. After a successful `selectFolder("Trips/Iceland")`, assert the adapter atomically stores its returned selection ID and breadcrumbs. When `GET /selections/{id}` returns 404, assert bootstrap clears only the invalid ID, retains the breadcrumbs, and exposes `folderBrowserState()` with `initialPath === "Trips/Iceland"`.
+
+Use fake timers to assert `setWallInteraction(true)` posts immediately and every 10 seconds while active, each post includes the current scope, and `setWallInteraction(false)`, stream disposal, or selection change cancels the timer. When an event stream reaches `open` while interaction is active, assert the adapter refreshes the lease immediately to close the connection-opening race. Reconnecting an event stream repeats selection and scope. Changing scope starts a distinct replay position rather than reusing the previous scope's event ID.
+
+Restore `newestFirst` from local storage and assert the first wall query uses `newestFirst`. Repeat after `resetSource` and assert the reducer preserves the accepted direction.
 
 - [ ] **Step 2: Run interface unit tests and confirm RED**
 
-Run: `npm exec --workspace @photo-viewer/interface -- vitest run --project unit src/services/browserPreferences.test.ts src/services/httpPhotoService.test.ts`
+Run: `npm exec --workspace @photo-viewer/interface -- vitest run --project unit src/services/browserPreferences.test.ts src/services/httpPhotoService.test.ts src/wall/wallReducer.test.ts && npm exec --workspace @photo-viewer/interface -- vitest run --project browser src/components/PhotoWall.browser.test.tsx`
 
 Expected: missing modules/types and failing `PhotoService` conformance.
 
 - [ ] **Step 3: Implement preferences, HTTP mapping, and hosted entry selection**
 
-Implement strict JSON decoding with a versioned storage key. `getBootstrapState` calls server bootstrap, resolves the saved selection with `GET /selections/{id}`, and combines that source summary with local appearance/scope. On 404, retain breadcrumbs for folder-browser recovery but clear the invalid selection ID.
+Implement strict JSON decoding with a versioned storage key. `getBootstrapState` calls server bootstrap, resolves the saved selection with `GET /selections/{id}`, and combines that source summary with local appearance/scope. Selection responses use the same structured `FolderBreadcrumb` shape as folder listings. `selectFolder` stores the returned stable selection ID and breadcrumbs in one preference write before returning its selected state. On 404, retain breadcrumbs for folder-browser recovery but clear the invalid selection ID. `folderBrowserState()` returns a defensive copy of those breadcrumbs and uses the last breadcrumb path as `initialPath`, falling back to the empty mounted-root path.
 
-The Tauri and in-memory adapters implement the expanded contract explicitly. They return `oldestFirst` from `initialSortDirection`, keep `rememberSortDirection` in adapter memory, and reject `listFolders`/`selectFolder` with `new PhotoServiceError("unsupportedCapability", "This host uses its system folder picker.")`; their capability prevents those methods from being called by the interface.
+The Tauri and in-memory adapters implement the expanded contract explicitly. They return `{ breadcrumbs: [], initialPath: "" }` from `folderBrowserState`, return `oldestFirst` from `initialSortDirection`, keep `rememberSortDirection` in adapter memory, and reject `listFolders`/`selectFolder` with `new PhotoServiceError("unsupportedCapability", "This host uses its system folder picker.")`; their capability prevents those methods from being called by the interface.
 
-`watchWallUpdates` creates an `EventSource` URL with `clientId` and the current selection. Because native `EventSource` cannot set `Last-Event-ID` manually, reconnect through a query parameter `afterEventId` that the server treats the same as the header. Use capped exponential delays from 250 ms to 5 seconds. Keep the current wall during disconnect. Deliver one `resyncRequired` per detected gap.
+`watchWallUpdates` creates an `EventSource` URL with `clientId`, scope, and the current selection. Because native `EventSource` cannot set `Last-Event-ID` manually, reconnect through a query parameter `afterEventId` that the server treats the same as the header. Associate the active replay ID with its `(selectionId, scope)` and clear it when either value changes; only a reconnect for the same pair reuses it. Use capped exponential delays from 250 ms to 5 seconds. Keep the current wall during disconnect. Deliver one `resyncRequired` per detected gap.
 
-Update `usePhotoWall` to initialize direction from `service.initialSortDirection()` and call `service.rememberSortDirection(direction)` only after the reducer accepts a new direction. Do not put sort in SQLite.
+`setWallInteraction(true)` posts immediately, then refreshes the active lease every 10 seconds while interaction remains active. Each request includes `clientId`, the current scope, and `state: "active"`. If the stream's `open` event fires while interaction is active, post another active refresh immediately. `setWallInteraction(false)` cancels the timer and posts `state: "idle"`. Event-stream disposal, selection change, and adapter disposal cancel the timer; the server still treats subscription drop as authoritative if a heartbeat races with disconnect.
+
+Initialize `usePhotoWall` with `service.initialSortDirection()` rather than the module-level oldest-first state. Change `resetSource` to preserve the current accepted direction, remove the `initialSourceQuery ? "oldestFirst"` override, and make the first wall request use reducer state. Call `service.rememberSortDirection(direction)` only after the reducer accepts a new direction. Do not put sort in SQLite.
 
 Select adapters explicitly in `main.tsx`:
 
@@ -769,7 +838,7 @@ const service = import.meta.env.MODE === "memory"
 
 - [ ] **Step 4: Verify all adapters and desktop type compatibility**
 
-Run: `npm run typecheck && npm test && cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml`
+Run: `npm run typecheck && npm test && npm run test:browser && cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml`
 
 Expected: PASS. Tauri still uses native selection and hosted state never invokes a Tauri API.
 
@@ -802,7 +871,7 @@ git commit -m "feat: connect browser galleries over HTTP"
 
 ```tsx
 interface HostedFolderBrowserProps {
-	initialPath: string;
+	initialBreadcrumbs: FolderBreadcrumb[];
 	onClose(): void;
 	onSelected(result: ChooseFolderResult): void;
 	service: PhotoService;
@@ -815,7 +884,7 @@ At 1440×1024, assert the hosted Folders button opens a centred modal with bread
 
 Test keyboard focus enters the dialog, remains contained through Tab/Shift-Tab, Escape closes and restores the Folders trigger, loading sets `aria-busy`, and a failed child request leaves the last good listing visible with an alert and Retry. Test reduced motion and run `axe` with zero serious/critical violations.
 
-Add a service fixture that returns `Trips -> Iceland -> Processed`. Select `Iceland`, assert the dialog closes and source title updates, then reopen and assert breadcrumbs resume there.
+Add a service fixture that returns `Trips -> Iceland -> Processed`. Select `Iceland`, assert the dialog closes and source title updates, then reopen and assert breadcrumbs resume there. Add an invalid-saved-selection fixture whose retained breadcrumbs are `Trips`, `Iceland`, `Processed`; make `Processed` fail, `Iceland` succeed, and assert recovery tries those mount-relative breadcrumb paths deepest-first without slicing strings or exposing `/photos`.
 
 - [ ] **Step 2: Run the browser tests and confirm RED**
 
@@ -829,7 +898,7 @@ Render `HostedFolderBrowser` only when `capabilities.folderSelection === "hosted
 
 Use the existing spacing, colour, typography, icon, focus, and safe-area tokens. The desktop modal is at most 640 px wide and 70 vh tall. Under 640 px or `(pointer: coarse)`, use the viewport minus safe-area insets. Directory rows have at least a 44 px target. Suppress nonessential motion under `prefers-reduced-motion`.
 
-When a stored selection no longer resolves, open at the deepest breadcrumb whose `listFolders` call succeeds. If none succeeds, list the mounted root. Never show a Locate Folder action in hosted mode.
+When AppShell opens the hosted picker, read `service.folderBrowserState()` and pass its breadcrumbs as `initialBreadcrumbs`. `HostedFolderBrowser` tries those structured breadcrumb paths from deepest to shallowest and opens the first whose `listFolders` call succeeds. If none succeeds, it lists the mounted root with the empty path. Use only each breadcrumb's returned `path`; do not reconstruct it from names or import browser preferences into React. Never show a Locate Folder action in hosted mode.
 
 - [ ] **Step 4: Verify responsive UI and existing viewer behavior**
 
@@ -939,7 +1008,13 @@ git commit -m "feat: serve the hosted photo viewer securely"
 
 - [ ] **Step 1: Write the failing hosted acceptance test and source snapshot helper**
 
-Add `@playwright/test` version `1.62.1` as a direct dev dependency. The test receives `PHOTO_VIEWER_BASE_URL`, opens two browser contexts with separate local/session storage, selects `A` and `B`, and asserts source titles, first wall filenames, scope, order, viewer, filmstrip, zoom, and pan remain independent.
+Add `@playwright/test` version `1.62.1` as a direct dev dependency and add `test:hosted` to the root scripts now so the RED command invokes the real test. The test receives `PHOTO_VIEWER_BASE_URL`, `PHOTO_VIEWER_PHASE`, and `PHOTO_VIEWER_STATE_DIR`.
+
+In `beforeRestart`, open two browser contexts with separate local/session storage, select `A` and `B`, choose different appearance and sort values, keep A on `currentFolder`, and put B on `includeSubfolders`. Give A one child photo that remains outside its current-folder derivative demand. Assert source titles, first wall filenames, viewer, filmstrip, zoom, and pan remain independent. Save each context's Playwright storage state to the temporary state directory and record its opaque selection ID plus one cached derivative URL and ETag in a temporary JSON record.
+
+In `afterRestart`, create new contexts from those two saved storage states. Assert each browser restores its own folder, appearance, scope, sort direction, first wall row, and cached viewer without selecting a folder again. Assert the recorded selection IDs still resolve and cached derivative requests retain their ETags. New tabs receive new session client IDs; restoration depends only on local storage.
+
+In `offline`, reopen both saved contexts after source availability has been refreshed. Assert cached wall and viewer content remain usable. Switch A to `includeSubfolders`, which must query its already-recursive catalogue without walking the source, then assert the known child photo has the unavailable cue and cannot open because its derivative was never requested.
 
 The shell smoke script creates a temporary tree with deterministic JPEG fixtures and computes a manifest before startup:
 
@@ -954,7 +1029,7 @@ Use GNU `stat -c` when `stat -f` is unavailable. Compare both manifests after fo
 
 Run: `npm run test:hosted`
 
-Expected: FAIL because the Playwright config, running container, and test script do not exist yet.
+Expected: FAIL because no hosted server is running at the required base URL.
 
 - [ ] **Step 3: Build the standard OCI image and deployment files**
 
@@ -1001,13 +1076,13 @@ The Nginx example proxies to `127.0.0.1:8080`, forwards `Host`, `X-Forwarded-Hos
 2. build `localhost/photo-viewer:dev` with `podman build`;
 3. run with `/photos:ro,Z`, writable retained volumes, and `127.0.0.1::8080`;
 4. discover the mapped port and wait up to 60 seconds for `/healthz`;
-5. run the two-context Playwright test;
-6. stop and recreate the container with the same data/cache;
-7. verify selection IDs and cached derivative ETags remain valid;
-8. while the restarted container remains running, make the mounted source unreadable, trigger a folder-list or scan request so availability is refreshed, confirm degraded health plus cached wall/viewer access, and confirm uncached items show unavailable behavior, then restore access for cleanup;
-9. probe `%2e%2e`, absolute, NUL-encoded, file, and symlink escape folder paths;
-10. compare source metadata and hash manifests;
-11. remove only its named temporary container, network, and volumes through an EXIT trap.
+5. run Playwright with `PHOTO_VIEWER_PHASE=beforeRestart`, storing both contexts under the smoke test's temporary state directory;
+6. stop and recreate the container with the same data/cache, then wait for `/healthz` again;
+7. run Playwright with `PHOTO_VIEWER_PHASE=afterRestart` and the saved storage states, proving browser restoration as well as stable selection IDs and derivative ETags;
+8. while the restarted container remains running, make the mounted source unreadable, trigger a folder-list or scan request so availability is refreshed, confirm degraded health, then run `PHOTO_VIEWER_PHASE=offline` to verify cached wall/viewer access and the uncached unavailable behavior before restoring access for cleanup;
+9. probe `%2e%2e`, absolute, NUL-encoded, over-limit, repeated-parameter, file, and symlink escape folder paths;
+10. compare source metadata and hash manifests after every phase;
+11. remove only its named temporary container, network, volumes, browser-state directory, and record files through an EXIT trap.
 
 Use explicit generated names prefixed `photo-viewer-smoke-`; never prune global Podman state.
 
@@ -1015,7 +1090,7 @@ Use explicit generated names prefixed `photo-viewer-smoke-`; never prune global 
 
 `docs/deployment/hosted.md` must include Podman and Docker build/run commands, Compose usage, the `/photos` read-only contract, UID 10001 bind-mount permissions, named-volume persistence, health checking, backup of `catalog.sqlite`, cache rebuild expectations, Nginx config, restart/upgrade steps, and the fact that `https://photos.docker.jenner.lan` needs no hostname setting because every URL is origin-relative.
 
-Update `README.md` with links to desktop development and hosted deployment. Add:
+Update `README.md` with links to desktop development and hosted deployment. Keep the script introduced by the acceptance test:
 
 ```json
 {
@@ -1023,9 +1098,43 @@ Update `README.md` with links to desktop development and hosted deployment. Add:
 }
 ```
 
-- [ ] **Step 6: Run the full verification gate**
+- [ ] **Step 6: Run the pre-commit verification gate**
 
 Run these commands from the feature worktree with fresh output:
+
+```bash
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
+npm run check
+npm run typecheck
+npm test
+npm run test:browser
+podman build -t localhost/photo-viewer:dev -f Containerfile .
+./scripts/hosted-smoke.sh
+```
+
+Expected: every command exits 0; the smoke test reports two-browser independence, browser-state restoration after restart, stable derivative ETags, offline cached viewing, traversal and limit rejection, and an unchanged source manifest. Task 9 files remain intentionally uncommitted until Step 7.
+
+- [ ] **Step 7: Commit deployment and acceptance artifacts**
+
+```bash
+git add Containerfile .containerignore deploy docs/deployment tests/hosted scripts/hosted-smoke.sh package.json package-lock.json README.md
+git commit -m "feat: package hosted photo viewer for OCI"
+```
+
+- [ ] **Step 8: Request code review and prepare the user demo**
+
+Use `superpowers:requesting-code-review` against the full branch diff from its merge base with `codex/include-subfolders-gallery`. Fix Critical and Important findings through `superpowers:receiving-code-review` and rerun each focused test named by the affected task. Stage only tracked fixes plus new files under the already approved feature paths, then commit review fixes before the final gate:
+
+```bash
+git add -u
+git add apps/interface crates tests/hosted scripts/hosted-smoke.sh Containerfile .containerignore deploy docs/deployment README.md package.json package-lock.json Cargo.toml Cargo.lock
+git diff --cached --quiet || git commit -m "fix: address hosted web review"
+```
+
+Run the final gate from the committed tree with fresh output:
 
 ```bash
 cargo fmt --all -- --check
@@ -1041,15 +1150,4 @@ podman build -t localhost/photo-viewer:dev -f Containerfile .
 git status --short
 ```
 
-Expected: every command exits 0; the smoke test reports two-browser independence, restart restoration, offline cached viewing, traversal rejection, and an unchanged source manifest; `git status --short` is empty after the final documentation commit.
-
-- [ ] **Step 7: Commit deployment and acceptance artifacts**
-
-```bash
-git add Containerfile .containerignore deploy docs/deployment tests/hosted scripts/hosted-smoke.sh package.json package-lock.json README.md
-git commit -m "feat: package hosted photo viewer for OCI"
-```
-
-- [ ] **Step 8: Request code review and prepare the user demo**
-
-Use `superpowers:requesting-code-review` against the full branch diff from its merge base with `codex/include-subfolders-gallery`. Fix Critical and Important findings through `superpowers:receiving-code-review`, rerun the affected focused tests, then rerun the full verification gate. Start the accepted image locally and provide the exact mapped loopback URL printed by `podman port`, such as `http://127.0.0.1:49152`, for exploratory testing. Do not merge or push until the user approves the demo.
+Expected: every command exits 0, the hosted smoke report repeats the complete acceptance evidence, and `git status --short` prints nothing. Start the accepted image locally and provide the exact mapped loopback URL printed by `podman port`, such as `http://127.0.0.1:49152`, for exploratory testing. Do not merge or push until the user approves the demo.
