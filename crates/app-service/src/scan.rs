@@ -487,7 +487,7 @@ fn mark_unavailable_selection(
     Ok(())
 }
 
-fn progress_dto(progress: photo_indexer::ScanProgress) -> crate::ScanProgressDto {
+pub(crate) fn progress_dto(progress: photo_indexer::ScanProgress) -> crate::ScanProgressDto {
     crate::ScanProgressDto {
         discovered: progress.discovered,
         shaped: progress.shaped,

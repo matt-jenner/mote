@@ -406,6 +406,12 @@ impl<F: SourceFs> RecentSourceValidator for SourceValidator<F> {
 #[derive(Clone)]
 pub(crate) struct ReaderAdapter(Arc<dyn MetadataReader>);
 
+impl ReaderAdapter {
+    pub(crate) fn new(reader: Arc<dyn MetadataReader>) -> Self {
+        Self(reader)
+    }
+}
+
 impl MetadataReader for ReaderAdapter {
     fn read(
         &self,
@@ -908,6 +914,17 @@ impl AppService {
         else {
             return Ok(empty_page());
         };
+        let explicit_selection = crate::GallerySelection {
+            id: SelectionToken {
+                library_id: selection.library_id,
+                group_id: group,
+                epoch: state.selection_epoch,
+            }
+            .selection_id(),
+            library_id: selection.library_id,
+            group_id: group,
+            relative_folder: selection.relative_folder.clone(),
+        };
         let settled = state
             .libraries
             .catalog()
@@ -923,7 +940,15 @@ impl AppService {
         let cursor = request
             .cursor
             .as_deref()
-            .map(|v| crate::wall::decode_cursor(v, request.direction, group, order))
+            .map(|v| {
+                crate::wall::decode_cursor(
+                    v,
+                    request.direction,
+                    stored.gallery_scope,
+                    &explicit_selection,
+                    order,
+                )
+            })
             .transpose()?;
         let page = state.libraries.catalog().wall_page_scoped(
             group,
@@ -949,7 +974,14 @@ impl AppService {
         let next_cursor = page
             .next
             .as_ref()
-            .map(|k| crate::wall::encode_cursor(request.direction, group, k))
+            .map(|k| {
+                crate::wall::encode_cursor(
+                    request.direction,
+                    stored.gallery_scope,
+                    &explicit_selection,
+                    k,
+                )
+            })
             .transpose()?;
         Ok(crate::WallPage {
             items,
@@ -1020,7 +1052,7 @@ fn empty_page() -> crate::WallPage {
     }
 }
 
-fn map_availability(availability: Availability) -> SourceAvailability {
+pub(crate) fn map_availability(availability: Availability) -> SourceAvailability {
     match availability {
         Availability::Available => SourceAvailability::Available,
         Availability::RootOffline => SourceAvailability::RootOffline,
@@ -1100,7 +1132,7 @@ fn map_asset_warning_code(code: &str) -> crate::WallWarningState {
     }
 }
 
-fn map_source_warning_code(code: &str) -> crate::WallWarningState {
+pub(crate) fn map_source_warning_code(code: &str) -> crate::WallWarningState {
     let public_code = match code {
         "wall_thumbnail_cache_unavailable" => "wallThumbnailCacheUnavailable",
         "screen_preview_cache_unavailable" => "screenPreviewCacheUnavailable",

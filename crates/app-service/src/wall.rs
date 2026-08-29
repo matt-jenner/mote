@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize)]
 struct Cursor {
     direction: crate::SortDirection,
+    scope: photo_domain::GalleryScope,
+    selection_id: String,
     group_id: String,
     key: Key,
 }
@@ -23,7 +25,8 @@ enum Key {
 
 pub fn encode_cursor(
     direction: crate::SortDirection,
-    group: photo_domain::FolderGroupId,
+    scope: photo_domain::GalleryScope,
+    selection: &crate::GallerySelection,
     key: &WallCursorKey,
 ) -> Result<String, crate::AppServiceError> {
     let key = match key {
@@ -43,7 +46,9 @@ pub fn encode_cursor(
     };
     let bytes = serde_json::to_vec(&Cursor {
         direction,
-        group_id: group.as_uuid().hyphenated().to_string(),
+        scope,
+        selection_id: selection.id().to_owned(),
+        group_id: selection.group_id().as_uuid().hyphenated().to_string(),
         key,
     })?;
     Ok(encode(&bytes))
@@ -52,7 +57,8 @@ pub fn encode_cursor(
 pub fn decode_cursor(
     value: &str,
     direction: crate::SortDirection,
-    group: photo_domain::FolderGroupId,
+    scope: photo_domain::GalleryScope,
+    selection: &crate::GallerySelection,
     order: WallOrder,
 ) -> Result<WallCursorKey, crate::AppServiceError> {
     if value.is_empty() || value.len() > 2048 || value.len() % 4 == 1 {
@@ -64,7 +70,10 @@ pub fn decode_cursor(
     }
     let cursor: Cursor =
         serde_json::from_slice(&bytes).map_err(|_| crate::AppServiceError::InvalidCursor)?;
-    if cursor.direction != direction || cursor.group_id != group.as_uuid().hyphenated().to_string()
+    if cursor.direction != direction
+        || cursor.scope != scope
+        || cursor.selection_id != selection.id()
+        || cursor.group_id != selection.group_id().as_uuid().hyphenated().to_string()
     {
         return Err(crate::AppServiceError::InvalidCursor);
     }
