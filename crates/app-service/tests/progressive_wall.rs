@@ -15,7 +15,7 @@ use photo_app_service::{
 use photo_cache::CacheBudget;
 use photo_catalog::{Catalog, CatalogWarningRecord, NewDerivative, NewFolderGroup};
 use photo_domain::{
-    AssetId, DerivativeId, FolderGroupId, GalleryScope, LibraryId, RelativePathKey,
+    Appearance, AssetId, DerivativeId, FolderGroupId, GalleryScope, LibraryId, RelativePathKey,
 };
 use photo_metadata::{MetadataBundle, MetadataCandidate, MetadataReadWarning, MetadataSource};
 
@@ -2665,6 +2665,58 @@ async fn invalidation_before_commit_admission_has_no_side_effects() {
         assert_eq!(commits.load(Ordering::SeqCst), 0);
         assert_eq!(derivative_update_counts(&mut updates), (0, 0, 0));
     }
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scope_update_returns_bootstrap_refreshed_after_invalidation_waits() {
+    let (_fixture, service, asset_id) = prepare_managed_cache_wall_ready_fixture().await;
+    service
+        .set_interaction(photo_app_service::InteractionState::Idle)
+        .await;
+    let post_admission_entered = Arc::new(tokio::sync::Notify::new());
+    let post_admission_release = Arc::new(tokio::sync::Notify::new());
+    service
+        .install_screen_preview_post_admission_test_gate(
+            post_admission_entered.clone(),
+            post_admission_release.clone(),
+        )
+        .await;
+    let invalidation_waiting = Arc::new(tokio::sync::Notify::new());
+    service
+        .install_background_invalidation_wait_test_hook(invalidation_waiting.clone())
+        .await;
+
+    let background_service = service.clone();
+    let background = tokio::spawn(async move {
+        background_service
+            .request_derivatives(DerivativeRequest {
+                asset_ids: vec![asset_id],
+                priority: photo_app_service::DerivativePriority::NearViewport,
+                kind: DerivativeClass::ScreenPreview,
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), post_admission_entered.notified())
+        .await
+        .expect("screen preview should hold after commit admission");
+
+    let scope_service = service.clone();
+    let scope_update = tokio::spawn(async move {
+        scope_service
+            .update_gallery_scope(GalleryScope::CurrentFolder)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), invalidation_waiting.notified())
+        .await
+        .expect("scope update should wait for the admitted background commit");
+    service.update_appearance(Appearance::Dark).unwrap();
+
+    post_admission_release.notify_waiters();
+    assert!(background.await.unwrap().is_ok());
+    let returned = scope_update.await.unwrap().unwrap();
+
+    assert_eq!(returned.settings.appearance, Appearance::Dark);
 }
 
 #[cfg(debug_assertions)]
