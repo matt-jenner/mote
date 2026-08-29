@@ -103,7 +103,7 @@ impl Catalog {
         if source_online != 0 {
             transaction.execute(
                 "DELETE FROM folder_group_assets
-                 WHERE folder_group_id = ?1 AND last_seen_generation <> ?2",
+                 WHERE folder_group_id = ?1 AND last_seen_generation < ?2",
                 params![group.as_uuid().as_bytes(), generation],
             )?;
             transaction.execute(
@@ -200,7 +200,8 @@ pub(crate) fn add_asset_membership_on(
         "INSERT INTO folder_group_assets (folder_group_id, asset_id, last_seen_generation)
          VALUES (?1, ?2, ?3)
          ON CONFLICT(folder_group_id, asset_id) DO UPDATE SET
-           last_seen_generation = excluded.last_seen_generation",
+           last_seen_generation = MAX(folder_group_assets.last_seen_generation,
+                                      excluded.last_seen_generation)",
         params![
             group.as_uuid().as_bytes(),
             asset.as_uuid().as_bytes(),

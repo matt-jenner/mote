@@ -1,6 +1,8 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
+use std::thread;
+use std::time::Duration;
 
 use photo_cache::{
     CacheError, CacheWriter, DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget,
@@ -204,6 +206,108 @@ fn eviction_removes_oldest_whole_group_and_keeps_durable_thumbnails() {
     assert_eq!(fixture.catalog.derivative_count(new, false).unwrap(), 1);
     assert!(!temp.path().join("old-preview.bin").exists());
     assert!(temp.path().join("old-thumb.bin").exists());
+}
+
+#[test]
+fn shared_derivative_bytes_are_counted_only_when_all_owners_are_evicted() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut fixture = CacheFixture::new(temp.path());
+    let first = fixture.group("first", Some(10));
+    let second = fixture.group("second", Some(20));
+    fixture.derivative(first, "shared", 40, false);
+    let derivative = fixture.catalog.all_derivatives().unwrap()[0].id;
+    fixture
+        .catalog
+        .link_derivative_group(derivative, second)
+        .unwrap();
+
+    let plan = EvictionPlanner::plan(&fixture.catalog, 35, &ProtectedGroups::default()).unwrap();
+
+    assert_eq!(plan.groups, vec![first, second]);
+    assert_eq!(plan.reclaimable_bytes, 40);
+    EvictionPlanner::execute(
+        &mut fixture.catalog,
+        temp.path(),
+        &plan,
+        &ProtectedGroups::default(),
+    )
+    .unwrap();
+    assert_eq!(fixture.catalog.all_derivatives().unwrap().len(), 0);
+    assert!(!temp.path().join("shared.bin").exists());
+}
+
+#[test]
+fn eviction_transaction_blocks_a_cross_connection_group_link_until_commit() {
+    let temp = tempfile::tempdir().unwrap();
+    let database = temp.path().join("catalog.sqlite");
+    let mut catalog = Catalog::open(&database).unwrap();
+    let library = NewLibrary::configured("Photos", temp.path());
+    let library_id = catalog.add_library(&library).unwrap().id;
+    let first = fixture_group(&mut catalog, library_id, "first");
+    let second = fixture_group(&mut catalog, library_id, "second");
+    let asset = photo_catalog::NewAsset::minimal(
+        library_id,
+        RelativePathKey::from_relative_path(std::path::Path::new("image.jpg")).unwrap(),
+        "image.jpg",
+        MediaKind::Jpeg,
+        1,
+    );
+    catalog.upsert_asset(&asset).unwrap();
+    fixture_derivative(&mut catalog, first, asset.id, "shared", 4);
+    let derivative = catalog.all_derivatives().unwrap()[0].id;
+
+    let eviction = catalog.begin_derivative_eviction(&[first]).unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let other_database = database.clone();
+    let handle = thread::spawn(move || {
+        let mut other = Catalog::open(&other_database).unwrap();
+        started_tx.send(()).unwrap();
+        let linked = other.link_derivative_group(derivative, second).is_ok();
+        done_tx.send(linked).unwrap();
+    });
+    started_rx.recv().unwrap();
+    assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+    eviction.commit().unwrap();
+    assert!(!done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+    handle.join().unwrap();
+    let reopened = Catalog::open(&database).unwrap();
+    assert_eq!(reopened.derivative_count(second, false).unwrap(), 0);
+}
+
+fn fixture_group(catalog: &mut Catalog, library_id: LibraryId, path: &str) -> FolderGroupId {
+    catalog
+        .upsert_folder_group(&NewFolderGroup {
+            id: FolderGroupId::new(),
+            library_id,
+            relative_path: RelativePathKey::from_relative_path(std::path::Path::new(path)).unwrap(),
+            display_path: path.to_owned(),
+            last_viewed_at: Some(1),
+        })
+        .unwrap()
+}
+
+fn fixture_derivative(
+    catalog: &mut Catalog,
+    group: FolderGroupId,
+    asset_id: AssetId,
+    cache_key: &str,
+    size_bytes: u64,
+) {
+    catalog
+        .insert_derivative(&NewDerivative {
+            id: DerivativeId::new(),
+            asset_id,
+            folder_group_id: group,
+            kind: "screen_preview".to_owned(),
+            cache_key: cache_key.to_owned(),
+            relative_cache_path: PathBuf::from(format!("{cache_key}.bin")),
+            size_bytes,
+            durable: false,
+            created_at: 1,
+        })
+        .unwrap();
 }
 
 #[test]

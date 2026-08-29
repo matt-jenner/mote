@@ -193,3 +193,98 @@ fn one_immutable_derivative_can_be_reused_by_multiple_groups() {
     assert_eq!(catalog.derivative_count(parent, false).unwrap(), 1);
     assert_eq!(catalog.derivative_count(child, false).unwrap(), 1);
 }
+
+#[test]
+fn membership_freshness_never_moves_backward_or_resets_on_plain_upsert() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured("Photos", Path::new("/Photos")))
+        .unwrap();
+    let selected = group(&mut catalog, library.id, "selected");
+    let asset = ready_asset(&mut catalog, library.id, selected, "selected/photo.jpg");
+
+    let first = catalog
+        .begin_generation_for_group(library.id, selected)
+        .unwrap();
+    catalog
+        .add_asset_membership(selected, asset, first)
+        .unwrap();
+    catalog
+        .finish_group_generation(library.id, selected, first)
+        .unwrap();
+    let second = catalog
+        .begin_generation_for_group(library.id, selected)
+        .unwrap();
+    catalog
+        .add_asset_membership(selected, asset, second)
+        .unwrap();
+    // A stale scan completes after the current scan, and an ordinary upsert also occurs.
+    catalog
+        .add_asset_membership(selected, asset, first)
+        .unwrap();
+    let plain = NewAsset {
+        folder_group_id: Some(selected),
+        ..NewAsset::minimal(
+            library.id,
+            RelativePathKey::from_relative_path(Path::new("selected/photo.jpg")).unwrap(),
+            "selected/photo.jpg",
+            MediaKind::Jpeg,
+            2,
+        )
+    };
+    catalog.upsert_asset(&plain).unwrap();
+    catalog
+        .finish_group_generation(library.id, selected, second)
+        .unwrap();
+
+    assert_eq!(
+        catalog
+            .wall_page(selected, WallOrder::Provisional, None, 10)
+            .unwrap()
+            .items
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec![asset]
+    );
+}
+
+#[test]
+fn library_generation_uses_asset_freshness_not_old_selection_memberships() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured("Photos", Path::new("/Photos")))
+        .unwrap();
+    let selected = group(&mut catalog, library.id, "selected");
+    let selected_asset = ready_asset(&mut catalog, library.id, selected, "selected/old.jpg");
+    let current = NewAsset::minimal(
+        library.id,
+        RelativePathKey::from_relative_path(Path::new("current.jpg")).unwrap(),
+        "current.jpg",
+        MediaKind::Jpeg,
+        1,
+    );
+    catalog.upsert_asset(&current).unwrap();
+    let generation = catalog.begin_generation(library.id).unwrap();
+    catalog
+        .record_generation_assets(library.id, generation, std::slice::from_ref(&current))
+        .unwrap();
+    catalog.complete_generation(library.id, generation).unwrap();
+
+    assert_eq!(
+        catalog
+            .find_asset(current.id)
+            .unwrap()
+            .unwrap()
+            .availability,
+        photo_domain::Availability::Available
+    );
+    assert_eq!(
+        catalog
+            .find_asset(selected_asset)
+            .unwrap()
+            .unwrap()
+            .availability,
+        photo_domain::Availability::Missing
+    );
+}

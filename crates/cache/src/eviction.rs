@@ -99,10 +99,14 @@ impl EvictionPlanner {
             .collect::<Vec<_>>();
         for group in catalog.cache_eviction_groups_excluding(&blocked)? {
             plan.groups.push(group.id);
-            plan.reclaimable_bytes = plan
-                .reclaimable_bytes
-                .checked_add(group.reclaimable_bytes)
-                .ok_or(CacheError::SizeOutOfRange)?;
+            plan.reclaimable_bytes = catalog
+                .reclaimable_derivatives_for_groups(&plan.groups)?
+                .iter()
+                .try_fold(0_u64, |total, derivative| {
+                    total
+                        .checked_add(derivative.size_bytes)
+                        .ok_or(CacheError::SizeOutOfRange)
+                })?;
             if plan.reclaimable_bytes >= bytes_to_free {
                 break;
             }
@@ -122,8 +126,9 @@ impl EvictionPlanner {
         }) {
             return Err(CacheError::GroupBecameProtected);
         }
-        let derivatives = catalog.non_durable_derivatives(&plan.groups)?;
-        let reclaimable = catalog.reclaimable_derivatives_for_groups(&plan.groups)?;
+        let eviction = catalog.begin_derivative_eviction(&plan.groups)?;
+        let derivatives = eviction.derivatives().to_vec();
+        let reclaimable = eviction.reclaimable().to_vec();
         let reclaimable_ids = reclaimable
             .iter()
             .map(|derivative| derivative.id)
@@ -135,18 +140,15 @@ impl EvictionPlanner {
         for derivative in &reclaimable {
             writer.remove_relative_file(&derivative.relative_cache_path)?;
         }
-        let ids = derivatives
-            .iter()
-            .map(|derivative| derivative.id)
-            .collect::<Vec<_>>();
-        catalog.remove_derivative_group_links(&ids, &plan.groups)?;
-        derivatives
+        let reclaimed_bytes = derivatives
             .iter()
             .filter(|derivative| reclaimable_ids.contains(&derivative.id))
             .try_fold(0_u64, |total, item| {
                 total
                     .checked_add(item.size_bytes)
                     .ok_or(CacheError::SizeOutOfRange)
-            })
+            })?;
+        eviction.commit()?;
+        Ok(reclaimed_bytes)
     }
 }

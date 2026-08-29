@@ -255,12 +255,9 @@ impl Catalog {
             )?;
             transaction.execute(
                 "UPDATE assets SET availability = 'missing'
-                 WHERE library_id = ?1 AND availability <> 'missing'
-                   AND NOT EXISTS (
-                     SELECT 1 FROM folder_group_assets fga
-                     WHERE fga.asset_id = assets.id
-                   )",
-                [library.as_uuid().as_bytes()],
+                 WHERE library_id = ?1 AND last_seen_generation <> ?2
+                   AND availability <> 'missing'",
+                params![library.as_uuid().as_bytes(), generation],
             )?
         } else {
             0
