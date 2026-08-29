@@ -29,3 +29,7 @@ Regression-first tests were added for isolated scheduler namespaces, canonical s
 The fix round preserves the base checkpoint at `4f46c88` and is committed separately with the final verification results below. The report intentionally identifies the immutable base SHA; the fix-round commit is the commit containing this report.
 
 The scan path now keeps the actual cancellation sender, flushes progressive batches after 50 ms, propagates catalog batch failures, avoids completing failed generations, and emits `catalogUnavailable` without native paths. Concurrent runtime publishes serialize history insertion and broadcast delivery, synthetic resyncs do not advance the event head, dead runtime registry entries are pruned, and subscription demand removal is token-owned.
+
+Fix-round implementation commit: `228743a` (`fix: harden hosted selection runtimes`).
+
+Fix-round verification passed: `cargo test -p photo-app-service`, `cargo test --workspace`, `cargo fmt --all -- --check`, and `git diff --check`.
