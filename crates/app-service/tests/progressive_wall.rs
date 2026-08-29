@@ -615,6 +615,29 @@ async fn uncached_folder_emits_geometry_before_metadata_settles_and_reopens_from
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn progressive_flush_arrives_within_the_bounded_window() {
+    let fixture = ProgressiveFixture::new(12);
+    let (reader, release) = BlockingReader::new();
+    let service = fixture.service(reader);
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+
+    let first_batch = tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            let event = updates.recv().await.unwrap();
+            if matches!(&event, WallUpdate::CatalogBatch { assets, .. } if !assets.is_empty()) {
+                break event;
+            }
+        }
+    })
+    .await;
+    release.release();
+    let first_batch =
+        first_batch.expect("progressive catalog batch exceeded its bounded flush window");
+    assert!(matches!(first_batch, WallUpdate::CatalogBatch { .. }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn open_recent_starts_the_selected_folder_scan() {
     let fixture = ProgressiveFixture::new(4);
     let service =

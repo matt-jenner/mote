@@ -386,11 +386,7 @@ impl GalleryEngine {
             // runtime alive, but it must not leak that stale selection ID into
             // the new desktop stream.
             if self.shared_coordinator.is_some() {
-                if let Ok(mut cancel) = runtime.scan_cancel.try_lock()
-                    && let Some(sender) = cancel.take()
-                {
-                    let _ = sender.send(true);
-                }
+                runtime.request_cancel();
                 runtimes.remove(&selection.group_id);
             } else {
                 return runtime;
@@ -456,11 +452,7 @@ impl GalleryEngine {
         let Some(runtime) = runtime else {
             return;
         };
-        if let Ok(mut cancel) = runtime.scan_cancel.try_lock()
-            && let Some(sender) = cancel.take()
-        {
-            let _ = sender.send(true);
-        }
+        runtime.request_cancel();
     }
 
     pub async fn ensure_running(
@@ -555,7 +547,8 @@ impl GalleryEngine {
             .lock()
             .expect("runtime publication poisoned");
         let receiver = runtime.updates.subscribe();
-        let client_token = runtime.register(client_id.clone(), scope);
+        let (client_token, scope_receiver) = runtime.register(client_id.clone(), scope);
+        let lifecycle = runtime.lifecycle_receiver();
         let history = runtime
             .history
             .lock()
@@ -586,11 +579,13 @@ impl GalleryEngine {
             runtime,
             client_id,
             client_token,
-            scope,
+            scope: scope_receiver,
+            lifecycle,
             lagged,
             resync_after,
             resume_after: None,
             engine: self.clone(),
+            terminal: None,
         }
     }
 
@@ -616,6 +611,7 @@ impl GalleryEngine {
         };
         let value = demand.get_mut(&token).expect("demand token was present");
         value.scope = scope;
+        let _ = value.scope_sender.send(scope);
         value.interaction = interaction;
         value.lease_until = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         Ok(true)
@@ -625,6 +621,10 @@ impl GalleryEngine {
         &self,
         runtime: Arc<SelectionRuntime>,
     ) -> Result<(), AppServiceError> {
+        if runtime.cancellation_requested() {
+            runtime.finish_scan(crate::hosted_runtime::ScanLifecycle::Cancelled);
+            return Ok(());
+        }
         if !self.ensure_runtime_source(&runtime).await? {
             return Ok(());
         }
@@ -654,6 +654,10 @@ impl GalleryEngine {
         // still publish SourceUnavailable and leave cached wall rows readable.
         if !root.is_dir() || !root.join(&selected).is_dir() {
             self.mark_runtime_source_unavailable(&runtime).await?;
+            return Ok(());
+        }
+        if runtime.cancellation_requested() {
+            runtime.finish_scan(crate::hosted_runtime::ScanLifecycle::Cancelled);
             return Ok(());
         }
         let generation = {
@@ -689,6 +693,10 @@ impl GalleryEngine {
             self.scheduler.clone(),
         );
         let selection_root = root.join(&selected);
+        if runtime.cancellation_requested() {
+            runtime.finish_scan(crate::hosted_runtime::ScanLifecycle::Cancelled);
+            return Ok(());
+        }
         let handle = indexer
             .start(
                 ScanRequest::new(selection_root.clone())
@@ -697,10 +705,7 @@ impl GalleryEngine {
                     .for_folder_group(runtime.selection.group_id),
             )
             .map_err(|e| AppServiceError::LibrarySetup(std::io::Error::other(e.to_string())))?;
-        runtime
-            .scan_active
-            .store(true, std::sync::atomic::Ordering::Release);
-        *runtime.scan_cancel.lock().await = Some(handle.cancellation_sender());
+        runtime.install_scan_sender(handle.cancellation_sender());
         let engine = self.clone();
         tokio::spawn(async move {
             engine.drain_runtime_scan(runtime, handle, generation).await;
@@ -750,6 +755,10 @@ impl GalleryEngine {
         &self,
         runtime: &Arc<SelectionRuntime>,
     ) -> Result<(), AppServiceError> {
+        if runtime.cancellation_requested() {
+            runtime.finish_scan(crate::hosted_runtime::ScanLifecycle::Cancelled);
+            return Ok(());
+        }
         let should_publish = {
             let mut state = self
                 .state
@@ -793,8 +802,7 @@ impl GalleryEngine {
                 })
                 .await;
         }
-        *runtime.scan_cancel.lock().await = None;
-        runtime.scan_finished.notify_one();
+        runtime.finish_scan(crate::hosted_runtime::ScanLifecycle::SourceUnavailable);
         self.remove_runtime_if_dead(runtime.selection.group_id, runtime);
         Ok(())
     }
@@ -812,20 +820,13 @@ impl GalleryEngine {
     pub(crate) fn runtime_scan_state(
         &self,
         selection: &GallerySelection,
-    ) -> Option<(Arc<tokio::sync::Notify>, bool)> {
+    ) -> Option<tokio::sync::watch::Receiver<crate::hosted_runtime::ScanLifecycle>> {
         self.runtimes
             .lock()
             .ok()
             .and_then(|runtimes| runtimes.get(&selection.group_id).and_then(Weak::upgrade))
             .filter(|runtime| runtime.selection == *selection)
-            .map(|runtime| {
-                (
-                    runtime.scan_finished.clone(),
-                    runtime
-                        .scan_active
-                        .load(std::sync::atomic::Ordering::Acquire),
-                )
-            })
+            .map(|runtime| runtime.lifecycle_receiver())
     }
 
     #[cfg(debug_assertions)]
@@ -879,6 +880,9 @@ impl GalleryEngine {
                     }
                 }
             }
+            if runtime.cancellation_requested() {
+                break;
+            }
             if self
                 .apply_runtime_batch(&runtime, generation, &batch)
                 .await
@@ -895,8 +899,9 @@ impl GalleryEngine {
             .await
             .map(|summary| !summary.cancelled)
             .unwrap_or(false);
-        if successful && !persistence_failed {
-            let completed = if let Ok(mut state) = self.state.lock() {
+        let mut completed = false;
+        if successful && !persistence_failed && !runtime.cancellation_requested() {
+            completed = if let Ok(mut state) = self.state.lock() {
                 state
                     .libraries
                     .catalog_mut()
@@ -929,7 +934,7 @@ impl GalleryEngine {
                 persistence_failed = true;
             }
         }
-        if persistence_failed {
+        if persistence_failed && !runtime.cancellation_requested() {
             let _ = runtime
                 .publish(WallUpdate::Warning {
                     selection_id: runtime.selection.id().to_owned(),
@@ -947,11 +952,16 @@ impl GalleryEngine {
                 })
                 .await;
         }
-        runtime
-            .scan_active
-            .store(false, std::sync::atomic::Ordering::Release);
-        runtime.scan_finished.notify_one();
-        *runtime.scan_cancel.lock().await = None;
+        let terminal = if runtime.cancellation_requested() {
+            crate::hosted_runtime::ScanLifecycle::Cancelled
+        } else if persistence_failed {
+            crate::hosted_runtime::ScanLifecycle::Failed
+        } else if completed {
+            crate::hosted_runtime::ScanLifecycle::Completed
+        } else {
+            crate::hosted_runtime::ScanLifecycle::Failed
+        };
+        runtime.finish_scan(terminal);
         self.remove_runtime_if_dead(runtime.selection.group_id, &runtime);
     }
 
@@ -961,6 +971,9 @@ impl GalleryEngine {
         generation: u64,
         events: &[IndexEvent],
     ) -> Result<(), AppServiceError> {
+        if runtime.cancellation_requested() {
+            return Ok(());
+        }
         let progress = events
             .iter()
             .filter_map(|e| {
@@ -1027,6 +1040,9 @@ impl GalleryEngine {
             updates
         };
         for update in updates {
+            if runtime.cancellation_requested() {
+                break;
+            }
             let _ = runtime.publish(update).await;
         }
         Ok(())

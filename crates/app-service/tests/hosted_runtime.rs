@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use photo_app_service::{
     AppConfig, DerivativeClass, DerivativeReference, GalleryEngine, GalleryScope, InteractionState,
-    MetadataReader, WallUpdate, WallWarningState,
+    MetadataReader, OrderState, WallUpdate, WallWarningState,
 };
 use photo_metadata::{MetadataBundle, MetadataReadWarning};
 
@@ -370,6 +370,143 @@ async fn primary_scan_survives_last_stream_drop() {
     assert_eq!(page.items.len(), 1);
 }
 
+async fn wait_for_runtime_count(engine: &GalleryEngine, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if engine.runtime_count_for_test() == expected {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("runtime registry did not reach the expected count");
+}
+
+async fn publish_child_updates(
+    engine: &GalleryEngine,
+    selection: &photo_app_service::GallerySelection,
+    child_asset: &photo_app_service::WallAsset,
+    selection_id: &str,
+    source_id: &str,
+    child_id: &str,
+) {
+    engine
+        .publish_update_for_test(
+            selection,
+            WallUpdate::CatalogBatch {
+                selection_id: selection_id.to_owned(),
+                assets: vec![child_asset.clone()],
+                order_state: OrderState::Provisional,
+                generation: 1,
+                progress: Default::default(),
+            },
+        )
+        .await;
+    engine
+        .publish_update_for_test(
+            selection,
+            WallUpdate::DerivativesReady {
+                selection_id: selection_id.to_owned(),
+                derivatives: vec![DerivativeReference {
+                    asset_id: child_id.to_owned(),
+                    kind: DerivativeClass::WallThumbnail,
+                    key: "child-thumb".to_owned(),
+                }],
+            },
+        )
+        .await;
+    engine
+        .publish_update_for_test(
+            selection,
+            WallUpdate::Warning {
+                selection_id: selection_id.to_owned(),
+                source_id: source_id.to_owned(),
+                asset_id: Some(child_id.to_owned()),
+                warning: WallWarningState {
+                    code: "scope-test".to_owned(),
+                    retryable: true,
+                },
+            },
+        )
+        .await;
+    engine
+        .publish_update_for_test(
+            selection,
+            WallUpdate::WarningCleared {
+                selection_id: selection_id.to_owned(),
+                source_id: source_id.to_owned(),
+                asset_id: Some(child_id.to_owned()),
+                code: "scope-test".to_owned(),
+            },
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn runtime_registry_drains_when_stream_drops_before_scan_completion() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    write_jpeg(&source.join("photo.jpg"));
+    let reader = BlockingReader::new();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open_with_reader(config, source, Arc::new(reader.clone())).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    let stream = engine.subscribe(
+        &selection,
+        "drop-before-completion".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    let entered = reader.entered.notified();
+    tokio::pin!(entered);
+    entered.as_mut().enable();
+    engine.ensure_running(&selection).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered)
+        .await
+        .expect("scan did not reach metadata reader");
+    drop(stream);
+    assert_eq!(engine.runtime_count_for_test(), 1);
+    reader.release();
+    wait_for_runtime_count(&engine, 0).await;
+}
+
+#[tokio::test]
+async fn runtime_registry_drains_after_completion_and_final_stream_drop() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    write_jpeg(&source.join("photo.jpg"));
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config, source).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    let mut stream = engine.subscribe(
+        &selection,
+        "drop-after-completion".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    engine.ensure_running(&selection).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if matches!(
+                stream.recv().await.unwrap().update,
+                WallUpdate::MetadataSettled { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("scan did not settle");
+    assert_eq!(engine.runtime_count_for_test(), 1);
+    drop(stream);
+    wait_for_runtime_count(&engine, 0).await;
+}
+
 #[tokio::test]
 async fn mixed_scope_filters_catalog_derivatives_and_warning_events() {
     let temp = tempfile::tempdir().unwrap();
@@ -662,4 +799,143 @@ async fn broadcast_lag_resync_watermark_is_monotonic() {
     let live = lagged.recv().await.unwrap();
     assert_eq!(live.id, 333);
     assert!(live.id > resync.id);
+}
+
+#[tokio::test]
+async fn scope_update_changes_filter_for_an_existing_subscription() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir_all(source.join("child")).unwrap();
+    write_jpeg(&source.join("root.jpg"));
+    write_jpeg(&source.join("child/child.jpg"));
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config, source).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    let mut subscription = engine.subscribe(
+        &selection,
+        "scope-change".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    engine.ensure_running(&selection).await.unwrap();
+
+    let page = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let event = subscription.recv().await.unwrap();
+            if matches!(event.update, WallUpdate::MetadataSettled { .. }) {
+                break engine
+                    .query_wall(
+                        &selection,
+                        GalleryScope::IncludeSubfolders,
+                        photo_app_service::WallQueryRequest::oldest_first(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+    })
+    .await
+    .expect("scan did not settle");
+    let child_id = page
+        .items
+        .iter()
+        .find(|asset| asset.display_name == "child.jpg")
+        .unwrap()
+        .id
+        .clone();
+    let child_asset = page
+        .items
+        .iter()
+        .find(|asset| asset.id == child_id)
+        .unwrap()
+        .clone();
+    let source_id = summary.source_id.clone();
+    let selection_id = summary.id.clone();
+
+    publish_child_updates(
+        &engine,
+        &selection,
+        &child_asset,
+        &selection_id,
+        &source_id,
+        &child_id,
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), subscription.recv())
+            .await
+            .is_err(),
+        "current-folder scope admitted child updates before its scope changed"
+    );
+
+    engine
+        .update_client_interaction(
+            &selection,
+            "scope-change",
+            GalleryScope::IncludeSubfolders,
+            InteractionState::Active,
+        )
+        .await
+        .unwrap();
+    publish_child_updates(
+        &engine,
+        &selection,
+        &child_asset,
+        &selection_id,
+        &source_id,
+        &child_id,
+    )
+    .await;
+    let mut admitted = Vec::new();
+    for _ in 0..4 {
+        admitted.push(
+            tokio::time::timeout(Duration::from_secs(1), subscription.recv())
+                .await
+                .expect("include-subfolders scope did not admit a child update")
+                .unwrap()
+                .update,
+        );
+    }
+    assert!(admitted.iter().any(|update| matches!(
+        update,
+        WallUpdate::CatalogBatch { assets, .. } if assets.iter().any(|asset| asset.id == child_id)
+    )));
+    assert!(admitted.iter().any(|update| matches!(
+        update,
+        WallUpdate::DerivativesReady { derivatives, .. } if derivatives.iter().any(|derivative| derivative.asset_id == child_id)
+    )));
+    assert!(admitted.iter().any(|update| matches!(
+        update,
+        WallUpdate::Warning { asset_id: Some(asset_id), .. } if asset_id == &child_id
+    )));
+    assert!(admitted.iter().any(|update| matches!(
+        update,
+        WallUpdate::WarningCleared { asset_id: Some(asset_id), .. } if asset_id == &child_id
+    )));
+
+    engine
+        .update_client_interaction(
+            &selection,
+            "scope-change",
+            GalleryScope::CurrentFolder,
+            InteractionState::Active,
+        )
+        .await
+        .unwrap();
+    publish_child_updates(
+        &engine,
+        &selection,
+        &child_asset,
+        &selection_id,
+        &source_id,
+        &child_id,
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), subscription.recv())
+            .await
+            .is_err(),
+        "current-folder scope admitted child updates after changing back"
+    );
 }

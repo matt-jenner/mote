@@ -3,13 +3,50 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use photo_domain::GalleryScope;
-use tokio::sync::{Notify, broadcast, watch};
+use tokio::sync::{broadcast, watch};
 
 use crate::{GalleryEngine, GallerySelection, InteractionState, WallUpdate};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScanLifecycle {
+    Idle,
+    Starting,
+    Running,
+    Completed,
+    Cancelled,
+    SourceUnavailable,
+    Failed,
+}
+
+impl ScanLifecycle {
+    pub(crate) fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Cancelled | Self::SourceUnavailable | Self::Failed
+        )
+    }
+}
+
+struct ScanControl {
+    state: ScanLifecycle,
+    cancel_requested: bool,
+    sender: Option<watch::Sender<bool>>,
+}
+
+impl ScanControl {
+    fn new(state: ScanLifecycle) -> Self {
+        Self {
+            state,
+            cancel_requested: false,
+            sender: None,
+        }
+    }
+}
+
 pub(crate) struct SelectionRuntime {
     pub(crate) selection: GallerySelection,
-    pub(crate) scan_cancel: tokio::sync::Mutex<Option<watch::Sender<bool>>>,
+    scan_cancel: Mutex<ScanControl>,
+    pub(crate) scan_lifecycle: watch::Sender<ScanLifecycle>,
     pub(crate) coordinator: Arc<crate::derivative_coordinator::DerivativeCoordinator>,
     pub(crate) updates: broadcast::Sender<SequencedWallUpdate>,
     pub(crate) publication: Mutex<()>,
@@ -17,8 +54,6 @@ pub(crate) struct SelectionRuntime {
     pub(crate) next_event_id: AtomicU64,
     pub(crate) next_client_token: AtomicU64,
     pub(crate) settled: std::sync::atomic::AtomicBool,
-    pub(crate) scan_active: std::sync::atomic::AtomicBool,
-    pub(crate) scan_finished: Arc<Notify>,
     pub(crate) source_unavailable_reported: std::sync::atomic::AtomicBool,
     pub(crate) client_demand: Mutex<HashMap<u64, ClientDemand>>,
 }
@@ -29,6 +64,7 @@ pub(crate) struct ClientDemand {
     pub(crate) scope: GalleryScope,
     pub(crate) interaction: InteractionState,
     pub(crate) lease_until: tokio::time::Instant,
+    pub(crate) scope_sender: watch::Sender<GalleryScope>,
 }
 
 #[derive(Clone, Debug)]
@@ -61,9 +97,16 @@ impl SelectionRuntime {
         settled: bool,
     ) -> Arc<Self> {
         let (updates, _) = broadcast::channel(256);
+        let initial_lifecycle = if settled {
+            ScanLifecycle::Completed
+        } else {
+            ScanLifecycle::Idle
+        };
+        let (scan_lifecycle, _) = watch::channel(initial_lifecycle);
         Arc::new(Self {
             selection: selection.clone(),
-            scan_cancel: tokio::sync::Mutex::new(None),
+            scan_cancel: Mutex::new(ScanControl::new(initial_lifecycle)),
+            scan_lifecycle,
             coordinator,
             updates,
             publication: Mutex::new(()),
@@ -71,11 +114,94 @@ impl SelectionRuntime {
             next_event_id: AtomicU64::new(0),
             next_client_token: AtomicU64::new(1),
             settled: std::sync::atomic::AtomicBool::new(settled),
-            scan_active: std::sync::atomic::AtomicBool::new(false),
-            scan_finished: Arc::new(Notify::new()),
             source_unavailable_reported: std::sync::atomic::AtomicBool::new(false),
             client_demand: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub(crate) fn lifecycle_receiver(&self) -> watch::Receiver<ScanLifecycle> {
+        self.scan_lifecycle.subscribe()
+    }
+
+    pub(crate) fn admit_scan(&self) -> bool {
+        let admitted = {
+            let mut control = self.scan_cancel.lock().expect("scan control poisoned");
+            if !matches!(
+                control.state,
+                ScanLifecycle::Idle | ScanLifecycle::SourceUnavailable | ScanLifecycle::Failed
+            ) {
+                false
+            } else {
+                control.state = ScanLifecycle::Starting;
+                control.cancel_requested = false;
+                control.sender = None;
+                true
+            }
+        };
+        if admitted {
+            self.scan_lifecycle.send_replace(ScanLifecycle::Starting);
+        }
+        admitted
+    }
+
+    /// Installs the indexer's cancellation sender after scan admission. A
+    /// cancellation can race this handoff, so the sender is cancelled before
+    /// it is published when the control state has already been terminated.
+    pub(crate) fn install_scan_sender(&self, sender: watch::Sender<bool>) -> bool {
+        let cancel_now = {
+            let mut control = self.scan_cancel.lock().expect("scan control poisoned");
+            if control.state == ScanLifecycle::Starting && !control.cancel_requested {
+                control.state = ScanLifecycle::Running;
+                control.sender = Some(sender.clone());
+                false
+            } else {
+                true
+            }
+        };
+        if cancel_now {
+            let _ = sender.send(true);
+        } else {
+            self.scan_lifecycle.send_replace(ScanLifecycle::Running);
+        }
+        cancel_now
+    }
+
+    /// Requests cancellation without holding a guard across an await. The
+    /// sender handoff and cancellation flag share one short synchronous lock,
+    /// so a replacement cannot miss a sender installed concurrently.
+    pub(crate) fn request_cancel(&self) {
+        let sender = {
+            let mut control = self.scan_cancel.lock().expect("scan control poisoned");
+            control.cancel_requested = true;
+            control.state = ScanLifecycle::Cancelled;
+            control.sender.take()
+        };
+        self.scan_lifecycle.send_replace(ScanLifecycle::Cancelled);
+        if let Some(sender) = sender {
+            let _ = sender.send(true);
+        }
+    }
+
+    pub(crate) fn finish_scan(&self, requested_state: ScanLifecycle) -> ScanLifecycle {
+        let state = {
+            let mut control = self.scan_cancel.lock().expect("scan control poisoned");
+            let state = if control.cancel_requested || control.state == ScanLifecycle::Cancelled {
+                ScanLifecycle::Cancelled
+            } else {
+                requested_state
+            };
+            control.state = state;
+            control.cancel_requested = state == ScanLifecycle::Cancelled;
+            control.sender = None;
+            state
+        };
+        self.scan_lifecycle.send_replace(state);
+        state
+    }
+
+    pub(crate) fn cancellation_requested(&self) -> bool {
+        let control = self.scan_cancel.lock().expect("scan control poisoned");
+        control.cancel_requested || control.state == ScanLifecycle::Cancelled
     }
 
     pub(crate) async fn publish(&self, update: WallUpdate) -> SequencedWallUpdate {
@@ -97,8 +223,13 @@ impl SelectionRuntime {
         event
     }
 
-    pub(crate) fn register(&self, client_id: String, scope: GalleryScope) -> u64 {
+    pub(crate) fn register(
+        &self,
+        client_id: String,
+        scope: GalleryScope,
+    ) -> (u64, watch::Receiver<GalleryScope>) {
         let token = self.next_client_token.fetch_add(1, Ordering::AcqRel);
+        let (scope_sender, scope_receiver) = watch::channel(scope);
         let mut demand = self.client_demand.lock().expect("client demand poisoned");
         demand.insert(
             token,
@@ -107,9 +238,10 @@ impl SelectionRuntime {
                 scope,
                 interaction: InteractionState::Active,
                 lease_until: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                scope_sender,
             },
         );
-        token
+        (token, scope_receiver)
     }
 
     pub(crate) fn remove(&self, client_id: &str, token: u64) {
@@ -146,18 +278,13 @@ impl SelectionRuntime {
         if self.settled.load(Ordering::Acquire) {
             return Ok(());
         }
-        let (placeholder, _) = watch::channel(false);
-        {
-            let mut cancel = self.scan_cancel.lock().await;
-            if cancel.is_some() {
-                return Ok(());
-            }
-            *cancel = Some(placeholder);
+        if !self.admit_scan() {
+            return Ok(());
         }
         match engine.start_runtime_scan(self.clone()).await {
             Ok(()) => Ok(()),
             Err(error) => {
-                *self.scan_cancel.lock().await = None;
+                self.finish_scan(ScanLifecycle::Failed);
                 Err(error)
             }
         }
@@ -170,18 +297,26 @@ pub struct SelectionEventSubscription {
     pub(crate) runtime: Arc<SelectionRuntime>,
     pub(crate) client_id: String,
     pub(crate) client_token: u64,
-    pub(crate) scope: GalleryScope,
+    pub(crate) scope: watch::Receiver<GalleryScope>,
+    pub(crate) lifecycle: watch::Receiver<ScanLifecycle>,
     pub(crate) lagged: bool,
     pub(crate) resync_after: Option<u64>,
     pub(crate) resume_after: Option<u64>,
     pub(crate) engine: GalleryEngine,
+    pub(crate) terminal: Option<ScanLifecycle>,
 }
 
 impl SelectionEventSubscription {
     pub async fn recv(&mut self) -> Option<SequencedWallUpdate> {
         loop {
+            if *self.lifecycle.borrow() == ScanLifecycle::Cancelled {
+                self.terminal = Some(ScanLifecycle::Cancelled);
+                return None;
+            }
             let next = if let Some(event) = self.backlog.pop_front() {
                 Ok(event)
+            } else if self.terminal == Some(ScanLifecycle::Cancelled) {
+                return None;
             } else if self.lagged {
                 self.lagged = false;
                 let head = self.runtime.next_event_id.load(Ordering::Acquire);
@@ -194,7 +329,22 @@ impl SelectionEventSubscription {
                     },
                 });
             } else {
-                self.receiver.recv().await
+                tokio::select! {
+                    event = self.receiver.recv() => event,
+                    changed = self.lifecycle.changed() => {
+                        match changed {
+                            Ok(()) => {
+                                let state = *self.lifecycle.borrow();
+                                if state == ScanLifecycle::Cancelled {
+                                    self.terminal = Some(state);
+                                    return None;
+                                }
+                                continue;
+                            }
+                            Err(_) => return None,
+                        }
+                    }
+                }
             };
             let event = match next {
                 Ok(event) => event,
@@ -204,6 +354,13 @@ impl SelectionEventSubscription {
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
             };
+            if self
+                .terminal
+                .is_some_and(|terminal| terminal == ScanLifecycle::Cancelled)
+                || *self.lifecycle.borrow() == ScanLifecycle::Cancelled
+            {
+                return None;
+            }
             if self
                 .resume_after
                 .is_some_and(|watermark| event.id <= watermark)
@@ -218,6 +375,7 @@ impl SelectionEventSubscription {
     }
 
     fn filter(&self, mut event: SequencedWallUpdate) -> Option<SequencedWallUpdate> {
+        let scope = *self.scope.borrow();
         let state = self.engine.state.lock().ok()?;
         let catalog = state.libraries.catalog();
         match &mut event.update {
@@ -231,11 +389,7 @@ impl SelectionEventSubscription {
                     })
                     .collect::<Vec<_>>();
                 let allowed = catalog
-                    .wall_records_for_assets_scoped(
-                        self.runtime.selection.group_id(),
-                        self.scope,
-                        &ids,
-                    )
+                    .wall_records_for_assets_scoped(self.runtime.selection.group_id(), scope, &ids)
                     .ok()?;
                 assets.retain(|a| {
                     allowed
@@ -254,11 +408,7 @@ impl SelectionEventSubscription {
                     })
                     .collect::<Vec<_>>();
                 let allowed = catalog
-                    .wall_records_for_assets_scoped(
-                        self.runtime.selection.group_id(),
-                        self.scope,
-                        &ids,
-                    )
+                    .wall_records_for_assets_scoped(self.runtime.selection.group_id(), scope, &ids)
                     .ok()?;
                 derivatives.retain(|a| {
                     allowed
@@ -283,7 +433,7 @@ impl SelectionEventSubscription {
                 if catalog
                     .wall_records_for_assets_scoped(
                         self.runtime.selection.group_id(),
-                        self.scope,
+                        scope,
                         &[parsed],
                     )
                     .ok()?
@@ -312,6 +462,7 @@ mod tests {
     use super::*;
     use photo_domain::{FolderGroupId, LibraryId, RelativePathKey};
     use std::path::Path;
+    use std::time::Duration;
 
     fn selection() -> GallerySelection {
         GallerySelection {
@@ -374,7 +525,8 @@ mod tests {
             Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
             false,
         );
-        let token = runtime.register("client".to_owned(), GalleryScope::IncludeSubfolders);
+        let (token, _scope) =
+            runtime.register("client".to_owned(), GalleryScope::IncludeSubfolders);
         runtime
             .client_demand
             .lock()
@@ -386,5 +538,99 @@ mod tests {
         assert_eq!(runtime.aggregate_scope(), GalleryScope::IncludeSubfolders);
         runtime.remove("client", token);
         assert_eq!(runtime.aggregate_scope(), GalleryScope::CurrentFolder);
+    }
+
+    #[tokio::test]
+    async fn scan_cancellation_wakes_multiple_lifecycle_waiters() {
+        let runtime = SelectionRuntime::new(
+            selection(),
+            Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
+            false,
+        );
+        let mut first = runtime.lifecycle_receiver();
+        let mut second = runtime.lifecycle_receiver();
+        assert!(runtime.admit_scan());
+        runtime.request_cancel();
+
+        tokio::time::timeout(Duration::from_secs(1), first.changed())
+            .await
+            .expect("first lifecycle waiter did not wake")
+            .expect("first lifecycle sender closed");
+        tokio::time::timeout(Duration::from_secs(1), second.changed())
+            .await
+            .expect("second lifecycle waiter did not wake")
+            .expect("second lifecycle sender closed");
+        assert_eq!(*first.borrow(), ScanLifecycle::Cancelled);
+        assert_eq!(*second.borrow(), ScanLifecycle::Cancelled);
+    }
+
+    #[test]
+    fn scan_admission_is_exactly_once_under_concurrent_callers() {
+        let runtime = SelectionRuntime::new(
+            selection(),
+            Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
+            false,
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let first_runtime = runtime.clone();
+        let first_barrier = barrier.clone();
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_runtime.admit_scan()
+        });
+        let second_runtime = runtime.clone();
+        let second_barrier = barrier.clone();
+        let second = std::thread::spawn(move || {
+            second_barrier.wait();
+            second_runtime.admit_scan()
+        });
+        barrier.wait();
+        let admitted = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(admitted.iter().filter(|admitted| **admitted).count(), 1);
+    }
+
+    #[test]
+    fn cancellation_survives_scan_control_lock_contention() {
+        let runtime = SelectionRuntime::new(
+            selection(),
+            Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
+            false,
+        );
+        assert!(runtime.admit_scan());
+        let guard = runtime.scan_cancel.lock().unwrap();
+        let worker = {
+            let runtime = runtime.clone();
+            std::thread::spawn(move || runtime.request_cancel())
+        };
+        drop(guard);
+        worker.join().unwrap();
+        assert_eq!(
+            *runtime.lifecycle_receiver().borrow(),
+            ScanLifecycle::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_completion_wakes_multiple_lifecycle_waiters() {
+        let runtime = SelectionRuntime::new(
+            selection(),
+            Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
+            false,
+        );
+        let mut first = runtime.lifecycle_receiver();
+        let mut second = runtime.lifecycle_receiver();
+        assert!(runtime.admit_scan());
+        runtime.finish_scan(ScanLifecycle::Completed);
+
+        tokio::time::timeout(Duration::from_secs(1), first.changed())
+            .await
+            .expect("first lifecycle waiter did not wake")
+            .expect("first lifecycle sender closed");
+        tokio::time::timeout(Duration::from_secs(1), second.changed())
+            .await
+            .expect("second lifecycle waiter did not wake")
+            .expect("second lifecycle sender closed");
+        assert_eq!(*first.borrow(), ScanLifecycle::Completed);
+        assert_eq!(*second.borrow(), ScanLifecycle::Completed);
     }
 }

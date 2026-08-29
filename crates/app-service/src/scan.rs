@@ -20,14 +20,29 @@ impl AppService {
         selection_token: SelectionToken,
     ) -> Result<(), AppServiceError> {
         let selection = self.gallery.selection_from_token(selection_token)?;
-        let scope = self
-            .state()
-            .ok()
-            .and_then(|state| state.libraries.catalog().load_app_state().ok())
-            .map(|state| state.gallery_scope)
-            .unwrap_or(GalleryScope::IncludeSubfolders);
-        self.start_desktop_update_bridge(&selection, scope, selection_token);
-        self.mark_desktop_scan_started(selection_token);
+        if !self.admit_desktop_scan(selection_token)? {
+            return Ok(());
+        }
+        {
+            // Keep bridge installation in the same transition critical section
+            // as selection changes. A newer selection therefore cannot become
+            // active between this check and the bridge subscription.
+            let _transition = self
+                .selection_transition
+                .lock()
+                .map_err(|_| AppServiceError::StatePoisoned)?;
+            if !self.desktop_selection_is_current_locked(selection_token) {
+                self.clear_desktop_scan(selection_token);
+                return Ok(());
+            }
+            let scope = self
+                .state()
+                .ok()
+                .and_then(|state| state.libraries.catalog().load_app_state().ok())
+                .map(|state| state.gallery_scope)
+                .unwrap_or(GalleryScope::IncludeSubfolders);
+            self.start_desktop_update_bridge(&selection, scope, selection_token);
+        }
         self.wake_derivative_workers();
         let result = self.gallery.ensure_running(&selection).await;
         if result.is_err() {
@@ -56,16 +71,18 @@ impl AppService {
             scope,
             None,
         );
-        let updates = self.updates.clone();
         let service = self.clone();
         tokio::spawn(async move {
             while let Some(event) = subscription.recv().await {
-                let settled = matches!(event.update, WallUpdate::MetadataSettled { .. });
+                let update = event.update;
+                let settled = matches!(&update, WallUpdate::MetadataSettled { .. });
                 let terminal = matches!(
-                    event.update,
+                    &update,
                     WallUpdate::MetadataSettled { .. } | WallUpdate::SourceUnavailable { .. }
                 );
-                let _ = updates.send(event.update);
+                if !service.forward_desktop_update(selection_token, update) {
+                    break;
+                }
                 if terminal {
                     service.clear_desktop_scan(selection_token);
                     service.coordinator.wake();
@@ -82,13 +99,74 @@ impl AppService {
         });
     }
 
-    fn mark_desktop_scan_started(&self, selection: SelectionToken) {
-        if let Ok(mut state) = self.state.lock() {
-            state.active_scan = Some(crate::service::ScanOwner {
-                selection,
-                generation: 0,
-            });
+    fn admit_desktop_scan(&self, selection: SelectionToken) -> Result<bool, AppServiceError> {
+        let _transition = self
+            .selection_transition
+            .lock()
+            .map_err(|_| AppServiceError::StatePoisoned)?;
+        let mut state = self.state()?;
+        let stored = state.libraries.catalog().load_app_state()?;
+        let Some(active) = stored.active_selection else {
+            return Ok(false);
+        };
+        let group = state
+            .libraries
+            .catalog()
+            .folder_group_for_path(active.library_id, &active.relative_folder)?;
+        if active.library_id != selection.library_id
+            || group != Some(selection.group_id)
+            || state.selection_epoch != selection.epoch
+            || state.protected_group != Some(selection.group_id)
+        {
+            return Ok(false);
         }
+        if state
+            .active_scan
+            .is_some_and(|owner| owner.selection == selection)
+        {
+            return Ok(false);
+        }
+        state.active_scan = Some(crate::service::ScanOwner {
+            selection,
+            generation: 0,
+        });
+        Ok(true)
+    }
+
+    fn desktop_selection_is_current_locked(&self, selection: SelectionToken) -> bool {
+        let Ok(state) = self.state() else {
+            return false;
+        };
+        let Ok(Some(active)) = state
+            .libraries
+            .catalog()
+            .load_app_state()
+            .map(|state| state.active_selection)
+        else {
+            return false;
+        };
+        let Ok(group) = state
+            .libraries
+            .catalog()
+            .folder_group_for_path(active.library_id, &active.relative_folder)
+        else {
+            return false;
+        };
+        active.library_id == selection.library_id
+            && group == Some(selection.group_id)
+            && state.selection_epoch == selection.epoch
+            && state.protected_group == Some(selection.group_id)
+    }
+
+    fn forward_desktop_update(&self, selection: SelectionToken, update: WallUpdate) -> bool {
+        let Ok(_transition) = self.selection_transition.lock() else {
+            return false;
+        };
+        if !self.desktop_selection_is_current_locked(selection) {
+            return false;
+        }
+        let _ = self.updates.send(update);
+        true
     }
 
     fn clear_desktop_scan(&self, selection: SelectionToken) {
@@ -109,16 +187,18 @@ impl AppService {
         let service = self.clone();
         tokio::spawn(async move {
             loop {
-                let Some((finished, active)) = service.gallery.runtime_scan_state(&selection)
-                else {
+                let Some(mut lifecycle) = service.gallery.runtime_scan_state(&selection) else {
                     service.clear_desktop_scan(selection_token);
                     return;
                 };
-                if !active {
+                if lifecycle.borrow().is_terminal() {
                     service.clear_desktop_scan(selection_token);
                     return;
                 }
-                finished.notified().await;
+                if lifecycle.changed().await.is_err() {
+                    service.clear_desktop_scan(selection_token);
+                    return;
+                }
             }
         });
     }

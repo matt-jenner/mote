@@ -480,6 +480,7 @@ pub struct AppService {
     #[cfg(test)]
     pub(crate) scan_completion_wake_test_hook: Arc<Mutex<Option<ScanCompletionWakeTestHook>>>,
     source_validator: Arc<dyn RecentSourceValidator>,
+    pub(crate) selection_transition: Arc<Mutex<()>>,
     selection_request_sequence: Arc<AtomicU64>,
     latest_validated_selection: Arc<AtomicU64>,
 }
@@ -619,6 +620,7 @@ impl AppService {
             #[cfg(test)]
             scan_completion_wake_test_hook: Arc::new(Mutex::new(None)),
             source_validator,
+            selection_transition: Arc::new(Mutex::new(())),
             selection_request_sequence: Arc::new(AtomicU64::new(0)),
             latest_validated_selection: Arc::new(AtomicU64::new(0)),
         };
@@ -753,6 +755,10 @@ impl AppService {
             .wrapping_add(1)
             .max(1);
         let validated = self.source_validator.validate_recent(folder)?;
+        let _transition = self
+            .selection_transition
+            .lock()
+            .map_err(|_| AppServiceError::StatePoisoned)?;
         let mut state = self.state()?;
         let prepared = state.libraries.prepare_validated_recent(validated)?;
         self.latest_validated_selection
@@ -1488,6 +1494,120 @@ mod tests {
         assert_eq!(stored.library_id, older_token.library_id);
         assert_eq!(state.selection_epoch, older_token.epoch);
         assert_eq!(state.protected_group, Some(older_token.group_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_async_scan_token_is_rejected_before_bridge_or_scan_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        ImageBuffer::from_pixel(2, 2, Rgb([10_u8, 20, 30]))
+            .save(first.join("first.jpg"))
+            .unwrap();
+        ImageBuffer::from_pixel(2, 2, Rgb([30_u8, 20, 10]))
+            .save(second.join("second.jpg"))
+            .unwrap();
+        let reader_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let service = AppService::open_with_reader(
+            AppConfig::new(temp.path().join("data"), temp.path().join("cache")),
+            Arc::new(BlockingReader(reader_gate.clone())),
+        )
+        .unwrap();
+        let first_token = service.select_recent(&first).unwrap().1;
+        service.select_recent(&second).unwrap();
+        let mut updates = service.subscribe_wall_updates();
+
+        let start_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            service.start_selected_scan(first_token),
+        )
+        .await;
+
+        let (released, changed) = &*reader_gate;
+        *released.lock().unwrap() = true;
+        changed.notify_all();
+
+        start_result
+            .expect("stale scan admission must not block")
+            .unwrap();
+        assert!(
+            service.state().unwrap().active_scan.is_none(),
+            "a stale scan token must not install the desktop active marker"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), updates.recv())
+                .await
+                .is_err(),
+            "a stale scan token must not install a bridge or forward updates"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_desktop_bridge_observes_terminal_lifecycle_and_drops_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        ImageBuffer::from_pixel(2, 2, Rgb([10_u8, 20, 30]))
+            .save(first.join("first.jpg"))
+            .unwrap();
+        ImageBuffer::from_pixel(2, 2, Rgb([30_u8, 20, 10]))
+            .save(second.join("second.jpg"))
+            .unwrap();
+        let reader_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let service = AppService::open_with_reader(
+            AppConfig::new(temp.path().join("data"), temp.path().join("cache")),
+            Arc::new(BlockingReader(reader_gate.clone())),
+        )
+        .unwrap();
+        let first_token = service.select_recent(&first).unwrap().1;
+        let first_selection = service.gallery.selection_from_token(first_token).unwrap();
+        let mut lifecycle = {
+            service.start_selected_scan(first_token).await.unwrap();
+            service
+                .gallery
+                .runtime_scan_state(&first_selection)
+                .expect("admitted scan should retain its runtime")
+        };
+        assert_eq!(
+            *lifecycle.borrow(),
+            crate::hosted_runtime::ScanLifecycle::Running
+        );
+
+        let mut updates = service.subscribe_wall_updates();
+        service.select_recent(&second).unwrap();
+        let (released, changed) = &*reader_gate;
+        *released.lock().unwrap() = true;
+        changed.notify_all();
+        if *lifecycle.borrow() != crate::hosted_runtime::ScanLifecycle::Cancelled {
+            tokio::time::timeout(Duration::from_secs(1), lifecycle.changed())
+                .await
+                .expect("cancellation did not wake the bridge lifecycle watcher")
+                .expect("bridge lifecycle sender closed before cancellation");
+        }
+        assert_eq!(
+            *lifecycle.borrow(),
+            crate::hosted_runtime::ScanLifecycle::Cancelled
+        );
+        assert!(service.state().unwrap().active_scan.is_none());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while service.runtime_count_for_test() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled bridge did not release its runtime");
+
+        while updates.try_recv().is_ok() {}
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), updates.recv())
+                .await
+                .is_err(),
+            "cancelled desktop bridge forwarded a stale update"
+        );
     }
 
     fn seed_wall_asset(service: &AppService, selection: super::SelectionToken, name: &str) {
