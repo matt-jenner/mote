@@ -330,6 +330,9 @@ async fn invalid_folder_queries_are_rejected_before_filesystem_access() {
 
 #[tokio::test]
 async fn mounted_root_missing_file_and_unreadable_fail_as_source_unavailable() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");
     std::fs::create_dir(&source).unwrap();
@@ -392,7 +395,16 @@ async fn mounted_root_missing_file_and_unreadable_fail_as_source_unavailable() {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Privileged runners can still enumerate this directory. In that
+        // environment there is no unreadable case to assert, so restore and
+        // skip only after the real operation demonstrably succeeds.
+        if std::fs::read_dir(&source).is_ok() {
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
     }
+    #[cfg(not(unix))]
+    return;
     let app = build_router(state);
     let response = app
         .oneshot(
@@ -403,6 +415,8 @@ async fn mounted_root_missing_file_and_unreadable_fail_as_source_unavailable() {
         )
         .await
         .unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let value: serde_json::Value =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
