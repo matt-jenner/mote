@@ -90,6 +90,7 @@ pub struct IndexScheduler {
     state: Mutex<SchedulerState>,
     config: SchedulerConfig,
     available_background_permits: AtomicUsize,
+    active_enrichment: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -131,6 +132,7 @@ impl IndexScheduler {
         Self {
             state: Mutex::new(SchedulerState::default()),
             available_background_permits: AtomicUsize::new(config.idle_workers),
+            active_enrichment: AtomicUsize::new(0),
             config,
         }
     }
@@ -184,21 +186,32 @@ impl IndexScheduler {
     /// higher-priority job owned by another consumer.
     pub async fn next_owned(&self, owner_prefix: &str) -> Option<IndexJob> {
         let mut state = self.state.lock().await;
-        loop {
-            let entry = state.heap.peek()?.clone();
+        // A foreign job may be globally highest priority. Find the best valid
+        // job for this owner without removing or reordering any foreign work.
+        let mut heap = std::mem::take(&mut state.heap).into_vec();
+        let mut selected = None;
+        let mut index = 0;
+        while index < heap.len() {
+            let entry = &heap[index];
             let valid = state.queued.get(&entry.name).is_some_and(|current| {
                 current.sequence == entry.sequence && current.job.priority == entry.priority
             });
             if !valid {
-                state.heap.pop();
+                heap.swap_remove(index);
                 continue;
             }
-            if !entry.name.starts_with(owner_prefix) {
-                return None;
+            if entry.name.starts_with(owner_prefix)
+                && selected
+                    .as_ref()
+                    .is_none_or(|best: &QueueEntry| entry > best)
+            {
+                selected = Some(entry.clone());
             }
-            state.heap.pop();
-            return state.queued.remove(&entry.name).map(|queued| queued.job);
+            index += 1;
         }
+        state.heap = BinaryHeap::from(heap);
+        let entry = selected?;
+        state.queued.remove(&entry.name).map(|queued| queued.job)
     }
 
     pub async fn set_interaction_mode(&self, mode: InteractionMode) {
@@ -213,6 +226,29 @@ impl IndexScheduler {
     pub fn available_background_permits(&self) -> usize {
         self.available_background_permits
             .load(AtomicOrdering::Acquire)
+    }
+
+    pub(crate) fn try_admit_enrichment(&self) -> bool {
+        let limit = self.available_background_permits().clamp(1, 2);
+        let mut current = self.active_enrichment.load(AtomicOrdering::Acquire);
+        loop {
+            if current >= limit {
+                return false;
+            }
+            match self.active_enrichment.compare_exchange_weak(
+                current,
+                current + 1,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    pub(crate) fn release_enrichment(&self) {
+        self.active_enrichment.fetch_sub(1, AtomicOrdering::AcqRel);
     }
 
     pub async fn cancel_below(&self, minimum: JobPriority) {

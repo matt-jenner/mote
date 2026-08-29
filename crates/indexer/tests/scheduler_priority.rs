@@ -77,13 +77,6 @@ async fn owned_dequeue_does_not_remove_foreign_higher_priority_work() {
         ))
         .await;
 
-    assert!(
-        scheduler
-            .next_owned("photo-derivative-coordinator:")
-            .await
-            .is_none()
-    );
-    assert_eq!(scheduler.next().await.unwrap().name(), "foreign-visible");
     assert_eq!(
         scheduler
             .next_owned("photo-derivative-coordinator:")
@@ -91,6 +84,40 @@ async fn owned_dequeue_does_not_remove_foreign_higher_priority_work() {
             .unwrap()
             .name(),
         "photo-derivative-coordinator:idle"
+    );
+    assert_eq!(scheduler.next().await.unwrap().name(), "foreign-visible");
+    assert!(
+        scheduler
+            .next_owned("photo-derivative-coordinator:")
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn owned_dequeue_finds_its_best_job_behind_a_foreign_head() {
+    let scheduler = IndexScheduler::new(SchedulerConfig::default());
+    scheduler
+        .enqueue(job("left-low", JobPriority::NearViewport))
+        .await;
+    scheduler
+        .enqueue(job("right-high", JobPriority::Visible))
+        .await;
+    scheduler
+        .enqueue(job("left-high", JobPriority::ViewerPreview))
+        .await;
+
+    assert_eq!(
+        scheduler.next_owned("left-").await.unwrap().name(),
+        "left-high"
+    );
+    assert_eq!(
+        scheduler.next_owned("left-").await.unwrap().name(),
+        "left-low"
+    );
+    assert_eq!(
+        scheduler.next_owned("right-").await.unwrap().name(),
+        "right-high"
     );
 }
 

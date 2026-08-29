@@ -51,3 +51,17 @@ async fn selection_id_aliases_are_rejected_before_runtime_creation() {
     let uppercase = format!("selection-{}", uuid.to_uppercase());
     assert!(engine.resolve_selection(&uppercase).is_err());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn selection_rejects_a_symlink_that_escapes_the_hosted_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, source.join("escape")).unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config, source).unwrap();
+    assert!(engine.select_relative(Path::new("escape")).await.is_err());
+}

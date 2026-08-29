@@ -13,18 +13,20 @@ pub(crate) struct SelectionRuntime {
     #[allow(dead_code)]
     pub(crate) coordinator: Arc<crate::derivative_coordinator::DerivativeCoordinator>,
     pub(crate) updates: broadcast::Sender<SequencedWallUpdate>,
+    pub(crate) publication: Mutex<()>,
     pub(crate) history: Mutex<VecDeque<SequencedWallUpdate>>,
     pub(crate) next_event_id: AtomicU64,
     pub(crate) next_client_token: AtomicU64,
-    pub(crate) client_demand: Mutex<HashMap<String, ClientDemand>>,
+    pub(crate) settled: std::sync::atomic::AtomicBool,
+    pub(crate) client_demand: Mutex<HashMap<u64, ClientDemand>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct ClientDemand {
+    pub(crate) client_id: String,
     pub(crate) scope: GalleryScope,
     pub(crate) interaction: InteractionState,
     pub(crate) lease_until: tokio::time::Instant,
-    pub(crate) token: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -49,14 +51,20 @@ impl SelectionRuntime {
                 ),
             ),
             updates,
+            publication: Mutex::new(()),
             history: Mutex::new(VecDeque::with_capacity(256)),
             next_event_id: AtomicU64::new(0),
             next_client_token: AtomicU64::new(1),
+            settled: std::sync::atomic::AtomicBool::new(false),
             client_demand: Mutex::new(HashMap::new()),
         })
     }
 
     pub(crate) async fn publish(&self, update: WallUpdate) -> SequencedWallUpdate {
+        let _publication = self
+            .publication
+            .lock()
+            .expect("runtime publication poisoned");
         let event = SequencedWallUpdate {
             id: self.next_event_id.fetch_add(1, Ordering::AcqRel) + 1,
             update,
@@ -75,12 +83,12 @@ impl SelectionRuntime {
         let token = self.next_client_token.fetch_add(1, Ordering::AcqRel);
         let mut demand = self.client_demand.lock().expect("client demand poisoned");
         demand.insert(
-            client_id,
+            token,
             ClientDemand {
+                client_id,
                 scope,
                 interaction: InteractionState::Active,
                 lease_until: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
-                token,
             },
         );
         token
@@ -88,12 +96,8 @@ impl SelectionRuntime {
 
     pub(crate) fn remove(&self, client_id: &str, token: u64) {
         let mut demand = self.client_demand.lock().expect("client demand poisoned");
-        if demand
-            .get(client_id)
-            .is_some_and(|value| value.token == token)
-        {
-            demand.remove(client_id);
-        }
+        let _ = client_id;
+        demand.remove(&token);
     }
 
     pub(crate) fn aggregate_scope(&self) -> GalleryScope {
@@ -114,6 +118,9 @@ impl SelectionRuntime {
         self: &Arc<Self>,
         engine: GalleryEngine,
     ) -> Result<(), crate::AppServiceError> {
+        if self.settled.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let (placeholder, _) = watch::channel(false);
         {
             let mut cancel = self.scan_cancel.lock().await;
@@ -140,6 +147,7 @@ pub struct SelectionEventSubscription {
     pub(crate) client_token: u64,
     pub(crate) scope: GalleryScope,
     pub(crate) lagged: bool,
+    pub(crate) resume_after: Option<u64>,
     pub(crate) engine: GalleryEngine,
 }
 
@@ -150,8 +158,9 @@ impl SelectionEventSubscription {
                 Ok(event)
             } else if self.lagged {
                 self.lagged = false;
+                self.resume_after = Some(self.runtime.next_event_id.load(Ordering::Acquire));
                 return Some(SequencedWallUpdate {
-                    id: self.runtime.next_event_id.load(Ordering::Acquire),
+                    id: self.resume_after.unwrap_or_default(),
                     update: WallUpdate::ResyncRequired {
                         selection_id: self.runtime.selection.id().to_owned(),
                     },
@@ -167,6 +176,13 @@ impl SelectionEventSubscription {
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
             };
+            if self
+                .resume_after
+                .is_some_and(|watermark| event.id <= watermark)
+            {
+                continue;
+            }
+            self.resume_after = None;
             if let Some(event) = self.filter(event) {
                 return Some(event);
             }

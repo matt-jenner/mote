@@ -175,9 +175,15 @@ impl GalleryEngine {
             .canonical_root_key
             .to_path_buf()
             .map_err(|e| CatalogError::InvalidData(e.to_string()))?;
-        if !root.join(relative).is_dir() {
+        let selected_native = root.join(relative);
+        let selected_canonical = std::fs::canonicalize(&selected_native).map_err(|_| {
+            AppServiceError::OpenRecent(photo_core::AddLibraryError::NotDirectory(
+                selected_native.clone(),
+            ))
+        })?;
+        if !selected_canonical.starts_with(&root) || !selected_canonical.is_dir() {
             return Err(AppServiceError::OpenRecent(
-                photo_core::AddLibraryError::NotDirectory(root.join(relative)),
+                photo_core::AddLibraryError::InvalidSelection,
             ));
         }
         let display_name = relative
@@ -393,6 +399,10 @@ impl GalleryEngine {
         after_event_id: Option<u64>,
     ) -> SelectionEventSubscription {
         let runtime = self.runtime(selection);
+        let _publication = runtime
+            .publication
+            .lock()
+            .expect("runtime publication poisoned");
         let receiver = runtime.updates.subscribe();
         let client_token = runtime.register(client_id.clone(), scope);
         let history = runtime
@@ -417,6 +427,7 @@ impl GalleryEngine {
                 false,
             ),
         };
+        drop(_publication);
         SelectionEventSubscription {
             backlog,
             receiver,
@@ -425,6 +436,7 @@ impl GalleryEngine {
             client_token,
             scope,
             lagged,
+            resume_after: None,
             engine: self.clone(),
         }
     }
@@ -441,11 +453,17 @@ impl GalleryEngine {
             .client_demand
             .lock()
             .map_err(|_| AppServiceError::StatePoisoned)?;
-        let Some(value) = demand.get_mut(client_id) else {
+        let token = demand
+            .iter()
+            .filter(|(_, value)| value.client_id == client_id)
+            .map(|(token, _)| *token)
+            .max();
+        let Some(token) = token else {
             return Ok(false);
         };
+        let value = demand.get_mut(&token).expect("demand token was present");
         if value.lease_until <= tokio::time::Instant::now() {
-            demand.remove(client_id);
+            demand.remove(&token);
             return Ok(false);
         }
         value.scope = scope;
@@ -605,6 +623,9 @@ impl GalleryEngine {
                 false
             };
             if completed {
+                runtime
+                    .settled
+                    .store(true, std::sync::atomic::Ordering::Release);
                 let _ = runtime
                     .publish(WallUpdate::MetadataSettled {
                         selection_id: runtime.selection.id().to_owned(),

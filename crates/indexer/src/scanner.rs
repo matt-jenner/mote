@@ -153,7 +153,6 @@ impl<R: MetadataReader> Indexer<R> {
         let join = tokio::spawn(async move {
             let summary = Arc::new(Mutex::new(ScanSummary::default()));
             let progress = Arc::new((AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)));
-            let admissions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let (enrich_tx, enrich_rx) = mpsc::channel::<DiscoveredAsset>(64);
             let shared_discovered = Arc::new(Mutex::new(discovered_rx));
             let shared_enrich = Arc::new(Mutex::new(enrich_rx));
@@ -165,6 +164,7 @@ impl<R: MetadataReader> Indexer<R> {
                 let mut cancel = cancel_rx.clone();
                 let summary = summary.clone();
                 let progress = progress.clone();
+                let scheduler = scheduler.clone();
                 workers.push(tokio::spawn(async move {
                     loop {
                         let item = tokio::select! {
@@ -200,8 +200,11 @@ impl<R: MetadataReader> Indexer<R> {
                                 asset: item.asset.clone(),
                             })
                             .await;
+                        if !admit_enrichment(&cancel, &scheduler).await {
+                            break;
+                        }
                         let path = item.source_path.clone();
-                        match tokio::task::spawn_blocking(move || {
+                        let shape_result = tokio::task::spawn_blocking(move || {
                             let shape = MediaProbe::shape(&path)?;
                             let orientation = EmbeddedExifReader::read(&path)
                                 .ok()
@@ -214,8 +217,9 @@ impl<R: MetadataReader> Indexer<R> {
                                 orientation,
                             ))
                         })
-                        .await
-                        {
+                        .await;
+                        scheduler.release_enrichment();
+                        match shape_result {
                             Ok(Ok((width, height, orientation))) => {
                                 let _ = events
                                     .send(IndexEvent::ShapeReady {
@@ -290,7 +294,6 @@ impl<R: MetadataReader> Indexer<R> {
                 let mut cancel = cancel_rx.clone();
                 let summary = summary.clone();
                 let progress = progress.clone();
-                let admissions = admissions.clone();
                 let scheduler = scheduler.clone();
                 workers.push(tokio::spawn(async move {
                     loop {
@@ -304,7 +307,7 @@ impl<R: MetadataReader> Indexer<R> {
                         }
                         let id = item.asset.id;
                         let counts_as_photo = item.asset.media_kind != MediaKind::Video;
-                        if !admit_enrichment(&cancel, &scheduler, &admissions).await {
+                        if !admit_enrichment(&cancel, &scheduler).await {
                             break;
                         }
                         let reader = reader.clone();
@@ -315,7 +318,10 @@ impl<R: MetadataReader> Indexer<R> {
                             result = &mut process => Some(result),
                             _ = cancel.changed() => None,
                         };
-                        let Some(result) = result else { break };
+                        let Some(result) = result else {
+                            scheduler.release_enrichment();
+                            break;
+                        };
                         match result {
                             Ok(Ok(p)) => {
                                 for warning in &p.metadata.warnings {
@@ -377,7 +383,7 @@ impl<R: MetadataReader> Indexer<R> {
                             }
                             Err(_) => {}
                         }
-                        admissions.fetch_sub(1, Ordering::Release);
+                        scheduler.release_enrichment();
                     }
                 }));
             }
@@ -416,32 +422,16 @@ impl<R: MetadataReader> Indexer<R> {
     }
 }
 
-async fn admit_enrichment(
-    cancel: &watch::Receiver<bool>,
-    scheduler: &Arc<IndexScheduler>,
-    admissions: &Arc<std::sync::atomic::AtomicUsize>,
-) -> bool {
+async fn admit_enrichment(cancel: &watch::Receiver<bool>, scheduler: &IndexScheduler) -> bool {
     loop {
         if *cancel.borrow() {
             return false;
         }
-        if try_admit_enrichment(scheduler, admissions) {
+        if scheduler.try_admit_enrichment() {
             return true;
         }
         tokio::task::yield_now().await;
     }
-}
-
-fn try_admit_enrichment(
-    scheduler: &IndexScheduler,
-    admissions: &std::sync::atomic::AtomicUsize,
-) -> bool {
-    let limit = scheduler.available_background_permits().clamp(1, 2);
-    let current = admissions.load(Ordering::Acquire);
-    current < limit
-        && admissions
-            .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
 }
 
 struct ProcessedAsset {
@@ -516,9 +506,7 @@ fn discover_all(
 
 #[cfg(test)]
 mod tests {
-    use super::try_admit_enrichment;
     use crate::{IndexScheduler, InteractionMode, SchedulerConfig};
-    use std::sync::atomic::AtomicUsize;
 
     #[tokio::test]
     async fn admission_decision_respects_active_limit() {
@@ -529,9 +517,8 @@ mod tests {
         scheduler
             .set_interaction_mode(InteractionMode::Active)
             .await;
-        let admissions = AtomicUsize::new(0);
-
-        assert!(try_admit_enrichment(&scheduler, &admissions));
-        assert!(!try_admit_enrichment(&scheduler, &admissions));
+        assert!(scheduler.try_admit_enrichment());
+        assert!(!scheduler.try_admit_enrichment());
+        scheduler.release_enrichment();
     }
 }
