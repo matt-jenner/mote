@@ -50,7 +50,7 @@ Additional regression verification passed: the blocking foreground/indexing desk
 
 Remaining architectural concern: the existing desktop `AppService` still owns its historical active-selection coordinator/scanner path; fully replacing it with `GalleryEngine` requires moving its extensive derivative test hooks and reconciliation lifecycle together. The public desktop regression suite remains green, but this extraction is not represented as a completed change in this round.
 
-Final HEAD semantics: after the verified implementation commits above, the final report commit is the branch HEAD and contains this report; `3cdb520` is the latest implementation commit.
+Final HEAD semantics: after the verified implementation commits above, the final report commit is the branch HEAD and contains this report; `b30a481` is the latest implementation commit.
 
 ## Fix round 3 evidence
 
