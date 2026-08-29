@@ -74,6 +74,73 @@ fn symlink_inside_root_is_listed_and_escape_is_rejected() {
     assert!(!listing.children.iter().any(|entry| entry.name == "Escape"));
 }
 
+#[test]
+fn folder_validation_rejects_traversal_nul_and_empty_components() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    let root = ContainedFolderRoot::new(source).unwrap();
+
+    for path in [".", "Trips//Processed", "Trips/", "Trips\0Processed"] {
+        assert!(
+            matches!(root.resolve(path), Err(FolderError::InvalidPath)),
+            "{path:?}"
+        );
+    }
+}
+
+#[test]
+fn folder_listing_returns_breadcrumbs_sorted_children_and_missing_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(source.join("Trips")).unwrap();
+    for name in ["zulu", "alpha", "beta"] {
+        std::fs::create_dir(source.join("Trips").join(name)).unwrap();
+    }
+    let root = ContainedFolderRoot::new(source).unwrap();
+
+    let listing = root.list("Trips").unwrap();
+    assert_eq!(
+        listing.breadcrumbs,
+        vec![photo_server::FolderBreadcrumb {
+            name: "Trips".to_owned(),
+            path: "Trips".to_owned(),
+        }]
+    );
+    assert_eq!(
+        listing
+            .children
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "beta", "zulu"]
+    );
+    assert!(matches!(
+        root.list("Trips/Missing"),
+        Err(FolderError::Unavailable)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn mode_bits_make_unreadable_directories_fail_resolution() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    let unreadable = source.join("Private");
+    std::fs::create_dir(&unreadable).unwrap();
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let root = ContainedFolderRoot::new(source).unwrap();
+
+    assert!(matches!(
+        root.resolve("Private"),
+        Err(FolderError::Unreadable)
+    ));
+}
+
 #[tokio::test]
 async fn folder_api_returns_bootstrap_and_rejects_oversized_or_repeated_paths() {
     let temp = tempfile::tempdir().unwrap();
@@ -166,6 +233,51 @@ async fn folder_api_returns_bootstrap_and_rejects_oversized_or_repeated_paths() 
         source_metadata_after.modified().unwrap(),
         source_metadata_before.modified().unwrap()
     );
+}
+
+#[tokio::test]
+async fn invalid_folder_queries_are_rejected_before_filesystem_access() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    let state = AppState::new_with_source_root(
+        Catalog::open_in_memory().unwrap(),
+        temp.path().join("cache"),
+        source.clone(),
+    )
+    .unwrap();
+    std::fs::remove_dir(&source).unwrap();
+    let app = build_router(state);
+
+    let oversized = format!("/api/v1/folders?path={}", "x".repeat(4097));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(oversized)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(value["code"], "invalidFolderPath");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/folders?path=Trips&path=Other")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(value["code"], "invalidFolderPath");
 }
 
 #[test]

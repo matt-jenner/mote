@@ -38,14 +38,9 @@ pub(crate) async fn folders(
             "The photo source is unavailable.",
         )
     })?;
-    if !root.is_available() {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "sourceUnavailable",
-            "The photo source is unavailable.",
-        ));
-    }
-    root.list(&path).map(Json).map_err(map_folder_error)
+    root.list(&path)
+        .map(Json)
+        .map_err(|error| map_folder_error(error, path.is_empty()))
 }
 
 fn parse_folder_path(query: Option<&str>) -> Result<String, ApiError> {
@@ -113,9 +108,14 @@ fn invalid_folder_path() -> ApiError {
     )
 }
 
-fn map_folder_error(error: FolderError) -> ApiError {
+fn map_folder_error(error: FolderError, mounted_root: bool) -> ApiError {
     match error {
         FolderError::InvalidPath | FolderError::OutsideRoot => invalid_folder_path(),
+        FolderError::Unavailable if mounted_root => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sourceUnavailable",
+            "The photo source is unavailable.",
+        ),
         FolderError::Unavailable | FolderError::NotDirectory => ApiError::new(
             StatusCode::NOT_FOUND,
             "folderUnavailable",

@@ -67,6 +67,9 @@ impl ContainedFolderRoot {
         if !canonical.is_dir() {
             return Err(FolderError::NotDirectory);
         }
+        if !directory_is_readable(&canonical) {
+            return Err(FolderError::Unreadable);
+        }
         Ok(canonical)
     }
 
@@ -110,7 +113,9 @@ impl ContainedFolderRoot {
     }
 
     pub(crate) fn is_available(&self) -> bool {
-        self.root.is_dir() && fs::read_dir(&self.root).is_ok()
+        fs::metadata(&self.root)
+            .map(|metadata| metadata.is_dir() && directory_is_readable(&self.root))
+            .unwrap_or(false)
     }
 }
 
@@ -175,5 +180,20 @@ fn map_read_error(error: std::io::Error) -> FolderError {
         std::io::ErrorKind::PermissionDenied => FolderError::Unreadable,
         std::io::ErrorKind::NotFound => FolderError::Unavailable,
         _ => FolderError::Unreadable,
+    }
+}
+
+fn directory_is_readable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o444 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
     }
 }
