@@ -1,4 +1,6 @@
+mod api;
 mod config;
+mod folders;
 mod health;
 
 use std::path::PathBuf;
@@ -13,6 +15,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 
 pub use config::{ConfigError, ServerConfig};
+pub use folders::{ContainedFolderRoot, FolderBreadcrumb, FolderEntry, FolderError, FolderListing};
 pub use health::{
     ComponentHealth, ComponentStatus, HealthReport, HealthStatus, SourceHealthCounts,
 };
@@ -21,6 +24,7 @@ pub use health::{
 pub struct AppState {
     pub(crate) catalog: Arc<Mutex<Catalog>>,
     pub(crate) cache_root: Arc<PathBuf>,
+    pub(crate) folder_root: Option<Arc<ContainedFolderRoot>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +37,8 @@ pub enum StartupError {
     Cache(#[from] photo_cache::CacheError),
     #[error("cataloged source root has invalid native encoding")]
     InvalidCatalogPath,
+    #[error("source root startup failed: {0}")]
+    Folder(#[from] FolderError),
 }
 
 impl AppState {
@@ -40,7 +46,20 @@ impl AppState {
         Self {
             catalog: Arc::new(Mutex::new(catalog)),
             cache_root: Arc::new(cache_root),
+            folder_root: None,
         }
+    }
+
+    pub fn new_with_source_root(
+        catalog: Catalog,
+        cache_root: PathBuf,
+        source_root: PathBuf,
+    ) -> Result<Self, FolderError> {
+        Ok(Self {
+            catalog: Arc::new(Mutex::new(catalog)),
+            cache_root: Arc::new(cache_root),
+            folder_root: Some(Arc::new(ContainedFolderRoot::new(source_root)?)),
+        })
     }
 
     pub fn open(config: &ServerConfig) -> Result<(Self, CacheReconcileReport), StartupError> {
@@ -63,12 +82,21 @@ impl AppState {
 
         let writer = CacheWriter::new(config.cache_dir())?;
         let report = writer.reconcile_catalog(&mut catalog)?;
-        Ok((Self::new(catalog, config.cache_dir().to_owned()), report))
+        Ok((
+            Self::new_with_source_root(
+                catalog,
+                config.cache_dir().to_owned(),
+                config.source_root().to_owned(),
+            )?,
+            report,
+        ))
     }
 }
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
+        .route("/api/v1/bootstrap", get(api::bootstrap))
+        .route("/api/v1/folders", get(api::folders))
         .route(
             "/healthz",
             get(|State(state): State<AppState>| async move { health::healthz(state).await }),

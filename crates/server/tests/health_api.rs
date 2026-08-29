@@ -5,7 +5,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use photo_catalog::{Catalog, NewAsset, NewDerivative, NewFolderGroup, NewLibrary};
 use photo_domain::{Availability, DerivativeId, FolderGroupId, MediaKind, RelativePathKey};
-use photo_server::{AppState, ConfigError, ServerConfig, StartupError, build_router};
+use photo_server::{AppState, ConfigError, ServerConfig, build_router};
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -78,15 +78,11 @@ fn config_defaults_to_loopback_and_rejects_local_state_inside_a_source() {
         source.join("app-data"),
         temp.path().join("cache"),
         None,
-        vec![source.clone()],
-    )
-    .unwrap();
+        source.clone(),
+        temp.path().join("web"),
+    );
 
-    assert_eq!(config.bind().to_string(), "127.0.0.1:8080");
-    assert!(matches!(
-        config.prepare(),
-        Err(ConfigError::InsideSourceRoot)
-    ));
+    assert!(matches!(config, Err(ConfigError::InsideSourceRoot)));
     assert!(!source.join("app-data").exists());
 }
 
@@ -99,14 +95,11 @@ fn server_config_translates_shared_local_state_overlap_errors() {
         source.join("app-data"),
         temp.path().join("cache"),
         None,
-        vec![],
-    )
-    .unwrap();
+        source.clone(),
+        temp.path().join("web"),
+    );
 
-    assert!(matches!(
-        config.validate_source_roots(&[source]),
-        Err(ConfigError::InsideSourceRoot)
-    ));
+    assert!(matches!(config, Err(ConfigError::InsideSourceRoot)));
 }
 
 #[cfg(unix)]
@@ -123,14 +116,11 @@ fn config_rejects_a_symlink_alias_into_a_source_root() {
         alias.join("app-data"),
         temp.path().join("cache"),
         None,
-        vec![source.clone()],
-    )
-    .unwrap();
+        alias,
+        temp.path().join("web"),
+    );
 
-    assert!(matches!(
-        config.prepare(),
-        Err(ConfigError::InsideSourceRoot)
-    ));
+    assert!(matches!(config, Err(ConfigError::InsideSourceRoot)));
     assert!(!source.join("app-data").exists());
 }
 
@@ -140,11 +130,14 @@ fn config_creates_private_local_directories() {
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
     let config = ServerConfig::new(
         temp.path().join("data"),
         temp.path().join("cache"),
         Some("127.0.0.1:0"),
-        vec![],
+        source,
+        temp.path().join("web"),
     )
     .unwrap();
     config.prepare().unwrap();
@@ -175,7 +168,14 @@ fn application_startup_repairs_cache_before_serving() {
     let cache = temp.path().join("cache");
     std::fs::create_dir(&source).unwrap();
     std::fs::create_dir(&cache).unwrap();
-    let config = ServerConfig::new(data, cache.clone(), None, vec![]).unwrap();
+    let config = ServerConfig::new(
+        data,
+        cache.clone(),
+        None,
+        source.clone(),
+        temp.path().join("web"),
+    )
+    .unwrap();
     let (group, missing_id) = catalog_with_missing_derivative(&config, &source);
     std::fs::write(cache.join("orphan.partial-test"), b"partial").unwrap();
 
@@ -199,10 +199,19 @@ fn application_startup_repairs_cache_before_serving() {
 fn application_preflights_cataloged_roots_before_creating_cache_state() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");
+    let configured_source = temp.path().join("configured-photos");
     let data_inside_source = source.join("viewer-data");
     let cache = temp.path().join("cache-not-created");
     std::fs::create_dir_all(&data_inside_source).unwrap();
-    let config = ServerConfig::new(data_inside_source, cache.clone(), None, vec![]).unwrap();
+    std::fs::create_dir(&configured_source).unwrap();
+    let config = ServerConfig::new(
+        data_inside_source,
+        cache.clone(),
+        None,
+        configured_source,
+        temp.path().join("web"),
+    )
+    .unwrap();
     let mut catalog = Catalog::open(&config.catalog_path()).unwrap();
     catalog
         .add_library(&NewLibrary::configured("Photos", &source))
@@ -213,7 +222,9 @@ fn application_preflights_cataloged_roots_before_creating_cache_state() {
 
     assert!(matches!(
         result,
-        Err(StartupError::Config(ConfigError::InsideSourceRoot))
+        Err(photo_server::StartupError::Config(
+            ConfigError::InsideSourceRoot
+        ))
     ));
     assert!(!cache.exists());
 }
@@ -228,21 +239,32 @@ fn application_rejects_a_catalog_symlink_into_a_source_root() {
     let source_catalog = source.join("catalog.sqlite");
     let data = temp.path().join("data");
     let cache = temp.path().join("cache-not-created");
+    let configured_source = temp.path().join("configured-photos");
     std::fs::create_dir(&source).unwrap();
     std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&configured_source).unwrap();
     let mut catalog = Catalog::open(&source_catalog).unwrap();
     catalog
         .add_library(&NewLibrary::configured("Photos", &source))
         .unwrap();
     drop(catalog);
     symlink(&source_catalog, data.join("catalog.sqlite")).unwrap();
-    let config = ServerConfig::new(data, cache.clone(), None, vec![]).unwrap();
+    let config = ServerConfig::new(
+        data,
+        cache.clone(),
+        None,
+        configured_source,
+        temp.path().join("web"),
+    )
+    .unwrap();
 
     let result = AppState::open(&config);
 
     assert!(matches!(
         result,
-        Err(StartupError::Config(ConfigError::InsideSourceRoot))
+        Err(photo_server::StartupError::Config(
+            ConfigError::InsideSourceRoot
+        ))
     ));
     assert!(!cache.exists());
 }
@@ -252,11 +274,20 @@ fn application_rejects_a_source_nested_inside_the_cache_root() {
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().join("data");
     let cache = temp.path().join("cache");
+    let configured_source = temp.path().join("configured-photos");
     let source = cache.join("photos");
     let source_file = source.join("original.partial-camera.jpg");
     std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir(&configured_source).unwrap();
     std::fs::write(&source_file, b"source").unwrap();
-    let config = ServerConfig::new(data, cache, None, vec![]).unwrap();
+    let config = ServerConfig::new(
+        data,
+        cache,
+        None,
+        configured_source,
+        temp.path().join("web"),
+    )
+    .unwrap();
     let mut catalog = Catalog::open(&config.catalog_path()).unwrap();
     catalog
         .add_library(&NewLibrary::configured("Photos", &source))
@@ -267,7 +298,9 @@ fn application_rejects_a_source_nested_inside_the_cache_root() {
 
     assert!(matches!(
         result,
-        Err(StartupError::Config(ConfigError::InsideSourceRoot))
+        Err(photo_server::StartupError::Config(
+            ConfigError::InsideSourceRoot
+        ))
     ));
     assert_eq!(std::fs::read(source_file).unwrap(), b"source");
 }

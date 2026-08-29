@@ -10,7 +10,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let config = ServerConfig::from_env(Vec::new())?;
+    let config = ServerConfig::from_env()?;
     let (state, repair) = AppState::open(&config)?;
     if repair.partial_files_removed > 0 || repair.missing_rows_removed > 0 {
         tracing::info!(

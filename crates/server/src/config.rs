@@ -8,7 +8,8 @@ use photo_core::{LocalStateError, LocalStatePaths};
 pub struct ServerConfig {
     local: LocalStatePaths,
     bind: SocketAddr,
-    source_roots: Vec<PathBuf>,
+    source_root: PathBuf,
+    web_root: PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -21,6 +22,8 @@ pub enum ConfigError {
     InvalidBind(#[from] AddrParseError),
     #[error("catalog data and cache directories must not be inside a source root")]
     InsideSourceRoot,
+    #[error("configured source root is not a directory")]
+    SourceRootNotDirectory,
     #[error("configuration filesystem operation failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -30,18 +33,29 @@ impl ServerConfig {
         data_dir: PathBuf,
         cache_dir: PathBuf,
         bind: Option<&str>,
-        source_roots: Vec<PathBuf>,
+        source_root: PathBuf,
+        web_root: PathBuf,
     ) -> Result<Self, ConfigError> {
+        let source_root = source_root.canonicalize()?;
+        if !source_root.is_dir() {
+            return Err(ConfigError::SourceRootNotDirectory);
+        }
+        let local = LocalStatePaths::new(data_dir, cache_dir);
+        local
+            .validate_source_roots(std::slice::from_ref(&source_root))
+            .map_err(ConfigError::from_local_state)?;
         Ok(Self {
-            local: LocalStatePaths::new(data_dir, cache_dir),
+            local,
             bind: bind.unwrap_or("127.0.0.1:8080").parse()?,
-            source_roots,
+            source_root,
+            web_root,
         })
     }
 
-    pub fn from_env(source_roots: Vec<PathBuf>) -> Result<Self, ConfigError> {
+    pub fn from_env() -> Result<Self, ConfigError> {
         let data_dir = required_path("PHOTO_VIEWER_DATA_DIR")?;
         let cache_dir = required_path("PHOTO_VIEWER_CACHE_DIR")?;
+        let source_root = required_path("PHOTO_VIEWER_SOURCE_ROOT")?;
         let bind = match env::var("PHOTO_VIEWER_BIND") {
             Ok(value) => Some(value),
             Err(env::VarError::NotPresent) => None,
@@ -49,12 +63,19 @@ impl ServerConfig {
                 return Err(ConfigError::InvalidEnvironment("PHOTO_VIEWER_BIND"));
             }
         };
-        Self::new(data_dir, cache_dir, bind.as_deref(), source_roots)
+        let web_root = match env::var("PHOTO_VIEWER_WEB_ROOT") {
+            Ok(value) => PathBuf::from(value),
+            Err(env::VarError::NotPresent) => PathBuf::from("/app/web"),
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::InvalidEnvironment("PHOTO_VIEWER_WEB_ROOT"));
+            }
+        };
+        Self::new(data_dir, cache_dir, bind.as_deref(), source_root, web_root)
     }
 
     pub fn prepare(&self) -> Result<(), ConfigError> {
         self.local
-            .prepare(&self.source_roots)
+            .prepare(std::slice::from_ref(&self.source_root))
             .map_err(ConfigError::from_local_state)
     }
 
@@ -78,6 +99,14 @@ impl ServerConfig {
 
     pub const fn bind(&self) -> SocketAddr {
         self.bind
+    }
+
+    pub fn source_root(&self) -> &Path {
+        &self.source_root
+    }
+
+    pub fn web_root(&self) -> &Path {
+        &self.web_root
     }
 }
 

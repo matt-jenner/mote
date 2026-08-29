@@ -1,0 +1,193 @@
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
+use photo_catalog::Catalog;
+use photo_server::{
+    AppState, ConfigError, ContainedFolderRoot, FolderError, ServerConfig, build_router,
+};
+use tower::ServiceExt;
+
+#[test]
+fn config_canonicalizes_source_and_folder_paths_stay_mount_relative() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(source.join("Trips")).unwrap();
+    std::fs::create_dir(source.join("Trips").join("Iceland")).unwrap();
+    std::fs::write(source.join("photo.jpg"), b"source").unwrap();
+    let config = ServerConfig::new(
+        temp.path().join("data"),
+        temp.path().join("cache"),
+        None,
+        source.clone(),
+        temp.path().join("web"),
+    )
+    .unwrap();
+    let root = ContainedFolderRoot::new(source.clone()).unwrap();
+
+    assert_eq!(config.source_root(), source.canonicalize().unwrap());
+    assert!(matches!(
+        root.list("../outside"),
+        Err(FolderError::InvalidPath)
+    ));
+    assert!(matches!(
+        root.list("/absolute"),
+        Err(FolderError::InvalidPath)
+    ));
+    assert!(matches!(
+        root.list("photo.jpg"),
+        Err(FolderError::NotDirectory)
+    ));
+    let listing = root.list("Trips").unwrap();
+    assert_eq!(listing.path, "Trips");
+    assert_eq!(listing.children[0].path, "Trips/Iceland");
+    assert!(
+        !serde_json::to_string(&listing)
+            .unwrap()
+            .contains(source.to_str().unwrap())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_inside_root_is_listed_and_escape_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::create_dir(source.join("Trips")).unwrap();
+    std::fs::create_dir(source.join("Trips").join("Iceland")).unwrap();
+    symlink(source.join("Trips"), source.join("Alias")).unwrap();
+    symlink(&outside, source.join("Escape")).unwrap();
+    let root = ContainedFolderRoot::new(source).unwrap();
+
+    assert!(root.resolve("Alias").is_ok());
+    assert!(matches!(
+        root.resolve("Escape"),
+        Err(FolderError::OutsideRoot)
+    ));
+    let listing = root.list("").unwrap();
+    assert!(listing.children.iter().any(|entry| entry.name == "Alias"));
+    assert!(!listing.children.iter().any(|entry| entry.name == "Escape"));
+}
+
+#[tokio::test]
+async fn folder_api_returns_bootstrap_and_rejects_oversized_or_repeated_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(source.join("Trips")).unwrap();
+    std::fs::create_dir(source.join("Trips").join("Iceland")).unwrap();
+    let source_file = source.join("photo.jpg");
+    std::fs::write(&source_file, b"source-bytes").unwrap();
+    let source_before = std::fs::read(&source_file).unwrap();
+    let source_metadata_before = std::fs::metadata(&source_file).unwrap();
+    let state = AppState::new_with_source_root(
+        Catalog::open_in_memory().unwrap(),
+        temp.path().join("cache"),
+        source,
+    )
+    .unwrap();
+    let app = build_router(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/bootstrap")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(value["capabilities"]["folderBrowser"], true);
+    assert_eq!(value["capabilities"]["video"], false);
+    assert_eq!(value["sourceAvailable"], true);
+    assert!(!value.to_string().contains("photos"));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/folders?path=Trips")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(value["path"], "Trips");
+    assert_eq!(value["children"][0]["name"], "Iceland");
+    assert_eq!(value["children"][0]["path"], "Trips/Iceland");
+    assert!(!value.to_string().contains("photos"));
+
+    let oversized = format!("/api/v1/folders?path={}", "x".repeat(4097));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(oversized)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(value["code"], "invalidFolderPath");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/folders?path=Trips&path=Other")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(value["code"], "invalidFolderPath");
+
+    let source_metadata_after = std::fs::metadata(&source_file).unwrap();
+    assert_eq!(std::fs::read(&source_file).unwrap(), source_before);
+    assert_eq!(source_metadata_after.len(), source_metadata_before.len());
+    assert_eq!(
+        source_metadata_after.modified().unwrap(),
+        source_metadata_before.modified().unwrap()
+    );
+}
+
+#[test]
+fn config_rejects_a_source_that_is_missing_or_overlaps_local_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = ServerConfig::new(
+        temp.path().join("data"),
+        temp.path().join("cache"),
+        None,
+        temp.path().join("missing"),
+        temp.path().join("web"),
+    );
+    assert!(matches!(missing, Err(ConfigError::Io(_))));
+
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    let overlap = ServerConfig::new(
+        source.join("data"),
+        temp.path().join("cache"),
+        None,
+        source,
+        temp.path().join("web"),
+    );
+    assert!(matches!(overlap, Err(ConfigError::InsideSourceRoot)));
+}
