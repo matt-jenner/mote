@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use axum::Router;
 use axum::extract::State;
 use axum::routing::get;
+use photo_app_service::{AppConfig, AppServiceError, GalleryEngine};
 use photo_cache::{CacheReconcileReport, CacheWriter};
 use photo_catalog::Catalog;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -25,6 +26,7 @@ pub struct AppState {
     pub(crate) catalog: Arc<Mutex<Catalog>>,
     pub(crate) cache_root: Arc<PathBuf>,
     pub(crate) folder_root: Option<Arc<ContainedFolderRoot>>,
+    pub(crate) gallery: Option<Arc<GalleryEngine>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +41,8 @@ pub enum StartupError {
     InvalidCatalogPath,
     #[error("source root startup failed: {0}")]
     Folder(#[from] FolderError),
+    #[error("gallery startup failed: {0}")]
+    Gallery(#[from] AppServiceError),
 }
 
 impl AppState {
@@ -47,6 +51,7 @@ impl AppState {
             catalog: Arc::new(Mutex::new(catalog)),
             cache_root: Arc::new(cache_root),
             folder_root: None,
+            gallery: None,
         }
     }
 
@@ -59,6 +64,7 @@ impl AppState {
             catalog: Arc::new(Mutex::new(catalog)),
             cache_root: Arc::new(cache_root),
             folder_root: Some(Arc::new(ContainedFolderRoot::new(source_root)?)),
+            gallery: None,
         })
     }
 
@@ -82,12 +88,20 @@ impl AppState {
 
         let writer = CacheWriter::new(config.cache_dir())?;
         let report = writer.reconcile_catalog(&mut catalog)?;
+        let state = Self::new_with_source_root(
+            catalog,
+            config.cache_dir().to_owned(),
+            config.source_root().to_owned(),
+        )?;
+        let gallery = GalleryEngine::open(
+            AppConfig::new(config.data_dir().to_owned(), config.cache_dir().to_owned()),
+            config.source_root().to_owned(),
+        )?;
         Ok((
-            Self::new_with_source_root(
-                catalog,
-                config.cache_dir().to_owned(),
-                config.source_root().to_owned(),
-            )?,
+            Self {
+                gallery: Some(Arc::new(gallery)),
+                ..state
+            },
             report,
         ))
     }
@@ -97,6 +111,26 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/bootstrap", get(api::bootstrap))
         .route("/api/v1/folders", get(api::folders))
+        .route(
+            "/api/v1/selections",
+            axum::routing::post(api::create_selection),
+        )
+        .route(
+            "/api/v1/selections/{id}",
+            get(api::selection_summary),
+        )
+        .route(
+            "/api/v1/selections/{id}/wall",
+            get(api::wall),
+        )
+        .route(
+            "/api/v1/selections/{id}/interaction",
+            axum::routing::post(api::interaction),
+        )
+        .route(
+            "/api/v1/selections/{id}/events",
+            get(api::events),
+        )
         .route(
             "/healthz",
             get(|State(state): State<AppState>| async move { health::healthz(state).await }),

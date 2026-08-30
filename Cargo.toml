@@ -9,6 +9,7 @@ rust-version = "1.97.1"
 
 [workspace.dependencies]
 axum = "0.8.9"
+futures-util = { version = "0.3.31", default-features = false, features = ["alloc"] }
 blake3 = "1.8.7"
 fs2 = "0.4.3"
 chrono = { version = "0.4.45", features = ["serde"] }

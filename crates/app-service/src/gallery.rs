@@ -625,24 +625,62 @@ impl GalleryEngine {
         interaction: InteractionState,
     ) -> Result<bool, AppServiceError> {
         let runtime = self.runtime(selection);
-        let mut demand = runtime
-            .client_demand
-            .lock()
-            .map_err(|_| AppServiceError::StatePoisoned)?;
-        let token = demand
-            .iter()
-            .filter(|(_, value)| value.client_id == client_id)
-            .map(|(token, _)| *token)
-            .max();
-        let Some(token) = token else {
-            return Ok(false);
+        let found = {
+            let mut demand = runtime
+                .client_demand
+                .lock()
+                .map_err(|_| AppServiceError::StatePoisoned)?;
+            let token = demand
+                .iter()
+                .filter(|(_, value)| value.client_id == client_id)
+                .map(|(token, _)| *token)
+                .max();
+            let Some(token) = token else {
+                return Ok(false);
+            };
+            let value = demand.get_mut(&token).expect("demand token was present");
+            value.scope = scope;
+            let _ = value.scope_sender.send(scope);
+            value.interaction = interaction;
+            value.lease_until = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            true
         };
-        let value = demand.get_mut(&token).expect("demand token was present");
-        value.scope = scope;
-        let _ = value.scope_sender.send(scope);
-        value.interaction = interaction;
-        value.lease_until = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        if !found {
+            return Ok(false);
+        }
+        self.refresh_scheduler_interaction().await;
+        if interaction == InteractionState::Active {
+            let runtime_for_lease = Arc::downgrade(&runtime);
+            let engine = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if runtime_for_lease.upgrade().is_some() {
+                    engine.refresh_scheduler_interaction().await;
+                }
+            });
+        }
         Ok(true)
+    }
+
+    pub(crate) async fn refresh_scheduler_interaction(&self) {
+        let active = self
+            .runtimes
+            .lock()
+            .ok()
+            .map(|runtimes| {
+                runtimes
+                    .values()
+                    .filter_map(Weak::upgrade)
+                    .any(|runtime| runtime.has_active_lease())
+            })
+            .unwrap_or(false);
+        self.scheduler
+            .set_interaction_mode(if active {
+                photo_indexer::InteractionMode::Active
+            } else {
+                photo_indexer::InteractionMode::Idle
+            })
+            .await;
     }
 
     pub(crate) async fn start_runtime_scan(
@@ -917,6 +955,12 @@ impl GalleryEngine {
     #[doc(hidden)]
     pub async fn aggregate_scope_for_test(&self, selection: &GallerySelection) -> GalleryScope {
         self.runtime(selection).aggregate_scope()
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn scheduler_permits_for_test(&self) -> usize {
+        self.scheduler.available_background_permits()
     }
 
     #[cfg(test)]

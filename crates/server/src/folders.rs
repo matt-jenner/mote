@@ -3,19 +3,14 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
+pub use photo_app_service::FolderBreadcrumb;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderListing {
     pub path: String,
     pub breadcrumbs: Vec<FolderBreadcrumb>,
     pub children: Vec<FolderEntry>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FolderBreadcrumb {
-    pub name: String,
-    pub path: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

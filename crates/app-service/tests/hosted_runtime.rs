@@ -111,6 +111,43 @@ async fn an_old_subscription_drop_cannot_remove_a_reconnected_client_demand() {
 }
 
 #[tokio::test]
+async fn active_lease_keeps_scheduler_active_until_subscription_drops_or_expires() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config, source).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    let active = engine.subscribe(
+        &selection,
+        "active-client".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    let idle = engine.subscribe(
+        &selection,
+        "idle-client".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    engine
+        .update_client_interaction(
+            &selection,
+            "idle-client",
+            GalleryScope::CurrentFolder,
+            InteractionState::Idle,
+        )
+        .await
+        .unwrap();
+    assert_eq!(engine.scheduler_permits_for_test(), 1);
+    drop(active);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(engine.scheduler_permits_for_test(), 4);
+    drop(idle);
+}
+
+#[tokio::test]
 async fn a_reconnected_subscription_drop_cannot_remove_the_original_client_demand() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");

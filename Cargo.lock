@@ -1153,7 +1153,9 @@ name = "photo-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "http-body-util",
+ "photo-app-service",
  "photo-cache",
  "photo-catalog",
  "photo-core",

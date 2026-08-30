@@ -18,6 +18,7 @@ pub use dto::{
     WallQueryRequest, WallShapeState, WallUpdate, WallWarningState,
 };
 pub use gallery::{FolderBreadcrumb, GalleryEngine, GallerySelection, SelectionSummary};
+pub use hosted_runtime::SelectionEventSubscription;
 pub use hosted_runtime::SequencedWallUpdate;
 pub use photo_domain::GalleryScope;
 pub use photo_indexer::MetadataReader;

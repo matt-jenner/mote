@@ -345,6 +345,11 @@ impl SelectionRuntime {
         scope: GalleryScope,
     ) -> (u64, watch::Receiver<GalleryScope>) {
         let token = self.next_client_token.fetch_add(1, Ordering::AcqRel);
+        let interaction = if client_id.starts_with("desktop-") {
+            InteractionState::Idle
+        } else {
+            InteractionState::Active
+        };
         let (scope_sender, scope_receiver) = watch::channel(scope);
         let mut demand = self.client_demand.lock().expect("client demand poisoned");
         demand.insert(
@@ -352,8 +357,13 @@ impl SelectionRuntime {
             ClientDemand {
                 client_id,
                 scope,
-                interaction: InteractionState::Active,
-                lease_until: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                interaction,
+                lease_until: tokio::time::Instant::now()
+                    + if interaction == InteractionState::Active {
+                        std::time::Duration::from_secs(30)
+                    } else {
+                        std::time::Duration::ZERO
+                    },
                 scope_sender,
             },
         );
@@ -376,6 +386,15 @@ impl SelectionRuntime {
         } else {
             GalleryScope::CurrentFolder
         }
+    }
+
+    pub(crate) fn has_active_lease(&self) -> bool {
+        let now = tokio::time::Instant::now();
+        self.client_demand
+            .lock()
+            .expect("client demand poisoned")
+            .values()
+            .any(|value| value.interaction == InteractionState::Active && value.lease_until > now)
     }
 
     pub(crate) async fn begin_scan(
@@ -605,6 +624,14 @@ impl Drop for SelectionEventSubscription {
         self.runtime.remove(&self.client_id, self.client_token);
         self.engine
             .remove_runtime_if_dead(self.runtime.selection.group_id, &self.runtime);
+        if !self.client_id.starts_with("desktop-")
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let engine = self.engine.clone();
+            handle.spawn(async move {
+                engine.refresh_scheduler_interaction().await;
+            });
+        }
     }
 }
 

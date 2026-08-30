@@ -1,16 +1,86 @@
 mod error;
+mod events;
+mod gallery;
 mod types;
+
+pub(crate) use events::events;
+pub(crate) use gallery::{create_selection, interaction, selection_summary, wall};
 
 use axum::Json;
 use axum::extract::{RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use std::collections::HashSet;
 
 use crate::AppState;
 use crate::folders::FolderError;
 
 pub use error::ApiError;
 pub use types::{BootstrapResponse, Capabilities};
+
+const MAX_QUERY_BYTES: usize = 8192;
+
+pub(crate) fn invalid_request() -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        "invalidRequest",
+        "That request is not valid.",
+    )
+}
+
+pub(crate) fn guard_query_shape(raw_query: Option<&str>) -> Result<(), ApiError> {
+    let Some(raw_query) = raw_query else {
+        return Ok(());
+    };
+    if raw_query.len() > MAX_QUERY_BYTES {
+        return Err(invalid_request());
+    }
+    let mut count = 0;
+    for pair in raw_query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        count += 1;
+        if count > 8 {
+            return Err(invalid_request());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn query_pairs(raw_query: Option<&str>) -> Result<Vec<(String, String)>, ApiError> {
+    guard_query_shape(raw_query)?;
+    let mut seen = HashSet::new();
+    let mut pairs = Vec::new();
+    for pair in raw_query.unwrap_or_default().split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode(key).map_err(|_| invalid_request())?;
+        if !seen.insert(key.clone()) {
+            return Err(invalid_request());
+        }
+        pairs.push((key, percent_decode(value).map_err(|_| invalid_request())?));
+    }
+    Ok(pairs)
+}
+
+pub(crate) fn validate_ascii_identifier(value: &str, max: usize) -> Result<(), ApiError> {
+    if value.len() > max || !value.is_ascii() {
+        Err(invalid_request())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_decoded_identifier(value: &str, max: usize) -> Result<(), ApiError> {
+    if value.len() > max {
+        Err(invalid_request())
+    } else {
+        Ok(())
+    }
+}
 
 pub(crate) async fn bootstrap(State(state): State<AppState>) -> impl IntoResponse {
     let source_available = state
@@ -30,6 +100,7 @@ pub(crate) async fn folders(
     State(state): State<AppState>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<impl IntoResponse, ApiError> {
+    guard_query_shape(raw_query.as_deref())?;
     let path = parse_folder_path(raw_query.as_deref())?;
     let root = state.folder_root.as_ref().ok_or_else(|| {
         ApiError::new(
@@ -66,7 +137,7 @@ fn parse_folder_path(query: Option<&str>) -> Result<String, ApiError> {
     Ok(path)
 }
 
-fn percent_decode(value: &str) -> Result<String, ApiError> {
+pub(crate) fn percent_decode(value: &str) -> Result<String, ApiError> {
     let mut decoded = Vec::with_capacity(value.len());
     let bytes = value.as_bytes();
     let mut index = 0;
