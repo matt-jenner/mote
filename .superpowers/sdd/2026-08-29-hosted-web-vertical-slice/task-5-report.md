@@ -162,3 +162,51 @@ git diff --check
 ```
 
 Round-2 concern: Unix/macOS uses descriptor-relative no-follow component walks for opening and unlinking. Windows avoids following the final reparse point and checks the opened handle’s final path before reading/deleting, but Windows ancestor traversal remains a platform boundary because the standard library has no handle-relative `CreateFile` equivalent; this is explicitly not claimed as descriptor-relative Windows ancestor opening. No Cargo process was launched in the background; the final full gate exited successfully before report generation.
+
+## Task 5 fix round 3
+
+Implementation/fix commit: `27b46b0` (`fix: preserve derivative priority across hosted selections`), based on `2b4c11e`.
+
+Root-cause RED evidence:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections corrupt_hosted_thumbnail_is_repaired_before_it_is_reused --jobs 2
+  RED: with a live subscription retained, repair returned Err(NotFound); the coordinator replayed a retained completion even though the stale cache row had been removed.
+```
+
+Round-3 changes make the immutable derivative identity independent of waiter scope while retaining scope for admission and event filtering. Hosted drivers now use an engine-wide priority-aware scheduler family reservation, shared bounded admission, atomic empty-to-idle handoff, and supervised restart/abort cleanup. The retained-completion repair path invalidates the coordinator result before re-enqueue. A direct scheduler regression proves a later visible job from another selection is reserved before queued background work. Existing Unix/macOS descriptor-relative no-follow cache opening and deletion, Windows final-handle validation, managed-file streaming, source-snapshot checks, and typed HTTP ETag/size guards remain covered by the prior round.
+
+Exact round-3 GREEN commands/results:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections corrupt_hosted_thumbnail_is_repaired_before_it_is_reused --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test cache_policy open_checked --jobs 2
+  PASS: 2 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test cache_policy --jobs 2
+  PASS: 17 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections hosted_derivative_requests_enforce_current_folder_and_foreign_membership --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections --jobs 2
+  PASS: 9 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --test derivative_api --jobs 2
+  PASS: 2 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --lib --jobs 2
+  PASS: 92 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-indexer --test scheduler_priority family_owned_dequeue_preserves_priority_across_selection_drivers --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo fmt --all -- --check
+  PASS: no formatting differences (after cargo fmt --all)
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test --offline --workspace --jobs 2
+  PASS: all workspace tests and doc-tests; 0 failures
+git diff --check
+  PASS: no whitespace errors
+```
+
+The final full workspace output included hosted runtime (15), hosted selections (9), progressive wall (57), task-7 source safety (1), cache policy (17), server derivative API (2), the new scheduler priority test (12 total), and all remaining workspace tests/doc-tests. No background Cargo/rustc process was launched; the sole final full command exited 0 before this report was written.
+
+## Round-3 audit concerns
+
+The scheduler family reservation closes the cross-selection dequeue race, but the bounded admission check is still cooperative: work already encoding cannot be preempted when a higher-priority request arrives. The post-encode stale-key cleanup prevents reusable stale cache/catalog state after the final check, but a scan mutation racing exactly between that check and publication is not protected by one shared catalog/cache admission lock. Hosted worker failures still settle through the existing `Option<DerivativeReference>` coordinator channel, so an underlying encode/join/cache cause is not preserved distinctly as `DerivativeFailed`; route mapping exists, but the hosted path currently reports unavailable for that class of failure. Windows ancestor traversal remains the documented platform boundary described above. These are explicit residual concerns, not claims of complete linearized publication or cause-preserving settlement.
+
+Source-media audit: hosted derivative writes, deletes, and cleanup target only managed cache paths; source roots are read-only. Browser-visible derivative responses use opaque cache keys and path-free error envelopes. No Cargo/rustc process was left running after the final gate; process enumeration is restricted on this host, so this statement is based on the foreground command's exit and the absence of any background launch.
