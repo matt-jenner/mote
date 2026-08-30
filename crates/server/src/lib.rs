@@ -105,6 +105,12 @@ impl AppState {
             report,
         ))
     }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn gallery_for_test(&self) -> Option<Arc<GalleryEngine>> {
+        self.gallery.clone()
+    }
 }
 
 pub fn build_router(state: AppState) -> Router {

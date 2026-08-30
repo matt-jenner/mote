@@ -179,6 +179,17 @@ fn invalid_folder_path() -> ApiError {
     )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derivative_identifier_limit_is_decoded_and_fixed() {
+        assert!(validate_decoded_identifier(&"x".repeat(512), 512).is_ok());
+        assert!(validate_decoded_identifier(&"x".repeat(513), 512).is_err());
+    }
+}
+
 fn map_folder_error(error: FolderError, mounted_root: bool) -> ApiError {
     match error {
         FolderError::InvalidPath | FolderError::OutsideRoot => invalid_folder_path(),

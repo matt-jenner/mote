@@ -839,6 +839,59 @@ async fn hosted_lease_expires_automatically_without_losing_connected_scope() {
 }
 
 #[tokio::test]
+async fn hosted_desktop_named_clients_are_hosted_but_internal_desktop_updates_stay_idle() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config, source).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    let forged = engine.subscribe(
+        &selection,
+        "desktop-forged".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(engine.scheduler_permits_for_test(), 1);
+    assert!(
+        engine
+            .update_client_interaction(
+                &selection,
+                "desktop-forged",
+                GalleryScope::CurrentFolder,
+                InteractionState::Idle,
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(engine.scheduler_permits_for_test(), 4);
+    drop(forged);
+
+    let desktop = engine.subscribe_desktop_for_test(
+        &selection,
+        "desktop-internal".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    let baseline = engine.scheduler_permits_for_test();
+    assert!(
+        engine
+            .update_client_interaction_desktop_for_test(
+                &selection,
+                "desktop-internal",
+                GalleryScope::IncludeSubfolders,
+                InteractionState::Active,
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(engine.scheduler_permits_for_test(), baseline);
+    drop(desktop);
+}
+
+#[tokio::test]
 async fn broadcast_lag_resync_watermark_is_monotonic() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");

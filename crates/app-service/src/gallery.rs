@@ -592,6 +592,18 @@ impl GalleryEngine {
         )
     }
 
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn subscribe_desktop_for_test(
+        &self,
+        selection: &GallerySelection,
+        client_id: String,
+        scope: GalleryScope,
+        after_event_id: Option<u64>,
+    ) -> SelectionEventSubscription {
+        self.subscribe_desktop(selection, client_id, scope, after_event_id)
+    }
+
     fn subscribe_with_origin(
         &self,
         selection: &GallerySelection,
@@ -687,6 +699,19 @@ impl GalleryEngine {
             SubscriptionOrigin::Desktop,
         )
         .await
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn update_client_interaction_desktop_for_test(
+        &self,
+        selection: &GallerySelection,
+        client_id: &str,
+        scope: GalleryScope,
+        interaction: InteractionState,
+    ) -> Result<bool, AppServiceError> {
+        self.update_client_interaction_desktop(selection, client_id, scope, interaction)
+            .await
     }
 
     async fn update_client_interaction_with_origin(
@@ -989,6 +1014,12 @@ impl GalleryEngine {
         self.runtime(selection)
             .next_event_id
             .load(Ordering::Acquire)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn current_event_id_for_test(&self, selection: &GallerySelection) -> u64 {
+        self.current_event_id(selection)
     }
 
     pub(crate) fn runtime_scan_state(
