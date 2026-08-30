@@ -27,3 +27,21 @@ The full workspace run required `CARGO_INCREMENTAL=0` after reclaiming this work
 ## Concerns
 
 The later derivative route must call the shared decoded identifier guard for its 512-byte ID limit and enforce its own 1–250 asset-list limit. Browser-side 10-second lease refresh remains a later adapter task; the server lease is 30 seconds and is refreshed by interaction requests.
+
+## Fix round 1 evidence
+
+RED was reproduced before the repair: the hostile future replay test returned the future watermark instead of the runtime head, and the hosted-runtime registry cleanup test timed out because the lease reaper retained the runtime while waiting. The missing HTTP regressions were then added first for future `u64::MAX` replay, header precedence, SSE framing, bounded bodies, route guards, child-folder classification, path-free errors, and unknown-client interaction.
+
+GREEN after `93f77e3`:
+
+- `CARGO_INCREMENTAL=0 cargo test --offline -p photo-server --test gallery_api --test events_api` passed (7 gallery, 4 event tests).
+- `CARGO_INCREMENTAL=0 cargo test --offline -p photo-app-service --lib --tests` passed (92 unit tests and all app-service integration suites, including 14 hosted-runtime and 57 progressive-wall tests).
+- `CARGO_INCREMENTAL=0 cargo test --offline -p photo-server --tests` passed all server unit/integration suites.
+- `CARGO_INCREMENTAL=0 cargo test --offline --workspace` passed all workspace unit, integration, benchmark-smoke, and doc tests.
+- `cargo fmt --all -- --check` and `git diff --check` passed.
+
+The reaper now has one weakly-owned resettable timer task per runtime, activates hosted demand when the stream opens, expires leases under paused Tokio time, preserves connected scope after expiry, and exits when the runtime drops. Desktop subscriptions use an internal origin enum and cannot be forged through a `desktop-*` client ID. Request guards run before gallery lookup and body buffering is bounded at 64 KiB with the fixed `invalidRequest` envelope.
+
+Implementation commit: `93f77e3` (`fix: harden hosted gallery leases and transport`).
+
+Remaining concerns are intentionally deferred to the task boundaries: the browser's 10-second refresh adapter and the derivative route's 512-byte/list limits belong to Tasks 5–6. No source-media writes were introduced.
