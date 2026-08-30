@@ -323,3 +323,60 @@ All Cargo commands were run in the foreground, serially, offline, with `CARGO_BU
 ## Round-5 evidence limits
 
 The publication fence and post-publication rollback establish the exercised in-process admission/repair boundary; they do not claim cross-process transactional atomicity. Unix/macOS tests exercise descriptor-relative ancestor/final-component swaps. The Windows test covers final reparse-point containment compilation and behavior, but Windows ancestor traversal is not claimed to be descriptor-relative. `replace_atomic` has an in-process repair contract; no crash-consistency or cross-process guarantee is claimed.
+
+## Task 5 exceptional fix round 6
+
+Implementation/test commit: `88c49f8` (`fix: harden hosted derivative publication`), based on `4d2984c`.
+
+This round closes the late-waiter, hosted-supervisor, cache-replacement, bounded-read, and proof gaps found by the breaker review. Hosted commit settlement now drains the current waiter set at the commit boundary and applies a scope authorizer to each waiter. The hosted driver stores and aborts its active child before owner cleanup, uses a hosted-only force-abort transition, and serializes cancellation/publication with one in-process fence; an old attempt cannot publish after terminal failure or overlap a queued successor. Ordinary desktop workers retain their started-blocking-commit cancellation contract.
+
+Unix/macOS cache writes now pin every managed ancestor with descriptor-relative `openat`/`mkdirat`/`renameat`/`linkat`/`unlinkat` operations and `O_NOFOLLOW`; create, replace, and delete ancestor/final-component swaps are deterministic tests with an outside sentinel. Windows has reparse-point-safe parent directory guards, a non-destructive `ReplaceFileW`/`MoveFileExW` replacement seam, and a `cfg(windows)` replacement-failure test. A failed repair leaves old shared bytes and all catalog links intact. The report makes no cross-process catalog transaction claim.
+
+Gallery validation now checks only bounded metadata/JPEG framing with a 64 MiB ceiling and fixed 64 KiB prefix buffer; derivative GET returns a managed asynchronous chunk stream. Sparse oversized and same-prefix malformed files are rejected without full-file buffering or decode. Added proof covers a genuinely foreign library, an actual mixed-scope ready event, shared-link repair/reuse, an HTTP traversal row, cleanup failure injection, and child termination/no stale ready publication after hosted driver cancellation.
+
+Round-6 RED evidence:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --lib hosted_commit_uses_current_waiters_and_their_commit_scopes --jobs 2
+  RED: compile failed because complete_commit_authorized was not yet implemented
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test cache_policy replacement_failure_preserves_existing_bytes --jobs 2
+  RED: compile failed because fail_next_replace_for_test was not yet implemented
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test progressive_wall --jobs 2
+  RED: 55 passed, 2 failed; cancelled_screen_commit_waits_for_started_blocking_work and cancelled_wall_commit_waits_for_started_blocking_work regressed when the initial abort transition was made global
+```
+
+The first two commands are behavioral RED probes whose test seams intentionally did not exist before implementation; the third is the genuine behavioral regression used to split hosted force-abort from desktop abort semantics.
+
+Round-6 GREEN evidence:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test cache_policy --jobs 2
+  PASS: 25 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test image_derivative --jobs 2
+  PASS: 12 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --lib --jobs 2
+  PASS: 102 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections --jobs 2
+  PASS: 17 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_runtime --jobs 2
+  PASS: 16 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test progressive_wall --jobs 2
+  PASS: 57 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --test derivative_api --jobs 2
+  PASS: 3 passed, 0 failed
+CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 cargo fmt --all -- --check
+  PASS: no formatting differences
+git diff --check
+  PASS: no whitespace errors
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test --offline --workspace --jobs 2
+  PASS: all workspace unit/integration tests and doc-tests; 0 failures
+  PASS: app-service lib 102, hosted selections 17, hosted runtime 16,
+        progressive wall 57, cache policy 25, cache image derivatives 12,
+        scheduler priority 13, derivative HTTP 3, and all remaining suites
+```
+
+All Cargo commands were foreground, serial, offline, and used `CARGO_BUILD_JOBS=2`; test commands used `--jobs 2`. No background commands or `cargo clean` were used. The full workspace gate ran exactly once, last, after all source/test edits and formatting. After it returned successfully, no source or test file was changed. This host exposes only the aarch64-apple-darwin Rust target, so the Windows-only compile/run seam was added but not executed locally. Process-table enumeration is restricted; every foreground Cargo command exited and no background build was launched.
+
+## Round-6 evidence limits
+
+Descriptor-relative containment and the publication fence establish the exercised in-process guarantees. Windows parent handles prevent the tested ancestor pathname swap while held and replacement is non-destructive, but Windows and catalog consistency are not claimed as a universal cross-process transaction. The direct hosted commit path intentionally keeps the short cache/catalog publication operation in the owned async attempt under the fence; this avoids a detached blocking publisher, while unusually slow filesystem/catalog operations could still occupy an async worker briefly. GET and cache validation remain bounded and streamed. The Windows-specific tests were not runnable on this macOS-only target.
