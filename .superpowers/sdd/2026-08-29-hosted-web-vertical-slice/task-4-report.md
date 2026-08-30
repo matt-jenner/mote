@@ -45,3 +45,17 @@ The reaper now has one weakly-owned resettable timer task per runtime, activates
 Implementation commit: `93f77e3` (`fix: harden hosted gallery leases and transport`).
 
 Remaining concerns are intentionally deferred to the task boundaries: the browser's 10-second refresh adapter and the derivative route's 512-byte/list limits belong to Tasks 5–6. No source-media writes were introduced.
+
+## Fix round 2 evidence
+
+The mandatory HTTP/runtime regression matrix was added test-first without changing release behavior. The additions cover successful wall paging and route cursor scope/direction rejection; normal `Last-Event-ID`, `afterEventId`, header precedence, retained-history resync and live recovery; deterministic 15-second heartbeat framing; bounded slow-consumer lag recovery; response-body drop cleanup; mixed HTTP scopes and aggregate demand; paused route lease expiry; query/body/identifier limits; public `desktop-*` Hosted behavior versus internal Desktop behavior; and multi-chunk request overflow with the fixed JSON envelope. Debug-only accessors expose the existing gallery runtime to these real-router lifecycle tests.
+
+GREEN after round 2:
+
+- `CARGO_INCREMENTAL=0 cargo test --offline -p photo-server --lib --test gallery_api --test events_api` passed (1 API unit, 9 gallery, 10 event tests).
+- `CARGO_INCREMENTAL=0 cargo test --offline -p photo-app-service --lib --test hosted_runtime` passed (92 unit and 15 hosted-runtime tests).
+- `CARGO_INCREMENTAL=0 cargo test --offline -p photo-app-service --test progressive_wall` passed (57 tests).
+- `CARGO_INCREMENTAL=0 cargo test --offline --workspace` passed all workspace unit, integration, benchmark-smoke, and doc tests.
+- `cargo fmt --all -- --check` and `git diff --check` passed.
+
+No round-2 production defect was exposed; only debug-only test hooks and regression coverage were added. The implementation baseline remains `93f77e3`; round-2 test coverage is committed separately.
