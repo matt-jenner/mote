@@ -15,11 +15,13 @@ use photo_core::{LibraryService, RealSourceFs};
 use photo_domain::{FolderGroupId, GalleryScope, LibraryId, RelativePathKey};
 use photo_indexer::{DefaultMetadataReader, IndexEvent, Indexer, MetadataReader, ScanRequest};
 
+use crate::derivative_coordinator::{WorkKey, WorkLane, WorkTicket};
 use crate::hosted_runtime::{SelectionEventSubscription, SelectionRuntime, SubscriptionOrigin};
 use crate::service::{ReaderAdapter, ServiceState};
 use crate::{
-    AppConfig, AppServiceError, DerivativeClass, DerivativeReference, DerivativeRequest,
-    InteractionState, OrderState, SourceAvailability, WallPage, WallQueryRequest, WallUpdate,
+    AppConfig, AppServiceError, DerivativeClass, DerivativePriority, DerivativeReference,
+    DerivativeRequest, InteractionState, OrderState, SourceAvailability, WallPage,
+    WallQueryRequest, WallUpdate,
 };
 
 fn canonicalize_for_identity(path: &Path) -> PathBuf {
@@ -66,6 +68,49 @@ fn derivative_kind_name_for_gallery(class: DerivativeClass) -> &'static str {
     match class {
         DerivativeClass::WallThumbnail => "wall_thumbnail",
         DerivativeClass::ScreenPreview => "screen_preview",
+    }
+}
+
+fn derivative_record_is_valid(root: &Path, record: &photo_catalog::DerivativeRecord) -> bool {
+    let Ok(writer) = CacheWriter::new(root) else {
+        return false;
+    };
+    let Ok(mut file) = writer.open_checked(&record.relative_cache_path) else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if metadata.len() != record.size_bytes {
+        return false;
+    }
+    let mut signature = [0_u8; 3];
+    std::io::Read::read_exact(&mut file, &mut signature).is_ok() && signature == [0xff, 0xd8, 0xff]
+}
+
+struct ProtectedGroupGuard {
+    groups: photo_cache::ProtectedGroups,
+    group: FolderGroupId,
+}
+
+enum HostedDerivativePrepared {
+    Wall(photo_cache::GeneratedDerivative),
+    Screen(photo_cache::EncodedScreenPreview),
+}
+
+impl ProtectedGroupGuard {
+    fn new(
+        groups: photo_cache::ProtectedGroups,
+        group: FolderGroupId,
+    ) -> Result<Self, AppServiceError> {
+        groups.protect(group)?;
+        Ok(Self { groups, group })
+    }
+}
+
+impl Drop for ProtectedGroupGuard {
+    fn drop(&mut self) {
+        let _ = self.groups.unprotect(self.group);
     }
 }
 
@@ -135,7 +180,8 @@ pub struct GalleryEngine {
         Option<Arc<crate::derivative_coordinator::DerivativeCoordinator>>,
     pub(crate) cache_root: PathBuf,
     pub(crate) catalog_path: PathBuf,
-    derivative_locks: Arc<TokioMutex<HashMap<String, Arc<TokioMutex<()>>>>>,
+    derivative_driver: Arc<TokioMutex<()>>,
+    protected_groups: photo_cache::ProtectedGroups,
     #[cfg(test)]
     fail_next_start: Arc<AtomicBool>,
     #[cfg(test)]
@@ -217,7 +263,8 @@ impl GalleryEngine {
             shared_coordinator: None,
             cache_root,
             catalog_path,
-            derivative_locks: Arc::new(TokioMutex::new(HashMap::new())),
+            derivative_driver: Arc::new(TokioMutex::new(())),
+            protected_groups: photo_cache::ProtectedGroups::default(),
             #[cfg(test)]
             fail_next_start: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -246,7 +293,8 @@ impl GalleryEngine {
             shared_coordinator: Some(shared_coordinator),
             cache_root,
             catalog_path,
-            derivative_locks: Arc::new(TokioMutex::new(HashMap::new())),
+            derivative_driver: Arc::new(TokioMutex::new(())),
+            protected_groups: photo_cache::ProtectedGroups::default(),
             #[cfg(test)]
             fail_next_start: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -613,14 +661,140 @@ impl GalleryEngine {
     }
 
     /// Generates only the derivatives explicitly requested by this selection.
-    /// Membership is checked before any source file is opened, and concurrent
-    /// callers share one cache-key lock so an immutable output is generated once.
+    /// Membership is checked before any source file is opened. Work is then
+    /// admitted through the selection runtime's coordinator, so duplicate
+    /// callers share one queued attempt and inherit its cancellation and lane
+    /// semantics.
     pub async fn request_derivatives(
         &self,
         selection: &GallerySelection,
         scope: GalleryScope,
         request: DerivativeRequest,
     ) -> Result<(), AppServiceError> {
+        let assets = self.validate_derivative_request(selection, scope, &request)?;
+
+        let runtime = self.runtime(selection);
+        let _protected =
+            ProtectedGroupGuard::new(self.protected_groups.clone(), selection.group_id)?;
+        let classes = if request.kind == DerivativeClass::ScreenPreview {
+            vec![
+                DerivativeClass::WallThumbnail,
+                DerivativeClass::ScreenPreview,
+            ]
+        } else {
+            vec![DerivativeClass::WallThumbnail]
+        };
+        for class in classes {
+            let mut receivers = Vec::new();
+            for asset in &assets {
+                if asset.media_kind == photo_domain::MediaKind::Video {
+                    continue;
+                }
+                let spec = derivative_spec_for_gallery(asset, class);
+                let key = DerivativeKey::compute(&spec);
+                let existing = {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .map_err(|_| AppServiceError::StatePoisoned)?;
+                    let existing = state.libraries.catalog().find_derivative(
+                        asset.id,
+                        derivative_kind_name_for_gallery(class),
+                        key.as_str(),
+                    )?;
+                    if let Some(record) = existing.as_ref() {
+                        if derivative_record_is_valid(&self.cache_root, record) {
+                            state
+                                .libraries
+                                .catalog_mut()
+                                .link_derivative_group(record.id, selection.group_id)?;
+                            Some(record.cache_key.clone())
+                        } else {
+                            CacheWriter::new(&self.cache_root)?
+                                .remove_checked(&record.relative_cache_path)?;
+                            state
+                                .libraries
+                                .catalog_mut()
+                                .delete_derivatives(&[record.id])?;
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if let Some(key) = existing {
+                    runtime
+                        .publish(WallUpdate::DerivativesReady {
+                            selection_id: selection.id.clone(),
+                            derivatives: vec![DerivativeReference {
+                                asset_id: asset.id.as_uuid().hyphenated().to_string(),
+                                kind: class,
+                                key,
+                            }],
+                        })
+                        .await;
+                    continue;
+                }
+                let lane = match (class, request.priority) {
+                    (DerivativeClass::WallThumbnail, DerivativePriority::Visible) => {
+                        WorkLane::VisibleWall
+                    }
+                    (DerivativeClass::WallThumbnail, DerivativePriority::NearViewport) => {
+                        WorkLane::NearWall
+                    }
+                    (DerivativeClass::ScreenPreview, DerivativePriority::Visible) => {
+                        WorkLane::ViewerPreview
+                    }
+                    (DerivativeClass::ScreenPreview, DerivativePriority::NearViewport) => {
+                        WorkLane::IdlePreview
+                    }
+                };
+                let prerequisite = (class == DerivativeClass::ScreenPreview).then(|| {
+                    DerivativeKey::compute(&derivative_spec_for_gallery(
+                        asset,
+                        DerivativeClass::WallThumbnail,
+                    ))
+                    .as_str()
+                    .to_owned()
+                });
+                let receiver = runtime
+                    .coordinator
+                    .enqueue_with_prerequisite_observed(
+                        WorkKey {
+                            selection: selection.token(),
+                            asset_id: asset.id,
+                            class,
+                            cache_key: key.as_str().to_owned(),
+                            availability: asset.availability,
+                        },
+                        lane,
+                        prerequisite,
+                        None,
+                    )
+                    .await;
+                receivers.push(receiver);
+            }
+            if !receivers.is_empty() {
+                self.start_hosted_derivative_driver(runtime.clone());
+            }
+            for receiver in receivers {
+                if receiver.await.ok().flatten().is_none() {
+                    return Err(AppServiceError::DerivativeUnavailable);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates derivative identifiers and selection scope without starting
+    /// a scan or touching source media. HTTP callers use this boundary before
+    /// admitting work for a selection.
+    pub fn validate_derivative_request(
+        &self,
+        selection: &GallerySelection,
+        scope: GalleryScope,
+        request: &DerivativeRequest,
+    ) -> Result<Vec<photo_catalog::AssetRecord>, AppServiceError> {
         if !(1..=250).contains(&request.asset_ids.len()) {
             return Err(AppServiceError::InvalidLimit);
         }
@@ -633,179 +807,219 @@ impl GalleryEngine {
                     .map_err(|_| AppServiceError::InvalidAssetId)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let assets = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| AppServiceError::StatePoisoned)?;
-            let allowed = state.libraries.catalog().wall_records_for_assets_scoped(
-                selection.group_id,
-                scope,
-                &ids,
-            )?;
-            if allowed.len() != ids.len() {
-                return Err(AppServiceError::ForeignAsset);
-            }
-            ids.iter()
-                .map(|id| {
-                    state
-                        .libraries
-                        .catalog()
-                        .find_asset(*id)?
-                        .ok_or(AppServiceError::UnknownAsset)
-                })
-                .collect::<Result<Vec<_>, AppServiceError>>()?
-        };
-
-        let runtime = self.runtime(selection);
-        let classes = if request.kind == DerivativeClass::ScreenPreview {
-            [
-                DerivativeClass::WallThumbnail,
-                DerivativeClass::ScreenPreview,
-            ]
-        } else {
-            [
-                DerivativeClass::WallThumbnail,
-                DerivativeClass::WallThumbnail,
-            ]
-        };
-        let class_count = if request.kind == DerivativeClass::ScreenPreview {
-            2
-        } else {
-            1
-        };
-        for class in classes.into_iter().take(class_count) {
-            for asset in &assets {
-                if asset.media_kind == photo_domain::MediaKind::Video {
-                    continue;
-                }
-                let spec = derivative_spec_for_gallery(asset, class);
-                let key = DerivativeKey::compute(&spec);
-                let lock = {
-                    let mut locks = self.derivative_locks.lock().await;
-                    locks
-                        .entry(key.as_str().to_owned())
-                        .or_insert_with(|| Arc::new(TokioMutex::new(())))
-                        .clone()
-                };
-                let _guard = lock.lock().await;
-                let generated = self
-                    .generate_one_derivative(selection, asset, class, spec)
-                    .await?;
-                runtime
-                    .publish(WallUpdate::DerivativesReady {
-                        selection_id: selection.id.clone(),
-                        derivatives: vec![DerivativeReference {
-                            asset_id: asset.id.as_uuid().hyphenated().to_string(),
-                            kind: class,
-                            key: generated,
-                        }],
-                    })
-                    .await;
-            }
-        }
-        Ok(())
-    }
-
-    async fn generate_one_derivative(
-        &self,
-        selection: &GallerySelection,
-        asset: &photo_catalog::AssetRecord,
-        class: DerivativeClass,
-        spec: photo_cache::DerivativeSpec,
-    ) -> Result<String, AppServiceError> {
-        let key = DerivativeKey::compute(&spec);
-        {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| AppServiceError::StatePoisoned)?;
-            if let Some(record) = state.libraries.catalog().find_derivative(
-                asset.id,
-                derivative_kind_name_for_gallery(class),
-                key.as_str(),
-            )? {
-                if CacheWriter::new(&self.cache_root)
-                    .and_then(|writer| writer.open_checked(&record.relative_cache_path))
-                    .is_ok()
-                {
-                    state
-                        .libraries
-                        .catalog_mut()
-                        .link_derivative_group(record.id, selection.group_id)?;
-                    return Ok(record.cache_key);
-                }
-            }
-        }
-        let source = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| AppServiceError::StatePoisoned)?;
-            let library = state
-                .libraries
-                .catalog()
-                .find_library(selection.library_id)?
-                .ok_or(AppServiceError::UnknownAsset)?;
-            let root = library
-                .canonical_root_key
-                .to_path_buf()
-                .map_err(|e| CatalogError::InvalidData(e.to_string()))?;
-            let relative = asset
-                .relative_path
-                .to_path_buf()
-                .map_err(|e| CatalogError::InvalidData(e.to_string()))?;
-            root.join(relative)
-        };
-        let cache_root = self.cache_root.clone();
-        let catalog_path = self.catalog_path.clone();
-        let asset_id = asset.id;
-        let group = selection.group_id;
-        let generated = tokio::task::spawn_blocking(move || {
-            let generator = ImageDerivativeGenerator::new(&cache_root)
-                .map_err(|_| AppServiceError::DerivativeFailed)?;
-            let generated = if class == DerivativeClass::WallThumbnail {
-                generator
-                    .generate(&source, &spec)
-                    .map_err(|_| AppServiceError::DerivativeFailed)?
-            } else {
-                let mut catalog = Catalog::open(&catalog_path).map_err(AppServiceError::Catalog)?;
-                generator
-                    .generate_screen_preview(
-                        &source,
-                        asset_id,
-                        spec.signature,
-                        spec.orientation,
-                        group,
-                        &mut catalog,
-                        CacheBudget::automatic(&cache_root).map_err(AppServiceError::Cache)?,
-                        &photo_cache::ProtectedGroups::default(),
-                    )
-                    .map_err(|_| AppServiceError::DerivativeFailed)?
-            };
-            Ok::<_, AppServiceError>(generated)
-        })
-        .await
-        .map_err(|_| AppServiceError::DerivativeFailed)??;
-        let mut state = self
+        let state = self
             .state
             .lock()
             .map_err(|_| AppServiceError::StatePoisoned)?;
-        state
+        let allowed = state.libraries.catalog().wall_records_for_assets_scoped(
+            selection.group_id,
+            scope,
+            &ids,
+        )?;
+        if allowed.len() != ids.len() {
+            return Err(AppServiceError::ForeignAsset);
+        }
+        ids.iter()
+            .map(|id| {
+                state
+                    .libraries
+                    .catalog()
+                    .find_asset(*id)?
+                    .ok_or(AppServiceError::UnknownAsset)
+            })
+            .collect::<Result<Vec<_>, AppServiceError>>()
+    }
+
+    fn start_hosted_derivative_driver(&self, runtime: Arc<SelectionRuntime>) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let _driver = engine.derivative_driver.lock().await;
+            while let Some(ticket) = runtime.coordinator.next_work().await {
+                let Some(key) = runtime.coordinator.work_key(ticket).await else {
+                    continue;
+                };
+                engine
+                    .process_hosted_derivative(runtime.clone(), ticket, key)
+                    .await;
+            }
+        });
+    }
+
+    async fn process_hosted_derivative(
+        &self,
+        runtime: Arc<SelectionRuntime>,
+        ticket: WorkTicket,
+        key: WorkKey,
+    ) {
+        let Some((asset, source, spec)) = self.pending_hosted_derivative(&key) else {
+            runtime.coordinator.discard(ticket).await;
+            return;
+        };
+        let prerequisite = (key.class == DerivativeClass::ScreenPreview).then(|| {
+            DerivativeKey::compute(&derivative_spec_for_gallery(
+                &asset,
+                DerivativeClass::WallThumbnail,
+            ))
+            .as_str()
+            .to_owned()
+        });
+        let Some(permit) = runtime
+            .coordinator
+            .admit_commit(ticket, key.selection, prerequisite.as_deref())
+            .await
+        else {
+            runtime.coordinator.discard(ticket).await;
+            return;
+        };
+        let group = key.selection.group_id;
+        let Ok(_protected) = ProtectedGroupGuard::new(self.protected_groups.clone(), group) else {
+            runtime.coordinator.fail_commit(permit).await;
+            return;
+        };
+        let cache_root = self.cache_root.clone();
+        let catalog_path = self.catalog_path.clone();
+        let protected = self.protected_groups.clone();
+        let asset_id = key.asset_id;
+        let class = key.class;
+        let signature = spec.signature;
+        let orientation = spec.orientation;
+        let generation_spec = spec.clone();
+        let generation_cache_root = cache_root.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            let generator = ImageDerivativeGenerator::new(&generation_cache_root)
+                .map_err(|_| AppServiceError::DerivativeFailed)?;
+            if class == DerivativeClass::ScreenPreview {
+                generator
+                    .encode_screen_preview(
+                        &source,
+                        &photo_cache::DerivativeSpec {
+                            asset_id,
+                            signature,
+                            orientation,
+                            kind: photo_cache::DerivativeKind::ScreenPreview,
+                            decoder_version: DERIVATIVE_DECODER_VERSION.to_owned(),
+                            colour_space: "srgb".to_owned(),
+                            target: photo_cache::DerivativeTarget::LongEdge(4096),
+                        },
+                    )
+                    .map(HostedDerivativePrepared::Screen)
+                    .map_err(|_| AppServiceError::DerivativeFailed)
+            } else {
+                let generated = generator
+                    .generate(&source, &generation_spec)
+                    .map_err(|_| AppServiceError::DerivativeFailed)?;
+                Ok(HostedDerivativePrepared::Wall(generated))
+            }
+        })
+        .await;
+        let Some(prepared) = (match prepared {
+            Ok(Ok(prepared)) => Some(prepared),
+            Ok(Err(_)) | Err(_) => None,
+        }) else {
+            runtime.coordinator.fail_commit(permit).await;
+            return;
+        };
+        if self.pending_hosted_derivative(&key).is_none() {
+            runtime.coordinator.fail_commit(permit).await;
+            return;
+        }
+        let result = tokio::task::spawn_blocking(move || {
+            let generator = ImageDerivativeGenerator::new(&cache_root)
+                .map_err(|_| AppServiceError::DerivativeFailed)?;
+            let mut catalog = Catalog::open(&catalog_path).map_err(AppServiceError::Catalog)?;
+            match prepared {
+                HostedDerivativePrepared::Screen(encoded) => generator
+                    .commit_screen_preview(
+                        encoded,
+                        &spec,
+                        group,
+                        &mut catalog,
+                        CacheBudget::automatic(&cache_root).map_err(AppServiceError::Cache)?,
+                        &protected,
+                    )
+                    .map_err(|_| AppServiceError::DerivativeFailed),
+                HostedDerivativePrepared::Wall(generated) => {
+                    catalog.upsert_derivative(&NewDerivative {
+                        id: photo_domain::DerivativeId::new(),
+                        asset_id,
+                        folder_group_id: group,
+                        kind: derivative_kind_name_for_gallery(class).to_owned(),
+                        cache_key: generated.key.as_str().to_owned(),
+                        relative_cache_path: generated.relative_path.clone(),
+                        size_bytes: generated.size_bytes,
+                        durable: true,
+                        created_at: crate::service::unix_timestamp(),
+                    })?;
+                    Ok(generated)
+                }
+            }
+        })
+        .await;
+        let result = match result {
+            Ok(Ok(generated)) => Some(generated),
+            Ok(Err(_)) | Err(_) => None,
+        };
+        if let Some(generated) = result {
+            let reference = DerivativeReference {
+                asset_id: asset_id.as_uuid().hyphenated().to_string(),
+                kind: class,
+                key: generated.key.as_str().to_owned(),
+            };
+            runtime
+                .publish(WallUpdate::DerivativesReady {
+                    selection_id: runtime.selection.id.clone(),
+                    derivatives: vec![reference.clone()],
+                })
+                .await;
+            runtime.coordinator.complete_commit(permit, reference).await;
+        } else {
+            runtime.coordinator.fail_commit(permit).await;
+        }
+    }
+
+    fn pending_hosted_derivative(
+        &self,
+        key: &WorkKey,
+    ) -> Option<(
+        photo_catalog::AssetRecord,
+        PathBuf,
+        photo_cache::DerivativeSpec,
+    )> {
+        let state = self.state.lock().ok()?;
+        let asset = state.libraries.catalog().find_asset(key.asset_id).ok()??;
+        if asset.folder_group_id != Some(key.selection.group_id)
+            || asset.media_kind == photo_domain::MediaKind::Video
+            || asset.availability != key.availability
+        {
+            return None;
+        }
+        let spec = derivative_spec_for_gallery(&asset, key.class);
+        if DerivativeKey::compute(&spec).as_str() != key.cache_key {
+            return None;
+        }
+        if key.class == DerivativeClass::ScreenPreview {
+            let wall = derivative_spec_for_gallery(&asset, DerivativeClass::WallThumbnail);
+            let wall_key = DerivativeKey::compute(&wall);
+            let ready = state
+                .libraries
+                .catalog()
+                .find_derivative(asset.id, "wall_thumbnail", wall_key.as_str())
+                .ok()??;
+            if !derivative_record_is_valid(&self.cache_root, &ready) {
+                return None;
+            }
+        }
+        let library = state
             .libraries
-            .catalog_mut()
-            .upsert_derivative(&NewDerivative {
-                id: photo_domain::DerivativeId::new(),
-                asset_id,
-                folder_group_id: group,
-                kind: derivative_kind_name_for_gallery(class).to_owned(),
-                cache_key: generated.key.as_str().to_owned(),
-                relative_cache_path: generated.relative_path,
-                size_bytes: generated.size_bytes,
-                durable: class == DerivativeClass::WallThumbnail,
-                created_at: crate::service::unix_timestamp(),
-            })?;
-        Ok(generated.key.as_str().to_owned())
+            .catalog()
+            .find_library(key.selection.library_id)
+            .ok()??;
+        let root = library.canonical_root_key.to_path_buf().ok()?;
+        let relative = asset.relative_path.to_path_buf().ok()?;
+        Some((asset, root.join(relative), spec))
     }
 
     pub fn open_derivative(&self, opaque_id: &str) -> Result<ManagedDerivative, AppServiceError> {

@@ -4,6 +4,7 @@ use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_N
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use photo_app_service::AppServiceError;
+use tokio::io::AsyncReadExt;
 
 use super::gallery::{gallery, map_service_error};
 use super::types::DerivativeHttpRequest;
@@ -33,6 +34,9 @@ pub(crate) async fn request_derivatives(
     }
     let engine = gallery(&state)?;
     let selection = engine.resolve_selection(&id).map_err(map_service_error)?;
+    engine
+        .validate_derivative_request(&selection, request.scope, &request.request)
+        .map_err(map_service_error)?;
     engine
         .ensure_running(&selection)
         .await
@@ -69,7 +73,7 @@ pub(crate) async fn derivative(
     if headers
         .get(IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == managed.etag)
+        .is_some_and(|value| if_none_match_matches(value, &managed.etag))
     {
         let mut response = Response::new(Body::empty());
         *response.status_mut() = StatusCode::NOT_MODIFIED;
@@ -84,16 +88,19 @@ pub(crate) async fn derivative(
         );
         return Ok(response);
     }
-    let mut file = managed.file;
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|_| {
-        super::ApiError::new(
-            StatusCode::NOT_FOUND,
-            "notFound",
-            "That derivative is not available.",
-        )
-    })?;
-    let mut response = Response::new(Body::from(bytes));
+    let file = tokio::fs::File::from_std(managed.file);
+    let stream = futures_util::stream::unfold(file, |mut file| async move {
+        let mut chunk = vec![0_u8; 64 * 1024];
+        match file.read(&mut chunk).await {
+            Ok(0) => None,
+            Ok(read) => {
+                chunk.truncate(read);
+                Some((Ok::<_, std::io::Error>(chunk), file))
+            }
+            Err(error) => Some((Err(error), file)),
+        }
+    });
+    let mut response = Response::new(Body::from_stream(stream));
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static(managed.content_type));
@@ -114,6 +121,29 @@ pub(crate) async fn derivative(
     Ok(response)
 }
 
+fn if_none_match_matches(header: &str, current: &str) -> bool {
+    header.trim() == "*"
+        || header.split(',').any(|candidate| {
+            let candidate = candidate.trim();
+            let candidate = candidate.strip_prefix("W/").unwrap_or(candidate);
+            let current = current.strip_prefix("W/").unwrap_or(current);
+            candidate == current
+        })
+}
+
 fn header(value: &str) -> Result<HeaderValue, super::ApiError> {
     HeaderValue::from_str(value).map_err(|_| invalid_request())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::if_none_match_matches;
+
+    #[test]
+    fn if_none_match_accepts_wildcard_lists_and_weak_tags() {
+        assert!(if_none_match_matches("*", "\"abc\""));
+        assert!(if_none_match_matches("\"old\", W/\"abc\"", "\"abc\""));
+        assert!(if_none_match_matches("W/\"abc\"", "\"abc\""));
+        assert!(!if_none_match_matches("\"other\"", "\"abc\""));
+    }
 }

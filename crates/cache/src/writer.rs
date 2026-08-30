@@ -167,7 +167,25 @@ impl CacheWriter {
                 "cache file does not exist",
             )));
         }
-        Ok(OpenOptions::new().read(true).open(path)?)
+        let file = OpenOptions::new().read(true).open(path)?;
+        // The lexical/symlink checks above can race a rename. Validate the
+        // descriptor after opening as well, so a swap cannot redirect the
+        // returned handle outside the managed root.
+        if !file.metadata()?.is_file() || !descriptor_is_contained(&file, &self.root) {
+            return Err(CacheError::PathEscape);
+        }
+        Ok(file)
+    }
+
+    /// Removes a managed cache file after applying the same containment checks
+    /// used for reads. Missing files are treated as already removed.
+    pub fn remove_checked(&self, relative_path: &Path) -> Result<(), CacheError> {
+        let path = self.resolve_checked(relative_path)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub(crate) fn resolve_checked(&self, relative_path: &Path) -> Result<PathBuf, CacheError> {
@@ -232,6 +250,67 @@ impl CacheWriter {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn descriptor_is_contained(file: &File, root: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    #[cfg(target_os = "macos")]
+    {
+        let mut buffer = [0_i8; libc::PATH_MAX as usize];
+        let result = unsafe { libc::fcntl(fd, libc::F_GETPATH, buffer.as_mut_ptr()) };
+        if result == -1 {
+            return false;
+        }
+        let path = unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) };
+        return path
+            .to_str()
+            .ok()
+            .is_some_and(|path| Path::new(path).starts_with(root));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        [format!("/proc/self/fd/{fd}"), format!("/dev/fd/{fd}")]
+            .into_iter()
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .any(|path| path.starts_with(root))
+    }
+}
+
+#[cfg(windows)]
+fn descriptor_is_contained(file: &File, root: &Path) -> bool {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFinalPathNameByHandleW(
+            hFile: *mut std::ffi::c_void,
+            lpszFilePath: *mut u16,
+            cchFilePath: u32,
+            dwFlags: u32,
+        ) -> u32;
+    }
+
+    let mut buffer = vec![0_u16; 32_768];
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle() as *mut std::ffi::c_void,
+            buffer.as_mut_ptr(),
+            u32::try_from(buffer.len()).unwrap_or(u32::MAX),
+            0,
+        )
+    };
+    if length == 0
+        || usize::try_from(length)
+            .ok()
+            .is_none_or(|length| length >= buffer.len())
+    {
+        return false;
+    }
+    let path = std::ffi::OsString::from_wide(&buffer[..length as usize]);
+    Path::new(&path).starts_with(root)
 }
 
 fn is_regular_file(path: &Path) -> Result<bool, CacheError> {

@@ -262,7 +262,7 @@ async fn hosted_selection_can_request_and_open_a_managed_thumbnail() {
         .request_derivatives(
             &selection,
             photo_app_service::GalleryScope::CurrentFolder,
-            photo_app_service::DerivativeRequest::visible(vec![asset_id]),
+            photo_app_service::DerivativeRequest::visible(vec![asset_id.clone()]),
         )
         .await
         .unwrap();
@@ -288,4 +288,100 @@ async fn hosted_selection_can_request_and_open_a_managed_thumbnail() {
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut managed.file, &mut bytes).unwrap();
     assert_eq!(&bytes[..3], &[0xff, 0xd8, 0xff]);
+}
+
+#[tokio::test]
+async fn corrupt_hosted_thumbnail_is_repaired_before_it_is_reused() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir_all(&source).unwrap();
+    image::ImageBuffer::from_pixel(3, 2, image::Rgb([220_u8, 180_u8, 80_u8]))
+        .save(source.join("photo.jpg"))
+        .unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config.clone(), source.clone()).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    engine.ensure_running(&selection).await.unwrap();
+    let page = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let page = engine
+                .query_wall(
+                    &selection,
+                    photo_app_service::GalleryScope::CurrentFolder,
+                    photo_app_service::WallQueryRequest::oldest_first(),
+                )
+                .await
+                .unwrap();
+            if !page.items.is_empty() {
+                break page;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let asset_id = page.items[0].id.clone();
+    engine
+        .request_derivatives(
+            &selection,
+            photo_app_service::GalleryScope::CurrentFolder,
+            photo_app_service::DerivativeRequest::visible(vec![asset_id.clone()]),
+        )
+        .await
+        .unwrap();
+    let key = engine
+        .query_wall(
+            &selection,
+            photo_app_service::GalleryScope::CurrentFolder,
+            photo_app_service::WallQueryRequest::oldest_first(),
+        )
+        .await
+        .unwrap()
+        .items[0]
+        .wall_thumbnail
+        .as_ref()
+        .unwrap()
+        .key
+        .clone();
+    let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    let record = catalog.find_derivative_by_cache_key(&key).unwrap().unwrap();
+    let cache_path = config.cache_dir().join(record.relative_cache_path);
+    std::fs::write(&cache_path, b"corrupt").unwrap();
+    engine
+        .request_derivatives(
+            &selection,
+            photo_app_service::GalleryScope::CurrentFolder,
+            photo_app_service::DerivativeRequest::visible(vec![asset_id.clone()]),
+        )
+        .await
+        .unwrap();
+    let repaired = std::fs::read(cache_path).unwrap();
+    assert_eq!(&repaired[..3], &[0xff, 0xd8, 0xff]);
+
+    let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    let record = catalog.find_derivative_by_cache_key(&key).unwrap().unwrap();
+    let cache_path = config.cache_dir().join(record.relative_cache_path);
+    std::fs::write(&cache_path, [0xff_u8, 0xd8, 0xff]).unwrap();
+    let first = engine.clone();
+    let second = engine.clone();
+    let first_selection = selection.clone();
+    let second_selection = selection.clone();
+    let (first, second) = tokio::join!(
+        first.request_derivatives(
+            &first_selection,
+            photo_app_service::GalleryScope::CurrentFolder,
+            photo_app_service::DerivativeRequest::visible(vec![asset_id.clone()]),
+        ),
+        second.request_derivatives(
+            &second_selection,
+            photo_app_service::GalleryScope::CurrentFolder,
+            photo_app_service::DerivativeRequest::visible(vec![asset_id]),
+        )
+    );
+    first.unwrap();
+    second.unwrap();
+    let repaired = std::fs::read(cache_path).unwrap();
+    assert!(repaired.len() > 3);
+    assert_eq!(&repaired[..3], &[0xff, 0xd8, 0xff]);
 }
