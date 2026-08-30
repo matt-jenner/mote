@@ -4,7 +4,7 @@ use http_body_util::BodyExt;
 use photo_app_service::{GalleryScope, OrderState, WallUpdate};
 use photo_server::{AppState, ServerConfig, build_router};
 use serde_json::json;
-use tokio::sync::mpsc;
+use std::path::Path;
 use tower::ServiceExt;
 
 async fn next_sse_frame(body: &mut Body) -> String {
@@ -89,6 +89,30 @@ async fn event_body(app: &axum::Router, id: &str, client: &str, scope: &str, aft
         .await
         .unwrap()
         .into_body()
+}
+
+async fn wait_for_metadata_settled(
+    gallery: &photo_app_service::GalleryEngine,
+    selection: &photo_app_service::GallerySelection,
+    client_id: &str,
+) -> photo_app_service::SelectionEventSubscription {
+    let mut updates = gallery.subscribe(
+        selection,
+        client_id.to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    gallery.ensure_running(selection).await.unwrap();
+    loop {
+        let event = updates
+            .recv()
+            .await
+            .expect("selection scan ended before metadata settlement");
+        if matches!(event.update, WallUpdate::MetadataSettled { .. }) {
+            break;
+        }
+    }
+    updates
 }
 
 fn progress(selection_id: &str, generation: u64) -> WallUpdate {
@@ -430,41 +454,50 @@ fn sse_id(frame: &str) -> u64 {
 async fn sse_heartbeat_is_a_framed_comment_after_fifteen_seconds() {
     let (_temp, state, app) = test_state();
     let gallery = state.gallery_for_test().unwrap();
-    let id = create_selection(&app, "").await;
+    let summary = gallery.select_relative(Path::new(".")).await.unwrap();
+    let id = summary.id.clone();
     let selection = gallery.resolve_selection(&id).unwrap();
+    let _settled_subscription =
+        wait_for_metadata_settled(&gallery, &selection, "heartbeat-settler").await;
     let base = gallery.current_event_id_for_test(&selection);
-    let response = app
-        .oneshot(
-            Request::get(format!(
-                "/api/v1/selections/{id}/events?clientId=heartbeat&scope=currentFolder&afterEventId={base}"
-            ))
-            .body(Body::empty())
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    let mut body = response.into_body();
-    let (sender, mut received) = mpsc::unbounded_channel();
-    let reader = tokio::spawn(async move {
-        loop {
-            let frame = next_sse_frame(&mut body).await;
-            sender.send(frame).unwrap();
-        }
-    });
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
+    for _ in 0..100 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/selections/{id}/events?clientId=heartbeat&scope=currentFolder&afterEventId={base}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+
+        let initial = tokio::time::timeout(std::time::Duration::ZERO, body.frame()).await;
+        assert!(
+            initial.is_err(),
+            "event stream yielded a frame before polling"
+        );
+
+        tokio::time::advance(std::time::Duration::from_millis(14_999)).await;
+        let before_boundary = tokio::time::timeout(std::time::Duration::ZERO, body.frame()).await;
+        assert!(
+            before_boundary.is_err(),
+            "heartbeat arrived before fifteen seconds"
+        );
+
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), body.frame())
+            .await
+            .expect("heartbeat did not arrive at fifteen seconds")
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert_eq!(frame.as_ref(), b": heartbeat\n\n");
     }
-    while received.try_recv().is_ok() {}
-    tokio::time::advance(std::time::Duration::from_millis(14_999)).await;
-    tokio::task::yield_now().await;
-    assert!(
-        received.try_recv().is_err(),
-        "heartbeat arrived before 15 seconds"
-    );
-    tokio::time::advance(std::time::Duration::from_millis(1)).await;
-    tokio::task::yield_now().await;
-    assert_eq!(received.recv().await.unwrap(), ": heartbeat\n\n");
-    reader.abort();
 }
 
 #[tokio::test]

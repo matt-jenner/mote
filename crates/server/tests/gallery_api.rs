@@ -2,13 +2,14 @@ use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode};
 use futures_util::stream;
 use http_body_util::BodyExt;
+use photo_app_service::{GalleryScope, WallUpdate};
 use photo_server::{AppState, ServerConfig, build_router};
 use serde_json::json;
+use std::path::Path;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
 const MOUNTAIN: &[u8] = include_bytes!("../../../apps/interface/public/demo-photos/mountain.jpg");
-const COAST: &[u8] = include_bytes!("../../../apps/interface/public/demo-photos/coast.jpg");
 
 fn app() -> (TempDir, axum::Router) {
     let temp = tempfile::tempdir().unwrap();
@@ -27,12 +28,17 @@ fn app() -> (TempDir, axum::Router) {
     (temp, build_router(state))
 }
 
-fn app_with_photos() -> (TempDir, axum::Router) {
+fn app_with_photos() -> (TempDir, AppState, axum::Router) {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");
     std::fs::create_dir(&source).unwrap();
-    std::fs::write(source.join("mountain.jpg"), MOUNTAIN).unwrap();
-    std::fs::write(source.join("coast.jpg"), COAST).unwrap();
+    for (name, captured_at) in [
+        ("oldest.jpg", "2020:01:01 00:00:00"),
+        ("middle.jpg", "2021:01:01 00:00:00"),
+        ("newest.jpg", "2022:01:01 00:00:00"),
+    ] {
+        std::fs::write(source.join(name), jpeg_with_capture_date(captured_at)).unwrap();
+    }
     let config = ServerConfig::new(
         temp.path().join("data"),
         temp.path().join("cache"),
@@ -42,7 +48,63 @@ fn app_with_photos() -> (TempDir, axum::Router) {
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    (temp, build_router(state))
+    (temp, state.clone(), build_router(state))
+}
+
+fn jpeg_with_capture_date(captured_at: &str) -> Vec<u8> {
+    assert_eq!(captured_at.len(), 19);
+    let mut exif = Vec::new();
+    exif.extend_from_slice(b"Exif\0\0");
+    exif.extend_from_slice(b"MM");
+    exif.extend_from_slice(&0x002a_u16.to_be_bytes());
+    exif.extend_from_slice(&8_u32.to_be_bytes());
+    exif.extend_from_slice(&1_u16.to_be_bytes());
+    exif.extend_from_slice(&0x8769_u16.to_be_bytes());
+    exif.extend_from_slice(&4_u16.to_be_bytes());
+    exif.extend_from_slice(&1_u32.to_be_bytes());
+    exif.extend_from_slice(&26_u32.to_be_bytes());
+    exif.extend_from_slice(&0_u32.to_be_bytes());
+    exif.extend_from_slice(&1_u16.to_be_bytes());
+    exif.extend_from_slice(&0x9003_u16.to_be_bytes());
+    exif.extend_from_slice(&2_u16.to_be_bytes());
+    exif.extend_from_slice(&20_u32.to_be_bytes());
+    exif.extend_from_slice(&44_u32.to_be_bytes());
+    exif.extend_from_slice(&0_u32.to_be_bytes());
+    exif.extend_from_slice(captured_at.as_bytes());
+    exif.push(0);
+    assert_eq!(exif.len(), 70);
+
+    let segment_length = u16::try_from(exif.len() + 2).unwrap();
+    let mut jpeg = Vec::with_capacity(MOUNTAIN.len() + exif.len() + 6);
+    jpeg.extend_from_slice(&[0xff, 0xd8, 0xff, 0xe1]);
+    jpeg.extend_from_slice(&segment_length.to_be_bytes());
+    jpeg.extend_from_slice(&exif);
+    jpeg.extend_from_slice(&MOUNTAIN[2..]);
+    jpeg
+}
+
+async fn wait_for_metadata_settled(
+    gallery: &photo_app_service::GalleryEngine,
+    selection: &photo_app_service::GallerySelection,
+    client_id: &str,
+) -> photo_app_service::SelectionEventSubscription {
+    let mut updates = gallery.subscribe(
+        selection,
+        client_id.to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    gallery.ensure_running(selection).await.unwrap();
+    loop {
+        let event = updates
+            .recv()
+            .await
+            .expect("selection scan ended before metadata settlement");
+        if matches!(event.update, WallUpdate::MetadataSettled { .. }) {
+            break;
+        }
+    }
+    updates
 }
 
 fn app_with_state() -> (TempDir, AppState, axum::Router) {
@@ -143,6 +205,18 @@ async fn invalid_request_limits_are_rejected_before_lookup() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/folders?a=1&b=2&c=3&d=4&e=5&f=6&g=7&h=8&i=9")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(response).await["code"], "invalidRequest");
     let oversized_target = (b'a'..=b'h')
         .enumerate()
         .map(|(index, _)| format!("p{index}={}", "x".repeat(1_030)))
@@ -203,18 +277,6 @@ async fn gallery_routes_apply_shared_query_guard_before_lookup() {
         .clone()
         .oneshot(
             Request::get("/api/v1/selections/not-found?scope=currentFolder&scope=currentFolder")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(json_body(response).await["code"], "invalidRequest");
-
-    let response = app
-        .clone()
-        .oneshot(
-            Request::get("/api/v1/selections/not-found/wall?a=1&b=2&c=3&d=4&e=5&f=6&g=7&h=8&i=9")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -329,60 +391,211 @@ async fn unknown_selection_errors_do_not_echo_the_path_or_id() {
 
 #[tokio::test]
 async fn wall_paging_and_route_cursor_scope_direction_validation_work() {
-    let (_temp, app) = app_with_photos();
-    let created = app
-        .clone()
-        .oneshot(
-            Request::post("/api/v1/selections")
-                .header("content-type", "application/json")
-                .body(Body::from(json!({"path": ""}).to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let summary = json_body(created).await;
-    let id = summary["id"].as_str().unwrap().to_owned();
+    let (_temp, state, app) = app_with_photos();
+    let gallery = state.gallery_for_test().unwrap();
+    let summary = gallery.select_relative(Path::new(".")).await.unwrap();
+    let id = summary.id.clone();
+    let selection = gallery.resolve_selection(&id).unwrap();
+    let _settled_subscription =
+        wait_for_metadata_settled(&gallery, &selection, "wall-settler").await;
 
-    let first = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::get(format!(
-                        "/api/v1/selections/{id}/wall?scope=currentFolder&direction=oldestFirst&limit=1"
-                    ))
-                    .body(Body::empty())
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let value = json_body(response).await;
-            if value["items"].as_array().is_some_and(|items| items.len() == 1) {
-                break value;
+    let mut expected_oldest_cursor = None;
+    let mut expected_oldest_terminal_cursor = None;
+    let mut expected_newest_cursor = None;
+    let mut expected_newest_terminal_cursor = None;
+    for _ in 0..100 {
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::get(format!(
+                            "/api/v1/selections/{id}/wall?scope=currentFolder&direction=oldestFirst&limit=2"
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let value = json_body(response).await;
+                if value["orderState"] == "settled"
+                    && value["items"].as_array().is_some_and(|items| items.len() == 2)
+                    && value["nextCursor"].as_str().is_some()
+                {
+                    break value;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("wall scan did not produce a page");
-    let cursor = first["nextCursor"].as_str().unwrap().to_owned();
-    let second = app
-        .clone()
-        .oneshot(
-            Request::get(format!(
-                "/api/v1/selections/{id}/wall?scope=currentFolder&direction=oldestFirst&limit=1&cursor={cursor}"
-            ))
-            .body(Body::empty())
-            .unwrap(),
-        )
+        })
         .await
-        .unwrap();
-    assert_eq!(second.status(), StatusCode::OK);
-    let second = json_body(second).await;
-    assert_eq!(second["items"].as_array().unwrap().len(), 1);
-    assert_ne!(first["items"][0]["id"], second["items"][0]["id"]);
+        .expect("wall scan did not produce a settled page with a cursor");
+        assert_eq!(
+            first["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["displayName"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["oldest.jpg", "middle.jpg"]
+        );
+        let cursor = first["nextCursor"].as_str().unwrap().to_owned();
+        if let Some(expected) = &expected_oldest_cursor {
+            assert_eq!(&cursor, expected);
+        } else {
+            expected_oldest_cursor = Some(cursor.clone());
+        }
 
+        let second_response = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/selections/{id}/wall?scope=currentFolder&direction=oldestFirst&limit=2&cursor={cursor}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let second = json_body(second_response).await;
+        assert_eq!(second["orderState"], "settled");
+        assert_eq!(
+            second["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["displayName"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["newest.jpg"]
+        );
+        let second_ids = second["items"].as_array().unwrap();
+        let first_ids = first["items"].as_array().unwrap();
+        let mut ids = std::collections::HashSet::new();
+        for item in first_ids.iter().chain(second_ids.iter()) {
+            assert!(ids.insert(item["id"].as_str().unwrap()));
+        }
+        assert_eq!(ids.len(), 3);
+        let terminal_cursor = second["nextCursor"].as_str().unwrap().to_owned();
+        if let Some(expected) = &expected_oldest_terminal_cursor {
+            assert_eq!(&terminal_cursor, expected);
+        } else {
+            expected_oldest_terminal_cursor = Some(terminal_cursor.clone());
+        }
+        let terminal_response = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/selections/{id}/wall?scope=currentFolder&direction=oldestFirst&limit=2&cursor={terminal_cursor}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal_response.status(), StatusCode::OK);
+        let terminal = json_body(terminal_response).await;
+        assert!(terminal["items"].as_array().unwrap().is_empty());
+        assert_eq!(terminal["nextCursor"], serde_json::Value::Null);
+
+        let newest = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::get(format!(
+                            "/api/v1/selections/{id}/wall?scope=currentFolder&direction=newestFirst&limit=2"
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let value = json_body(response).await;
+                if value["orderState"] == "settled"
+                    && value["items"].as_array().is_some_and(|items| items.len() == 2)
+                    && value["nextCursor"].as_str().is_some()
+                {
+                    break value;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("wall scan did not produce a settled newest page with a cursor");
+        assert_eq!(
+            newest["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["displayName"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["newest.jpg", "middle.jpg"]
+        );
+        let newest_cursor = newest["nextCursor"].as_str().unwrap().to_owned();
+        if let Some(expected) = &expected_newest_cursor {
+            assert_eq!(&newest_cursor, expected);
+        } else {
+            expected_newest_cursor = Some(newest_cursor.clone());
+        }
+        let newest_second_response = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/selections/{id}/wall?scope=currentFolder&direction=newestFirst&limit=2&cursor={newest_cursor}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(newest_second_response.status(), StatusCode::OK);
+        let newest_second = json_body(newest_second_response).await;
+        assert_eq!(newest_second["orderState"], "settled");
+        assert_eq!(
+            newest_second["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["displayName"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["oldest.jpg"]
+        );
+        let mut newest_ids = std::collections::HashSet::new();
+        for item in newest["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(newest_second["items"].as_array().unwrap().iter())
+        {
+            assert!(newest_ids.insert(item["id"].as_str().unwrap()));
+        }
+        assert_eq!(newest_ids.len(), 3);
+        let newest_terminal_cursor = newest_second["nextCursor"].as_str().unwrap().to_owned();
+        if let Some(expected) = &expected_newest_terminal_cursor {
+            assert_eq!(&newest_terminal_cursor, expected);
+        } else {
+            expected_newest_terminal_cursor = Some(newest_terminal_cursor.clone());
+        }
+        let newest_terminal_response = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/selections/{id}/wall?scope=currentFolder&direction=newestFirst&limit=2&cursor={newest_terminal_cursor}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(newest_terminal_response.status(), StatusCode::OK);
+        let newest_terminal = json_body(newest_terminal_response).await;
+        assert!(newest_terminal["items"].as_array().unwrap().is_empty());
+        assert_eq!(newest_terminal["nextCursor"], serde_json::Value::Null);
+    }
+
+    let cursor = expected_oldest_cursor.unwrap();
     for (scope, direction) in [
         ("includeSubfolders", "oldestFirst"),
         ("currentFolder", "newestFirst"),
@@ -391,7 +604,7 @@ async fn wall_paging_and_route_cursor_scope_direction_validation_work() {
             .clone()
             .oneshot(
                 Request::get(format!(
-                    "/api/v1/selections/{id}/wall?scope={scope}&direction={direction}&limit=1&cursor={cursor}"
+                    "/api/v1/selections/{id}/wall?scope={scope}&direction={direction}&limit=2&cursor={cursor}"
                 ))
                 .body(Body::empty())
                 .unwrap(),

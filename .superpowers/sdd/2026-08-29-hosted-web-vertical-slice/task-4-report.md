@@ -76,3 +76,39 @@ Verification for round 3:
 - `cargo fmt --all -- --check` and `git diff --check` passed before the final commit gate.
 
 The implementation baseline remains `93f77e3`; round-3 test coverage and this evidence update are committed separately.
+
+## Fix round 4 evidence
+
+Round 4 closed the remaining test-evidence gaps. The shared query-count
+regression now uses the folder route with eight benign ignored parameters for
+the successful boundary and the same route with nine parameters for the fixed
+`invalidRequest` response; it does not rely on a gallery parser rejecting
+unknown keys. The heartbeat test creates a direct subscription before scan
+admission, awaits its `MetadataSettled` event, records the authoritative head,
+and then opens the HTTP stream under paused Tokio time. It asserts no frame at
+14,999 ms and exactly `: heartbeat\n\n` at 15,000 ms across 100 iterations.
+
+The wall regression uses three dated JPEG fixtures, awaits `MetadataSettled`
+before querying, and polls only for a settled two-item page with a non-null
+cursor. It verifies the literal oldest/newest order, both page continuations,
+duplicate-free IDs, stable cursors, and an empty terminal page with a null
+cursor across 100 iterations. No production defect was exposed; this round is
+test and evidence hardening only.
+
+Verification for round 4:
+
+- `CARGO_INCREMENTAL=0 cargo test --offline -p photo-server --test gallery_api invalid_request_limits_are_rejected_before_lookup` passed.
+- `CARGO_INCREMENTAL=0 cargo test --offline -p photo-server --test gallery_api wall_paging_and_route_cursor_scope_direction_validation_work` passed.
+- `CARGO_INCREMENTAL=0 cargo test --offline -p photo-server --test events_api sse_heartbeat_is_a_framed_comment_after_fifteen_seconds` passed (100 paused-time iterations).
+- The focused server matrix passed (1 server unit, 9 gallery, and 10 event
+  tests); the hosted-runtime suite passed (92 unit and 15 integration tests),
+  and the progressive-wall suite passed (57 tests).
+- The latest full-workspace run had one unrelated timeout in
+  `unavailable_selected_child_marks_only_its_group_offline`; rerunning that
+  existing test alone passed. The changed server suites were green.
+- The release server test gate is blocked before execution because the
+  existing `AppState::gallery_for_test` helper is `cfg(debug_assertions)` and
+  therefore unavailable to release integration tests (nine method-lookup
+  errors). An earlier release attempt also hit the shared volume's
+  `No space left on device` limit before this compile error was observed.
+- `cargo fmt --all -- --check` and `git diff --check` passed.
