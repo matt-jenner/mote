@@ -270,3 +270,56 @@ All Cargo commands were foreground, serial, offline, and used `CARGO_BUILD_JOBS=
 ## Round-4 evidence limits
 
 The generation fence and deterministic test establish rejection before publication for the exercised in-process and direct-catalog mutation window; they do not claim a universal transaction covering arbitrary external processes after the final recheck. The durable owner and attempt join handling are covered by coordinator owner tests and the hosted panic regression, but an OS-level crash is outside the process contract. Existing cache containment coverage remains Unix/macOS descriptor-relative plus Windows final-handle validation; no new Windows ancestor traversal guarantee is claimed. Existing source snapshot and HTTP path/error tests remain covered by the workspace gate; this round adds no claim beyond those passing tests.
+
+## Task 5 fix round 5
+
+Implementation/test commit: `cce983d` (`fix: close final hosted derivative races`), based on `bcfe0c0`.
+
+Round-5 RED evidence was a behavioral hosted HTTP regression, not a compile-only probe:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --test derivative_api --jobs 2
+  RED: derivative_request_exposes_invalid_unavailable_and_failed_envelopes failed; missing-source request returned HTTP 500 instead of the expected derivativeUnavailable HTTP 503
+```
+
+The final fix classifies a missing/non-regular source as `DerivativeUnavailable` before encoding. It also carries typed `DerivativeResult::{Ready,Failed,Unavailable}` through every hosted waiter and completion entry; late waiters validate their own scope at arrival. A dropped/cancelled/panicking hosted supervisor settles its active ticket as failure, releases ownership, and starts a successor for queued work. Hosted drivers serialize bounded admission behind one shared owner and select only the best queued job in the hosted derivative family, so unrelated index work cannot block it.
+
+Publication now holds the shared in-process hosted publication fence across current-key/signature/membership checks, cache publication, and catalog mutation. A final post-publication fence recheck rolls back the requesting group link before terminal settlement. Corrupt same-size JPEG-prefix files are decoded before reuse, and repair can replace the immutable-key bytes atomically while preserving links held by other groups. Cache open/unlink tests use a one-shot Unix/macOS race seam for deterministic ancestor and final-component swaps; a `cfg(windows)` final reparse-point containment test compiles for Windows.
+
+The direct acceptance additions cover another selection/group foreign asset, empty and 251-ID service and HTTP requests, mixed-scope ready filtering, missing/corrupt cache repair, multi-group link preservation, source snapshots across hosted wall/screen generation, HTTP missing-file and escaping-symlink rows, and all three HTTP envelopes. Source roots remain read-only; derivative GET remains opaque-ID and managed-cache-only.
+
+Exact round-5 GREEN commands/results:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections --jobs 2
+  PASS: 14 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_runtime --jobs 2
+  PASS: 15 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test progressive_wall --jobs 2
+  PASS: 57 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test task7_source_safety --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --test derivative_api --jobs 2
+  PASS: 3 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test cache_policy --jobs 2
+  PASS: 21 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test image_derivative --jobs 2
+  PASS: 11 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-indexer --test scheduler_priority --jobs 2
+  PASS: 13 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo fmt --all -- --check
+  PASS: no formatting differences
+git diff --check
+  PASS: no whitespace errors
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test --offline --workspace --jobs 2
+  PASS: all workspace unit/integration tests and doc-tests; 0 failures
+  PASS: app-service lib 99, hosted selections 14, progressive wall 57,
+        cache policy 21, cache image derivatives 11, scheduler priority 13,
+        derivative HTTP 3, and all remaining workspace suites
+```
+
+All Cargo commands were run in the foreground, serially, offline, with `CARGO_BUILD_JOBS=2` and `--jobs 2`; no `cargo clean` or background build was used. The workspace gate was run exactly once, after the final source/test edit and formatting check. After it returned successfully, no source or test file was changed. `pgrep -fl '(^|/)(cargo|rustc)( |$)'` could not enumerate processes on this host (`sysmond service not found`; `Cannot get process list`), so cleanup confirmation is based on every foreground command returning and no background launch.
+
+## Round-5 evidence limits
+
+The publication fence and post-publication rollback establish the exercised in-process admission/repair boundary; they do not claim cross-process transactional atomicity. Unix/macOS tests exercise descriptor-relative ancestor/final-component swaps. The Windows test covers final reparse-point containment compilation and behavior, but Windows ancestor traversal is not claimed to be descriptor-relative. `replace_atomic` has an in-process repair contract; no crash-consistency or cross-process guarantee is claimed.
