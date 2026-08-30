@@ -22,7 +22,7 @@ The full workspace run required `CARGO_INCREMENTAL=0` after reclaiming this work
 
 ## Implementation commit
 
-`b4ac861` (`feat: expose selection scoped gallery events`).
+`c349e05` (`feat: expose selection scoped gallery events`).
 
 ## Concerns
 
