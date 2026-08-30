@@ -150,6 +150,102 @@ fn commit_wall_thumbnail_replaces_corrupt_bytes_under_an_immutable_key() {
 }
 
 #[test]
+fn shared_screen_repair_failure_preserves_bytes_and_existing_group_link() {
+    let fixture = fixture();
+    let cache = tempfile::tempdir().unwrap();
+    let library = NewLibrary::configured("Photos", cache.path());
+    let asset = photo_catalog::NewAsset::minimal(
+        library.id,
+        RelativePathKey::from_relative_path(std::path::Path::new("image.jpg")).unwrap(),
+        "image.jpg",
+        MediaKind::Jpeg,
+        1,
+    );
+    let first_group = FolderGroupId::new();
+    let second_group = FolderGroupId::new();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    catalog.add_library(&library).unwrap();
+    catalog.upsert_asset(&asset).unwrap();
+    for (group, name) in [(first_group, "first"), (second_group, "second")] {
+        catalog
+            .upsert_folder_group(&NewFolderGroup {
+                id: group,
+                library_id: library.id,
+                relative_path: RelativePathKey::from_relative_path(std::path::Path::new(name))
+                    .unwrap(),
+                display_path: name.into(),
+                last_viewed_at: Some(1),
+            })
+            .unwrap();
+    }
+    let generator = ImageDerivativeGenerator::new(cache.path()).unwrap();
+    let source_signature = FileSignature {
+        size_bytes: std::fs::metadata(fixture.path()).unwrap().len(),
+        modified_unix_ns: 1,
+        sidecar_modified_unix_ns: None,
+    };
+    let requested = DerivativeSpec {
+        asset_id: asset.id,
+        signature: source_signature,
+        orientation: 1,
+        kind: DerivativeKind::ScreenPreview,
+        decoder_version: "image-0.25-v1".into(),
+        colour_space: "srgb".into(),
+        target: DerivativeTarget::LongEdge(4096),
+    };
+    let budget = CacheBudget::from_total_space(100_000_000);
+    let first = generator
+        .generate_screen_preview(
+            fixture.path(),
+            asset.id,
+            source_signature,
+            1,
+            first_group,
+            &mut catalog,
+            budget,
+            &ProtectedGroups::default(),
+        )
+        .unwrap();
+    let cache_path = cache.path().join(&first.relative_path);
+    std::fs::write(&cache_path, b"old-shared-bytes").unwrap();
+    let encoded = generator
+        .encode_screen_preview(fixture.path(), &requested)
+        .unwrap();
+    generator.fail_next_replace_for_test();
+    let failed = generator.commit_screen_preview_repairing(
+        encoded.clone(),
+        &requested,
+        second_group,
+        &mut catalog,
+        budget,
+        &ProtectedGroups::default(),
+    );
+    assert!(matches!(
+        failed,
+        Err(photo_cache::ImageDerivativeError::Cache(
+            photo_cache::CacheError::Write(_)
+        ))
+    ));
+    assert_eq!(std::fs::read(&cache_path).unwrap(), b"old-shared-bytes");
+    assert_eq!(catalog.derivative_count(first_group, false).unwrap(), 1);
+    assert_eq!(catalog.derivative_count(second_group, false).unwrap(), 0);
+
+    generator
+        .commit_screen_preview_repairing(
+            encoded,
+            &requested,
+            second_group,
+            &mut catalog,
+            budget,
+            &ProtectedGroups::default(),
+        )
+        .unwrap();
+    assert_eq!(catalog.derivative_count(first_group, false).unwrap(), 1);
+    assert_eq!(catalog.derivative_count(second_group, false).unwrap(), 1);
+    assert!(image::open(&cache_path).is_ok());
+}
+
+#[test]
 fn controlled_demo_fixture_generation_leaves_source_unchanged() {
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../apps/interface/public/demo-photos/city.jpg");

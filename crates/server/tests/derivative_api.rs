@@ -180,6 +180,9 @@ async fn derivative_route_delivers_managed_jpeg_with_immutable_headers() {
     let etag = response.headers()["etag"].clone();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&bytes[..3], &[0xff, 0xd8, 0xff]);
+    let catalog = photo_catalog::Catalog::open(&temp.path().join("data/catalog.sqlite")).unwrap();
+    let record = catalog.find_derivative_by_cache_key(&key).unwrap().unwrap();
+    let managed_path = temp.path().join("cache").join(record.relative_cache_path);
 
     let response = app
         .clone()
@@ -193,6 +196,40 @@ async fn derivative_route_delivers_managed_jpeg_with_immutable_headers() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
 
+    // A catalogued sparse file above the managed derivative ceiling must be
+    // rejected from GET without reading its apparent length into memory.
+    let managed_file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&managed_path)
+        .unwrap();
+    managed_file.set_len(128 * 1024 * 1024).unwrap();
+    drop(managed_file);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/derivatives/{key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    std::fs::write(&managed_path, &bytes).unwrap();
+    let mut malformed = vec![0xff_u8, 0xd8, 0xff];
+    malformed.resize(bytes.len(), 0);
+    std::fs::write(&managed_path, malformed).unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/derivatives/{key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    std::fs::write(&managed_path, &bytes).unwrap();
+
     let response = app
         .clone()
         .oneshot(
@@ -205,9 +242,6 @@ async fn derivative_route_delivers_managed_jpeg_with_immutable_headers() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    let catalog = photo_catalog::Catalog::open(&temp.path().join("data/catalog.sqlite")).unwrap();
-    let record = catalog.find_derivative_by_cache_key(&key).unwrap().unwrap();
-    let managed_path = temp.path().join("cache").join(record.relative_cache_path);
     std::fs::remove_file(&managed_path).unwrap();
     let response = app
         .clone()
@@ -227,6 +261,7 @@ async fn derivative_route_delivers_managed_jpeg_with_immutable_headers() {
         std::fs::write(&outside, JPEG).unwrap();
         std::os::unix::fs::symlink(&outside, &managed_path).unwrap();
         let response = app
+            .clone()
             .oneshot(
                 Request::get(format!("/api/v1/derivatives/{key}"))
                     .body(Body::empty())
@@ -237,6 +272,31 @@ async fn derivative_route_delivers_managed_jpeg_with_immutable_headers() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(body(response).await["code"], "notFound");
     }
+
+    // A catalog row must not turn an opaque derivative id into a traversal
+    // primitive. Bypass the typed catalog writer to model a legacy/corrupt row
+    // and prove the HTTP boundary still refuses to open outside the cache.
+    let outside = temp.path().join("outside-row.jpg");
+    std::fs::write(&outside, JPEG).unwrap();
+    drop(catalog);
+    let connection = rusqlite::Connection::open(temp.path().join("data/catalog.sqlite")).unwrap();
+    connection
+        .execute(
+            "UPDATE derivatives SET relative_cache_path = ?1 WHERE cache_key = ?2",
+            rusqlite::params!["../outside-row.jpg", key],
+        )
+        .unwrap();
+    drop(connection);
+    let response = app
+        .oneshot(
+            Request::get(format!("/api/v1/derivatives/{key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(std::fs::read(&outside).unwrap(), JPEG);
 }
 
 #[tokio::test]

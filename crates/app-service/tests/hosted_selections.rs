@@ -320,6 +320,59 @@ async fn hosted_derivative_requests_enforce_current_folder_and_foreign_membershi
 }
 
 #[tokio::test]
+async fn hosted_derivative_requests_reject_an_asset_from_a_foreign_library() {
+    let temp = tempfile::tempdir().unwrap();
+    let first_source = temp.path().join("photos-a");
+    let second_source = temp.path().join("photos-b");
+    std::fs::create_dir_all(&first_source).unwrap();
+    std::fs::create_dir_all(&second_source).unwrap();
+    ImageBuffer::from_pixel(3, 2, image::Rgb([220_u8, 180_u8, 80_u8]))
+        .save(first_source.join("first.jpg"))
+        .unwrap();
+    ImageBuffer::from_pixel(3, 2, image::Rgb([80_u8, 180_u8, 220_u8]))
+        .save(second_source.join("second.jpg"))
+        .unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let first_engine = GalleryEngine::open(config.clone(), first_source).unwrap();
+    let first_summary = first_engine.select_relative(Path::new(".")).await.unwrap();
+    let first_selection = first_engine.resolve_selection(&first_summary.id).unwrap();
+    first_engine.ensure_running(&first_selection).await.unwrap();
+    let second_engine = GalleryEngine::open(config, second_source).unwrap();
+    let second_summary = second_engine.select_relative(Path::new(".")).await.unwrap();
+    let second_selection = second_engine.resolve_selection(&second_summary.id).unwrap();
+    second_engine
+        .ensure_running(&second_selection)
+        .await
+        .unwrap();
+    let foreign_id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let page = second_engine
+                .query_wall(
+                    &second_selection,
+                    photo_app_service::GalleryScope::CurrentFolder,
+                    photo_app_service::WallQueryRequest::oldest_first(),
+                )
+                .await
+                .unwrap();
+            if let Some(item) = page.items.first() {
+                break item.id.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        first_engine.validate_derivative_request(
+            &first_selection,
+            photo_app_service::GalleryScope::CurrentFolder,
+            &photo_app_service::DerivativeRequest::visible(vec![foreign_id]),
+        ),
+        Err(photo_app_service::AppServiceError::ForeignAsset)
+    ));
+}
+
+#[tokio::test]
 async fn hosted_derivative_service_rejects_empty_and_oversized_id_lists() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");
@@ -613,6 +666,101 @@ async fn corrupt_hosted_thumbnail_is_repaired_before_it_is_reused() {
 }
 
 #[tokio::test]
+async fn hosted_repair_reuses_a_shared_derivative_linked_to_another_group() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir_all(source.join("child")).unwrap();
+    ImageBuffer::from_pixel(3, 2, image::Rgb([220_u8, 180_u8, 80_u8]))
+        .save(source.join("child/photo.jpg"))
+        .unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config.clone(), source).unwrap();
+    let root_summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let child_summary = engine.select_relative(Path::new("child")).await.unwrap();
+    let root = engine.resolve_selection(&root_summary.id).unwrap();
+    let child = engine.resolve_selection(&child_summary.id).unwrap();
+    engine.ensure_running(&root).await.unwrap();
+    engine.ensure_running(&child).await.unwrap();
+    let root_page = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let page = engine
+                .query_wall(
+                    &root,
+                    photo_app_service::GalleryScope::IncludeSubfolders,
+                    photo_app_service::WallQueryRequest::oldest_first(),
+                )
+                .await
+                .unwrap();
+            if !page.items.is_empty() {
+                break page;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let asset_id = root_page.items[0].id.clone();
+    let child_page = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let page = engine
+                .query_wall(
+                    &child,
+                    photo_app_service::GalleryScope::CurrentFolder,
+                    photo_app_service::WallQueryRequest::oldest_first(),
+                )
+                .await
+                .unwrap();
+            if !page.items.is_empty() {
+                break page;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(child_page.items[0].id, asset_id);
+    engine
+        .request_derivatives(
+            &child,
+            photo_app_service::GalleryScope::CurrentFolder,
+            photo_app_service::DerivativeRequest::visible(vec![asset_id.clone()]),
+        )
+        .await
+        .unwrap();
+    let key = engine
+        .query_wall(
+            &child,
+            photo_app_service::GalleryScope::CurrentFolder,
+            photo_app_service::WallQueryRequest::oldest_first(),
+        )
+        .await
+        .unwrap()
+        .items[0]
+        .wall_thumbnail
+        .as_ref()
+        .unwrap()
+        .key
+        .clone();
+    let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    let record = catalog.find_derivative_by_cache_key(&key).unwrap().unwrap();
+    let cache_path = config.cache_dir().join(&record.relative_cache_path);
+    std::fs::write(&cache_path, b"corrupt").unwrap();
+    engine
+        .request_derivatives(
+            &root,
+            photo_app_service::GalleryScope::IncludeSubfolders,
+            photo_app_service::DerivativeRequest::visible(vec![asset_id]),
+        )
+        .await
+        .unwrap();
+
+    let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    assert_eq!(catalog.derivative_count(child.group_id(), true).unwrap(), 1);
+    assert_eq!(catalog.derivative_count(root.group_id(), true).unwrap(), 1);
+    assert!(image::load_from_memory(&std::fs::read(cache_path).unwrap()).is_ok());
+}
+
+#[tokio::test]
 async fn hosted_encode_failure_reaches_the_request_as_derivative_failed() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");
@@ -841,6 +989,141 @@ async fn hosted_supervisor_drop_restarts_queued_work_and_settles_active_waiter()
     // owner cleanup may settle it as failed; either outcome must terminate.
     let _ = first_result;
     assert!(second_result.is_ok(), "successor must process queued work");
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn hosted_driver_drop_aborts_active_attempt_without_stale_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir_all(&source).unwrap();
+    for name in ["first.jpg", "second.jpg"] {
+        ImageBuffer::from_pixel(3, 2, image::Rgb([220_u8, 180_u8, 80_u8]))
+            .save(source.join(name))
+            .unwrap();
+    }
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config, source).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    engine.ensure_running(&selection).await.unwrap();
+    let page = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let page = engine
+                .query_wall(
+                    &selection,
+                    photo_app_service::GalleryScope::CurrentFolder,
+                    photo_app_service::WallQueryRequest::oldest_first(),
+                )
+                .await
+                .unwrap();
+            if page.items.len() == 2 {
+                break page;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let first = page
+        .items
+        .iter()
+        .find(|item| item.display_name == "first.jpg")
+        .unwrap()
+        .id
+        .clone();
+    let second = page
+        .items
+        .iter()
+        .find(|item| item.display_name == "second.jpg")
+        .unwrap()
+        .id
+        .clone();
+    let watermark = engine.current_event_id_for_test(&selection);
+    let mut updates = engine.subscribe(
+        &selection,
+        "drop-no-stale-ready".to_owned(),
+        photo_app_service::GalleryScope::CurrentFolder,
+        Some(watermark),
+    );
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    engine
+        .install_hosted_commit_publication_test_gate(entered.clone(), release.clone())
+        .await;
+    let first_engine = engine.clone();
+    let first_selection = selection.clone();
+    let first_for_request = first.clone();
+    let first_request = tokio::spawn(async move {
+        first_engine
+            .request_derivatives(
+                &first_selection,
+                photo_app_service::GalleryScope::CurrentFolder,
+                photo_app_service::DerivativeRequest::visible(vec![first_for_request]),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .expect("active attempt did not reach commit barrier");
+
+    let second_engine = engine.clone();
+    let second_selection = selection.clone();
+    let second_for_request = second.clone();
+    let second_request = tokio::spawn(async move {
+        second_engine
+            .request_derivatives(
+                &second_selection,
+                photo_app_service::GalleryScope::CurrentFolder,
+                photo_app_service::DerivativeRequest::visible(vec![second_for_request]),
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+    engine.abort_hosted_derivative_driver_for_test().await;
+    release.notify_waiters();
+
+    let first_result = tokio::time::timeout(std::time::Duration::from_secs(5), first_request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        first_result,
+        Err(photo_app_service::AppServiceError::DerivativeFailed)
+    ));
+    assert!(second_request.await.unwrap().is_ok());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let event = updates.recv().await.unwrap();
+            if let photo_app_service::WallUpdate::DerivativesReady { derivatives, .. } =
+                event.update
+            {
+                assert!(
+                    derivatives
+                        .iter()
+                        .all(|derivative| derivative.asset_id != first)
+                );
+                if derivatives
+                    .iter()
+                    .any(|derivative| derivative.asset_id == second)
+                {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("queued successor did not publish its ready event");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if engine.hosted_derivative_active_count_for_test() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled child did not terminate");
 }
 
 #[cfg(debug_assertions)]

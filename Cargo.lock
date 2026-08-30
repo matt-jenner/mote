@@ -1161,6 +1161,7 @@ dependencies = [
  "photo-catalog",
  "photo-core",
  "photo-domain",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

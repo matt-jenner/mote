@@ -729,6 +729,108 @@ async fn mixed_scope_filters_catalog_derivatives_and_warning_events() {
     }
 }
 
+#[tokio::test]
+async fn hosted_derivative_ready_event_is_filtered_for_a_current_folder_subscriber() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir_all(source.join("child")).unwrap();
+    write_jpeg(&source.join("root.jpg"));
+    write_jpeg(&source.join("child/child.jpg"));
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config, source).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    let mut current = engine.subscribe(
+        &selection,
+        "actual-current".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    let mut recursive = engine.subscribe(
+        &selection,
+        "actual-recursive".to_owned(),
+        GalleryScope::IncludeSubfolders,
+        None,
+    );
+    engine.ensure_running(&selection).await.unwrap();
+    let page = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let page = engine
+                .query_wall(
+                    &selection,
+                    GalleryScope::IncludeSubfolders,
+                    photo_app_service::WallQueryRequest::oldest_first(),
+                )
+                .await
+                .unwrap();
+            if page
+                .items
+                .iter()
+                .any(|asset| asset.display_name == "child.jpg")
+            {
+                break page;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let child_id = page
+        .items
+        .iter()
+        .find(|asset| asset.display_name == "child.jpg")
+        .unwrap()
+        .id
+        .clone();
+    engine
+        .request_derivatives(
+            &selection,
+            GalleryScope::IncludeSubfolders,
+            photo_app_service::DerivativeRequest::visible(vec![child_id.clone()]),
+        )
+        .await
+        .unwrap();
+
+    let recursive_ready = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = recursive.recv().await.unwrap();
+            if matches!(
+                event.update,
+                WallUpdate::DerivativesReady { ref derivatives, .. }
+                    if derivatives.iter().any(|derivative| derivative.asset_id == child_id)
+            ) {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(recursive_ready.is_ok());
+    let no_child_ready = tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            let Ok(event) = tokio::time::timeout(Duration::from_millis(50), current.recv()).await
+            else {
+                break true;
+            };
+            let Some(event) = event else {
+                break true;
+            };
+            if matches!(
+                event.update,
+                WallUpdate::DerivativesReady { ref derivatives, .. }
+                    if derivatives.iter().any(|derivative| derivative.asset_id == child_id)
+            ) {
+                break false;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        no_child_ready,
+        "current-folder subscriber must not receive a child ready event"
+    );
+}
+
 fn progress(selection_id: &str, generation: u64) -> WallUpdate {
     WallUpdate::Progress {
         selection_id: selection_id.to_owned(),

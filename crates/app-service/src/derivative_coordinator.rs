@@ -98,6 +98,32 @@ impl CommitPermit {
             .compare_exchange(0, 2, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
             .is_ok()
     }
+
+    /// Hosted attempts own their child task and may be cancelled after commit
+    /// admission. Desktop workers intentionally retain the historical
+    /// started-blocking-work contract, so this stronger transition is kept
+    /// separate from [`Self::claim_abort`].
+    fn claim_hosted_abort(&self) -> bool {
+        let mut state = self.supervisor_state.load(AtomicOrdering::Acquire);
+        loop {
+            if state == 2 {
+                return false;
+            }
+            match self.supervisor_state.compare_exchange(
+                state,
+                2,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => state = observed,
+            }
+        }
+    }
+
+    pub(crate) fn was_cancelled(&self) -> bool {
+        self.supervisor_state.load(AtomicOrdering::Acquire) == 2
+    }
 }
 
 /// The coordinator's settlement is intentionally typed.  A missing source,
@@ -902,7 +928,7 @@ impl DerivativeCoordinator {
         reference: DerivativeReference,
     ) {
         let Some(delivery) = self
-            .begin_commit_delivery(permit, DerivativeResult::Ready(reference), None)
+            .begin_commit_delivery(permit, DerivativeResult::Ready(reference), None, None)
             .await
         else {
             return;
@@ -933,6 +959,7 @@ impl DerivativeCoordinator {
                 permit,
                 DerivativeResult::Ready(reference),
                 Some(allowed_scopes.to_vec()),
+                None,
             )
             .await
         else {
@@ -961,7 +988,35 @@ impl DerivativeCoordinator {
         allowed_scopes: Option<Vec<GalleryScope>>,
     ) {
         let Some(delivery) = self
-            .begin_commit_delivery(permit, result, allowed_scopes)
+            .begin_commit_delivery(permit, result, allowed_scopes, None)
+            .await
+        else {
+            return;
+        };
+        let coordinator = self.clone();
+        let delivery_task = tokio::spawn(async move {
+            coordinator.deliver_commit(delivery).await;
+        });
+        let _ = delivery_task.await;
+    }
+
+    /// Settles a hosted attempt using the waiter set at the exact transition
+    /// to commit-finished. The authorizer runs while the coordinator lock is
+    /// held, so waiters that joined during Running or early Committing cannot
+    /// be lost between a scope snapshot and delivery.
+    pub(crate) async fn complete_commit_authorized(
+        &self,
+        permit: CommitPermit,
+        reference: DerivativeReference,
+        authorizer: ScopeAuthorizer,
+    ) {
+        let Some(delivery) = self
+            .begin_commit_delivery(
+                permit,
+                DerivativeResult::Ready(reference),
+                None,
+                Some(authorizer),
+            )
             .await
         else {
             return;
@@ -1024,6 +1079,16 @@ impl DerivativeCoordinator {
     }
 
     async fn abort_attempt_with_result(&self, ticket: WorkTicket, result: DerivativeResult) {
+        self.abort_attempt_with_result_authorized(ticket, result, false)
+            .await;
+    }
+
+    async fn abort_attempt_with_result_authorized(
+        &self,
+        ticket: WorkTicket,
+        result: DerivativeResult,
+        hosted: bool,
+    ) {
         let status = {
             let state = self.state.lock().await;
             state.tickets.get(&ticket).map(|ticket_state| {
@@ -1053,7 +1118,12 @@ impl DerivativeCoordinator {
                     selection,
                     supervisor_state,
                 };
-                if permit.claim_abort() {
+                let claimed = if hosted {
+                    permit.claim_hosted_abort()
+                } else {
+                    permit.claim_abort()
+                };
+                if claimed {
                     self.fail_commit_with_result(permit, result, None).await;
                 }
             }
@@ -1063,6 +1133,11 @@ impl DerivativeCoordinator {
 
     pub(crate) async fn abort_attempt_as_failure(&self, ticket: WorkTicket) {
         self.abort_attempt_with_result(ticket, DerivativeResult::Failed)
+            .await;
+    }
+
+    pub(crate) async fn abort_hosted_attempt_as_failure(&self, ticket: WorkTicket) {
+        self.abort_attempt_with_result_authorized(ticket, DerivativeResult::Failed, true)
             .await;
     }
 
@@ -1086,6 +1161,7 @@ impl DerivativeCoordinator {
         permit: CommitPermit,
         result: DerivativeResult,
         allowed_scopes: Option<Vec<GalleryScope>>,
+        authorizer: Option<ScopeAuthorizer>,
     ) -> Option<CommitDelivery> {
         let delivery = {
             let mut state = self.state.lock().await;
@@ -1107,6 +1183,17 @@ impl DerivativeCoordinator {
             {
                 return None;
             }
+            if permit.was_cancelled() && matches!(result, DerivativeResult::Ready(_)) {
+                return None;
+            }
+            let allowed_scopes = allowed_scopes.or_else(|| {
+                authorizer.map(|authorizer| {
+                    [GalleryScope::CurrentFolder, GalleryScope::IncludeSubfolders]
+                        .into_iter()
+                        .filter(|scope| authorizer(&key, *scope))
+                        .collect()
+                })
+            });
             work.commit_result = Some(result.clone());
             work.commit_allowed_scopes = allowed_scopes.clone();
             work.commit_finishing = true;
@@ -2504,6 +2591,90 @@ mod tests {
         assert_eq!(initial.await.unwrap(), super::DerivativeResult::Unavailable);
         assert_eq!(late.await.unwrap(), super::DerivativeResult::Unavailable);
         completer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hosted_commit_uses_current_waiters_and_their_commit_scopes() {
+        let fixture = fixture();
+        let current = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let include = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let current_authorized = current.clone();
+        let include_authorized = include.clone();
+        let authorizer: super::ScopeAuthorizer = Arc::new(move |_key, scope| match scope {
+            GalleryScope::CurrentFolder => {
+                current_authorized.load(std::sync::atomic::Ordering::Acquire)
+            }
+            GalleryScope::IncludeSubfolders => {
+                include_authorized.load(std::sync::atomic::Ordering::Acquire)
+            }
+        });
+
+        let mut initial_key = screen_key();
+        initial_key.scope = GalleryScope::CurrentFolder;
+        let initial = fixture
+            .coordinator
+            .enqueue_hosted_with_prerequisite_observed(
+                initial_key,
+                WorkLane::VisibleWall,
+                None,
+                None,
+                authorizer.clone(),
+            )
+            .await;
+        let ticket = fixture.coordinator.next_work().await.unwrap();
+
+        // The first waiter was admitted while current-folder membership was
+        // true. It must be checked again at the commit boundary.
+        current.store(false, std::sync::atomic::Ordering::Release);
+        let mut running_late_key = screen_key();
+        running_late_key.scope = GalleryScope::IncludeSubfolders;
+        let running_late = fixture
+            .coordinator
+            .enqueue_hosted_with_prerequisite_observed(
+                running_late_key,
+                WorkLane::VisibleWall,
+                None,
+                None,
+                authorizer.clone(),
+            )
+            .await;
+        let permit = fixture
+            .coordinator
+            .admit_commit(ticket, fixture.selection, None)
+            .await
+            .unwrap();
+
+        // A waiter arriving after Running but before commit finishing joins
+        // the same attempt, and its own scope is evaluated atomically with
+        // the final waiter set.
+        include.store(true, std::sync::atomic::Ordering::Release);
+        let mut committing_late_key = screen_key();
+        committing_late_key.scope = GalleryScope::IncludeSubfolders;
+        let committing_late = fixture
+            .coordinator
+            .enqueue_hosted_with_prerequisite_observed(
+                committing_late_key,
+                WorkLane::VisibleWall,
+                None,
+                None,
+                authorizer.clone(),
+            )
+            .await;
+
+        fixture
+            .coordinator
+            .complete_commit_authorized(permit, reference(), authorizer)
+            .await;
+
+        assert_eq!(initial.await.unwrap(), super::DerivativeResult::Unavailable);
+        assert_eq!(
+            running_late.await.unwrap(),
+            super::DerivativeResult::Ready(reference())
+        );
+        assert_eq!(
+            committing_late.await.unwrap(),
+            super::DerivativeResult::Ready(reference())
+        );
     }
 
     #[tokio::test]

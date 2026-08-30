@@ -89,6 +89,12 @@ impl ImageDerivativeGenerator {
         })
     }
 
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn fail_next_replace_for_test(&self) {
+        self.writer.fail_next_replace_for_test();
+    }
+
     pub fn generate(
         &self,
         source: &Path,

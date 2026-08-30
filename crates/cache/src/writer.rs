@@ -1,6 +1,10 @@
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+#[cfg(any(test, debug_assertions))]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use photo_catalog::Catalog;
 
@@ -25,6 +29,10 @@ pub struct CacheWriter {
     #[cfg(any(test, debug_assertions))]
     path_race_test_hook:
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>>,
+    #[cfg(any(test, debug_assertions))]
+    replace_failure_test_hook: std::sync::Arc<AtomicBool>,
+    #[cfg(any(test, debug_assertions))]
+    cleanup_failure_test_hook: std::sync::Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for CacheWriter {
@@ -46,6 +54,10 @@ impl CacheWriter {
             root: root.canonicalize()?,
             #[cfg(any(test, debug_assertions))]
             path_race_test_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(any(test, debug_assertions))]
+            replace_failure_test_hook: std::sync::Arc::new(AtomicBool::new(false)),
+            #[cfg(any(test, debug_assertions))]
+            cleanup_failure_test_hook: std::sync::Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -72,6 +84,263 @@ impl CacheWriter {
         if let Some(hook) = hook {
             hook();
         }
+    }
+
+    #[cfg(unix)]
+    fn write_atomic_unix<F>(
+        &self,
+        relative_path: PathBuf,
+        write: F,
+        replace_existing: bool,
+    ) -> Result<CacheWrite, CacheError>
+    where
+        F: FnOnce(&mut File) -> std::io::Result<()>,
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::FromRawFd;
+
+        validate_relative(&relative_path)?;
+        let file_name = relative_path
+            .file_name()
+            .ok_or(CacheError::PathEscape)
+            .and_then(|name| CString::new(name.as_bytes()).map_err(|_| CacheError::PathEscape))?;
+        let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
+        let directory_fd = self.open_parent_fd_unix(parent, true)?;
+
+        // The opened parent descriptor pins every ancestor. An attacker may
+        // rename the pathname and install a symlink while the hook is held,
+        // but all operations below still target this directory inode.
+        #[cfg(any(test, debug_assertions))]
+        self.run_path_race_test_hook();
+
+        let mut existing_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let existing_result = unsafe {
+            libc::fstatat(
+                directory_fd,
+                file_name.as_ptr(),
+                existing_stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if existing_result == 0 {
+            let stat = unsafe { existing_stat.assume_init() };
+            if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG {
+                unsafe { libc::close(directory_fd) };
+                return Err(CacheError::PathEscape);
+            }
+            if !replace_existing {
+                let size_bytes =
+                    u64::try_from(stat.st_size).map_err(|_| CacheError::SizeOutOfRange)?;
+                unsafe { libc::close(directory_fd) };
+                return Ok(CacheWrite {
+                    relative_path,
+                    size_bytes,
+                    reused: true,
+                });
+            }
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                unsafe { libc::close(directory_fd) };
+                return Err(error.into());
+            }
+        }
+
+        let partial_name = CString::new(format!(
+            "{}.partial-{}",
+            file_name.to_string_lossy(),
+            uuid::Uuid::new_v4()
+        ))
+        .map_err(|_| CacheError::PathEscape)?;
+        let partial_fd = unsafe {
+            libc::openat(
+                directory_fd,
+                partial_name.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if partial_fd < 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::close(directory_fd) };
+            return Err(error.into());
+        }
+        let mut partial = unsafe { File::from_raw_fd(partial_fd) };
+        if let Err(error) = write(&mut partial) {
+            drop(partial);
+            unsafe {
+                libc::unlinkat(directory_fd, partial_name.as_ptr(), 0);
+                libc::close(directory_fd);
+            }
+            return Err(CacheError::Write(error));
+        }
+        if let Err(error) = partial.flush().and_then(|()| partial.sync_all()) {
+            drop(partial);
+            unsafe {
+                libc::unlinkat(directory_fd, partial_name.as_ptr(), 0);
+                libc::close(directory_fd);
+            }
+            return Err(CacheError::Write(error));
+        }
+        let size_bytes = partial.metadata()?.len();
+        drop(partial);
+
+        #[cfg(any(test, debug_assertions))]
+        if replace_existing && self.should_fail_replace_for_test() {
+            unsafe {
+                libc::unlinkat(directory_fd, partial_name.as_ptr(), 0);
+                libc::close(directory_fd);
+            }
+            return Err(CacheError::Write(std::io::Error::other(
+                "injected atomic replacement failure",
+            )));
+        }
+
+        let publish_result = if replace_existing {
+            unsafe {
+                libc::renameat(
+                    directory_fd,
+                    partial_name.as_ptr(),
+                    directory_fd,
+                    file_name.as_ptr(),
+                )
+            }
+        } else {
+            unsafe {
+                libc::linkat(
+                    directory_fd,
+                    partial_name.as_ptr(),
+                    directory_fd,
+                    file_name.as_ptr(),
+                    0,
+                )
+            }
+        };
+        if publish_result == 0 {
+            if !replace_existing {
+                let unlink_result =
+                    unsafe { libc::unlinkat(directory_fd, partial_name.as_ptr(), 0) };
+                if unlink_result < 0 {
+                    let error = std::io::Error::last_os_error();
+                    unsafe { libc::close(directory_fd) };
+                    return Err(error.into());
+                }
+            }
+            unsafe { libc::close(directory_fd) };
+            return Ok(CacheWrite {
+                relative_path,
+                size_bytes,
+                reused: false,
+            });
+        }
+
+        let publish_error = std::io::Error::last_os_error();
+        unsafe {
+            libc::unlinkat(directory_fd, partial_name.as_ptr(), 0);
+        }
+        if !replace_existing && publish_error.kind() == std::io::ErrorKind::AlreadyExists {
+            let mut final_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let final_result = unsafe {
+                libc::fstatat(
+                    directory_fd,
+                    file_name.as_ptr(),
+                    final_stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if final_result == 0 {
+                let final_stat = unsafe { final_stat.assume_init() };
+                unsafe { libc::close(directory_fd) };
+                if (final_stat.st_mode & libc::S_IFMT) == libc::S_IFREG {
+                    return Ok(CacheWrite {
+                        relative_path,
+                        size_bytes: u64::try_from(final_stat.st_size)
+                            .map_err(|_| CacheError::SizeOutOfRange)?,
+                        reused: true,
+                    });
+                }
+                return Err(CacheError::PathEscape);
+            }
+        }
+        unsafe { libc::close(directory_fd) };
+        Err(CacheError::Write(publish_error))
+    }
+
+    #[cfg(unix)]
+    fn open_parent_fd_unix(&self, relative: &Path, create: bool) -> Result<i32, CacheError> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root =
+            CString::new(self.root.as_os_str().as_bytes()).map_err(|_| CacheError::PathEscape)?;
+        let mut directory_fd = unsafe {
+            libc::open(
+                root.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if directory_fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        for component in relative.components() {
+            let name = CString::new(component.as_os_str().as_bytes())
+                .map_err(|_| CacheError::PathEscape)?;
+            let mut next_fd = unsafe {
+                libc::openat(
+                    directory_fd,
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if next_fd < 0
+                && create
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
+            {
+                let created = unsafe { libc::mkdirat(directory_fd, name.as_ptr(), 0o700) };
+                if created < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::AlreadyExists {
+                        unsafe { libc::close(directory_fd) };
+                        return Err(error.into());
+                    }
+                }
+                next_fd = unsafe {
+                    libc::openat(
+                        directory_fd,
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+            }
+            if next_fd < 0 {
+                let error = std::io::Error::last_os_error();
+                unsafe { libc::close(directory_fd) };
+                return Err(error.into());
+            }
+            unsafe { libc::close(directory_fd) };
+            directory_fd = next_fd;
+        }
+        Ok(directory_fd)
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn fail_next_replace_for_test(&self) {
+        self.replace_failure_test_hook
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn should_fail_replace_for_test(&self) -> bool {
+        self.replace_failure_test_hook.swap(false, Ordering::AcqRel)
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn fail_next_cleanup_for_test(&self) {
+        self.cleanup_failure_test_hook
+            .store(true, Ordering::Release);
     }
 
     pub fn write_atomic<F>(
@@ -108,86 +377,111 @@ impl CacheWriter {
     where
         F: FnOnce(&mut File) -> std::io::Result<()>,
     {
-        let final_path = self.resolve_checked(&relative_path)?;
-        if !replace_existing && is_regular_file(&final_path)? {
-            return Ok(CacheWrite {
-                relative_path,
-                size_bytes: final_path.metadata()?.len(),
-                reused: true,
-            });
+        #[cfg(unix)]
+        {
+            return self.write_atomic_unix(relative_path, write, replace_existing);
         }
 
-        let parent = final_path.parent().ok_or(CacheError::PathEscape)?;
-        self.create_safe_directories(parent)?;
-        let file_name = final_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or(CacheError::PathEscape)?;
-        let partial_path = parent.join(format!("{file_name}.partial-{}", uuid::Uuid::new_v4()));
-        let mut partial = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&partial_path)?;
-
-        if let Err(error) = write(&mut partial) {
-            drop(partial);
-            let _ = std::fs::remove_file(&partial_path);
-            return Err(CacheError::Write(error));
-        }
-        if let Err(error) = partial.flush().and_then(|()| partial.sync_all()) {
-            drop(partial);
-            let _ = std::fs::remove_file(&partial_path);
-            return Err(CacheError::Write(error));
-        }
-        let size_bytes = partial.metadata()?.len();
-        drop(partial);
-
-        let publish = if replace_existing {
-            match std::fs::rename(&partial_path, &final_path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Windows does not replace an existing destination with
-                    // rename. The destination was validated above and this
-                    // path is used only for an in-process immutable-key
-                    // repair, so remove and retry the atomic rename.
-                    std::fs::remove_file(&final_path)?;
-                    std::fs::rename(&partial_path, &final_path)
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            std::fs::hard_link(&partial_path, &final_path)
-        };
-        match publish {
-            Ok(()) => {
-                if !replace_existing {
-                    std::fs::remove_file(&partial_path)?;
-                }
-                Ok(CacheWrite {
-                    relative_path,
-                    size_bytes,
-                    reused: false,
-                })
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if replace_existing {
-                    let _ = std::fs::remove_file(&partial_path);
-                    return Err(CacheError::Write(error));
-                }
-                std::fs::remove_file(&partial_path)?;
-                self.resolve_checked(&relative_path)?;
-                if !is_regular_file(&final_path)? {
-                    return Err(CacheError::PathEscape);
-                }
-                Ok(CacheWrite {
+        #[cfg(not(unix))]
+        {
+            let final_path = self.resolve_checked(&relative_path)?;
+            if !replace_existing && is_regular_file(&final_path)? {
+                return Ok(CacheWrite {
                     relative_path,
                     size_bytes: final_path.metadata()?.len(),
                     reused: true,
-                })
+                });
             }
-            Err(error) => {
+
+            let parent = final_path.parent().ok_or(CacheError::PathEscape)?;
+            #[cfg(windows)]
+            let _parent_guards = self.open_windows_parent_guards(
+                relative_path.parent().unwrap_or_else(|| Path::new("")),
+            )?;
+            #[cfg(not(windows))]
+            self.create_safe_directories(parent)?;
+            let file_name = final_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or(CacheError::PathEscape)?;
+            let partial_path = parent.join(format!("{file_name}.partial-{}", uuid::Uuid::new_v4()));
+            let mut partial = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&partial_path)?;
+
+            if let Err(error) = write(&mut partial) {
+                drop(partial);
                 let _ = std::fs::remove_file(&partial_path);
-                Err(CacheError::Write(error))
+                return Err(CacheError::Write(error));
+            }
+            if let Err(error) = partial.flush().and_then(|()| partial.sync_all()) {
+                drop(partial);
+                let _ = std::fs::remove_file(&partial_path);
+                return Err(CacheError::Write(error));
+            }
+            let size_bytes = partial.metadata()?.len();
+            drop(partial);
+
+            #[cfg(any(test, debug_assertions))]
+            if replace_existing && self.should_fail_replace_for_test() {
+                let _ = std::fs::remove_file(&partial_path);
+                return Err(CacheError::Write(std::io::Error::other(
+                    "injected atomic replacement failure",
+                )));
+            }
+            let publish = if replace_existing {
+                match std::fs::rename(&partial_path, &final_path) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        // Do not remove the old bytes before a replacement
+                        // primitive has succeeded. A failed repair must leave
+                        // the shared derivative and all catalog links intact.
+                        #[cfg(windows)]
+                        {
+                            replace_file_windows(&partial_path, &final_path)
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            Err(error)
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                std::fs::hard_link(&partial_path, &final_path)
+            };
+            match publish {
+                Ok(()) => {
+                    if !replace_existing {
+                        std::fs::remove_file(&partial_path)?;
+                    }
+                    Ok(CacheWrite {
+                        relative_path,
+                        size_bytes,
+                        reused: false,
+                    })
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if replace_existing {
+                        let _ = std::fs::remove_file(&partial_path);
+                        return Err(CacheError::Write(error));
+                    }
+                    std::fs::remove_file(&partial_path)?;
+                    self.resolve_checked(&relative_path)?;
+                    if !is_regular_file(&final_path)? {
+                        return Err(CacheError::PathEscape);
+                    }
+                    Ok(CacheWrite {
+                        relative_path,
+                        size_bytes: final_path.metadata()?.len(),
+                        reused: true,
+                    })
+                }
+                Err(error) => {
+                    let _ = std::fs::remove_file(&partial_path);
+                    Err(CacheError::Write(error))
+                }
             }
         }
     }
@@ -281,6 +575,12 @@ impl CacheWriter {
     /// used for reads. Missing files are treated as already removed.
     pub fn remove_checked(&self, relative_path: &Path) -> Result<(), CacheError> {
         validate_relative(relative_path)?;
+        #[cfg(any(test, debug_assertions))]
+        if self.cleanup_failure_test_hook.swap(false, Ordering::AcqRel) {
+            return Err(CacheError::Io(std::io::Error::other(
+                "injected cache cleanup failure",
+            )));
+        }
         #[cfg(unix)]
         {
             return self.remove_checked_unix(relative_path);
@@ -476,6 +776,7 @@ impl CacheWriter {
         }
     }
 
+    #[cfg(not(unix))]
     fn create_safe_directories(&self, parent: &Path) -> Result<(), CacheError> {
         let relative = parent
             .strip_prefix(&self.root)
@@ -504,6 +805,56 @@ impl CacheWriter {
             }
         }
         Ok(())
+    }
+
+    /// Opens every Windows cache ancestor with reparse-point handling and
+    /// without sharing delete access. Keeping these directory handles alive
+    /// through staging and publication prevents an ancestor rename/reparse
+    /// swap from redirecting a pathname operation outside the managed root.
+    #[cfg(windows)]
+    fn open_windows_parent_guards(&self, relative: &Path) -> Result<Vec<File>, CacheError> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+
+        let mut guards = Vec::new();
+        let mut current = self.root.clone();
+        let mut open_directory = |path: &Path| -> Result<File, CacheError> {
+            let metadata = match std::fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match std::fs::create_dir(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    std::fs::symlink_metadata(path)?
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(CacheError::PathEscape);
+            }
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+            let file = options.open(path)?;
+            if !file.metadata()?.is_dir() || !descriptor_is_contained(&file, &self.root) {
+                return Err(CacheError::PathEscape);
+            }
+            Ok(file)
+        };
+        guards.push(open_directory(&current)?);
+        for component in relative.components() {
+            current.push(component.as_os_str());
+            guards.push(open_directory(&current)?);
+        }
+        Ok(guards)
     }
 
     #[cfg(windows)]
@@ -643,7 +994,14 @@ fn descriptor_is_contained(file: &File, root: &Path) -> bool {
         return false;
     }
     let path = std::ffi::OsString::from_wide(&buffer[..length as usize]);
-    Path::new(&path).starts_with(root)
+    let path = path.to_string_lossy();
+    let path = path.strip_prefix(r"\\?\").unwrap_or(&path);
+    let root = root.to_string_lossy();
+    let root = root.strip_prefix(r"\\?\").unwrap_or(&root);
+    path.eq_ignore_ascii_case(root)
+        || (path.len() > root.len()
+            && path[..root.len()].eq_ignore_ascii_case(root)
+            && path.as_bytes()[root.len()] == b'\\')
 }
 
 fn is_regular_file(path: &Path) -> Result<bool, CacheError> {
@@ -652,6 +1010,66 @@ fn is_regular_file(path: &Path) -> Result<bool, CacheError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+#[cfg(windows)]
+fn replace_file_windows(partial: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn ReplaceFileW(
+            replaced_file_name: *const u16,
+            replacement_file_name: *const u16,
+            backup_file_name: *const u16,
+            replace_flags: u32,
+            exclude: *mut std::ffi::c_void,
+            reserved: *mut std::ffi::c_void,
+        ) -> i32;
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const REPLACEFILE_WRITE_THROUGH: u32 = 1;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 2;
+    const MOVEFILE_WRITE_THROUGH: u32 = 8;
+    let mut old = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    let mut new = partial.as_os_str().encode_wide().collect::<Vec<_>>();
+    old.push(0);
+    new.push(0);
+    let replaced = unsafe {
+        ReplaceFileW(
+            old.as_ptr(),
+            new.as_ptr(),
+            std::ptr::null(),
+            REPLACEFILE_WRITE_THROUGH,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if replaced != 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32);
+    if error.kind() == std::io::ErrorKind::NotFound {
+        let moved = unsafe {
+            MoveFileExW(
+                new.as_ptr(),
+                old.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved != 0 {
+            return Ok(());
+        }
+        return Err(std::io::Error::from_raw_os_error(
+            unsafe { GetLastError() } as i32
+        ));
+    }
+    Err(error)
 }
 
 pub(crate) fn validate_relative(path: &Path) -> Result<(), CacheError> {

@@ -45,6 +45,8 @@ fn canonicalize_for_identity(path: &Path) -> PathBuf {
 }
 
 const DERIVATIVE_DECODER_VERSION: &str = "image-0.25-v1";
+const MAX_MANAGED_DERIVATIVE_BYTES: u64 = 64 * 1024 * 1024;
+const DERIVATIVE_HEADER_READ_BYTES: usize = 64 * 1024;
 
 fn derivative_spec_for_gallery(
     asset: &photo_catalog::AssetRecord,
@@ -79,20 +81,94 @@ fn derivative_record_is_valid(root: &Path, record: &photo_catalog::DerivativeRec
     let Ok(mut file) = writer.open_checked(&record.relative_cache_path) else {
         return false;
     };
-    let Ok(metadata) = file.metadata() else {
-        return false;
-    };
-    if metadata.len() != record.size_bytes {
-        return false;
-    }
-    let mut bytes = Vec::new();
-    if std::io::Read::read_to_end(&mut file, &mut bytes).is_err()
-        || u64::try_from(bytes.len()).ok() != Some(record.size_bytes)
-        || bytes.get(..3) != Some(&[0xff, 0xd8, 0xff])
+    validate_managed_jpeg(&mut file, record.size_bytes).unwrap_or(false)
+}
+
+/// Validates only bounded JPEG framing. The catalog supplies the expected
+/// length, while the cache imposes a hard ceiling so a sparse or corrupt file
+/// cannot force an allocation proportional to its apparent size. Full image
+/// decoding belongs to the controlled derivative worker, never to the async
+/// request path.
+fn validate_managed_jpeg(file: &mut std::fs::File, expected_size: u64) -> std::io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let metadata = file.metadata()?;
+    if metadata.len() != expected_size
+        || expected_size < 16
+        || expected_size > MAX_MANAGED_DERIVATIVE_BYTES
     {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut prefix = [0_u8; DERIVATIVE_HEADER_READ_BYTES];
+    let mut read = 0;
+    while read < prefix.len() {
+        let count = file.read(&mut prefix[read..])?;
+        if count == 0 {
+            break;
+        }
+        read += count;
+        if read >= 2 && prefix[read - 2..read] == [0xff, 0xd9] {
+            break;
+        }
+    }
+    let prefix = &prefix[..read];
+    if !jpeg_header_is_well_formed(prefix) {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(expected_size - 2))?;
+    let mut tail = [0_u8; 2];
+    file.read_exact(&mut tail)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(tail == [0xff, 0xd9])
+}
+
+fn jpeg_header_is_well_formed(bytes: &[u8]) -> bool {
+    if bytes.len() < 4 || bytes[..2] != [0xff, 0xd8] {
         return false;
     }
-    image::load_from_memory(&bytes).is_ok()
+    let mut offset = 2;
+    let mut frame = false;
+    while offset + 1 < bytes.len() {
+        if bytes[offset] != 0xff {
+            return false;
+        }
+        while offset < bytes.len() && bytes[offset] == 0xff {
+            offset += 1;
+        }
+        let Some(&marker) = bytes.get(offset) else {
+            return false;
+        };
+        offset += 1;
+        if marker == 0xda {
+            let Some(length_bytes) = bytes.get(offset..offset + 2) else {
+                return false;
+            };
+            let length = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
+            if length < 2 || offset + length > bytes.len() {
+                return false;
+            }
+            return frame;
+        }
+        if marker == 0xd9 {
+            return frame;
+        }
+        if marker == 0xd8 || marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        let Some(length_bytes) = bytes.get(offset..offset + 2) else {
+            return false;
+        };
+        let length = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
+        if length < 2 || offset + length > bytes.len() {
+            return false;
+        }
+        if (0xc0..=0xcf).contains(&marker) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
+            frame = true;
+        }
+        offset += length;
+    }
+    false
 }
 
 struct ProtectedGroupGuard {
@@ -106,6 +182,8 @@ struct HostedDriverOwner {
     engine: GalleryEngine,
     runtime: Arc<SelectionRuntime>,
     active_ticket: Arc<Mutex<Option<WorkTicket>>>,
+    active_attempt: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    publication_fence: Arc<TokioMutex<()>>,
 }
 
 impl Drop for HostedDriverOwner {
@@ -115,14 +193,31 @@ impl Drop for HostedDriverOwner {
         let engine = self.engine.clone();
         let runtime = self.runtime.clone();
         let active_ticket = self.active_ticket.clone();
+        let active_attempt = self.active_attempt.clone();
+        let publication_fence = self.publication_fence.clone();
+        if let Some(attempt) = active_attempt
+            .lock()
+            .expect("hosted active attempt poisoned")
+            .take()
+        {
+            // Abort the owned child before scheduling asynchronous owner
+            // cleanup. This closes the supervisor-drop window in which the
+            // child could otherwise wake and publish a stale result.
+            attempt.abort();
+        }
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
+                // Cancellation and publication use one lock. If publication
+                // already won the boundary, it completes before the owner
+                // settles the attempt. Otherwise cancellation wins before
+                // any old attempt can publish bytes or events.
+                let _publication = publication_fence.lock().await;
                 let ticket = active_ticket
                     .lock()
                     .expect("hosted active ticket poisoned")
                     .take();
                 if let Some(ticket) = ticket {
-                    coordinator.abort_attempt_as_failure(ticket).await;
+                    coordinator.abort_hosted_attempt_as_failure(ticket).await;
                 }
                 coordinator.release_driver_owner(generation).await;
                 if coordinator.pending_job_count().await > 0 {
@@ -918,6 +1013,12 @@ impl GalleryEngine {
         self.hosted_attempts.load(Ordering::Acquire)
     }
 
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn hosted_derivative_active_count_for_test(&self) -> usize {
+        self.hosted_active.load(Ordering::Acquire)
+    }
+
     fn try_hosted_slot(&self) -> bool {
         let limit = self.scheduler.available_background_permits().clamp(1, 4);
         let mut active = self.hosted_active.load(Ordering::Acquire);
@@ -1057,11 +1158,15 @@ impl GalleryEngine {
         }
         ids.iter()
             .map(|id| {
-                state
+                let asset = state
                     .libraries
                     .catalog()
                     .find_asset(*id)?
-                    .ok_or(AppServiceError::UnknownAsset)
+                    .ok_or(AppServiceError::UnknownAsset)?;
+                if asset.library_id != selection.library_id {
+                    return Err(AppServiceError::ForeignAsset);
+                }
+                Ok(asset)
             })
             .collect::<Result<Vec<_>, AppServiceError>>()
     }
@@ -1075,6 +1180,7 @@ impl GalleryEngine {
         };
         let engine = self.clone();
         let active_ticket = Arc::new(Mutex::new(None));
+        let active_attempt = Arc::new(Mutex::new(None));
         let driver = tokio::spawn(async move {
             let _owner = HostedDriverOwner {
                 coordinator: runtime.coordinator.clone(),
@@ -1082,6 +1188,8 @@ impl GalleryEngine {
                 engine: engine.clone(),
                 runtime: runtime.clone(),
                 active_ticket: active_ticket.clone(),
+                active_attempt: active_attempt.clone(),
+                publication_fence: engine.hosted_publication_fence.clone(),
             };
             loop {
                 let coordinator = runtime.coordinator.clone();
@@ -1145,9 +1253,18 @@ impl GalleryEngine {
                             .await;
                     }
                 });
+                *active_attempt
+                    .lock()
+                    .expect("hosted active attempt poisoned") = Some(attempt.abort_handle());
                 if attempt.await.is_err() {
-                    runtime.coordinator.abort_attempt_as_failure(ticket).await;
+                    runtime
+                        .coordinator
+                        .abort_hosted_attempt_as_failure(ticket)
+                        .await;
                 }
+                *active_attempt
+                    .lock()
+                    .expect("hosted active attempt poisoned") = None;
                 *active_ticket.lock().expect("hosted active ticket poisoned") = None;
             }
         });
@@ -1164,17 +1281,7 @@ impl GalleryEngine {
         key: WorkKey,
         _admission: HostedAdmission,
     ) {
-        let waiter_scopes = runtime.coordinator.waiter_scopes(ticket).await;
-        let generation_scope = if waiter_scopes
-            .iter()
-            .any(|scope| *scope == GalleryScope::IncludeSubfolders)
-        {
-            GalleryScope::IncludeSubfolders
-        } else {
-            GalleryScope::CurrentFolder
-        };
-        let Some((asset, source, spec)) = self.pending_hosted_derivative(&key, generation_scope)
-        else {
+        let Some((asset, source, spec)) = self.pending_hosted_derivative(&key) else {
             runtime.coordinator.discard(ticket).await;
             return;
         };
@@ -1200,6 +1307,12 @@ impl GalleryEngine {
             runtime.coordinator.discard(ticket).await;
             return;
         };
+        // Every hosted commit has exactly one live owner. The owner Drop path
+        // can claim an abort while the attempt is encoding, and all later
+        // publication boundaries reject the cancelled permit.
+        if !permit.claim_supervisor() {
+            return;
+        }
         let group = key.selection.group_id;
         let Ok(_protected) = ProtectedGroupGuard::new(self.protected_groups.clone(), group) else {
             runtime.coordinator.fail_commit_with_error(permit).await;
@@ -1252,12 +1365,11 @@ impl GalleryEngine {
         // the immutable cache/catalog state. Runtime scan writes take this
         // same fence, so no in-process scan can cross the decision boundary.
         let _publication = self.hosted_publication_fence.lock().await;
-        let admitted_scopes = self.admitted_hosted_scopes(&key, &waiter_scopes);
-        if admitted_scopes.is_empty()
-            || self
-                .pending_hosted_derivative(&key, generation_scope)
-                .is_none()
-        {
+        if permit.was_cancelled() {
+            runtime.coordinator.fail_commit_with_error(permit).await;
+            return;
+        }
+        if self.pending_hosted_derivative(&key).is_none() {
             runtime.coordinator.fail_commit(permit).await;
             return;
         }
@@ -1266,16 +1378,15 @@ impl GalleryEngine {
         // The test gate also represents the last externally observable fence:
         // re-read after it so a deterministic membership/signature mutation
         // rejects the staged bytes before either cache or catalog publication.
-        let admitted_scopes = self.admitted_hosted_scopes(&key, &waiter_scopes);
-        if admitted_scopes.is_empty()
-            || self
-                .pending_hosted_derivative(&key, generation_scope)
-                .is_none()
-        {
+        if self.pending_hosted_derivative(&key).is_none() {
             runtime.coordinator.fail_commit(permit).await;
             return;
         }
-        let result = tokio::task::spawn_blocking(move || {
+        // The publication fence makes this short catalog/cache transaction an
+        // indivisible supervisor boundary. Keep it in the owned attempt task:
+        // aborting the supervisor must never detach a blocking publisher that
+        // can outlive the terminal failure and write stale bytes afterward.
+        let result = (|| {
             let generator = ImageDerivativeGenerator::new(&cache_root)
                 .map_err(|_| AppServiceError::DerivativeFailed)?;
             let mut catalog = Catalog::open(&catalog_path).map_err(AppServiceError::Catalog)?;
@@ -1308,24 +1419,23 @@ impl GalleryEngine {
                     Ok(generated)
                 }
             }
-        })
-        .await;
+        })();
         let result = match result {
-            Ok(Ok(generated)) => Some(generated),
-            Ok(Err(_)) | Err(_) => None,
+            Ok(generated) => Some(generated),
+            Err(_) => None,
         };
         if let Some(generated) = result {
+            if permit.was_cancelled() {
+                let _ = self.rollback_hosted_publication(&generated, group);
+                runtime.coordinator.fail_commit_with_error(permit).await;
+                return;
+            }
             #[cfg(debug_assertions)]
             self.wait_hosted_commit_post_publication_test_gate().await;
             // Keep a final defensive fence for mutations made through a
             // separate Catalog connection. If it trips, leave immutable
             // shared state intact and suppress this request's publication.
-            let admitted_scopes = self.admitted_hosted_scopes(&key, &waiter_scopes);
-            if admitted_scopes.is_empty()
-                || self
-                    .pending_hosted_derivative(&key, generation_scope)
-                    .is_none()
-            {
+            if self.pending_hosted_derivative(&key).is_none() {
                 let _ = self.rollback_hosted_publication(&generated, group);
                 runtime.coordinator.fail_commit(permit).await;
                 return;
@@ -1343,7 +1453,7 @@ impl GalleryEngine {
                 .await;
             runtime
                 .coordinator
-                .complete_commit_filtered(permit, reference, &admitted_scopes)
+                .complete_commit_authorized(permit, reference, self.hosted_scope_authorizer())
                 .await;
         } else {
             runtime.coordinator.fail_commit_with_error(permit).await;
@@ -1353,7 +1463,6 @@ impl GalleryEngine {
     fn pending_hosted_derivative(
         &self,
         key: &WorkKey,
-        scope: GalleryScope,
     ) -> Option<(
         photo_catalog::AssetRecord,
         PathBuf,
@@ -1364,12 +1473,6 @@ impl GalleryEngine {
         if asset.media_kind == photo_domain::MediaKind::Video
             || asset.availability != photo_domain::Availability::Available
             || asset.availability != key.availability
-            || state
-                .libraries
-                .catalog()
-                .wall_records_for_assets_scoped(key.selection.group_id, scope, &[key.asset_id])
-                .ok()?
-                .is_empty()
         {
             return None;
         }
@@ -1426,29 +1529,6 @@ impl GalleryEngine {
         Ok(())
     }
 
-    fn admitted_hosted_scopes(&self, key: &WorkKey, scopes: &[GalleryScope]) -> Vec<GalleryScope> {
-        let Ok(state) = self.state.lock() else {
-            return Vec::new();
-        };
-        let mut admitted = Vec::new();
-        for scope in scopes.iter().copied() {
-            if admitted.contains(&scope) {
-                continue;
-            }
-            let Ok(records) = state.libraries.catalog().wall_records_for_assets_scoped(
-                key.selection.group_id,
-                scope,
-                &[key.asset_id],
-            ) else {
-                continue;
-            };
-            if !records.is_empty() {
-                admitted.push(scope);
-            }
-        }
-        admitted
-    }
-
     #[cfg(debug_assertions)]
     async fn consume_hosted_panic_before_admission_test_hook(&self) -> bool {
         let mut hook = self.hosted_panic_before_admission.lock().await;
@@ -1501,12 +1581,8 @@ impl GalleryEngine {
         }
         let writer = CacheWriter::new(&self.cache_root)?;
         let mut file = writer.open_checked(&record.relative_cache_path)?;
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut file, &mut bytes)
-            .map_err(|error| AppServiceError::Cache(error.into()))?;
-        if u64::try_from(bytes.len()).ok() != Some(record.size_bytes)
-            || bytes.get(..3) != Some(&[0xff, 0xd8, 0xff])
-            || image::load_from_memory(&bytes).is_err()
+        if !validate_managed_jpeg(&mut file, record.size_bytes)
+            .map_err(|error| AppServiceError::Cache(error.into()))?
         {
             return Err(AppServiceError::UnknownAsset);
         }
@@ -2242,5 +2318,30 @@ impl GalleryEngine {
             let _ = runtime.publish(update).await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod managed_derivative_validation_tests {
+    use std::io::Write;
+
+    use super::validate_managed_jpeg;
+
+    #[test]
+    fn oversized_sparse_derivative_is_rejected_without_reading_the_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut handle = file.reopen().unwrap();
+        handle.write_all(&[0xff, 0xd8, 0xff]).unwrap();
+        handle.set_len(128 * 1024 * 1024).unwrap();
+        assert!(!validate_managed_jpeg(&mut handle, 128 * 1024 * 1024).unwrap());
+    }
+
+    #[test]
+    fn same_prefix_garbage_is_rejected_by_bounded_jpeg_framing() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&[0xff, 0xd8, 0xff, 0x00, 0x00, 0xff, 0xd9])
+            .unwrap();
+        file.as_file_mut().flush().unwrap();
+        assert!(!validate_managed_jpeg(file.as_file_mut(), 7).unwrap());
     }
 }

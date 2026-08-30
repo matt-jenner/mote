@@ -305,6 +305,26 @@ fn windows_open_checked_rejects_a_reparse_point_final_component() {
     ));
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_replacement_failure_preserves_shared_derivative_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let writer = CacheWriter::new(temp.path()).unwrap();
+    writer
+        .write_atomic(PathBuf::from("shared.jpg"), |file| file.write_all(b"old"))
+        .unwrap();
+    writer.fail_next_replace_for_test();
+    assert!(
+        writer
+            .replace_atomic(PathBuf::from("shared.jpg"), |file| file.write_all(b"new"))
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(temp.path().join("shared.jpg")).unwrap(),
+        b"old"
+    );
+}
+
 #[test]
 fn concurrent_writers_publish_exactly_one_immutable_output() {
     let temp = tempfile::tempdir().unwrap();
@@ -356,6 +376,130 @@ fn interrupted_write_leaves_no_final_or_partial_file() {
     assert!(matches!(result, Err(CacheError::Write(_))));
     assert!(!temp.path().join("ab/cd/item.bin").exists());
     assert!(partial_files(temp.path()).is_empty());
+}
+
+#[test]
+fn replacement_failure_preserves_existing_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let writer = CacheWriter::new(temp.path()).unwrap();
+    writer
+        .write_atomic(PathBuf::from("ab/cd/item.bin"), |file| {
+            file.write_all(b"old")
+        })
+        .unwrap();
+    writer.fail_next_replace_for_test();
+
+    let result = writer.replace_atomic(PathBuf::from("ab/cd/item.bin"), |file| {
+        file.write_all(b"new")
+    });
+
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read(temp.path().join("ab/cd/item.bin")).unwrap(),
+        b"old"
+    );
+    assert!(partial_files(temp.path()).is_empty());
+}
+
+#[test]
+fn cleanup_failure_is_reported_without_removing_the_managed_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let writer = CacheWriter::new(temp.path()).unwrap();
+    writer
+        .write_atomic(PathBuf::from("item.bin"), |file| file.write_all(b"managed"))
+        .unwrap();
+    writer.fail_next_cleanup_for_test();
+
+    assert!(matches!(
+        writer.remove_checked(std::path::Path::new("item.bin")),
+        Err(CacheError::Io(_))
+    ));
+    assert_eq!(
+        std::fs::read(temp.path().join("item.bin")).unwrap(),
+        b"managed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_write_pins_ancestor_for_create_and_replace() {
+    for replace in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let writer = CacheWriter::new(&cache).unwrap();
+        if replace {
+            writer
+                .write_atomic(PathBuf::from("ab/cd/item.bin"), |file| {
+                    file.write_all(b"old")
+                })
+                .unwrap();
+        }
+        std::fs::write(outside.join("item.bin"), b"outside").unwrap();
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let hook_entered = entered.clone();
+        let hook_release = release.clone();
+        writer.install_path_race_test_hook(Arc::new(move || {
+            hook_entered.wait();
+            hook_release.wait();
+        }));
+        let worker = writer.clone();
+        let operation = thread::spawn(move || {
+            if replace {
+                worker.replace_atomic(PathBuf::from("ab/cd/item.bin"), |file| {
+                    file.write_all(b"new")
+                })
+            } else {
+                worker.write_atomic(PathBuf::from("ab/cd/item.bin"), |file| {
+                    file.write_all(b"new")
+                })
+            }
+        });
+        entered.wait();
+        std::fs::rename(cache.join("ab"), cache.join("ab-moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, cache.join("ab")).unwrap();
+        release.wait();
+        operation.join().unwrap().unwrap();
+
+        assert_eq!(
+            std::fs::read(cache.join("ab-moved/cd/item.bin")).unwrap(),
+            b"new"
+        );
+        assert_eq!(std::fs::read(outside.join("item.bin")).unwrap(), b"outside");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_write_rejects_a_final_component_swap_without_touching_outside() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let outside = temp.path().join("outside.bin");
+    std::fs::write(&outside, b"outside").unwrap();
+    let writer = CacheWriter::new(&cache).unwrap();
+
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let hook_entered = entered.clone();
+    let hook_release = release.clone();
+    writer.install_path_race_test_hook(Arc::new(move || {
+        hook_entered.wait();
+        hook_release.wait();
+    }));
+    let worker = writer.clone();
+    let write = thread::spawn(move || {
+        worker.write_atomic(PathBuf::from("item.bin"), |file| file.write_all(b"managed"))
+    });
+    entered.wait();
+    std::os::unix::fs::symlink(&outside, cache.join("item.bin")).unwrap();
+    release.wait();
+
+    assert!(matches!(write.join().unwrap(), Err(CacheError::PathEscape)));
+    assert_eq!(std::fs::read(outside).unwrap(), b"outside");
+    assert!(partial_files(&cache).is_empty());
 }
 
 #[test]
