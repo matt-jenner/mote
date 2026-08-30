@@ -535,3 +535,58 @@ All Cargo commands were run serially in the foreground, offline, with `CARGO_BUI
 ## Round-8 evidence limits
 
 `rustup target list --installed` reported only `aarch64-apple-darwin`. The `cfg(windows)` implementation and tests were therefore not compiled or run here. Static review checked the `SetFileInformationByHandle` signature, `FileRenameInfo` field offsets/alignment, `RawHandle` use, required staged-file delete access/share modes, pinned parent handle, relative UTF-16 leaf length, missing-destination behavior, and non-destructive failure paths. A Windows target build and runtime execution are still required; no Windows runtime evidence is claimed. The catalog guard is an in-process API backed by one SQLite immediate transaction plus compensating byte restoration. This report does not claim a cross-process cache/catalog transaction or crash consistency. Source roots remain read-only, and all physical mutation stays beneath the canonical managed cache.
+
+## Task 5 exceptional fix round 9
+
+Implementation/test commit: `4aa7876` (`fix: linearize hosted attempt handoff`), based on `5555643`.
+
+This round replaces the stale publication flag snapshot and the non-atomic runtime encode-idle check with one coordinator-created lease stored on the hosted work ticket. The lease moves through `PreEncode`, `Encoding`, `PrePublication`, `Publishing`, and `Finished` using short synchronous transitions. Its encode guard is owned by the blocking closure, while its task guard records completion of the async child. Cancellation either wins before publication and prevents any later encode registration, or observes `Publishing` and leaves the captured publication delivery alive. Driver generation is released only after the lease is finished, so an already-started blocking encoder exits before successor handoff. No mutex is held across blocking encode work or an async wait. Desktop commit cancellation remains on its existing path.
+
+Two debug-only deterministic barriers exercise the previously uncovered transitions. The publication regression pauses driver drop after the old snapshot point, allows the attempt to acquire the fence and authorize publication, then resumes cancellation; it checks successful typed settlement, the ready event, catalog state, zero retained coordinator jobs, and a source sentinel. The encode regression pauses before registration, completes cancellation and successor ownership handoff, then requires the abort-marked attempt to report `rejected` rather than `registered`; it also checks exact `DerivativeUnavailable` settlement and successor completion at hosted capacity four.
+
+Round-9 behavioral RED evidence:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test -p photo-app-service --test hosted_selections hosted_cancellation_ --offline --jobs 2 -- --nocapture
+  RED: 1 passed, 2 failed
+  FAIL: hosted_cancellation_transition_yields_to_publication_authorized_after_drop_starts
+        stale false publication snapshot aborted the already-authorized delivery
+  FAIL: hosted_cancellation_rejects_encode_registration_after_successor_handoff
+        abort-marked attempt registered blocking work after successor handoff
+  PASS: the existing already-entered blocking-encode cancellation regression
+```
+
+Round-9 focused GREEN and final evidence:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test -p photo-app-service --test hosted_selections hosted_cancellation_ --offline --jobs 2 -- --nocapture
+  PASS: 3 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test -p photo-app-service --test hosted_selections --offline --jobs 2
+  PASS: 24 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test -p photo-app-service --lib --offline --jobs 2
+  PASS: 102 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test -p photo-app-service --test progressive_wall cancelled_ --offline --jobs 2
+  PASS: 3 passed, 0 failed, including both desktop started-blocking-work cancellation tests
+CARGO_BUILD_JOBS=2 cargo test -p photo-app-service --test hosted_runtime --offline --jobs 2
+  PASS: 16 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test -p photo-server --test derivative_api --offline --jobs 2
+  PASS: 3 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo fmt --all
+  PASS: formatting completed
+CARGO_BUILD_JOBS=2 cargo fmt --all -- --check
+  PASS: no formatting differences
+git diff --check
+  PASS: no whitespace errors
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test --offline --workspace --jobs 2
+  PASS: all workspace unit/integration tests and doc-tests; 0 failures
+  PASS: app-service lib 102, hosted selections 24, hosted runtime 16,
+        progressive wall 57, task-7 source safety 1, cache policy 25,
+        cache image derivatives 15, catalog round trip 13,
+        derivative HTTP 3, and all remaining workspace suites
+```
+
+All Cargo commands ran serially in the foreground and offline with `CARGO_BUILD_JOBS=2`; test commands used `--jobs 2`. No background command or `cargo clean` was used. The full workspace gate ran exactly once and was the final Cargo command, after all source/test edits, formatting, and the implementation/test commit. No source or test file changed afterward, and every foreground Cargo command exited. Process enumeration is restricted on this host; cleanup confirmation is based on those exited foreground sessions and the fact that no background build was launched.
+
+## Round-9 evidence limits
+
+The two new regressions are macOS-executed in-process hosted cancellation tests. Round 9 did not change Windows-specific code and does not claim Windows compile or runtime evidence. It also does not claim a cross-process cache/catalog transaction. The lease closes the in-process supervisor/attempt ownership transitions under review while preserving the existing managed-cache, source-read-only, and desktop contracts.
