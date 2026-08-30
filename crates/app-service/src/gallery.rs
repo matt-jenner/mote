@@ -279,6 +279,11 @@ impl Drop for HostedDriverOwner {
                 if let Some(attempt_lease) = attempt_lease {
                     attempt_lease.wait_finished().await;
                 }
+                if let Some(ticket) = ticket {
+                    coordinator
+                        .recover_hosted_publication_as_failure(ticket)
+                        .await;
+                }
                 coordinator.release_driver_owner(generation).await;
                 if coordinator.pending_job_count().await > 0 {
                     engine.start_hosted_derivative_driver(runtime).await;
@@ -428,6 +433,8 @@ pub struct GalleryEngine {
     #[cfg(debug_assertions)]
     hosted_panic_before_admission: Arc<TokioMutex<bool>>,
     #[cfg(debug_assertions)]
+    hosted_post_authorization_fault: Arc<AtomicUsize>,
+    #[cfg(debug_assertions)]
     hosted_encode_test_gates: Arc<TokioMutex<VecDeque<HostedEncodeTestGate>>>,
     #[cfg(debug_assertions)]
     hosted_encode_registration_test_gate: Arc<TokioMutex<Option<HostedEncodeRegistrationTestGate>>>,
@@ -545,6 +552,8 @@ impl GalleryEngine {
             #[cfg(debug_assertions)]
             hosted_panic_before_admission: Arc::new(TokioMutex::new(false)),
             #[cfg(debug_assertions)]
+            hosted_post_authorization_fault: Arc::new(AtomicUsize::new(0)),
+            #[cfg(debug_assertions)]
             hosted_encode_test_gates: Arc::new(TokioMutex::new(VecDeque::new())),
             #[cfg(debug_assertions)]
             hosted_encode_registration_test_gate: Arc::new(TokioMutex::new(None)),
@@ -608,6 +617,8 @@ impl GalleryEngine {
             hosted_cancellation_transition_test_gate: Arc::new(Mutex::new(None)),
             #[cfg(debug_assertions)]
             hosted_panic_before_admission: Arc::new(TokioMutex::new(false)),
+            #[cfg(debug_assertions)]
+            hosted_post_authorization_fault: Arc::new(AtomicUsize::new(0)),
             #[cfg(debug_assertions)]
             hosted_encode_test_gates: Arc::new(TokioMutex::new(VecDeque::new())),
             #[cfg(debug_assertions)]
@@ -1485,6 +1496,11 @@ impl GalleryEngine {
                         .coordinator
                         .abort_hosted_attempt_as_failure(ticket)
                         .await;
+                } else {
+                    runtime
+                        .coordinator
+                        .recover_hosted_publication_as_failure(ticket)
+                        .await;
                 }
                 *active_attempt
                     .lock()
@@ -1684,6 +1700,18 @@ impl GalleryEngine {
         };
         #[cfg(debug_assertions)]
         self.wait_hosted_authorized_publication_test_gate().await;
+        #[cfg(debug_assertions)]
+        match self
+            .hosted_post_authorization_fault
+            .swap(0, Ordering::AcqRel)
+        {
+            1 => panic!("injected hosted derivative panic after publication authorization"),
+            2 => {
+                drop(publication);
+                return;
+            }
+            _ => {}
+        }
         // The publication fence makes this short catalog/cache transaction an
         // indivisible supervisor boundary. Keep it in the owned attempt task:
         // aborting the supervisor must never detach a blocking publisher that
@@ -1928,6 +1956,20 @@ impl GalleryEngine {
     #[doc(hidden)]
     pub async fn install_hosted_derivative_panic_before_admission_test_hook(&self) {
         *self.hosted_panic_before_admission.lock().await = true;
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn install_hosted_derivative_panic_after_authorization_test_hook(&self) {
+        self.hosted_post_authorization_fault
+            .store(1, Ordering::Release);
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn install_hosted_derivative_drop_after_authorization_test_hook(&self) {
+        self.hosted_post_authorization_fault
+            .store(2, Ordering::Release);
     }
 
     #[cfg(debug_assertions)]

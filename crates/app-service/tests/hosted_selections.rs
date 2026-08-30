@@ -995,6 +995,178 @@ async fn hosted_supervisor_recovers_after_pre_admission_panic_without_aborting_s
 }
 
 #[cfg(debug_assertions)]
+async fn assert_post_authorization_fault_is_typed_and_recovered(panic: bool) {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir_all(&source).unwrap();
+    for name in ["first.jpg", "second.jpg"] {
+        ImageBuffer::from_pixel(64, 48, image::Rgb([220_u8, 180_u8, 80_u8]))
+            .save(source.join(name))
+            .unwrap();
+    }
+    let sentinel = source.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-owned").unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config.clone(), source).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    engine.ensure_running(&selection).await.unwrap();
+    let page = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let page = engine
+                .query_wall(
+                    &selection,
+                    photo_app_service::GalleryScope::CurrentFolder,
+                    photo_app_service::WallQueryRequest::oldest_first(),
+                )
+                .await
+                .unwrap();
+            if page.items.len() == 2 {
+                break page;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let first = page
+        .items
+        .iter()
+        .find(|item| item.display_name == "first.jpg")
+        .unwrap()
+        .id
+        .clone();
+    let second = page
+        .items
+        .iter()
+        .find(|item| item.display_name == "second.jpg")
+        .unwrap()
+        .id
+        .clone();
+    let first_id = photo_domain::AssetId::from_uuid(uuid::Uuid::parse_str(&first).unwrap());
+    let second_id = photo_domain::AssetId::from_uuid(uuid::Uuid::parse_str(&second).unwrap());
+    let mut updates = engine.subscribe(
+        &selection,
+        "post-authorization-fault".to_owned(),
+        photo_app_service::GalleryScope::CurrentFolder,
+        Some(engine.current_event_id_for_test(&selection)),
+    );
+    let authorized_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let authorized_release = std::sync::Arc::new(tokio::sync::Notify::new());
+    engine
+        .install_hosted_authorized_publication_test_gate(
+            authorized_entered.clone(),
+            authorized_release.clone(),
+        )
+        .await;
+    if panic {
+        engine.install_hosted_derivative_panic_after_authorization_test_hook();
+    } else {
+        engine.install_hosted_derivative_drop_after_authorization_test_hook();
+    }
+
+    let first_engine = engine.clone();
+    let first_selection = selection.clone();
+    let first_request_asset = first.clone();
+    let first_request = tokio::spawn(async move {
+        first_engine
+            .request_derivatives(
+                &first_selection,
+                photo_app_service::GalleryScope::CurrentFolder,
+                photo_app_service::DerivativeRequest::visible(vec![first_request_asset]),
+            )
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        authorized_entered.notified(),
+    )
+    .await
+    .expect("attempt did not authorize publication before the injected fault");
+
+    let second_engine = engine.clone();
+    let second_selection = selection.clone();
+    let second_request_asset = second.clone();
+    let second_request = tokio::spawn(async move {
+        second_engine
+            .request_derivatives(
+                &second_selection,
+                photo_app_service::GalleryScope::CurrentFolder,
+                photo_app_service::DerivativeRequest::visible(vec![second_request_asset]),
+            )
+            .await
+    });
+    authorized_release.notify_waiters();
+
+    let first_result = tokio::time::timeout(std::time::Duration::from_secs(5), first_request)
+        .await
+        .expect("faulted request retained its captured sender")
+        .unwrap();
+    let second_result = tokio::time::timeout(std::time::Duration::from_secs(5), second_request)
+        .await
+        .expect("queued sibling did not complete")
+        .unwrap();
+    assert!(second_result.is_ok(), "queued sibling must still complete");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let photo_app_service::WallUpdate::DerivativesReady { derivatives, .. } =
+                updates.recv().await.unwrap().update
+            {
+                assert!(
+                    derivatives
+                        .iter()
+                        .all(|derivative| derivative.asset_id != first),
+                    "faulted publication emitted a stale ready event"
+                );
+                if derivatives
+                    .iter()
+                    .any(|derivative| derivative.asset_id == second)
+                {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("queued sibling did not emit its ready event");
+    let pending_jobs = engine.hosted_pending_job_count_for_test(&selection).await;
+    let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    assert!(
+        catalog
+            .derivatives_for_assets(&[first_id], "wall_thumbnail")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        catalog
+            .derivatives_for_assets(&[second_id], "wall_thumbnail")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"source-owned");
+    assert!(
+        matches!(
+            first_result,
+            Err(photo_app_service::AppServiceError::DerivativeFailed)
+        ) && pending_jobs == 0,
+        "post-authorization fault returned {first_result:?} and retained {pending_jobs} job(s)"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn hosted_post_authorization_panic_delivers_typed_failure_and_clears_job() {
+    assert_post_authorization_fault_is_typed_and_recovered(true).await;
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn hosted_post_authorization_drop_delivers_typed_failure_and_clears_job() {
+    assert_post_authorization_fault_is_typed_and_recovered(false).await;
+}
+
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn hosted_supervisor_drop_restarts_queued_work_and_settles_active_waiter() {
     let temp = tempfile::tempdir().unwrap();

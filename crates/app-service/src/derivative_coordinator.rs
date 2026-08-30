@@ -240,13 +240,40 @@ struct CommitDelivery {
     waiters: Vec<WorkWaiter>,
 }
 
+/// The ticket keeps this slot alive after authorization. A returned
+/// publication token may disappear with its child task, but captured senders
+/// remain here until normal finish or recovery takes the delivery exactly once.
+struct HostedPublicationDelivery {
+    delivery: std::sync::Mutex<Option<CommitDelivery>>,
+}
+
+impl HostedPublicationDelivery {
+    fn new(delivery: CommitDelivery) -> Self {
+        Self {
+            delivery: std::sync::Mutex::new(Some(delivery)),
+        }
+    }
+
+    fn take(&self) -> Option<CommitDelivery> {
+        self.delivery
+            .lock()
+            .expect("hosted publication delivery poisoned")
+            .take()
+    }
+}
+
 pub(crate) struct HostedPublication {
-    delivery: CommitDelivery,
+    delivery: Arc<HostedPublicationDelivery>,
 }
 
 impl HostedPublication {
     pub(crate) fn was_cancelled(&self) -> bool {
-        self.delivery.permit.was_cancelled()
+        self.delivery
+            .delivery
+            .lock()
+            .expect("hosted publication delivery poisoned")
+            .as_ref()
+            .is_some_and(|delivery| delivery.permit.was_cancelled())
     }
 }
 
@@ -415,6 +442,7 @@ struct TicketState {
     lane: WorkLane,
     status: TicketStatus,
     hosted_attempt: Option<HostedAttemptLease>,
+    hosted_publication: Option<Arc<HostedPublicationDelivery>>,
 }
 
 struct CoordinatorState {
@@ -807,6 +835,7 @@ impl DerivativeCoordinator {
                                         lane,
                                         status: TicketStatus::Running,
                                         hosted_attempt: None,
+                                        hosted_publication: None,
                                     },
                                 );
                                 Some(ticket)
@@ -1259,7 +1288,7 @@ impl DerivativeCoordinator {
         permit: CommitPermit,
         authorizer: ScopeAuthorizer,
     ) -> Option<HostedPublication> {
-        let (delivery, authorized) = {
+        let (publication, unauthorized_delivery) = {
             let mut state = self.state.lock().await;
             let ticket = WorkTicket {
                 job_id: permit.job_id,
@@ -1306,29 +1335,74 @@ impl DerivativeCoordinator {
                     .chain(work.background_waiters.drain(..))
                     .collect(),
             };
-            (delivery, authorized)
+            if authorized {
+                let delivery = Arc::new(HostedPublicationDelivery::new(delivery));
+                state
+                    .tickets
+                    .get_mut(&ticket)
+                    .expect("authorized hosted publication lost its ticket")
+                    .hosted_publication = Some(delivery.clone());
+                (Some(HostedPublication { delivery }), None)
+            } else {
+                (None, Some(delivery))
+            }
         };
         self.notify_waiters();
-        if !authorized {
+        if let Some(delivery) = unauthorized_delivery {
             self.deliver_commit(delivery).await;
             return None;
         }
-        Some(HostedPublication { delivery })
+        publication
     }
 
     pub(crate) async fn finish_hosted_publication(
         &self,
-        mut publication: HostedPublication,
+        publication: HostedPublication,
         result: DerivativeResult,
     ) {
-        {
-            let mut state = self.state.lock().await;
-            if let Some(work) = state.jobs.get_mut(&publication.delivery.key) {
-                work.commit_result = Some(result.clone());
+        self.settle_hosted_publication(publication.delivery, result)
+            .await;
+    }
+
+    async fn settle_hosted_publication(
+        &self,
+        publication: Arc<HostedPublicationDelivery>,
+        result: DerivativeResult,
+    ) -> bool {
+        let Some(mut delivery) = publication.take() else {
+            return false;
+        };
+        delivery.result = result.clone();
+        let coordinator = self.clone();
+        // Transfer the taken delivery to one owned task before awaiting. This
+        // matches ordinary commit settlement and prevents caller cancellation
+        // from dropping the captured senders halfway through delivery.
+        let delivery_task = tokio::spawn(async move {
+            {
+                let mut state = coordinator.state.lock().await;
+                if let Some(work) = state.jobs.get_mut(&delivery.key) {
+                    work.commit_result = Some(result);
+                }
             }
-        }
-        publication.delivery.result = result;
-        self.deliver_commit(publication.delivery).await;
+            coordinator.deliver_commit(delivery).await;
+        });
+        let _ = delivery_task.await;
+        true
+    }
+
+    pub(crate) async fn recover_hosted_publication_as_failure(&self, ticket: WorkTicket) -> bool {
+        let publication = self
+            .state
+            .lock()
+            .await
+            .tickets
+            .get(&ticket)
+            .and_then(|ticket| ticket.hosted_publication.clone());
+        let Some(publication) = publication else {
+            return false;
+        };
+        self.settle_hosted_publication(publication, DerivativeResult::Failed)
+            .await
     }
 
     /// Finishes a committed attempt as an asset-terminal outcome.  Unlike a failed
@@ -1440,6 +1514,9 @@ impl DerivativeCoordinator {
     }
 
     pub(crate) async fn abort_hosted_attempt_as_failure(&self, ticket: WorkTicket) {
+        if self.recover_hosted_publication_as_failure(ticket).await {
+            return;
+        }
         self.abort_attempt_with_result_authorized(ticket, DerivativeResult::Failed, true)
             .await;
     }
