@@ -17,7 +17,9 @@ pub use dto::{
     OrderState, ScanProgressDto, SortDirection, WallAsset, WallMediaKind, WallPage,
     WallQueryRequest, WallShapeState, WallUpdate, WallWarningState,
 };
-pub use gallery::{FolderBreadcrumb, GalleryEngine, GallerySelection, SelectionSummary};
+pub use gallery::{
+    FolderBreadcrumb, GalleryEngine, GallerySelection, ManagedDerivative, SelectionSummary,
+};
 pub use hosted_runtime::SelectionEventSubscription;
 pub use hosted_runtime::SequencedWallUpdate;
 pub use photo_domain::GalleryScope;

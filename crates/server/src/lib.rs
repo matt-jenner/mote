@@ -138,6 +138,14 @@ pub fn build_router(state: AppState) -> Router {
             get(api::events),
         )
         .route(
+            "/api/v1/selections/{id}/derivatives",
+            axum::routing::post(api::request_derivatives),
+        )
+        .route(
+            "/api/v1/derivatives/{id}",
+            get(api::derivative),
+        )
+        .route(
             "/healthz",
             get(|State(state): State<AppState>| async move { health::healthz(state).await }),
         )

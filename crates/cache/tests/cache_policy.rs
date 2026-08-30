@@ -91,6 +91,28 @@ fn writer_commits_atomically_and_reuses_immutable_output() {
 }
 
 #[test]
+fn open_checked_opens_only_a_managed_regular_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let writer = CacheWriter::new(temp.path()).unwrap();
+    writer
+        .write_atomic(PathBuf::from("ab/cd/item.bin"), |file| {
+            file.write_all(b"managed")
+        })
+        .unwrap();
+
+    let mut file = writer
+        .open_checked(std::path::Path::new("ab/cd/item.bin"))
+        .unwrap();
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+    assert_eq!(bytes, b"managed");
+    assert!(matches!(
+        writer.open_checked(std::path::Path::new("../item.bin")),
+        Err(CacheError::PathEscape)
+    ));
+}
+
+#[test]
 fn concurrent_writers_publish_exactly_one_immutable_output() {
     let temp = tempfile::tempdir().unwrap();
     let writer = CacheWriter::new(temp.path()).unwrap();

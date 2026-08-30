@@ -151,6 +151,15 @@ impl CacheWriter {
     }
 
     pub fn read_checked(&self, relative_path: &Path) -> Result<Vec<u8>, CacheError> {
+        let mut file = self.open_checked(relative_path)?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Opens a regular file beneath the managed cache root after checking every
+    /// path component for traversal or symlink escapes.
+    pub fn open_checked(&self, relative_path: &Path) -> Result<File, CacheError> {
         let path = self.resolve_checked(relative_path)?;
         if !is_regular_file(&path)? {
             return Err(CacheError::Io(std::io::Error::new(
@@ -158,7 +167,7 @@ impl CacheWriter {
                 "cache file does not exist",
             )));
         }
-        Ok(std::fs::read(path)?)
+        Ok(OpenOptions::new().read(true).open(path)?)
     }
 
     pub(crate) fn resolve_checked(&self, relative_path: &Path) -> Result<PathBuf, CacheError> {

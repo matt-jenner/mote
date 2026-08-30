@@ -574,6 +574,8 @@ impl AppService {
             scheduler.clone(),
             metadata_reader.clone(),
             coordinator.clone(),
+            cache_root.clone(),
+            catalog_path.clone(),
         );
         let service = Self {
             gallery,

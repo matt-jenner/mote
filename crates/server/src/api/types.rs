@@ -1,4 +1,4 @@
-use photo_app_service::{InteractionState, SortDirection};
+use photo_app_service::{DerivativeRequest, InteractionState, SortDirection};
 use photo_domain::GalleryScope;
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +23,13 @@ pub(crate) struct WallParams {
     pub direction: SortDirection,
     pub cursor: Option<String>,
     pub limit: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DerivativeHttpRequest {
+    pub scope: GalleryScope,
+    pub request: DerivativeRequest,
 }
 
 #[derive(Debug, Deserialize)]

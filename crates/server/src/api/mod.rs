@@ -1,8 +1,10 @@
+mod derivative;
 mod error;
 mod events;
 mod gallery;
 mod types;
 
+pub(crate) use derivative::{derivative, request_derivatives};
 pub(crate) use events::events;
 pub(crate) use gallery::{create_selection, interaction, selection_summary, wall};
 

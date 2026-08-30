@@ -4,9 +4,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, Weak};
+use tokio::sync::Mutex as TokioMutex;
 
-use photo_cache::CacheWriter;
-use photo_catalog::{Catalog, CatalogError, NewFolderGroup, WallOrder};
+use photo_cache::{
+    CacheBudget, CacheWriter, DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget,
+    ImageDerivativeGenerator,
+};
+use photo_catalog::{Catalog, CatalogError, NewDerivative, NewFolderGroup, WallOrder};
 use photo_core::{LibraryService, RealSourceFs};
 use photo_domain::{FolderGroupId, GalleryScope, LibraryId, RelativePathKey};
 use photo_indexer::{DefaultMetadataReader, IndexEvent, Indexer, MetadataReader, ScanRequest};
@@ -14,8 +18,8 @@ use photo_indexer::{DefaultMetadataReader, IndexEvent, Indexer, MetadataReader, 
 use crate::hosted_runtime::{SelectionEventSubscription, SelectionRuntime, SubscriptionOrigin};
 use crate::service::{ReaderAdapter, ServiceState};
 use crate::{
-    AppConfig, AppServiceError, InteractionState, OrderState, SourceAvailability, WallPage,
-    WallQueryRequest, WallUpdate,
+    AppConfig, AppServiceError, DerivativeClass, DerivativeReference, DerivativeRequest,
+    InteractionState, OrderState, SourceAvailability, WallPage, WallQueryRequest, WallUpdate,
 };
 
 fn canonicalize_for_identity(path: &Path) -> PathBuf {
@@ -35,6 +39,34 @@ fn canonicalize_for_identity(path: &Path) -> PathBuf {
         canonical.push(component);
     }
     canonical
+}
+
+const DERIVATIVE_DECODER_VERSION: &str = "image-0.25-v1";
+
+fn derivative_spec_for_gallery(
+    asset: &photo_catalog::AssetRecord,
+    class: DerivativeClass,
+) -> DerivativeSpec {
+    let (kind, edge) = match class {
+        DerivativeClass::WallThumbnail => (DerivativeKind::WallThumbnail, 1024),
+        DerivativeClass::ScreenPreview => (DerivativeKind::ScreenPreview, 4096),
+    };
+    DerivativeSpec {
+        asset_id: asset.id,
+        signature: asset.signature,
+        orientation: asset.orientation.unwrap_or(1),
+        kind,
+        decoder_version: DERIVATIVE_DECODER_VERSION.to_owned(),
+        colour_space: "srgb".to_owned(),
+        target: DerivativeTarget::LongEdge(edge),
+    }
+}
+
+fn derivative_kind_name_for_gallery(class: DerivativeClass) -> &'static str {
+    match class {
+        DerivativeClass::WallThumbnail => "wall_thumbnail",
+        DerivativeClass::ScreenPreview => "screen_preview",
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -78,6 +110,13 @@ pub struct SelectionSummary {
     pub availability: SourceAvailability,
 }
 
+pub struct ManagedDerivative {
+    pub file: std::fs::File,
+    pub content_type: &'static str,
+    pub content_length: u64,
+    pub etag: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderBreadcrumb {
@@ -94,6 +133,9 @@ pub struct GalleryEngine {
     hosted_library_id: Option<LibraryId>,
     pub(crate) shared_coordinator:
         Option<Arc<crate::derivative_coordinator::DerivativeCoordinator>>,
+    pub(crate) cache_root: PathBuf,
+    pub(crate) catalog_path: PathBuf,
+    derivative_locks: Arc<TokioMutex<HashMap<String, Arc<TokioMutex<()>>>>>,
     #[cfg(test)]
     fail_next_start: Arc<AtomicBool>,
     #[cfg(test)]
@@ -157,6 +199,8 @@ impl GalleryEngine {
                 )?
                 .id
         };
+        let cache_root = config.cache_dir().to_owned();
+        let catalog_path = config.catalog_path();
         Ok(Self {
             state: Arc::new(Mutex::new(ServiceState {
                 libraries,
@@ -171,6 +215,9 @@ impl GalleryEngine {
             metadata_reader: ReaderAdapter::new(reader),
             hosted_library_id: Some(hosted_library_id),
             shared_coordinator: None,
+            cache_root,
+            catalog_path,
+            derivative_locks: Arc::new(TokioMutex::new(HashMap::new())),
             #[cfg(test)]
             fail_next_start: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -187,6 +234,8 @@ impl GalleryEngine {
         scheduler: Arc<photo_indexer::IndexScheduler>,
         metadata_reader: ReaderAdapter,
         shared_coordinator: Arc<crate::derivative_coordinator::DerivativeCoordinator>,
+        cache_root: PathBuf,
+        catalog_path: PathBuf,
     ) -> Self {
         Self {
             state,
@@ -195,6 +244,9 @@ impl GalleryEngine {
             metadata_reader,
             hosted_library_id: None,
             shared_coordinator: Some(shared_coordinator),
+            cache_root,
+            catalog_path,
+            derivative_locks: Arc::new(TokioMutex::new(HashMap::new())),
             #[cfg(test)]
             fail_next_start: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -557,6 +609,245 @@ impl GalleryEngine {
                 .into_iter()
                 .map(|w| crate::service::map_source_warning_code(&w.code))
                 .collect(),
+        })
+    }
+
+    /// Generates only the derivatives explicitly requested by this selection.
+    /// Membership is checked before any source file is opened, and concurrent
+    /// callers share one cache-key lock so an immutable output is generated once.
+    pub async fn request_derivatives(
+        &self,
+        selection: &GallerySelection,
+        scope: GalleryScope,
+        request: DerivativeRequest,
+    ) -> Result<(), AppServiceError> {
+        if !(1..=250).contains(&request.asset_ids.len()) {
+            return Err(AppServiceError::InvalidLimit);
+        }
+        let ids = request
+            .asset_ids
+            .iter()
+            .map(|id| {
+                uuid::Uuid::parse_str(id)
+                    .map(photo_domain::AssetId::from_uuid)
+                    .map_err(|_| AppServiceError::InvalidAssetId)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let assets = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| AppServiceError::StatePoisoned)?;
+            let allowed = state.libraries.catalog().wall_records_for_assets_scoped(
+                selection.group_id,
+                scope,
+                &ids,
+            )?;
+            if allowed.len() != ids.len() {
+                return Err(AppServiceError::ForeignAsset);
+            }
+            ids.iter()
+                .map(|id| {
+                    state
+                        .libraries
+                        .catalog()
+                        .find_asset(*id)?
+                        .ok_or(AppServiceError::UnknownAsset)
+                })
+                .collect::<Result<Vec<_>, AppServiceError>>()?
+        };
+
+        let runtime = self.runtime(selection);
+        let classes = if request.kind == DerivativeClass::ScreenPreview {
+            [
+                DerivativeClass::WallThumbnail,
+                DerivativeClass::ScreenPreview,
+            ]
+        } else {
+            [
+                DerivativeClass::WallThumbnail,
+                DerivativeClass::WallThumbnail,
+            ]
+        };
+        let class_count = if request.kind == DerivativeClass::ScreenPreview {
+            2
+        } else {
+            1
+        };
+        for class in classes.into_iter().take(class_count) {
+            for asset in &assets {
+                if asset.media_kind == photo_domain::MediaKind::Video {
+                    continue;
+                }
+                let spec = derivative_spec_for_gallery(asset, class);
+                let key = DerivativeKey::compute(&spec);
+                let lock = {
+                    let mut locks = self.derivative_locks.lock().await;
+                    locks
+                        .entry(key.as_str().to_owned())
+                        .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                        .clone()
+                };
+                let _guard = lock.lock().await;
+                let generated = self
+                    .generate_one_derivative(selection, asset, class, spec)
+                    .await?;
+                runtime
+                    .publish(WallUpdate::DerivativesReady {
+                        selection_id: selection.id.clone(),
+                        derivatives: vec![DerivativeReference {
+                            asset_id: asset.id.as_uuid().hyphenated().to_string(),
+                            kind: class,
+                            key: generated,
+                        }],
+                    })
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn generate_one_derivative(
+        &self,
+        selection: &GallerySelection,
+        asset: &photo_catalog::AssetRecord,
+        class: DerivativeClass,
+        spec: photo_cache::DerivativeSpec,
+    ) -> Result<String, AppServiceError> {
+        let key = DerivativeKey::compute(&spec);
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| AppServiceError::StatePoisoned)?;
+            if let Some(record) = state.libraries.catalog().find_derivative(
+                asset.id,
+                derivative_kind_name_for_gallery(class),
+                key.as_str(),
+            )? {
+                if CacheWriter::new(&self.cache_root)
+                    .and_then(|writer| writer.open_checked(&record.relative_cache_path))
+                    .is_ok()
+                {
+                    state
+                        .libraries
+                        .catalog_mut()
+                        .link_derivative_group(record.id, selection.group_id)?;
+                    return Ok(record.cache_key);
+                }
+            }
+        }
+        let source = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| AppServiceError::StatePoisoned)?;
+            let library = state
+                .libraries
+                .catalog()
+                .find_library(selection.library_id)?
+                .ok_or(AppServiceError::UnknownAsset)?;
+            let root = library
+                .canonical_root_key
+                .to_path_buf()
+                .map_err(|e| CatalogError::InvalidData(e.to_string()))?;
+            let relative = asset
+                .relative_path
+                .to_path_buf()
+                .map_err(|e| CatalogError::InvalidData(e.to_string()))?;
+            root.join(relative)
+        };
+        let cache_root = self.cache_root.clone();
+        let catalog_path = self.catalog_path.clone();
+        let asset_id = asset.id;
+        let group = selection.group_id;
+        let generated = tokio::task::spawn_blocking(move || {
+            let generator = ImageDerivativeGenerator::new(&cache_root)
+                .map_err(|_| AppServiceError::DerivativeFailed)?;
+            let generated = if class == DerivativeClass::WallThumbnail {
+                generator
+                    .generate(&source, &spec)
+                    .map_err(|_| AppServiceError::DerivativeFailed)?
+            } else {
+                let mut catalog = Catalog::open(&catalog_path).map_err(AppServiceError::Catalog)?;
+                generator
+                    .generate_screen_preview(
+                        &source,
+                        asset_id,
+                        spec.signature,
+                        spec.orientation,
+                        group,
+                        &mut catalog,
+                        CacheBudget::automatic(&cache_root).map_err(AppServiceError::Cache)?,
+                        &photo_cache::ProtectedGroups::default(),
+                    )
+                    .map_err(|_| AppServiceError::DerivativeFailed)?
+            };
+            Ok::<_, AppServiceError>(generated)
+        })
+        .await
+        .map_err(|_| AppServiceError::DerivativeFailed)??;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AppServiceError::StatePoisoned)?;
+        state
+            .libraries
+            .catalog_mut()
+            .upsert_derivative(&NewDerivative {
+                id: photo_domain::DerivativeId::new(),
+                asset_id,
+                folder_group_id: group,
+                kind: derivative_kind_name_for_gallery(class).to_owned(),
+                cache_key: generated.key.as_str().to_owned(),
+                relative_cache_path: generated.relative_path,
+                size_bytes: generated.size_bytes,
+                durable: class == DerivativeClass::WallThumbnail,
+                created_at: crate::service::unix_timestamp(),
+            })?;
+        Ok(generated.key.as_str().to_owned())
+    }
+
+    pub fn open_derivative(&self, opaque_id: &str) -> Result<ManagedDerivative, AppServiceError> {
+        if opaque_id.is_empty() || opaque_id.len() > 512 || !opaque_id.is_ascii() {
+            return Err(AppServiceError::UnknownAsset);
+        }
+        let record = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| AppServiceError::StatePoisoned)?;
+            state
+                .libraries
+                .catalog()
+                .find_derivative_by_cache_key(opaque_id)?
+                .ok_or(AppServiceError::UnknownAsset)?
+        };
+        if !matches!(record.kind.as_str(), "wall_thumbnail" | "screen_preview") {
+            return Err(AppServiceError::UnknownAsset);
+        }
+        let writer = CacheWriter::new(&self.cache_root)?;
+        let mut file = writer.open_checked(&record.relative_cache_path)?;
+        let mut signature = [0_u8; 12];
+        let size = std::io::Read::read(&mut file, &mut signature)
+            .map_err(|error| AppServiceError::Cache(error.into()))?;
+        if size < 3 || signature[..3] != [0xff, 0xd8, 0xff] {
+            return Err(AppServiceError::UnknownAsset);
+        }
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))
+            .map_err(|error| AppServiceError::Cache(error.into()))?;
+        let content_length = file
+            .metadata()
+            .map_err(|error| AppServiceError::Cache(error.into()))?
+            .len();
+        if content_length != record.size_bytes {
+            return Err(AppServiceError::UnknownAsset);
+        }
+        Ok(ManagedDerivative {
+            file,
+            content_type: "image/jpeg",
+            content_length,
+            etag: format!("\"{}\"", record.cache_key),
         })
     }
 
