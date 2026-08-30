@@ -266,6 +266,30 @@ describe("HTTP PhotoService", () => {
 		});
 		expect(first.initialSortDirection()).toBe("newestFirst");
 		expect(second.initialSortDirection()).toBe("oldestFirst");
+		const firstBrowserState = first.folderBrowserState();
+		const secondBrowserState = second.folderBrowserState();
+		expect(firstBrowserState).toEqual({
+			breadcrumbs: selectionSummary.breadcrumbs,
+			initialPath: "Trips/Iceland",
+		});
+		expect(secondBrowserState).toEqual({
+			breadcrumbs: secondSelectionSummary.breadcrumbs,
+			initialPath: "Trips/Alps",
+		});
+		const firstLeaf = firstBrowserState.breadcrumbs.at(-1);
+		if (!firstLeaf) throw new Error("expected first restored breadcrumb");
+		firstLeaf.path = "mutated";
+		const secondLeaf = secondBrowserState.breadcrumbs.at(-1);
+		if (!secondLeaf) throw new Error("expected second restored breadcrumb");
+		secondLeaf.path = "mutated";
+		expect(first.folderBrowserState()).toEqual({
+			breadcrumbs: selectionSummary.breadcrumbs,
+			initialPath: "Trips/Iceland",
+		});
+		expect(second.folderBrowserState()).toEqual({
+			breadcrumbs: secondSelectionSummary.breadcrumbs,
+			initialPath: "Trips/Alps",
+		});
 		const stopFirst = first.watchWallUpdates(() => undefined);
 		const stopSecond = second.watchWallUpdates(() => undefined);
 		expect(streams.map((stream) => stream.url)).toEqual([
@@ -611,20 +635,21 @@ describe("HTTP PhotoService", () => {
 			streams.at(-1)?.open();
 		};
 
-		streams[0]?.emit(progress, "10");
-		streams[0]?.emit(progress, "010");
 		streams[0]?.emit(progress, "9");
+		streams[0]?.emit(progress, "9");
+		streams[0]?.emit(progress, "8");
+		streams[0]?.emit(progress, "010");
 		await reconnect(
-			"/api/v1/selections/selection-a/events?clientId=client-a&scope=includeSubfolders&afterEventId=10",
+			"/api/v1/selections/selection-a/events?clientId=client-a&scope=includeSubfolders&afterEventId=9",
 		);
 		streams.at(-1)?.emit(progress, "18446744073709551616");
 		await reconnect(
-			"/api/v1/selections/selection-a/events?clientId=client-a&scope=includeSubfolders&afterEventId=10",
+			"/api/v1/selections/selection-a/events?clientId=client-a&scope=includeSubfolders&afterEventId=9",
 		);
 		streams.at(-1)?.emit(progress, "");
 		streams.at(-1)?.emit(progress, "12x");
 		await reconnect(
-			"/api/v1/selections/selection-a/events?clientId=client-a&scope=includeSubfolders&afterEventId=10",
+			"/api/v1/selections/selection-a/events?clientId=client-a&scope=includeSubfolders&afterEventId=9",
 		);
 		streams.at(-1)?.emit(progress, "18446744073709551615");
 		await reconnect(
@@ -642,6 +667,92 @@ describe("HTTP PhotoService", () => {
 		await service.updateGalleryScope("includeSubfolders");
 		expect(streams.at(-1)?.url).toBe(
 			"/api/v1/selections/selection-a/events?clientId=client-a&scope=includeSubfolders",
+		);
+		stop();
+	});
+
+	it("starts replay fresh after replacing the selected folder", async () => {
+		vi.useFakeTimers();
+		const streams: FakeEventSource[] = [];
+		const service = createHttpPhotoService({
+			localStorage: savedPreferences({ selectionId: "selection-a" }),
+			sessionStorage: new MemoryStorage(),
+			fetch: vi.fn(async (input: RequestInfo | URL) => {
+				if (String(input) === "/api/v1/selections")
+					return json(secondSelectionSummary, 201);
+				return noContent();
+			}),
+			eventSourceFactory: (url) => {
+				const stream = new FakeEventSource(url);
+				streams.push(stream);
+				return stream;
+			},
+			randomUuid: () => "client-a",
+		});
+		const selectionAProgress = {
+			kind: "progress",
+			selectionId: "selection-a",
+			generation: 1,
+			progress: { discovered: 1, shaped: 1, enriched: 0, total: 1 },
+		};
+		const stopFirst = service.watchWallUpdates(() => undefined);
+		streams[0]?.emit(selectionAProgress, "7");
+
+		await service.selectFolder("Trips/Alps");
+
+		expect(streams[0]?.closed).toBe(true);
+		stopFirst();
+		const stopSecond = service.watchWallUpdates(() => undefined);
+		expect(streams[1]?.url).toBe(
+			"/api/v1/selections/selection-b/events?clientId=client-a&scope=includeSubfolders",
+		);
+		streams[1]?.emit(
+			{ ...selectionAProgress, selectionId: "selection-b", generation: 2 },
+			"3",
+		);
+		streams[1]?.fail();
+		await vi.advanceTimersByTimeAsync(250);
+		expect(streams[2]?.url).toBe(
+			"/api/v1/selections/selection-b/events?clientId=client-a&scope=includeSubfolders&afterEventId=3",
+		);
+		stopSecond();
+	});
+
+	it("accepts only canonical zero as the initial replay cursor", async () => {
+		vi.useFakeTimers();
+		const streams: FakeEventSource[] = [];
+		const service = createHttpPhotoService({
+			localStorage: savedPreferences({ selectionId: "selection-a" }),
+			sessionStorage: new MemoryStorage(),
+			fetch: vi.fn(async () => noContent()),
+			eventSourceFactory: (url) => {
+				const stream = new FakeEventSource(url);
+				streams.push(stream);
+				return stream;
+			},
+			randomUuid: () => "client-a",
+		});
+		const stop = service.watchWallUpdates(() => undefined);
+		const progress = {
+			kind: "progress",
+			selectionId: "selection-a",
+			generation: 1,
+			progress: { discovered: 0, shaped: 0, enriched: 0, total: 0 },
+		};
+
+		streams[0]?.emit(progress, "00");
+		streams[0]?.fail();
+		await vi.advanceTimersByTimeAsync(250);
+
+		expect(streams[1]?.url).toBe(
+			"/api/v1/selections/selection-a/events?clientId=client-a&scope=includeSubfolders",
+		);
+		streams[1]?.open();
+		streams[1]?.emit(progress, "0");
+		streams[1]?.fail();
+		await vi.advanceTimersByTimeAsync(250);
+		expect(streams[2]?.url).toBe(
+			"/api/v1/selections/selection-a/events?clientId=client-a&scope=includeSubfolders&afterEventId=0",
 		);
 		stop();
 	});

@@ -539,7 +539,7 @@ export function createHttpPhotoService(
 	};
 
 	const rememberReplayId = (value: string): void => {
-		if (!/^\d{1,20}$/.test(value)) return;
+		if (!/^(?:0|[1-9]\d{0,19})$/.test(value)) return;
 		const parsed = BigInt(value);
 		if (
 			parsed > maximumU64 ||
