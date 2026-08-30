@@ -59,3 +59,20 @@ GREEN after round 2:
 - `cargo fmt --all -- --check` and `git diff --check` passed.
 
 No round-2 production defect was exposed; only debug-only test hooks and regression coverage were added. The implementation baseline remains `93f77e3`; round-2 test coverage is committed separately.
+
+## Fix round 3 evidence
+
+Round 3 sharpened the regression assertions so each mandatory transport and guard case is discriminating rather than merely status-based. Valid selection and interaction JSON now carries ignored padding over the 64 KiB limit, including a multi-chunk body whose individual chunks are below the limit; the tests assert the fixed envelope and unchanged runtime state. Folder routes prove that benign eight-parameter requests succeed while nine parameters and an aggregate-over-8192 request are rejected, and the event suite rejects a parseable, zero-padded identifier whose textual form exceeds the fixed limit.
+
+The HTTP matrix now publishes retained events before each replay request, proves after-only and header-only replay, verifies future-watermark recovery on the same stream and reconnect, drains fixture backlog before the deterministic heartbeat boundary, and keeps the broad route body connected through lease expiry to distinguish idle scheduler state from retained aggregate scope.
+
+RED/GREEN: the first corrected heartbeat assertion went RED because a fixture scan event was still queued before virtual time advanced; draining that pre-existing event made the test target the heartbeat boundary and the focused rerun went GREEN. No production defect was exposed, so round 3 changes are regression tests only.
+
+Verification for round 3:
+
+- `cargo fmt --all && CARGO_INCREMENTAL=0 cargo test --offline -p photo-server --lib --test gallery_api --test events_api && CARGO_INCREMENTAL=0 cargo test --offline -p photo-app-service --lib --test hosted_runtime` passed (1 server unit, 9 gallery, 10 event, 92 app-service unit, and 15 hosted-runtime tests).
+- `CARGO_INCREMENTAL=0 cargo test --offline -p photo-app-service --test progressive_wall` passed (57 tests).
+- `CARGO_INCREMENTAL=0 cargo test --offline --workspace` passed all workspace unit, integration, benchmark-smoke, and doc tests.
+- `cargo fmt --all -- --check` and `git diff --check` passed before the final commit gate.
+
+The implementation baseline remains `93f77e3`; round-3 test coverage and this evidence update are committed separately.
