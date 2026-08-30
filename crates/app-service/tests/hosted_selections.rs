@@ -46,7 +46,7 @@ async fn selection_id_aliases_are_rejected_before_runtime_creation() {
     let source = temp.path().join("photos");
     std::fs::create_dir(&source).unwrap();
     let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
-    let engine = GalleryEngine::open(config, source).unwrap();
+    let engine = GalleryEngine::open(config.clone(), source).unwrap();
     let summary = engine.select_relative(Path::new(".")).await.unwrap();
     let uuid = summary.id.strip_prefix("selection-").unwrap();
     let uppercase = format!("selection-{}", uuid.to_uppercase());
@@ -532,6 +532,7 @@ async fn corrupt_hosted_thumbnail_is_repaired_before_it_is_reused() {
         .clone();
     let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
     let record = catalog.find_derivative_by_cache_key(&key).unwrap().unwrap();
+    let expected_size = record.size_bytes;
     let cache_path = config.cache_dir().join(record.relative_cache_path);
     std::fs::remove_file(&cache_path).unwrap();
     engine
@@ -554,6 +555,32 @@ async fn corrupt_hosted_thumbnail_is_repaired_before_it_is_reused() {
         .unwrap();
     let repaired = std::fs::read(&cache_path).unwrap();
     assert_eq!(&repaired[..3], &[0xff, 0xd8, 0xff]);
+
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgb8(image::ImageBuffer::from_pixel(
+        3,
+        2,
+        image::Rgb([10_u8, 20_u8, 30_u8]),
+    ))
+    .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+    .unwrap();
+    assert!(png.len() <= expected_size as usize);
+    png.resize(expected_size as usize, 0);
+    assert_eq!(image::guess_format(&png).unwrap(), image::ImageFormat::Png);
+    assert!(image::load_from_memory(&png).is_ok());
+    std::fs::write(&cache_path, png).unwrap();
+    engine
+        .request_derivatives(
+            &selection,
+            photo_app_service::GalleryScope::CurrentFolder,
+            photo_app_service::DerivativeRequest::visible(vec![asset_id.clone()]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        image::guess_format(&std::fs::read(&cache_path).unwrap()).unwrap(),
+        image::ImageFormat::Jpeg
+    );
     let attempts_before = engine.hosted_derivative_attempts_for_test();
 
     let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
@@ -673,8 +700,9 @@ async fn hosted_repair_reuses_a_shared_derivative_linked_to_another_group() {
     ImageBuffer::from_pixel(3, 2, image::Rgb([220_u8, 180_u8, 80_u8]))
         .save(source.join("child/photo.jpg"))
         .unwrap();
+    let source_before = std::fs::read(source.join("child/photo.jpg")).unwrap();
     let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
-    let engine = GalleryEngine::open(config.clone(), source).unwrap();
+    let engine = GalleryEngine::open(config.clone(), source.clone()).unwrap();
     let root_summary = engine.select_relative(Path::new(".")).await.unwrap();
     let child_summary = engine.select_relative(Path::new("child")).await.unwrap();
     let root = engine.resolve_selection(&root_summary.id).unwrap();
@@ -744,7 +772,74 @@ async fn hosted_repair_reuses_a_shared_derivative_linked_to_another_group() {
     let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
     let record = catalog.find_derivative_by_cache_key(&key).unwrap().unwrap();
     let cache_path = config.cache_dir().join(&record.relative_cache_path);
-    std::fs::write(&cache_path, b"corrupt").unwrap();
+    engine
+        .request_derivatives(
+            &root,
+            photo_app_service::GalleryScope::IncludeSubfolders,
+            photo_app_service::DerivativeRequest::visible(vec![asset_id.clone()]),
+        )
+        .await
+        .unwrap();
+    let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    assert_eq!(catalog.derivative_count(child.group_id(), true).unwrap(), 1);
+    assert_eq!(catalog.derivative_count(root.group_id(), true).unwrap(), 1);
+
+    std::fs::write(&cache_path, b"old-shared-bytes").unwrap();
+    engine.fail_next_hosted_link_removal_for_test();
+    assert!(matches!(
+        engine
+            .request_derivatives(
+                &root,
+                photo_app_service::GalleryScope::IncludeSubfolders,
+                photo_app_service::DerivativeRequest::visible(vec![asset_id.clone()]),
+            )
+            .await,
+        Err(photo_app_service::AppServiceError::DerivativeFailed)
+    ));
+    let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    assert_eq!(catalog.derivative_count(child.group_id(), true).unwrap(), 1);
+    assert_eq!(catalog.derivative_count(root.group_id(), true).unwrap(), 1);
+    assert_eq!(std::fs::read(&cache_path).unwrap(), b"old-shared-bytes");
+
+    engine
+        .request_derivatives(
+            &root,
+            photo_app_service::GalleryScope::IncludeSubfolders,
+            photo_app_service::DerivativeRequest::visible(vec![asset_id.clone()]),
+        )
+        .await
+        .unwrap();
+
+    let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    assert_eq!(catalog.derivative_count(child.group_id(), true).unwrap(), 1);
+    assert_eq!(catalog.derivative_count(root.group_id(), true).unwrap(), 1);
+    assert!(image::load_from_memory(&std::fs::read(&cache_path).unwrap()).is_ok());
+
+    let mut catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    let record = catalog.find_derivative_by_cache_key(&key).unwrap().unwrap();
+    assert_eq!(
+        catalog
+            .remove_derivative_group_links(&[record.id], &[child.group_id()])
+            .unwrap(),
+        1
+    );
+    std::fs::write(&cache_path, b"old-final-link-bytes").unwrap();
+    engine.fail_next_hosted_cleanup_for_test();
+    assert!(matches!(
+        engine
+            .request_derivatives(
+                &root,
+                photo_app_service::GalleryScope::IncludeSubfolders,
+                photo_app_service::DerivativeRequest::visible(vec![asset_id.clone()]),
+            )
+            .await,
+        Err(photo_app_service::AppServiceError::DerivativeFailed)
+    ));
+    let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    assert_eq!(catalog.derivative_count(child.group_id(), true).unwrap(), 0);
+    assert_eq!(catalog.derivative_count(root.group_id(), true).unwrap(), 1);
+    assert_eq!(std::fs::read(&cache_path).unwrap(), b"old-final-link-bytes");
+
     engine
         .request_derivatives(
             &root,
@@ -753,11 +848,14 @@ async fn hosted_repair_reuses_a_shared_derivative_linked_to_another_group() {
         )
         .await
         .unwrap();
-
     let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
-    assert_eq!(catalog.derivative_count(child.group_id(), true).unwrap(), 1);
+    assert_eq!(catalog.derivative_count(child.group_id(), true).unwrap(), 0);
     assert_eq!(catalog.derivative_count(root.group_id(), true).unwrap(), 1);
-    assert!(image::load_from_memory(&std::fs::read(cache_path).unwrap()).is_ok());
+    assert!(image::load_from_memory(&std::fs::read(&cache_path).unwrap()).is_ok());
+    assert_eq!(
+        std::fs::read(source.join("child/photo.jpg")).unwrap(),
+        source_before
+    );
 }
 
 #[tokio::test]
@@ -985,9 +1083,10 @@ async fn hosted_supervisor_drop_restarts_queued_work_and_settles_active_waiter()
         .await
         .unwrap()
         .unwrap();
-    // The active attempt may finish its already-admitted commit, or the
-    // owner cleanup may settle it as failed; either outcome must terminate.
-    let _ = first_result;
+    assert!(
+        first_result.is_ok(),
+        "an authorized publication must retain ownership through terminal settlement"
+    );
     assert!(second_result.is_ok(), "successor must process queued work");
 }
 
@@ -1414,7 +1513,7 @@ async fn hosted_cancellation_keeps_blocking_encode_admitted_until_successor_runs
             .unwrap();
     }
     let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
-    let engine = GalleryEngine::open(config, source).unwrap();
+    let engine = GalleryEngine::open(config.clone(), source).unwrap();
     let summary = engine.select_relative(Path::new(".")).await.unwrap();
     let selection = engine.resolve_selection(&summary.id).unwrap();
     engine.ensure_running(&selection).await.unwrap();
@@ -1450,10 +1549,20 @@ async fn hosted_cancellation_keeps_blocking_encode_admitted_until_successor_runs
         .unwrap()
         .id
         .clone();
+    engine.set_hosted_derivative_admission_cap_for_test(4);
+    assert!(
+        engine.hosted_derivative_admission_cap_for_test() > 1,
+        "the regression needs spare global capacity"
+    );
     let entered = std::sync::Arc::new(tokio::sync::Notify::new());
     let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     engine
         .install_hosted_encode_test_gate(entered.clone(), release.clone())
+        .await;
+    let successor_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let successor_release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    engine
+        .install_hosted_encode_test_gate(successor_entered.clone(), successor_release.clone())
         .await;
     let mut updates = engine.subscribe(
         &selection,
@@ -1461,6 +1570,9 @@ async fn hosted_cancellation_keeps_blocking_encode_admitted_until_successor_runs
         photo_app_service::GalleryScope::CurrentFolder,
         Some(engine.current_event_id_for_test(&selection)),
     );
+    engine
+        .set_interaction_for_test(photo_app_service::InteractionState::Idle)
+        .await;
     let first_engine = engine.clone();
     let first_selection = selection.clone();
     let first_for_request = first.clone();
@@ -1488,8 +1600,37 @@ async fn hosted_cancellation_keeps_blocking_encode_admitted_until_successor_runs
             )
             .await
     });
-    tokio::task::yield_now().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if engine.hosted_waiter_count_for_test(&selection).await == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queued successor waiter was not admitted before cancellation");
     engine.abort_hosted_derivative_driver_for_test().await;
+    let successor_started_early = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        successor_entered.notified(),
+    )
+    .await
+    .is_ok();
+    let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    assert!(catalog.all_derivatives().unwrap().is_empty());
+    release.store(true, std::sync::atomic::Ordering::Release);
+    if !successor_started_early {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            successor_entered.notified(),
+        )
+        .await
+        .expect(
+            "successor encoder did not start after cancellation cleanup joined the old encoder",
+        );
+    }
+    successor_release.store(true, std::sync::atomic::Ordering::Release);
     let first_result = tokio::time::timeout(std::time::Duration::from_secs(5), first_request)
         .await
         .unwrap()
@@ -1498,8 +1639,6 @@ async fn hosted_cancellation_keeps_blocking_encode_admitted_until_successor_runs
         first_result,
         Err(photo_app_service::AppServiceError::DerivativeUnavailable)
     ));
-    assert_eq!(engine.hosted_derivative_active_count_for_test(), 1);
-    release.store(true, std::sync::atomic::Ordering::Release);
     let second_result = tokio::time::timeout(std::time::Duration::from_secs(5), second_request)
         .await
         .unwrap()
@@ -1542,6 +1681,165 @@ async fn hosted_cancellation_keeps_blocking_encode_admitted_until_successor_runs
     })
     .await
     .expect("successor did not publish its ready event");
+    let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    let first_id = photo_domain::AssetId::from_uuid(uuid::Uuid::parse_str(&first).unwrap());
+    let second_id = photo_domain::AssetId::from_uuid(uuid::Uuid::parse_str(&second).unwrap());
+    assert!(
+        catalog
+            .derivatives_for_assets(&[first_id], "wall_thumbnail")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        catalog
+            .derivatives_for_assets(&[second_id], "wall_thumbnail")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        !successor_started_early,
+        "a successor encoder started before the cancelled encoder exited"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn authorized_late_waiter_at_empty_commit_boundary_allows_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir_all(&source).unwrap();
+    image::ImageBuffer::from_pixel(64, 48, image::Rgb([220_u8, 180_u8, 80_u8]))
+        .save(source.join("photo.jpg"))
+        .unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config.clone(), source).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    engine.ensure_running(&selection).await.unwrap();
+    let page = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let page = engine
+                .query_wall(
+                    &selection,
+                    photo_app_service::GalleryScope::CurrentFolder,
+                    photo_app_service::WallQueryRequest::oldest_first(),
+                )
+                .await
+                .unwrap();
+            if !page.items.is_empty() {
+                break page;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let asset = page.items[0].id.clone();
+    let asset_id = photo_domain::AssetId::from_uuid(uuid::Uuid::parse_str(&asset).unwrap());
+    let publication_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let publication_release = std::sync::Arc::new(tokio::sync::Notify::new());
+    engine
+        .install_hosted_commit_publication_test_gate(
+            publication_entered.clone(),
+            publication_release.clone(),
+        )
+        .await;
+    let empty_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let empty_release = std::sync::Arc::new(tokio::sync::Notify::new());
+    engine
+        .install_hosted_empty_authorization_test_gate(empty_entered.clone(), empty_release.clone())
+        .await;
+    let encode_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let encode_release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    engine
+        .install_hosted_encode_test_gate(encode_entered.clone(), encode_release.clone())
+        .await;
+    let first_engine = engine.clone();
+    let first_selection = selection.clone();
+    let first_asset = asset.clone();
+    let first = tokio::spawn(async move {
+        first_engine
+            .request_derivatives(
+                &first_selection,
+                photo_app_service::GalleryScope::CurrentFolder,
+                photo_app_service::DerivativeRequest::visible(vec![first_asset]),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), encode_entered.notified())
+        .await
+        .expect("initial encode did not reach its gate");
+    let pre_enqueue_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let pre_enqueue_release = std::sync::Arc::new(tokio::sync::Notify::new());
+    engine
+        .install_hosted_pre_enqueue_test_gate(
+            pre_enqueue_entered.clone(),
+            pre_enqueue_release.clone(),
+        )
+        .await;
+    let late_engine = engine.clone();
+    let late_selection = selection.clone();
+    let late_asset = asset.clone();
+    let late = tokio::spawn(async move {
+        late_engine
+            .request_derivatives(
+                &late_selection,
+                photo_app_service::GalleryScope::CurrentFolder,
+                photo_app_service::DerivativeRequest::visible(vec![late_asset]),
+            )
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        pre_enqueue_entered.notified(),
+    )
+    .await
+    .expect("late request did not reach the pre-enqueue boundary");
+    encode_release.store(true, std::sync::atomic::Ordering::Release);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        publication_entered.notified(),
+    )
+    .await
+    .expect("commit did not reach the membership mutation boundary");
+    let mut catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    assert!(
+        catalog
+            .remove_asset_membership(selection.group_id(), asset_id)
+            .unwrap()
+    );
+    publication_release.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(5), empty_entered.notified())
+        .await
+        .expect("commit did not observe an empty authorized waiter set");
+
+    catalog
+        .add_asset_membership(selection.group_id(), asset_id, 1)
+        .unwrap();
+    pre_enqueue_release.notify_waiters();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if engine.hosted_waiter_count_for_test(&selection).await == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late authorized waiter was not accepted during early committing");
+    empty_release.notify_waiters();
+
+    assert!(first.await.unwrap().is_ok());
+    assert!(late.await.unwrap().is_ok());
+    assert_eq!(
+        photo_catalog::Catalog::open(&config.catalog_path())
+            .unwrap()
+            .all_derivatives()
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[cfg(debug_assertions)]

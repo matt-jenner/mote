@@ -432,10 +432,22 @@ impl CacheWriter {
                 .and_then(|name| name.to_str())
                 .ok_or(CacheError::PathEscape)?;
             let partial_path = parent.join(format!("{file_name}.partial-{}", uuid::Uuid::new_v4()));
-            let mut partial = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&partial_path)?;
+            let mut partial_options = OpenOptions::new();
+            partial_options.create_new(true).write(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                const DELETE: u32 = 0x0001_0000;
+                const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+                const GENERIC_WRITE: u32 = 0x4000_0000;
+                const FILE_SHARE_READ: u32 = 0x1;
+                const FILE_SHARE_WRITE: u32 = 0x2;
+                const FILE_SHARE_DELETE: u32 = 0x4;
+                partial_options
+                    .access_mode(GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+            }
+            let mut partial = partial_options.open(&partial_path)?;
 
             if let Err(error) = write(&mut partial) {
                 drop(partial);
@@ -448,17 +460,10 @@ impl CacheWriter {
                 return Err(CacheError::Write(error));
             }
             let size_bytes = partial.metadata()?.len();
+            #[cfg(not(windows))]
             drop(partial);
 
-            #[cfg(windows)]
-            if replace_existing {
-                if let Err(error) = self.validate_windows_replacement_destination(&final_path) {
-                    let _ = std::fs::remove_file(&partial_path);
-                    return Err(error);
-                }
-            }
-
-            #[cfg(any(test, debug_assertions))]
+            #[cfg(all(any(test, debug_assertions), not(windows)))]
             if replace_existing && self.should_fail_replace_for_test() {
                 let _ = std::fs::remove_file(&partial_path);
                 return Err(CacheError::Write(std::io::Error::other(
@@ -470,36 +475,34 @@ impl CacheWriter {
                 self.run_replacement_test_hook();
             }
             #[cfg(windows)]
-            if replace_existing {
-                if let Err(error) = self.validate_windows_replacement_destination(&final_path) {
-                    let _ = std::fs::remove_file(&partial_path);
-                    return Err(error);
-                }
-            }
-            let publish = if replace_existing {
-                match std::fs::rename(&partial_path, &final_path) {
-                    Ok(()) => Ok(()),
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        // Do not remove the old bytes before a replacement
-                        // primitive has succeeded. A failed repair must leave
-                        // the shared derivative and all catalog links intact.
-                        #[cfg(windows)]
-                        {
-                            replace_file_windows(&partial_path, &final_path)
-                        }
-                        #[cfg(not(windows))]
-                        {
-                            Err(error)
-                        }
+            let publish = rename_file_by_handle_windows(
+                &partial,
+                _parent_guards.last().ok_or(CacheError::PathEscape)?,
+                std::ffi::OsStr::new(file_name),
+                replace_existing,
+                {
+                    #[cfg(any(test, debug_assertions))]
+                    {
+                        replace_existing && self.should_fail_replace_for_test()
                     }
-                    Err(error) => Err(error),
-                }
+                    #[cfg(not(any(test, debug_assertions)))]
+                    {
+                        false
+                    }
+                },
+            );
+            #[cfg(not(windows))]
+            let publish = if replace_existing {
+                std::fs::rename(&partial_path, &final_path)
             } else {
                 std::fs::hard_link(&partial_path, &final_path)
             };
             match publish {
                 Ok(()) => {
+                    #[cfg(windows)]
+                    drop(partial);
                     if !replace_existing {
+                        #[cfg(not(windows))]
                         std::fs::remove_file(&partial_path)?;
                     }
                     Ok(CacheWrite {
@@ -999,26 +1002,6 @@ impl CacheWriter {
         }
         Ok(())
     }
-
-    #[cfg(windows)]
-    fn validate_windows_replacement_destination(&self, path: &Path) -> Result<(), CacheError> {
-        use std::os::windows::fs::OpenOptionsExt;
-
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        let metadata = std::fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(CacheError::PathEscape);
-        }
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        let file = options.open(path)?;
-        if !file.metadata()?.is_file() || !descriptor_is_contained(&file, &self.root) {
-            return Err(CacheError::PathEscape);
-        }
-        Ok(())
-    }
 }
 
 #[cfg(unix)]
@@ -1098,37 +1081,72 @@ fn is_regular_file(path: &Path) -> Result<bool, CacheError> {
 }
 
 #[cfg(windows)]
-fn replace_file_windows(partial: &Path, destination: &Path) -> Result<(), std::io::Error> {
+fn rename_file_by_handle_windows(
+    partial: &File,
+    parent: &File,
+    file_name: &std::ffi::OsStr,
+    replace_existing: bool,
+    inject_native_failure: bool,
+) -> Result<(), std::io::Error> {
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, RawHandle};
+
+    #[repr(C)]
+    struct FileRenameInfo {
+        replace_if_exists: u8,
+        root_directory: RawHandle,
+        file_name_length: u32,
+        file_name: [u16; 1],
+    }
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn ReplaceFileW(
-            replaced_file_name: *const u16,
-            replacement_file_name: *const u16,
-            backup_file_name: *const u16,
-            replace_flags: u32,
-            exclude: *mut std::ffi::c_void,
-            reserved: *mut std::ffi::c_void,
+        fn SetFileInformationByHandle(
+            file: RawHandle,
+            info_class: u32,
+            info: *const std::ffi::c_void,
+            info_size: u32,
         ) -> i32;
         fn GetLastError() -> u32;
     }
-    const REPLACEFILE_WRITE_THROUGH: u32 = 1;
-    let mut old = destination.as_os_str().encode_wide().collect::<Vec<_>>();
-    let mut new = partial.as_os_str().encode_wide().collect::<Vec<_>>();
-    old.push(0);
-    new.push(0);
-    let replaced = unsafe {
-        ReplaceFileW(
-            old.as_ptr(),
-            new.as_ptr(),
-            std::ptr::null(),
-            REPLACEFILE_WRITE_THROUGH,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
+    const FILE_RENAME_INFO_CLASS: u32 = 3;
+    let wide = file_name.encode_wide().collect::<Vec<_>>();
+    let name_bytes = wide
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| std::io::Error::other("replacement name is too long"))?;
+    let info_size = std::mem::offset_of!(FileRenameInfo, file_name)
+        .checked_add(name_bytes)
+        .ok_or_else(|| std::io::Error::other("replacement metadata is too large"))?;
+    let words = info_size.div_ceil(std::mem::size_of::<usize>());
+    let mut storage = vec![0_usize; words];
+    let info = storage.as_mut_ptr().cast::<FileRenameInfo>();
+    unsafe {
+        (*info).replace_if_exists = u8::from(replace_existing);
+        (*info).root_directory = parent.as_raw_handle();
+        (*info).file_name_length = u32::try_from(name_bytes)
+            .map_err(|_| std::io::Error::other("replacement name is too long"))?;
+        std::ptr::copy_nonoverlapping(
+            wide.as_ptr(),
+            std::ptr::addr_of_mut!((*info).file_name).cast::<u16>(),
+            wide.len(),
+        );
+    }
+    if inject_native_failure {
+        return Err(std::io::Error::other(
+            "injected native atomic replacement failure",
+        ));
+    }
+    let renamed = unsafe {
+        SetFileInformationByHandle(
+            partial.as_raw_handle(),
+            FILE_RENAME_INFO_CLASS,
+            info.cast(),
+            u32::try_from(info_size)
+                .map_err(|_| std::io::Error::other("replacement metadata is too large"))?,
         )
     };
-    if replaced != 0 {
+    if renamed != 0 {
         return Ok(());
     }
     Err(std::io::Error::from_raw_os_error(

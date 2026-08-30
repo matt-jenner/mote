@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use photo_domain::GalleryScope;
@@ -68,6 +68,8 @@ pub(crate) struct SelectionRuntime {
     pub(crate) client_demand: Mutex<HashMap<u64, ClientDemand>>,
     pub(crate) lease_wake: Arc<Notify>,
     pub(crate) lease_reaper_started: std::sync::atomic::AtomicBool,
+    hosted_encode_active: AtomicUsize,
+    hosted_encode_wake: Notify,
     #[cfg(test)]
     pub(crate) cancel_attempt_test_hook: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
@@ -142,11 +144,32 @@ impl SelectionRuntime {
             client_demand: Mutex::new(HashMap::new()),
             lease_wake: Arc::new(Notify::new()),
             lease_reaper_started: std::sync::atomic::AtomicBool::new(false),
+            hosted_encode_active: AtomicUsize::new(0),
+            hosted_encode_wake: Notify::new(),
             #[cfg(test)]
             cancel_attempt_test_hook: Mutex::new(None),
             #[cfg(test)]
             lifecycle_publish_test_gate: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn begin_hosted_encode(self: &Arc<Self>) -> HostedEncodeGuard {
+        self.hosted_encode_active.fetch_add(1, Ordering::AcqRel);
+        HostedEncodeGuard {
+            runtime: self.clone(),
+        }
+    }
+
+    pub(crate) async fn wait_for_hosted_encode_idle(&self) {
+        loop {
+            let notified = self.hosted_encode_wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.hosted_encode_active.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub(crate) fn lifecycle_receiver(&self) -> watch::Receiver<ScanLifecycle> {
@@ -518,6 +541,23 @@ impl SelectionRuntime {
                 self.finish_scan(generation, ScanLifecycle::Failed);
                 Err(error)
             }
+        }
+    }
+}
+
+pub(crate) struct HostedEncodeGuard {
+    runtime: Arc<SelectionRuntime>,
+}
+
+impl Drop for HostedEncodeGuard {
+    fn drop(&mut self) {
+        if self
+            .runtime
+            .hosted_encode_active
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            self.runtime.hosted_encode_wake.notify_waiters();
         }
     }
 }

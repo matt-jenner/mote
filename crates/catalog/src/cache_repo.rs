@@ -54,6 +54,34 @@ pub struct DerivativeEviction<'a> {
     groups: Vec<FolderGroupId>,
 }
 
+pub struct DerivativeGroupLinkRemoval<'a> {
+    transaction: Option<Transaction<'a>>,
+    removed: bool,
+    remaining_links: usize,
+}
+
+impl DerivativeGroupLinkRemoval<'_> {
+    pub fn removed(&self) -> bool {
+        self.removed
+    }
+
+    pub fn remaining_links(&self) -> usize {
+        self.remaining_links
+    }
+
+    pub fn commit(mut self) -> Result<(), CatalogError> {
+        self.transaction
+            .take()
+            .ok_or_else(|| {
+                CatalogError::InvalidData(
+                    "derivative link removal transaction already completed".into(),
+                )
+            })?
+            .commit()?;
+        Ok(())
+    }
+}
+
 impl DerivativeEviction<'_> {
     pub fn derivatives(&self) -> &[DerivativeRecord] {
         &self.derivatives
@@ -90,6 +118,43 @@ impl DerivativeEviction<'_> {
 }
 
 impl Catalog {
+    /// Stages removal of exactly one group link in an immediate transaction.
+    /// The caller may inspect the remaining-link count and perform final-file
+    /// cleanup before committing. Dropping the guard rolls the link and row
+    /// changes back.
+    pub fn begin_derivative_group_link_removal(
+        &mut self,
+        derivative: DerivativeId,
+        group: FolderGroupId,
+    ) -> Result<DerivativeGroupLinkRemoval<'_>, CatalogError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let removed = transaction.execute(
+            "DELETE FROM derivative_folder_groups
+             WHERE derivative_id = ?1 AND folder_group_id = ?2",
+            params![derivative.as_uuid().as_bytes(), group.as_uuid().as_bytes()],
+        )? == 1;
+        let remaining: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM derivative_folder_groups WHERE derivative_id = ?1",
+            [derivative.as_uuid().as_bytes()],
+            |row| row.get(0),
+        )?;
+        let remaining_links =
+            usize::try_from(remaining).map_err(|_| CatalogError::ValueOutOfRange)?;
+        if removed && remaining_links == 0 {
+            transaction.execute(
+                "DELETE FROM derivatives WHERE id = ?1",
+                [derivative.as_uuid().as_bytes()],
+            )?;
+        }
+        Ok(DerivativeGroupLinkRemoval {
+            transaction: Some(transaction),
+            removed,
+            remaining_links,
+        })
+    }
+
     pub fn begin_derivative_eviction(
         &mut self,
         groups: &[FolderGroupId],

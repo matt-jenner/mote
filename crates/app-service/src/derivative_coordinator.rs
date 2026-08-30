@@ -240,6 +240,16 @@ struct CommitDelivery {
     waiters: Vec<WorkWaiter>,
 }
 
+pub(crate) struct HostedPublication {
+    delivery: CommitDelivery,
+}
+
+impl HostedPublication {
+    pub(crate) fn was_cancelled(&self) -> bool {
+        self.delivery.permit.was_cancelled()
+    }
+}
+
 struct TicketState {
     key: WorkKey,
     lane: WorkLane,
@@ -684,6 +694,17 @@ impl DerivativeCoordinator {
             .collect()
     }
 
+    #[cfg(debug_assertions)]
+    pub(crate) async fn waiter_count(&self) -> usize {
+        self.state
+            .lock()
+            .await
+            .jobs
+            .values()
+            .map(|work| work.foreground_waiters.len() + work.background_waiters.len())
+            .sum()
+    }
+
     /// Rechecks every waiter at the commit boundary. Hosted membership is
     /// mutable while an encoder runs, so the scope captured at enqueue time
     /// is only a hint and cannot authorize publication on its own.
@@ -1051,6 +1072,87 @@ impl DerivativeCoordinator {
             coordinator.deliver_commit(delivery).await;
         });
         let _ = delivery_task.await;
+    }
+
+    /// Atomically authorizes hosted publication and closes this attempt to
+    /// later waiters. A waiter racing this transition is either captured by
+    /// the locked transition or sees the attempt as finishing and is rejected
+    /// before it can join the publication.
+    pub(crate) async fn authorize_hosted_publication(
+        &self,
+        permit: CommitPermit,
+        authorizer: ScopeAuthorizer,
+    ) -> Option<HostedPublication> {
+        let (delivery, authorized) = {
+            let mut state = self.state.lock().await;
+            let ticket = WorkTicket {
+                job_id: permit.job_id,
+                attempt: permit.attempt,
+            };
+            let ticket_state = state.tickets.get(&ticket)?;
+            if ticket_state.status != TicketStatus::Committing
+                || ticket_state.key.selection != permit.selection
+            {
+                return None;
+            }
+            let key = ticket_state.key.clone();
+            let work = state.jobs.get_mut(&key)?;
+            if work.ticket != Some(ticket)
+                || work.status != JobStatus::Committing
+                || work.commit_finishing
+            {
+                return None;
+            }
+            let allowed_scopes = [GalleryScope::CurrentFolder, GalleryScope::IncludeSubfolders]
+                .into_iter()
+                .filter(|scope| {
+                    work.foreground_waiters
+                        .iter()
+                        .chain(work.background_waiters.iter())
+                        .any(|waiter| {
+                            waiter.authorized && waiter.scope == *scope && authorizer(&key, *scope)
+                        })
+                })
+                .collect::<Vec<_>>();
+            let authorized = !allowed_scopes.is_empty() && !permit.was_cancelled();
+            work.commit_result = Some(DerivativeResult::Unavailable);
+            work.commit_allowed_scopes = Some(allowed_scopes.clone());
+            work.commit_finishing = true;
+            let delivery = CommitDelivery {
+                permit,
+                key,
+                completion: work.completion.clone(),
+                result: DerivativeResult::Unavailable,
+                allowed_scopes: Some(allowed_scopes),
+                waiters: work
+                    .foreground_waiters
+                    .drain(..)
+                    .chain(work.background_waiters.drain(..))
+                    .collect(),
+            };
+            (delivery, authorized)
+        };
+        self.notify_waiters();
+        if !authorized {
+            self.deliver_commit(delivery).await;
+            return None;
+        }
+        Some(HostedPublication { delivery })
+    }
+
+    pub(crate) async fn finish_hosted_publication(
+        &self,
+        mut publication: HostedPublication,
+        result: DerivativeResult,
+    ) {
+        {
+            let mut state = self.state.lock().await;
+            if let Some(work) = state.jobs.get_mut(&publication.delivery.key) {
+                work.commit_result = Some(result.clone());
+            }
+        }
+        publication.delivery.result = result;
+        self.deliver_commit(publication.delivery).await;
     }
 
     /// Finishes a committed attempt as an asset-terminal outcome.  Unlike a failed

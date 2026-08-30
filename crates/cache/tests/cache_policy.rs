@@ -307,9 +307,31 @@ fn windows_open_checked_rejects_a_reparse_point_final_component() {
 
 #[cfg(windows)]
 #[test]
-fn windows_replacement_failure_preserves_shared_derivative_bytes() {
+fn windows_replacement_creates_a_missing_destination() {
     let temp = tempfile::tempdir().unwrap();
     let writer = CacheWriter::new(temp.path()).unwrap();
+
+    let replaced = writer
+        .replace_atomic(PathBuf::from("ab/cd/missing.jpg"), |file| {
+            file.write_all(b"first generation")
+        })
+        .unwrap();
+
+    assert!(!replaced.reused);
+    assert_eq!(
+        std::fs::read(temp.path().join("ab/cd/missing.jpg")).unwrap(),
+        b"first generation"
+    );
+    assert!(partial_files(temp.path()).is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_native_replacement_failure_preserves_old_and_outside_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let writer = CacheWriter::new(temp.path()).unwrap();
+    let outside = temp.path().join("outside-source-sentinel.jpg");
+    std::fs::write(&outside, b"outside source sentinel").unwrap();
     writer
         .write_atomic(PathBuf::from("shared.jpg"), |file| file.write_all(b"old"))
         .unwrap();
@@ -323,11 +345,59 @@ fn windows_replacement_failure_preserves_shared_derivative_bytes() {
         std::fs::read(temp.path().join("shared.jpg")).unwrap(),
         b"old"
     );
+    assert_eq!(std::fs::read(outside).unwrap(), b"outside source sentinel");
+    assert!(partial_files(temp.path()).is_empty());
 }
 
 #[cfg(windows)]
 #[test]
-fn windows_replacement_boundary_rejects_a_final_reparse_swap() {
+fn windows_replacement_boundary_pins_ancestors_against_a_reparse_swap() {
+    use std::os::windows::fs::symlink_dir;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("item.bin"), b"outside sentinel").unwrap();
+    let writer = CacheWriter::new(&cache).unwrap();
+    writer
+        .write_atomic(PathBuf::from("ab/cd/item.bin"), |file| {
+            file.write_all(b"old")
+        })
+        .unwrap();
+
+    let swap_blocked = Arc::new(AtomicBool::new(false));
+    let hook_swap_blocked = Arc::clone(&swap_blocked);
+    let ancestor = cache.join("ab");
+    let backup = cache.join("ab-old");
+    let hook_outside = outside.clone();
+    writer.install_replacement_test_hook(Arc::new(move || {
+        match std::fs::rename(&ancestor, &backup) {
+            Ok(()) => {
+                symlink_dir(&hook_outside, &ancestor).unwrap();
+            }
+            Err(_) => hook_swap_blocked.store(true, Ordering::Release),
+        }
+    }));
+
+    writer
+        .replace_atomic(PathBuf::from("ab/cd/item.bin"), |file| {
+            file.write_all(b"new")
+        })
+        .unwrap();
+
+    assert!(swap_blocked.load(Ordering::Acquire));
+    assert_eq!(std::fs::read(cache.join("ab/cd/item.bin")).unwrap(), b"new");
+    assert_eq!(
+        std::fs::read(outside.join("item.bin")).unwrap(),
+        b"outside sentinel"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_handle_relative_replacement_does_not_follow_a_final_reparse_swap() {
     use std::os::windows::fs::symlink_file;
 
     let temp = tempfile::tempdir().unwrap();
@@ -347,15 +417,14 @@ fn windows_replacement_boundary_rejects_a_final_reparse_swap() {
         std::fs::rename(&hook_destination, &hook_backup).unwrap();
         symlink_file(&hook_outside, &hook_destination).unwrap();
     }));
-    assert!(
-        writer
-            .replace_atomic(PathBuf::from("item.bin"), |file| file.write_all(b"new"))
-            .is_err()
-    );
+    writer
+        .replace_atomic(PathBuf::from("item.bin"), |file| file.write_all(b"new"))
+        .unwrap();
     assert_eq!(std::fs::read(&outside).unwrap(), b"outside sentinel");
     assert_eq!(std::fs::read(&backup).unwrap(), b"old");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"new");
     assert!(
-        std::fs::symlink_metadata(&destination)
+        !std::fs::symlink_metadata(&destination)
             .unwrap()
             .file_type()
             .is_symlink()

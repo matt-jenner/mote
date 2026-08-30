@@ -16,7 +16,9 @@ use std::num::ParseIntError;
 use std::path::Path;
 
 pub use asset_repo::{AssetRecord, NewAsset};
-pub use cache_repo::{CacheEvictionGroup, DerivativeRecord, NewDerivative, NewFolderGroup};
+pub use cache_repo::{
+    CacheEvictionGroup, DerivativeGroupLinkRemoval, DerivativeRecord, NewDerivative, NewFolderGroup,
+};
 pub use derivative_failure_repo::TerminalDerivativeFailure;
 pub use generation_repo::GenerationCompletion;
 pub use health_repo::CatalogHealthSnapshot;

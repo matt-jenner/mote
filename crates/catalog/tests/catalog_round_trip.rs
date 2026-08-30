@@ -363,6 +363,127 @@ fn aggregate_non_durable_cache_bytes_is_zero_and_sums_only_screen_previews() {
 }
 
 #[test]
+fn requester_link_removal_rolls_back_or_preserves_shared_derivative_links() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured(
+            "Pictures",
+            Path::new("/mounted/Pictures"),
+        ))
+        .unwrap();
+    let first_group = catalog
+        .upsert_folder_group(&NewFolderGroup {
+            id: FolderGroupId::new(),
+            library_id: library.id,
+            relative_path: RelativePathKey::from_relative_path(Path::new("first")).unwrap(),
+            display_path: "first".to_owned(),
+            last_viewed_at: None,
+        })
+        .unwrap();
+    let second_group = catalog
+        .upsert_folder_group(&NewFolderGroup {
+            id: FolderGroupId::new(),
+            library_id: library.id,
+            relative_path: RelativePathKey::from_relative_path(Path::new("second")).unwrap(),
+            display_path: "second".to_owned(),
+            last_viewed_at: None,
+        })
+        .unwrap();
+    let asset = NewAsset::minimal(
+        library.id,
+        RelativePathKey::from_relative_path(Path::new("first/photo.jpg")).unwrap(),
+        "first/photo.jpg",
+        MediaKind::Jpeg,
+        1,
+    );
+    catalog.upsert_asset(&asset).unwrap();
+    let derivative = DerivativeId::new();
+    for (id, group) in [
+        (derivative, first_group),
+        (DerivativeId::new(), second_group),
+    ] {
+        catalog
+            .insert_derivative(&NewDerivative {
+                id,
+                asset_id: asset.id,
+                folder_group_id: group,
+                kind: "screen_preview".to_owned(),
+                cache_key: "shared-key".to_owned(),
+                relative_cache_path: Path::new("shared.jpg").to_owned(),
+                size_bytes: 25,
+                durable: false,
+                created_at: 0,
+            })
+            .unwrap();
+    }
+
+    {
+        let removal = catalog
+            .begin_derivative_group_link_removal(derivative, first_group)
+            .unwrap();
+        assert!(removal.removed());
+        assert_eq!(removal.remaining_links(), 1);
+    }
+    assert_eq!(
+        catalog
+            .non_durable_derivatives(&[first_group])
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        catalog
+            .non_durable_derivatives(&[second_group])
+            .unwrap()
+            .len(),
+        1
+    );
+
+    catalog
+        .begin_derivative_group_link_removal(derivative, first_group)
+        .unwrap()
+        .commit()
+        .unwrap();
+    assert!(
+        catalog
+            .non_durable_derivatives(&[first_group])
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        catalog
+            .non_durable_derivatives(&[second_group])
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(catalog.all_derivatives().unwrap().len(), 1);
+
+    {
+        let removal = catalog
+            .begin_derivative_group_link_removal(derivative, second_group)
+            .unwrap();
+        assert!(removal.removed());
+        assert_eq!(removal.remaining_links(), 0);
+    }
+    assert_eq!(
+        catalog
+            .non_durable_derivatives(&[second_group])
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(catalog.all_derivatives().unwrap().len(), 1);
+
+    catalog
+        .begin_derivative_group_link_removal(derivative, second_group)
+        .unwrap()
+        .commit()
+        .unwrap();
+    assert!(catalog.all_derivatives().unwrap().is_empty());
+}
+
+#[test]
 fn aggregate_non_durable_cache_bytes_rejects_sqlite_sum_overflow() {
     let mut catalog = Catalog::open_in_memory().unwrap();
     let library = catalog

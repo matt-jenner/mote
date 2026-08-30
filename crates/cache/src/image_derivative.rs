@@ -463,6 +463,9 @@ impl ImageDerivativeGenerator {
         let Ok(reader) = reader.with_guessed_format() else {
             return false;
         };
+        if reader.format() != Some(image::ImageFormat::Jpeg) {
+            return false;
+        }
         reader.decode().is_ok()
     }
 }

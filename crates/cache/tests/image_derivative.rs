@@ -189,6 +189,27 @@ fn commit_wall_thumbnail_replaces_corrupt_bytes_under_an_immutable_key() {
 }
 
 #[test]
+fn valid_png_at_an_immutable_jpg_key_is_replaced_with_jpeg() {
+    let fixture = fixture();
+    let cache = tempfile::tempdir().unwrap();
+    let generator = ImageDerivativeGenerator::new(cache.path()).unwrap();
+    let requested = spec(DerivativeKind::WallThumbnail, 1024, 1);
+    let first = generator.generate(fixture.path(), &requested).unwrap();
+    let cache_path = cache.path().join(&first.relative_path);
+    image::ImageBuffer::from_pixel(8, 8, image::Rgb([10_u8, 20_u8, 30_u8]))
+        .save_with_format(&cache_path, image::ImageFormat::Png)
+        .unwrap();
+
+    let repaired = generator.generate(fixture.path(), &requested).unwrap();
+
+    assert!(!repaired.reused, "a PNG must not be reused as image/jpeg");
+    assert_eq!(
+        image::guess_format(&std::fs::read(cache_path).unwrap()).unwrap(),
+        image::ImageFormat::Jpeg
+    );
+}
+
+#[test]
 fn shared_screen_repair_failure_preserves_bytes_and_existing_group_link() {
     let fixture = fixture();
     let cache = tempfile::tempdir().unwrap();
