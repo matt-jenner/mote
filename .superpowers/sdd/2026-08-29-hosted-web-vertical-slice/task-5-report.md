@@ -67,3 +67,54 @@ Source-media mutation audit found no source-root `write`, `remove`, `rename`, or
 ## Concern
 
 `crates/server/src/api/derivative.rs` calls `Read::read_to_end` and constructs `Body::from(bytes)`, so delivery is safely cache-scoped but currently buffers the complete derivative rather than streaming the managed file. If “managed streaming” is a hard requirement for large derivatives, this should be addressed in a follow-up.
+
+## Task 5 fix round 1
+
+Implementation/fix commit: `3aa171a` (`fix: harden hosted derivative generation and delivery`), based on implementation `dbfdb39`.
+
+The first regression test was deliberately run before the fix:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections corrupt_hosted_thumbnail_is_repaired_before_it_is_reused --jobs 2
+  RED: failed; corrupt cache bytes were returned instead of a regenerated JPEG
+```
+
+The fix replaces the hosted per-key lock path with coordinator-backed work tickets and commit admission, preserves protected-group guards through generation/commit, rechecks current asset signature and cache key before commit, validates IDs and scope before scan admission, repairs stale regular cache records, verifies opened descriptors, and streams managed files in 64 KiB async chunks. `If-None-Match` now accepts wildcard, list, and weak matches. Changed files are `crates/app-service/src/gallery.rs`, `crates/app-service/tests/hosted_selections.rs`, `crates/cache/Cargo.toml`, `crates/cache/src/writer.rs`, `crates/server/src/api/derivative.rs`, and `Cargo.lock`.
+
+Fix-round GREEN evidence:
+
+- `photo-cache` cache policy: 15 passed; `open_checked`: 1 passed.
+- `photo-app-service` hosted selections, including corrupt size/signature and concurrent repair: 8 passed; progressive wall: 57 passed; task-7 source safety: 1 passed.
+- `photo-server` derivative API: 1 passed; server library tests: 2 passed (including ETag matching).
+- The invalidation test was reproduced alone with a 45-second outer timeout and then run three serial times; each passed (exit 0, approximately 0.47–0.63 seconds). It was not reproduced as a hang.
+- Required full workspace command passed all unit/integration tests and doc-tests with zero failures.
+- Formatting and whitespace checks passed.
+
+Exact fix-round commands/results:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test cache_policy open_checked --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test cache_policy --jobs 2
+  PASS: 15 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections --jobs 2
+  PASS: 8 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --lib --jobs 2
+  PASS: 2 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --test derivative_api --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test progressive_wall --jobs 2
+  PASS: 57 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test task7_source_safety --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 perl -e '$SIG{ALRM}=sub { exit 124 }; alarm 45; exec @ARGV' cargo test --offline -p photo-app-service --test progressive_wall invalidation_before_commit_admission_has_no_side_effects --jobs 2
+  PASS: 1 passed, 0 failed (repeated three times serially)
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test --offline --workspace --jobs 2
+  PASS: all workspace tests and doc-tests; 0 failures
+CARGO_BUILD_JOBS=2 cargo fmt --all -- --check
+  PASS: no formatting differences
+git diff --check
+  PASS: no whitespace errors
+```
+
+All Cargo commands were run one at a time, offline, with `CARGO_BUILD_JOBS=2` and `--jobs 2`; no background build was launched and existing target artifacts were reused. The source-media audit found no hosted derivative write/delete/rename/copy operations under source roots. Cache mutation remains managed-cache-only. The open-check implementation uses descriptor-relative containment verification on Unix/macOS/Windows code paths; no deterministic swap-race harness was added because no safe cross-platform deterministic scheduling hook exists in the current cache test fixtures.
