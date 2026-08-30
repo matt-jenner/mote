@@ -16,7 +16,9 @@ use photo_core::{LibraryService, RealSourceFs};
 use photo_domain::{FolderGroupId, GalleryScope, LibraryId, RelativePathKey};
 use photo_indexer::{DefaultMetadataReader, IndexEvent, Indexer, MetadataReader, ScanRequest};
 
-use crate::derivative_coordinator::{WorkKey, WorkLane, WorkTicket};
+use crate::derivative_coordinator::{
+    HostedAttemptLease, HostedCancellationDecision, WorkKey, WorkLane, WorkTicket,
+};
 use crate::hosted_runtime::{SelectionEventSubscription, SelectionRuntime, SubscriptionOrigin};
 use crate::service::{ReaderAdapter, ServiceState};
 use crate::{
@@ -184,24 +186,16 @@ struct HostedDriverOwner {
     runtime: Arc<SelectionRuntime>,
     active_ticket: Arc<Mutex<Option<WorkTicket>>>,
     active_attempt: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
-    active_publication: Arc<AtomicBool>,
-    publication_fence: Arc<TokioMutex<()>>,
+    active_attempt_lease: Arc<Mutex<Option<HostedAttemptLease>>>,
 }
 
-struct HostedPublicationFenceOwner {
-    active: Arc<AtomicBool>,
+struct HostedAttemptTaskOwner {
+    attempt: HostedAttemptLease,
 }
 
-impl HostedPublicationFenceOwner {
-    fn new(active: Arc<AtomicBool>) -> Self {
-        active.store(true, Ordering::Release);
-        Self { active }
-    }
-}
-
-impl Drop for HostedPublicationFenceOwner {
+impl Drop for HostedAttemptTaskOwner {
     fn drop(&mut self) {
-        self.active.store(false, Ordering::Release);
+        self.attempt.finish_task();
     }
 }
 
@@ -209,6 +203,23 @@ impl Drop for HostedPublicationFenceOwner {
 struct HostedEncodeTestGate {
     entered: Arc<Notify>,
     release: Arc<AtomicBool>,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Clone)]
+struct HostedCancellationTransitionTestGate {
+    entered: Arc<Notify>,
+    release: Arc<AtomicBool>,
+    applied: Arc<Notify>,
+    completed: Arc<Notify>,
+}
+
+#[cfg(debug_assertions)]
+struct HostedEncodeRegistrationTestGate {
+    entered: Arc<Notify>,
+    release: Arc<AtomicBool>,
+    registered: Arc<Notify>,
+    rejected: Arc<Notify>,
 }
 
 impl Drop for HostedDriverOwner {
@@ -219,35 +230,62 @@ impl Drop for HostedDriverOwner {
         let runtime = self.runtime.clone();
         let active_ticket = self.active_ticket.clone();
         let active_attempt = self.active_attempt.clone();
-        let active_publication = self.active_publication.clone();
-        let publication_fence = self.publication_fence.clone();
+        let active_attempt_lease = self.active_attempt_lease.clone();
         let attempt = active_attempt
             .lock()
             .expect("hosted active attempt poisoned")
             .take();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let publication_won = active_publication.load(Ordering::Acquire);
-            if !publication_won && let Some(attempt) = attempt.as_ref() {
+            #[cfg(debug_assertions)]
+            let cancellation_gate = engine
+                .hosted_cancellation_transition_test_gate
+                .lock()
+                .expect("hosted cancellation transition test gate poisoned")
+                .take();
+            #[cfg(debug_assertions)]
+            if let Some(gate) = cancellation_gate.as_ref() {
+                gate.entered.notify_one();
+                while !gate.release.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            }
+            let attempt_lease = active_attempt_lease
+                .lock()
+                .expect("hosted active attempt lease poisoned")
+                .take();
+            let cancellation = attempt_lease
+                .as_ref()
+                .map(HostedAttemptLease::cancel)
+                .unwrap_or(HostedCancellationDecision::CancelAttempt);
+            if cancellation == HostedCancellationDecision::CancelAttempt
+                && let Some(attempt) = attempt.as_ref()
+            {
                 attempt.abort();
             }
+            #[cfg(debug_assertions)]
+            if let Some(gate) = cancellation_gate.as_ref() {
+                gate.applied.notify_one();
+            }
             handle.spawn(async move {
-                let _publication = publication_fence.lock().await;
-                if publication_won && let Some(attempt) = attempt.as_ref() {
-                    // A publisher already owned the boundary. Let it settle
-                    // its captured waiters before aborting the now-complete
-                    // child and handing ownership to a successor.
-                    attempt.abort();
-                }
                 let ticket = active_ticket
                     .lock()
                     .expect("hosted active ticket poisoned")
                     .take();
-                if let Some(ticket) = ticket {
+                if cancellation == HostedCancellationDecision::CancelAttempt
+                    && let Some(ticket) = ticket
+                {
                     coordinator.abort_hosted_attempt(ticket).await;
+                }
+                if let Some(attempt_lease) = attempt_lease {
+                    attempt_lease.wait_finished().await;
                 }
                 coordinator.release_driver_owner(generation).await;
                 if coordinator.pending_job_count().await > 0 {
                     engine.start_hosted_derivative_driver(runtime).await;
+                }
+                #[cfg(debug_assertions)]
+                if let Some(gate) = cancellation_gate {
+                    gate.completed.notify_one();
                 }
             });
         }
@@ -381,11 +419,18 @@ pub struct GalleryEngine {
     #[cfg(debug_assertions)]
     hosted_commit_post_publication_test_gate: Arc<TokioMutex<Option<(Arc<Notify>, Arc<Notify>)>>>,
     #[cfg(debug_assertions)]
+    hosted_authorized_publication_test_gate: Arc<TokioMutex<Option<(Arc<Notify>, Arc<Notify>)>>>,
+    #[cfg(debug_assertions)]
     hosted_driver_abort_handle: Arc<TokioMutex<Option<tokio::task::AbortHandle>>>,
+    #[cfg(debug_assertions)]
+    hosted_cancellation_transition_test_gate:
+        Arc<Mutex<Option<HostedCancellationTransitionTestGate>>>,
     #[cfg(debug_assertions)]
     hosted_panic_before_admission: Arc<TokioMutex<bool>>,
     #[cfg(debug_assertions)]
     hosted_encode_test_gates: Arc<TokioMutex<VecDeque<HostedEncodeTestGate>>>,
+    #[cfg(debug_assertions)]
+    hosted_encode_registration_test_gate: Arc<TokioMutex<Option<HostedEncodeRegistrationTestGate>>>,
     #[cfg(debug_assertions)]
     hosted_empty_authorization_test_gate: Arc<TokioMutex<Option<(Arc<Notify>, Arc<Notify>)>>>,
     #[cfg(debug_assertions)]
@@ -492,11 +537,17 @@ impl GalleryEngine {
             #[cfg(debug_assertions)]
             hosted_commit_post_publication_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]
+            hosted_authorized_publication_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
             hosted_driver_abort_handle: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
+            hosted_cancellation_transition_test_gate: Arc::new(Mutex::new(None)),
             #[cfg(debug_assertions)]
             hosted_panic_before_admission: Arc::new(TokioMutex::new(false)),
             #[cfg(debug_assertions)]
             hosted_encode_test_gates: Arc::new(TokioMutex::new(VecDeque::new())),
+            #[cfg(debug_assertions)]
+            hosted_encode_registration_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]
             hosted_empty_authorization_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]
@@ -550,11 +601,17 @@ impl GalleryEngine {
             #[cfg(debug_assertions)]
             hosted_commit_post_publication_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]
+            hosted_authorized_publication_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
             hosted_driver_abort_handle: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
+            hosted_cancellation_transition_test_gate: Arc::new(Mutex::new(None)),
             #[cfg(debug_assertions)]
             hosted_panic_before_admission: Arc::new(TokioMutex::new(false)),
             #[cfg(debug_assertions)]
             hosted_encode_test_gates: Arc::new(TokioMutex::new(VecDeque::new())),
+            #[cfg(debug_assertions)]
+            hosted_encode_registration_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]
             hosted_empty_authorization_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]
@@ -1124,6 +1181,15 @@ impl GalleryEngine {
         self.runtime(selection).coordinator.waiter_count().await
     }
 
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn hosted_pending_job_count_for_test(&self, selection: &GallerySelection) -> usize {
+        self.runtime(selection)
+            .coordinator
+            .pending_job_count()
+            .await
+    }
+
     fn try_hosted_slot(&self) -> bool {
         let limit = self.hosted_admission_limit();
         let mut active = self.hosted_active.load(Ordering::Acquire);
@@ -1186,7 +1252,6 @@ impl GalleryEngine {
         &self,
         runtime: &Arc<SelectionRuntime>,
     ) -> Option<(WorkTicket, HostedAdmission)> {
-        runtime.wait_for_hosted_encode_idle().await;
         let _owner = self.hosted_admission_owner.lock().await;
         let permit = self.derivative_admission.clone().try_acquire_owned().ok()?;
         if !self.try_hosted_slot() {
@@ -1232,6 +1297,23 @@ impl GalleryEngine {
     async fn wait_hosted_commit_post_publication_test_gate(&self) {
         let gate = self
             .hosted_commit_post_publication_test_gate
+            .lock()
+            .await
+            .take();
+        let Some((entered, release)) = gate else {
+            return;
+        };
+        let notified = release.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        entered.notify_one();
+        notified.await;
+    }
+
+    #[cfg(debug_assertions)]
+    async fn wait_hosted_authorized_publication_test_gate(&self) {
+        let gate = self
+            .hosted_authorized_publication_test_gate
             .lock()
             .await
             .take();
@@ -1303,7 +1385,7 @@ impl GalleryEngine {
         let engine = self.clone();
         let active_ticket = Arc::new(Mutex::new(None));
         let active_attempt = Arc::new(Mutex::new(None));
-        let active_publication = Arc::new(AtomicBool::new(false));
+        let active_attempt_lease = Arc::new(Mutex::new(None));
         let driver = tokio::spawn(async move {
             let _owner = HostedDriverOwner {
                 coordinator: runtime.coordinator.clone(),
@@ -1312,8 +1394,7 @@ impl GalleryEngine {
                 runtime: runtime.clone(),
                 active_ticket: active_ticket.clone(),
                 active_attempt: active_attempt.clone(),
-                active_publication: active_publication.clone(),
-                publication_fence: engine.hosted_publication_fence.clone(),
+                active_attempt_lease: active_attempt_lease.clone(),
             };
             loop {
                 let coordinator = runtime.coordinator.clone();
@@ -1368,18 +1449,30 @@ impl GalleryEngine {
                     continue;
                 };
                 *active_ticket.lock().expect("hosted active ticket poisoned") = Some(ticket);
+                let Some(attempt_lease) = coordinator.claim_hosted_attempt(ticket).await else {
+                    coordinator.discard(ticket).await;
+                    *active_ticket.lock().expect("hosted active ticket poisoned") = None;
+                    drop(admission);
+                    continue;
+                };
+                *active_attempt_lease
+                    .lock()
+                    .expect("hosted active attempt lease poisoned") = Some(attempt_lease.clone());
                 let attempt = tokio::spawn({
                     let engine = engine.clone();
                     let runtime = runtime.clone();
-                    let active_publication = active_publication.clone();
+                    let attempt_lease = attempt_lease.clone();
                     async move {
+                        let _attempt_owner = HostedAttemptTaskOwner {
+                            attempt: attempt_lease.clone(),
+                        };
                         engine
                             .process_hosted_derivative(
                                 runtime,
                                 ticket,
                                 key,
                                 admission,
-                                active_publication,
+                                attempt_lease,
                             )
                             .await;
                     }
@@ -1396,6 +1489,9 @@ impl GalleryEngine {
                 *active_attempt
                     .lock()
                     .expect("hosted active attempt poisoned") = None;
+                *active_attempt_lease
+                    .lock()
+                    .expect("hosted active attempt lease poisoned") = None;
                 *active_ticket.lock().expect("hosted active ticket poisoned") = None;
             }
         });
@@ -1413,7 +1509,7 @@ impl GalleryEngine {
         ticket: WorkTicket,
         key: WorkKey,
         admission: HostedAdmission,
-        active_publication: Arc<AtomicBool>,
+        attempt_lease: HostedAttemptLease,
     ) {
         let Some((asset, source, spec)) = self.pending_hosted_derivative(&key).await else {
             runtime.coordinator.discard(ticket).await;
@@ -1463,7 +1559,31 @@ impl GalleryEngine {
         let generation_cache_root = cache_root.clone();
         #[cfg(debug_assertions)]
         let encode_test_gate = self.hosted_encode_test_gates.lock().await.pop_front();
-        let encode_guard = runtime.begin_hosted_encode();
+        #[cfg(debug_assertions)]
+        let encode_registration_gate = self
+            .hosted_encode_registration_test_gate
+            .lock()
+            .await
+            .take();
+        #[cfg(debug_assertions)]
+        if let Some(gate) = encode_registration_gate.as_ref() {
+            gate.entered.notify_one();
+            while !gate.release.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        }
+        let Some(encode_guard) = attempt_lease.begin_encode() else {
+            #[cfg(debug_assertions)]
+            if let Some(gate) = encode_registration_gate.as_ref() {
+                gate.rejected.notify_one();
+            }
+            runtime.coordinator.fail_commit(permit).await;
+            return;
+        };
+        #[cfg(debug_assertions)]
+        if let Some(gate) = encode_registration_gate.as_ref() {
+            gate.registered.notify_one();
+        }
         let prepared = tokio::task::spawn_blocking(move || {
             let _encode_guard = encode_guard;
             let generator = ImageDerivativeGenerator::new(&generation_cache_root)
@@ -1524,7 +1644,10 @@ impl GalleryEngine {
         // owner cleanup lets an authorized publisher retain terminal
         // settlement ownership rather than dropping its captured waiters.
         let _publication = self.hosted_publication_fence.lock().await;
-        let _publication_owner = HostedPublicationFenceOwner::new(active_publication);
+        if !attempt_lease.begin_publication() {
+            runtime.coordinator.fail_commit(permit).await;
+            return;
+        }
         if permit.was_cancelled() {
             runtime.coordinator.fail_commit_with_error(permit).await;
             return;
@@ -1559,6 +1682,8 @@ impl GalleryEngine {
         else {
             return;
         };
+        #[cfg(debug_assertions)]
+        self.wait_hosted_authorized_publication_test_gate().await;
         // The publication fence makes this short catalog/cache transaction an
         // indivisible supervisor boundary. Keep it in the owned attempt task:
         // aborting the supervisor must never detach a blocking publisher that
@@ -1820,6 +1945,45 @@ impl GalleryEngine {
 
     #[cfg(debug_assertions)]
     #[doc(hidden)]
+    pub async fn install_hosted_encode_registration_test_gate(
+        &self,
+        entered: Arc<Notify>,
+        release: Arc<AtomicBool>,
+        registered: Arc<Notify>,
+        rejected: Arc<Notify>,
+    ) {
+        *self.hosted_encode_registration_test_gate.lock().await =
+            Some(HostedEncodeRegistrationTestGate {
+                entered,
+                release,
+                registered,
+                rejected,
+            });
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn install_hosted_cancellation_transition_test_gate(
+        &self,
+        entered: Arc<Notify>,
+        release: Arc<AtomicBool>,
+        applied: Arc<Notify>,
+        completed: Arc<Notify>,
+    ) {
+        *self
+            .hosted_cancellation_transition_test_gate
+            .lock()
+            .expect("hosted cancellation transition test gate poisoned") =
+            Some(HostedCancellationTransitionTestGate {
+                entered,
+                release,
+                applied,
+                completed,
+            });
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
     pub async fn install_hosted_empty_authorization_test_gate(
         &self,
         entered: Arc<Notify>,
@@ -1859,6 +2023,16 @@ impl GalleryEngine {
         release: Arc<Notify>,
     ) {
         *self.hosted_commit_post_publication_test_gate.lock().await = Some((entered, release));
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_hosted_authorized_publication_test_gate(
+        &self,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    ) {
+        *self.hosted_authorized_publication_test_gate.lock().await = Some((entered, release));
     }
 
     #[cfg(debug_assertions)]

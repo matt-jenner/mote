@@ -250,10 +250,171 @@ impl HostedPublication {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedAttemptPhase {
+    PreEncode,
+    Encoding,
+    PrePublication,
+    Publishing,
+    Finished,
+}
+
+struct HostedAttemptState {
+    phase: HostedAttemptPhase,
+    cancelled: bool,
+    task_finished: bool,
+}
+
+struct HostedAttemptLeaseInner {
+    state: std::sync::Mutex<HostedAttemptState>,
+    wake: Notify,
+}
+
+/// A coordinator-created lease for one hosted ticket attempt. Short,
+/// synchronous state transitions decide cancellation, blocking encode
+/// admission, and publication ownership. The mutex is never held while the
+/// encoder runs or while an async operation is awaited.
+#[derive(Clone)]
+pub(crate) struct HostedAttemptLease {
+    inner: Arc<HostedAttemptLeaseInner>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostedCancellationDecision {
+    CancelAttempt,
+    PublicationOwns,
+}
+
+pub(crate) struct HostedEncodeLease {
+    attempt: HostedAttemptLease,
+}
+
+impl HostedAttemptLease {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(HostedAttemptLeaseInner {
+                state: std::sync::Mutex::new(HostedAttemptState {
+                    phase: HostedAttemptPhase::PreEncode,
+                    cancelled: false,
+                    task_finished: false,
+                }),
+                wake: Notify::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn begin_encode(&self) -> Option<HostedEncodeLease> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("hosted attempt lease poisoned");
+        if state.cancelled || state.phase != HostedAttemptPhase::PreEncode {
+            return None;
+        }
+        state.phase = HostedAttemptPhase::Encoding;
+        Some(HostedEncodeLease {
+            attempt: self.clone(),
+        })
+    }
+
+    pub(crate) fn begin_publication(&self) -> bool {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("hosted attempt lease poisoned");
+        if state.cancelled || state.phase != HostedAttemptPhase::PrePublication {
+            return false;
+        }
+        state.phase = HostedAttemptPhase::Publishing;
+        true
+    }
+
+    pub(crate) fn cancel(&self) -> HostedCancellationDecision {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("hosted attempt lease poisoned");
+        if state.phase == HostedAttemptPhase::Publishing {
+            return HostedCancellationDecision::PublicationOwns;
+        }
+        state.cancelled = true;
+        if matches!(
+            state.phase,
+            HostedAttemptPhase::PreEncode
+                | HostedAttemptPhase::PrePublication
+                | HostedAttemptPhase::Finished
+        ) {
+            state.phase = HostedAttemptPhase::Finished;
+            drop(state);
+            self.inner.wake.notify_waiters();
+        }
+        HostedCancellationDecision::CancelAttempt
+    }
+
+    pub(crate) fn finish_task(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("hosted attempt lease poisoned");
+        if state.phase == HostedAttemptPhase::Encoding {
+            state.task_finished = true;
+            return;
+        }
+        state.phase = HostedAttemptPhase::Finished;
+        drop(state);
+        self.inner.wake.notify_waiters();
+    }
+
+    pub(crate) async fn wait_finished(&self) {
+        loop {
+            let notified = self.inner.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .inner
+                .state
+                .lock()
+                .expect("hosted attempt lease poisoned")
+                .phase
+                == HostedAttemptPhase::Finished
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for HostedEncodeLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .attempt
+            .inner
+            .state
+            .lock()
+            .expect("hosted attempt lease poisoned");
+        if state.phase != HostedAttemptPhase::Encoding {
+            return;
+        }
+        if state.cancelled || state.task_finished {
+            state.phase = HostedAttemptPhase::Finished;
+            drop(state);
+            self.attempt.inner.wake.notify_waiters();
+        } else {
+            state.phase = HostedAttemptPhase::PrePublication;
+        }
+    }
+}
+
 struct TicketState {
     key: WorkKey,
     lane: WorkLane,
     status: TicketStatus,
+    hosted_attempt: Option<HostedAttemptLease>,
 }
 
 struct CoordinatorState {
@@ -645,6 +806,7 @@ impl DerivativeCoordinator {
                                         key,
                                         lane,
                                         status: TicketStatus::Running,
+                                        hosted_attempt: None,
                                     },
                                 );
                                 Some(ticket)
@@ -668,6 +830,20 @@ impl DerivativeCoordinator {
             .get(&ticket)
             .map(|ticket| ticket.lane)
             .unwrap_or(WorkLane::IdlePreview)
+    }
+
+    pub(crate) async fn claim_hosted_attempt(
+        &self,
+        ticket: WorkTicket,
+    ) -> Option<HostedAttemptLease> {
+        let mut state = self.state.lock().await;
+        let ticket_state = state.tickets.get_mut(&ticket)?;
+        if ticket_state.status != TicketStatus::Running || ticket_state.hosted_attempt.is_some() {
+            return None;
+        }
+        let attempt = HostedAttemptLease::new();
+        ticket_state.hosted_attempt = Some(attempt.clone());
+        Some(attempt)
     }
 
     pub(crate) async fn work_key(&self, ticket: WorkTicket) -> Option<WorkKey> {

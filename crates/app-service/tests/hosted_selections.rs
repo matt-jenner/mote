@@ -1321,6 +1321,325 @@ async fn hosted_membership_fence_rejects_staged_bytes_before_publication() {
     assert!(catalog.all_derivatives().unwrap().is_empty());
 }
 
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosted_cancellation_transition_yields_to_publication_authorized_after_drop_starts() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir_all(&source).unwrap();
+    image::ImageBuffer::from_pixel(64, 48, image::Rgb([220_u8, 180_u8, 80_u8]))
+        .save(source.join("photo.jpg"))
+        .unwrap();
+    let sentinel = source.join("source-sentinel.txt");
+    std::fs::write(&sentinel, b"source-owned").unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config.clone(), source).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    engine.ensure_running(&selection).await.unwrap();
+    let page = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let page = engine
+                .query_wall(
+                    &selection,
+                    photo_app_service::GalleryScope::CurrentFolder,
+                    photo_app_service::WallQueryRequest::oldest_first(),
+                )
+                .await
+                .unwrap();
+            if !page.items.is_empty() {
+                break page;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let asset = page.items[0].id.clone();
+    let asset_id = photo_domain::AssetId::from_uuid(uuid::Uuid::parse_str(&asset).unwrap());
+    let mut updates = engine.subscribe(
+        &selection,
+        "publication-transition".to_owned(),
+        photo_app_service::GalleryScope::CurrentFolder,
+        Some(engine.current_event_id_for_test(&selection)),
+    );
+
+    let publication_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let publication_release = std::sync::Arc::new(tokio::sync::Notify::new());
+    engine
+        .install_hosted_commit_publication_test_gate(
+            publication_entered.clone(),
+            publication_release.clone(),
+        )
+        .await;
+    let authorized_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let authorized_release = std::sync::Arc::new(tokio::sync::Notify::new());
+    engine
+        .install_hosted_authorized_publication_test_gate(
+            authorized_entered.clone(),
+            authorized_release.clone(),
+        )
+        .await;
+
+    let request_engine = engine.clone();
+    let request_selection = selection.clone();
+    let request_asset = asset.clone();
+    let request = tokio::spawn(async move {
+        request_engine
+            .request_derivatives(
+                &request_selection,
+                photo_app_service::GalleryScope::CurrentFolder,
+                photo_app_service::DerivativeRequest::visible(vec![request_asset]),
+            )
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        publication_entered.notified(),
+    )
+    .await
+    .expect("attempt did not reach the pre-publication barrier");
+
+    let cancellation_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let cancellation_release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancellation_applied = std::sync::Arc::new(tokio::sync::Notify::new());
+    let cancellation_completed = std::sync::Arc::new(tokio::sync::Notify::new());
+    engine.install_hosted_cancellation_transition_test_gate(
+        cancellation_entered.clone(),
+        cancellation_release.clone(),
+        cancellation_applied.clone(),
+        cancellation_completed,
+    );
+    engine.abort_hosted_derivative_driver_for_test().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        cancellation_entered.notified(),
+    )
+    .await
+    .expect("driver drop did not enter its cancellation transition");
+
+    publication_release.notify_waiters();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        authorized_entered.notified(),
+    )
+    .await
+    .expect("attempt did not authorize publication during cancellation transition");
+    cancellation_release.store(true, std::sync::atomic::Ordering::Release);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        cancellation_applied.notified(),
+    )
+    .await
+    .expect("driver drop did not apply its cancellation decision");
+    authorized_release.notify_waiters();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+        .await
+        .expect("authorized request remained retained")
+        .unwrap();
+    assert!(
+        result.is_ok(),
+        "publication authorization must win the cancellation transition"
+    );
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let photo_app_service::WallUpdate::DerivativesReady { derivatives, .. } =
+                updates.recv().await.unwrap().update
+                && derivatives
+                    .iter()
+                    .any(|derivative| derivative.asset_id == asset)
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(event.is_ok(), "authorized publication did not emit ready");
+    assert_eq!(
+        engine.hosted_pending_job_count_for_test(&selection).await,
+        0
+    );
+    let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    assert_eq!(
+        catalog
+            .derivatives_for_assets(&[asset_id], "wall_thumbnail")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"source-owned");
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosted_cancellation_rejects_encode_registration_after_successor_handoff() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir_all(&source).unwrap();
+    for name in ["first.jpg", "second.jpg"] {
+        image::ImageBuffer::from_pixel(64, 48, image::Rgb([220_u8, 180_u8, 80_u8]))
+            .save(source.join(name))
+            .unwrap();
+    }
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config, source).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    engine.ensure_running(&selection).await.unwrap();
+    let page = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let page = engine
+                .query_wall(
+                    &selection,
+                    photo_app_service::GalleryScope::CurrentFolder,
+                    photo_app_service::WallQueryRequest::oldest_first(),
+                )
+                .await
+                .unwrap();
+            if page.items.len() == 2 {
+                break page;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let first = page
+        .items
+        .iter()
+        .find(|item| item.display_name == "first.jpg")
+        .unwrap()
+        .id
+        .clone();
+    let second = page
+        .items
+        .iter()
+        .find(|item| item.display_name == "second.jpg")
+        .unwrap()
+        .id
+        .clone();
+    engine.set_hosted_derivative_admission_cap_for_test(4);
+
+    let registration_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let registration_release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let registered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let rejected = std::sync::Arc::new(tokio::sync::Notify::new());
+    engine
+        .install_hosted_encode_registration_test_gate(
+            registration_entered.clone(),
+            registration_release.clone(),
+            registered.clone(),
+            rejected.clone(),
+        )
+        .await;
+
+    let first_engine = engine.clone();
+    let first_selection = selection.clone();
+    let first_request = tokio::spawn(async move {
+        first_engine
+            .request_derivatives(
+                &first_selection,
+                photo_app_service::GalleryScope::CurrentFolder,
+                photo_app_service::DerivativeRequest::visible(vec![first]),
+            )
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        registration_entered.notified(),
+    )
+    .await
+    .expect("attempt did not reach the encode-registration barrier");
+
+    let second_engine = engine.clone();
+    let second_selection = selection.clone();
+    let second_request = tokio::spawn(async move {
+        second_engine
+            .request_derivatives(
+                &second_selection,
+                photo_app_service::GalleryScope::CurrentFolder,
+                photo_app_service::DerivativeRequest::visible(vec![second]),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if engine.hosted_waiter_count_for_test(&selection).await == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("successor waiter was not queued");
+
+    let cancellation_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let cancellation_release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancellation_applied = std::sync::Arc::new(tokio::sync::Notify::new());
+    let cancellation_completed = std::sync::Arc::new(tokio::sync::Notify::new());
+    engine.install_hosted_cancellation_transition_test_gate(
+        cancellation_entered.clone(),
+        cancellation_release.clone(),
+        cancellation_applied.clone(),
+        cancellation_completed.clone(),
+    );
+    engine.abort_hosted_derivative_driver_for_test().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        cancellation_entered.notified(),
+    )
+    .await
+    .expect("driver drop did not enter its cancellation transition");
+    cancellation_release.store(true, std::sync::atomic::Ordering::Release);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        cancellation_applied.notified(),
+    )
+    .await
+    .expect("driver drop did not abort-mark the attempt");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        cancellation_completed.notified(),
+    )
+    .await
+    .expect("driver drop did not hand ownership to the queued successor");
+
+    let registered_wait = registered.notified();
+    let rejected_wait = rejected.notified();
+    tokio::pin!(registered_wait);
+    tokio::pin!(rejected_wait);
+    registered_wait.as_mut().enable();
+    rejected_wait.as_mut().enable();
+    registration_release.store(true, std::sync::atomic::Ordering::Release);
+    let registration_rejected = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::select! {
+            _ = &mut registered_wait => false,
+            _ = &mut rejected_wait => true,
+        }
+    })
+    .await
+    .expect("encode registration produced no terminal transition");
+
+    let first_result = tokio::time::timeout(std::time::Duration::from_secs(5), first_request)
+        .await
+        .unwrap()
+        .unwrap();
+    let second_result = tokio::time::timeout(std::time::Duration::from_secs(5), second_request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        first_result,
+        Err(photo_app_service::AppServiceError::DerivativeUnavailable)
+    ));
+    assert!(second_result.is_ok());
+    assert!(
+        registration_rejected,
+        "an abort-marked attempt registered blocking work after successor handoff"
+    );
+}
+
 #[tokio::test]
 async fn hosted_repair_rejects_same_size_jpeg_with_corrupt_entropy() {
     let temp = tempfile::tempdir().unwrap();
