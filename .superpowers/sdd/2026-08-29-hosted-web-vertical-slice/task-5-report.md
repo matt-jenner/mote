@@ -447,3 +447,91 @@ All Cargo commands were run in the foreground, serially, offline, with `CARGO_BU
 ## Round-7 evidence limits
 
 The publication and repair guarantees are in-process fences; they do not claim a cross-process catalog transaction or crash-consistency guarantee. macOS tests exercise the hosted cancellation, membership, cleanup, full JPEG decode, managed streaming, and cache containment behavior. The Windows replacement seam is source-level/cfg-gated only on this host; a Windows build and runtime test remain required on a Windows target.
+
+## Task 5 exceptional fix round 8
+
+Implementation/test commit: `12f88b4` (`fix: close hosted derivative ownership gaps`), based on `f23babc`.
+
+This round closes the remaining hosted cancellation and publication ownership gaps. A per-selection encode guard is moved into the blocking closure, and recovered hosted admission waits for that durable guard to become idle. A cancelled driver therefore cannot admit its queued successor while the old blocking encoder is still running, even when the hosted capacity is greater than one. The publication fence separately records when an attempt owns publication: cancellation before that boundary remains `DerivativeUnavailable`, while a publisher that already captured its authorized waiters retains ownership through terminal settlement instead of dropping those waiters or leaving a committing job behind. Desktop blocking-commit cancellation remains unchanged.
+
+Hosted publication authorization now captures the current authorized waiter set, marks the attempt finishing, stores the allowed scopes, and drains its waiters in one coordinator-locked transition. A racing waiter is either captured by that transition or rejected before it joins a finishing attempt. The empty-to-late regression exercises a membership removal followed by re-addition at deterministic pre-enqueue, encode, publication, and empty-authorization barriers.
+
+Shared derivative cleanup uses an immediate catalog transaction that stages removal of only the requesting group link and reports the remaining link count. Dropping the guard rolls back the link and row changes. Shared bytes remain in place when another link exists. For the final link, the old bytes are bounded and retained until physical deletion and catalog commit finish; a physical-delete failure rolls the transaction back, and a catalog commit failure attempts to restore the retained bytes without deleting unrelated links or rows. The Gallery fault test uses root and child groups, injects requester-link and final physical-delete failures, checks both groups' link counts and old bytes, retries repair/reuse, and verifies the source sentinel.
+
+Cache and Gallery reuse validation now requires the decoded format to be `ImageFormat::Jpeg` before advertising `image/jpeg`. A valid PNG stored at the immutable `.jpg` key is repaired to actual JPEG bytes. On Windows, first-generation repair and replacement now keep the staged file and final parent handles open and publish with `SetFileInformationByHandle(FileRenameInfo)` using the pinned parent handle plus a relative leaf. The destination may be missing, and a raced final reparse entry is replaced as a directory entry rather than followed. The injected Windows failure is placed at the native handle-rename boundary and preserves old and outside sentinel bytes.
+
+Round-8 behavioral RED evidence:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections hosted_cancellation_keeps_blocking_encode_admitted_until_successor_runs --jobs 2
+  RED: failed with "a successor encoder started before the cancelled encoder exited" when the deterministic hosted admission cap was forced above one
+
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections authorized_late_waiter_at_empty_commit_boundary_allows_publication --jobs 2
+  RED: the late authorized waiter was accepted during early Committing, but the earlier empty scope snapshot settled the request as unavailable instead of publishing
+
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections hosted_repair_reuses_a_shared_derivative_linked_to_another_group --jobs 2
+  RED: after injected requester-link removal failure, the shared child-group derivative count was 0 instead of 1 because cleanup deleted the whole derivative row
+
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test image_derivative valid_png_at_an_immutable_jpg_key_is_replaced_with_jpeg --jobs 2
+  RED: failed with "a PNG must not be reused as image/jpeg"
+
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections hosted_supervisor_drop_restarts_queued_work_and_settles_active_waiter --jobs 2
+  RED: failed with "an authorized publication must retain ownership through terminal settlement" because abort dropped the captured delivery after publication authorization
+```
+
+The initial cancellation probes used the live scheduler's effective capacity of one and passed, so they are not counted as RED evidence. One later diagnostic was interrupted after its assertion left both artificial encode gates blocked; it is also not counted. The reported cancellation RED is the cleanly exiting, capacity-greater-than-one behavioral run. No Windows RED, compile, or runtime result is claimed.
+
+Round-8 focused GREEN and final evidence:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections hosted_cancellation_keeps_blocking_encode_admitted_until_successor_runs --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections authorized_late_waiter_at_empty_commit_boundary_allows_publication --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections hosted_repair_reuses_a_shared_derivative_linked_to_another_group --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test image_derivative valid_png_at_an_immutable_jpg_key_is_replaced_with_jpeg --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections hosted_supervisor_drop_restarts_queued_work_and_settles_active_waiter --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections hosted_driver_drop_aborts_active_attempt_without_stale_publication --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-catalog --test catalog_round_trip requester_link_removal_rolls_back_or_preserves_shared_derivative_links --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-catalog --test catalog_round_trip --jobs 2
+  PASS: 13 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test cache_policy --jobs 2
+  PASS: 25 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test image_derivative --jobs 2
+  PASS: 15 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections corrupt_hosted_thumbnail_is_repaired_before_it_is_reused --jobs 2
+  PASS: 1 passed, 0 failed, including same-size valid PNG repair
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections --jobs 2
+  PASS: 22 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test progressive_wall cancelled_ --jobs 2
+  PASS: 3 passed, 0 failed, including both desktop started-blocking-work cancellation tests
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --lib derivative_coordinator --jobs 2
+  PASS: 49 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_runtime --jobs 2
+  PASS: 16 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --test derivative_api --jobs 2
+  PASS: 3 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo fmt --all
+  PASS: formatting completed
+CARGO_BUILD_JOBS=2 cargo fmt --all -- --check
+  PASS: no formatting differences
+git diff --check
+  PASS: no whitespace errors
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test --offline --workspace --jobs 2
+  PASS: all workspace unit/integration tests and doc-tests; 0 failures
+  PASS: app-service lib 102, hosted runtime 16, hosted selections 22,
+        progressive wall 57, task-7 source safety 1, cache policy 25,
+        cache image derivatives 15, catalog round trip 13,
+        derivative HTTP 3, and all remaining workspace suites
+```
+
+All Cargo commands were run serially in the foreground, offline, with `CARGO_BUILD_JOBS=2`; test commands used `--jobs 2`. No background build or `cargo clean` was used. The full workspace gate ran exactly once and was the final Cargo command, after all source/test edits and formatting. No source or test file changed afterward. Every foreground command exited. Process enumeration remains restricted on this host, and no background Cargo/rustc process was launched.
+
+## Round-8 evidence limits
+
+`rustup target list --installed` reported only `aarch64-apple-darwin`. The `cfg(windows)` implementation and tests were therefore not compiled or run here. Static review checked the `SetFileInformationByHandle` signature, `FileRenameInfo` field offsets/alignment, `RawHandle` use, required staged-file delete access/share modes, pinned parent handle, relative UTF-16 leaf length, missing-destination behavior, and non-destructive failure paths. A Windows target build and runtime execution are still required; no Windows runtime evidence is claimed. The catalog guard is an in-process API backed by one SQLite immediate transaction plus compensating byte restoration. This report does not claim a cross-process cache/catalog transaction or crash consistency. Source roots remain read-only, and all physical mutation stays beneath the canonical managed cache.
