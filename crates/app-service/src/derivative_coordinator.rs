@@ -684,6 +684,31 @@ impl DerivativeCoordinator {
             .collect()
     }
 
+    /// Rechecks every waiter at the commit boundary. Hosted membership is
+    /// mutable while an encoder runs, so the scope captured at enqueue time
+    /// is only a hint and cannot authorize publication on its own.
+    pub(crate) async fn authorized_waiter_scopes(
+        &self,
+        ticket: WorkTicket,
+        authorizer: &ScopeAuthorizer,
+    ) -> Vec<GalleryScope> {
+        let state = self.state.lock().await;
+        let Some(ticket_state) = state.tickets.get(&ticket) else {
+            return Vec::new();
+        };
+        let Some(work) = state.jobs.get(&ticket_state.key) else {
+            return Vec::new();
+        };
+        work.foreground_waiters
+            .iter()
+            .chain(work.background_waiters.iter())
+            .filter_map(|waiter| {
+                (waiter.authorized && authorizer(&ticket_state.key, waiter.scope))
+                    .then_some(waiter.scope)
+            })
+            .collect()
+    }
+
     pub(crate) async fn ticket_for(&self, key: &WorkKey) -> Option<WorkTicket> {
         self.state
             .lock()
@@ -1138,6 +1163,11 @@ impl DerivativeCoordinator {
 
     pub(crate) async fn abort_hosted_attempt_as_failure(&self, ticket: WorkTicket) {
         self.abort_attempt_with_result_authorized(ticket, DerivativeResult::Failed, true)
+            .await;
+    }
+
+    pub(crate) async fn abort_hosted_attempt(&self, ticket: WorkTicket) {
+        self.abort_attempt_with_result_authorized(ticket, DerivativeResult::Unavailable, true)
             .await;
     }
 

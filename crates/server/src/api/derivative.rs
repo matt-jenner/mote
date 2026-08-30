@@ -62,17 +62,20 @@ pub(crate) async fn derivative(
         return Err(invalid_request());
     }
     let engine = gallery(&state)?;
-    let managed = engine.open_derivative(&id).map_err(|error| match error {
-        AppServiceError::UnknownAsset
-        | AppServiceError::Cache(_)
-        | AppServiceError::Catalog(_)
-        | AppServiceError::StatePoisoned => super::ApiError::new(
-            StatusCode::NOT_FOUND,
-            "notFound",
-            "That derivative is not available.",
-        ),
-        _ => invalid_request(),
-    })?;
+    let managed = engine
+        .open_derivative_async(&id)
+        .await
+        .map_err(|error| match error {
+            AppServiceError::UnknownAsset
+            | AppServiceError::Cache(_)
+            | AppServiceError::Catalog(_)
+            | AppServiceError::StatePoisoned => super::ApiError::new(
+                StatusCode::NOT_FOUND,
+                "notFound",
+                "That derivative is not available.",
+            ),
+            _ => invalid_request(),
+        })?;
     if headers
         .get(IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())

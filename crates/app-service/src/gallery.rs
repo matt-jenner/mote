@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -46,7 +46,6 @@ fn canonicalize_for_identity(path: &Path) -> PathBuf {
 
 const DERIVATIVE_DECODER_VERSION: &str = "image-0.25-v1";
 const MAX_MANAGED_DERIVATIVE_BYTES: u64 = 64 * 1024 * 1024;
-const DERIVATIVE_HEADER_READ_BYTES: usize = 64 * 1024;
 
 fn derivative_spec_for_gallery(
     asset: &photo_catalog::AssetRecord,
@@ -84,13 +83,12 @@ fn derivative_record_is_valid(root: &Path, record: &photo_catalog::DerivativeRec
     validate_managed_jpeg(&mut file, record.size_bytes).unwrap_or(false)
 }
 
-/// Validates only bounded JPEG framing. The catalog supplies the expected
-/// length, while the cache imposes a hard ceiling so a sparse or corrupt file
-/// cannot force an allocation proportional to its apparent size. Full image
-/// decoding belongs to the controlled derivative worker, never to the async
-/// request path.
+/// Validates a bounded JPEG file. The catalog supplies the expected length,
+/// while the cache imposes a hard ceiling so a sparse or corrupt file cannot
+/// force an unbounded allocation. Full image decoding runs only from callers
+/// that have moved this check to controlled blocking work when needed.
 fn validate_managed_jpeg(file: &mut std::fs::File, expected_size: u64) -> std::io::Result<bool> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::{Cursor, Read, Seek, SeekFrom};
 
     let metadata = file.metadata()?;
     if metadata.len() != expected_size
@@ -99,28 +97,30 @@ fn validate_managed_jpeg(file: &mut std::fs::File, expected_size: u64) -> std::i
     {
         return Ok(false);
     }
+    let expected_size = usize::try_from(expected_size).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "derivative is too large")
+    })?;
     file.seek(SeekFrom::Start(0))?;
-    let mut prefix = [0_u8; DERIVATIVE_HEADER_READ_BYTES];
-    let mut read = 0;
-    while read < prefix.len() {
-        let count = file.read(&mut prefix[read..])?;
-        if count == 0 {
-            break;
-        }
-        read += count;
-        if read >= 2 && prefix[read - 2..read] == [0xff, 0xd9] {
-            break;
-        }
-    }
-    let prefix = &prefix[..read];
-    if !jpeg_header_is_well_formed(prefix) {
+    let mut bytes = Vec::with_capacity(expected_size);
+    file.take(expected_size as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() != expected_size || !jpeg_header_is_well_formed(&bytes) {
         return Ok(false);
     }
-    file.seek(SeekFrom::Start(expected_size - 2))?;
-    let mut tail = [0_u8; 2];
-    file.read_exact(&mut tail)?;
+    // Marker framing does not validate the entropy stream. Decode the bounded
+    // bytes with image's allocation limit so same-size, well-framed garbage
+    // cannot be treated as an immutable cache hit.
+    let mut reader = image::ImageReader::new(Cursor::new(&bytes));
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(65_536);
+    limits.max_image_height = Some(65_536);
+    limits.max_alloc = Some(MAX_MANAGED_DERIVATIVE_BYTES);
+    reader.limits(limits);
+    if reader.with_guessed_format()?.decode().is_err() {
+        return Ok(false);
+    }
     file.seek(SeekFrom::Start(0))?;
-    Ok(tail == [0xff, 0xd9])
+    Ok(bytes.ends_with(&[0xff, 0xd9]))
 }
 
 fn jpeg_header_is_well_formed(bytes: &[u8]) -> bool {
@@ -186,6 +186,12 @@ struct HostedDriverOwner {
     publication_fence: Arc<TokioMutex<()>>,
 }
 
+#[cfg(debug_assertions)]
+struct HostedEncodeTestGate {
+    entered: Arc<Notify>,
+    release: Arc<AtomicBool>,
+}
+
 impl Drop for HostedDriverOwner {
     fn drop(&mut self) {
         let coordinator = self.coordinator.clone();
@@ -217,7 +223,7 @@ impl Drop for HostedDriverOwner {
                     .expect("hosted active ticket poisoned")
                     .take();
                 if let Some(ticket) = ticket {
-                    coordinator.abort_hosted_attempt_as_failure(ticket).await;
+                    coordinator.abort_hosted_attempt(ticket).await;
                 }
                 coordinator.release_driver_owner(generation).await;
                 if coordinator.pending_job_count().await > 0 {
@@ -328,10 +334,13 @@ pub struct GalleryEngine {
     pub(crate) shared_coordinator:
         Option<Arc<crate::derivative_coordinator::DerivativeCoordinator>>,
     pub(crate) cache_root: PathBuf,
+    cache_writer: CacheWriter,
     pub(crate) catalog_path: PathBuf,
     derivative_admission: Arc<Semaphore>,
     derivative_admission_wake: Arc<Notify>,
     hosted_active: Arc<AtomicUsize>,
+    #[cfg(debug_assertions)]
+    hosted_active_peak: Arc<AtomicUsize>,
     hosted_admission_owner: Arc<TokioMutex<()>>,
     hosted_publication_fence: Arc<TokioMutex<()>>,
     protected_groups: photo_cache::ProtectedGroups,
@@ -353,6 +362,10 @@ pub struct GalleryEngine {
     hosted_driver_abort_handle: Arc<TokioMutex<Option<tokio::task::AbortHandle>>>,
     #[cfg(debug_assertions)]
     hosted_panic_before_admission: Arc<TokioMutex<bool>>,
+    #[cfg(debug_assertions)]
+    hosted_encode_test_gate: Arc<TokioMutex<Option<HostedEncodeTestGate>>>,
+    #[cfg(debug_assertions)]
+    hosted_link_removal_failure_test_hook: Arc<AtomicBool>,
 }
 
 impl GalleryEngine {
@@ -409,6 +422,7 @@ impl GalleryEngine {
                 .id
         };
         let cache_root = config.cache_dir().to_owned();
+        let cache_writer = CacheWriter::new(&cache_root)?;
         let catalog_path = config.catalog_path();
         Ok(Self {
             state: Arc::new(Mutex::new(ServiceState {
@@ -425,10 +439,13 @@ impl GalleryEngine {
             hosted_library_id: Some(hosted_library_id),
             shared_coordinator: None,
             cache_root,
+            cache_writer,
             catalog_path,
             derivative_admission: Arc::new(Semaphore::new(4)),
             derivative_admission_wake: Arc::new(Notify::new()),
             hosted_active: Arc::new(AtomicUsize::new(0)),
+            #[cfg(debug_assertions)]
+            hosted_active_peak: Arc::new(AtomicUsize::new(0)),
             hosted_admission_owner: Arc::new(TokioMutex::new(())),
             hosted_publication_fence: Arc::new(TokioMutex::new(())),
             protected_groups: photo_cache::ProtectedGroups::default(),
@@ -444,9 +461,16 @@ impl GalleryEngine {
             fail_next_join: Arc::new(AtomicBool::new(false)),
             #[cfg(debug_assertions)]
             hosted_commit_publication_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
             hosted_commit_post_publication_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
             hosted_driver_abort_handle: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
             hosted_panic_before_admission: Arc::new(TokioMutex::new(false)),
+            #[cfg(debug_assertions)]
+            hosted_encode_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
+            hosted_link_removal_failure_test_hook: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -458,6 +482,7 @@ impl GalleryEngine {
         cache_root: PathBuf,
         catalog_path: PathBuf,
     ) -> Self {
+        let cache_writer = CacheWriter::new(&cache_root).expect("managed cache root exists");
         Self {
             state,
             scheduler,
@@ -466,10 +491,13 @@ impl GalleryEngine {
             hosted_library_id: None,
             shared_coordinator: Some(shared_coordinator),
             cache_root,
+            cache_writer,
             catalog_path,
             derivative_admission: Arc::new(Semaphore::new(4)),
             derivative_admission_wake: Arc::new(Notify::new()),
             hosted_active: Arc::new(AtomicUsize::new(0)),
+            #[cfg(debug_assertions)]
+            hosted_active_peak: Arc::new(AtomicUsize::new(0)),
             hosted_admission_owner: Arc::new(TokioMutex::new(())),
             hosted_publication_fence: Arc::new(TokioMutex::new(())),
             protected_groups: photo_cache::ProtectedGroups::default(),
@@ -485,9 +513,16 @@ impl GalleryEngine {
             fail_next_join: Arc::new(AtomicBool::new(false)),
             #[cfg(debug_assertions)]
             hosted_commit_publication_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
             hosted_commit_post_publication_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
             hosted_driver_abort_handle: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
             hosted_panic_before_admission: Arc::new(TokioMutex::new(false)),
+            #[cfg(debug_assertions)]
+            hosted_encode_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
+            hosted_link_removal_failure_test_hook: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -880,49 +915,102 @@ impl GalleryEngine {
                 let key = DerivativeKey::compute(&spec);
                 let existing = async {
                     let _publication = self.hosted_publication_fence.lock().await;
+                    let existing = {
+                        let state = self
+                            .state
+                            .lock()
+                            .map_err(|_| AppServiceError::StatePoisoned)?;
+                        state.libraries.catalog().find_derivative(
+                            asset.id,
+                            derivative_kind_name_for_gallery(class),
+                            key.as_str(),
+                        )?
+                    };
+                    let existing_is_valid = match existing.as_ref() {
+                        Some(record) => self.derivative_record_is_valid_async(record).await,
+                        None => false,
+                    };
                     let mut state = self
                         .state
                         .lock()
                         .map_err(|_| AppServiceError::StatePoisoned)?;
-                    let existing = state.libraries.catalog().find_derivative(
-                        asset.id,
-                        derivative_kind_name_for_gallery(class),
-                        key.as_str(),
-                    )?;
                     let result = if let Some(record) = existing.as_ref() {
-                        if derivative_record_is_valid(&self.cache_root, record) {
+                        if existing_is_valid {
+                            let authorized =
+                                state.libraries.catalog().wall_records_for_assets_scoped(
+                                    selection.group_id,
+                                    scope,
+                                    &[asset.id],
+                                )?;
+                            if authorized.is_empty() {
+                                return Err(AppServiceError::DerivativeUnavailable);
+                            }
                             state
                                 .libraries
                                 .catalog_mut()
                                 .link_derivative_group(record.id, selection.group_id)?;
                             Some(record.cache_key.clone())
                         } else {
-                            // Remove this requester's link first.  The cache
-                            // bytes are immutable and may still be owned by
-                            // another folder group; only remove the physical
-                            // file after the catalog confirms that no link
-                            // remains.
                             let record_id = record.id;
                             let relative_path = record.relative_cache_path.clone();
-                            state
-                                .libraries
-                                .catalog_mut()
-                                .remove_derivative_group_links(
-                                    &[record_id],
-                                    &[selection.group_id],
-                                )?;
-                            let still_linked = state
+                            let shared = state
                                 .libraries
                                 .catalog()
-                                .find_derivative(
-                                    asset.id,
-                                    derivative_kind_name_for_gallery(class),
-                                    key.as_str(),
-                                )?
-                                .is_some();
-                            if !still_linked {
-                                CacheWriter::new(&self.cache_root)?
-                                    .remove_checked(&relative_path)?;
+                                .derivative_has_other_group_links(record_id, selection.group_id)?;
+                            let old_bytes = if shared {
+                                None
+                            } else {
+                                let writer = &self.cache_writer;
+                                match writer.read_checked_limited(
+                                    &relative_path,
+                                    MAX_MANAGED_DERIVATIVE_BYTES,
+                                ) {
+                                    Ok(bytes) => Some(bytes),
+                                    Err(photo_cache::CacheError::Io(error))
+                                        if error.kind() == std::io::ErrorKind::NotFound =>
+                                    {
+                                        None
+                                    }
+                                    Err(_) => {
+                                        return Err(AppServiceError::DerivativeFailed);
+                                    }
+                                }
+                            };
+                            if !shared {
+                                self.cache_writer
+                                    .remove_checked(&relative_path)
+                                    .map_err(|_| AppServiceError::DerivativeFailed)?;
+                            }
+                            #[cfg(debug_assertions)]
+                            if self
+                                .hosted_link_removal_failure_test_hook
+                                .swap(false, Ordering::AcqRel)
+                            {
+                                let _ = self.restore_or_delete_removed_derivative(
+                                    state.libraries.catalog_mut(),
+                                    record_id,
+                                    &relative_path,
+                                    old_bytes.as_deref(),
+                                );
+                                return Err(AppServiceError::DerivativeFailed);
+                            }
+                            if let Err(error) = state
+                                .libraries
+                                .catalog_mut()
+                                .remove_derivative_group_links(&[record_id], &[selection.group_id])
+                            {
+                                if self
+                                    .restore_or_delete_removed_derivative(
+                                        state.libraries.catalog_mut(),
+                                        record_id,
+                                        &relative_path,
+                                        old_bytes.as_deref(),
+                                    )
+                                    .is_err()
+                                {
+                                    return Err(AppServiceError::DerivativeFailed);
+                                }
+                                return Err(error.into());
                             }
                             None
                         }
@@ -1019,6 +1107,18 @@ impl GalleryEngine {
         self.hosted_active.load(Ordering::Acquire)
     }
 
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn hosted_derivative_peak_count_for_test(&self) -> usize {
+        self.hosted_active_peak.load(Ordering::Acquire)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn hosted_derivative_admission_cap_for_test(&self) -> usize {
+        self.scheduler.available_background_permits().clamp(1, 4)
+    }
+
     fn try_hosted_slot(&self) -> bool {
         let limit = self.scheduler.available_background_permits().clamp(1, 4);
         let mut active = self.hosted_active.load(Ordering::Acquire);
@@ -1032,7 +1132,12 @@ impl GalleryEngine {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    #[cfg(debug_assertions)]
+                    self.hosted_active_peak
+                        .fetch_max(active + 1, Ordering::AcqRel);
+                    return true;
+                }
                 Err(next) => active = next,
             }
         }
@@ -1272,6 +1377,8 @@ impl GalleryEngine {
         {
             *self.hosted_driver_abort_handle.lock().await = Some(driver.abort_handle());
         }
+        #[cfg(not(debug_assertions))]
+        let _ = driver;
     }
 
     async fn process_hosted_derivative(
@@ -1279,9 +1386,9 @@ impl GalleryEngine {
         runtime: Arc<SelectionRuntime>,
         ticket: WorkTicket,
         key: WorkKey,
-        _admission: HostedAdmission,
+        admission: HostedAdmission,
     ) {
-        let Some((asset, source, spec)) = self.pending_hosted_derivative(&key) else {
+        let Some((asset, source, spec)) = self.pending_hosted_derivative(&key).await else {
             runtime.coordinator.discard(ticket).await;
             return;
         };
@@ -1327,10 +1434,19 @@ impl GalleryEngine {
         let orientation = spec.orientation;
         let generation_spec = spec.clone();
         let generation_cache_root = cache_root.clone();
+        #[cfg(debug_assertions)]
+        let encode_test_gate = self.hosted_encode_test_gate.lock().await.take();
         let prepared = tokio::task::spawn_blocking(move || {
             let generator = ImageDerivativeGenerator::new(&generation_cache_root)
                 .map_err(|_| AppServiceError::DerivativeFailed)?;
-            if class == DerivativeClass::ScreenPreview {
+            #[cfg(debug_assertions)]
+            if let Some(gate) = encode_test_gate {
+                gate.entered.notify_one();
+                while !gate.release.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            }
+            let prepared = if class == DerivativeClass::ScreenPreview {
                 generator
                     .encode_screen_preview(
                         &source,
@@ -1351,10 +1467,11 @@ impl GalleryEngine {
                     .encode_wall_thumbnail(&source, &generation_spec)
                     .map_err(|_| AppServiceError::DerivativeFailed)?;
                 Ok(HostedDerivativePrepared::Wall(encoded))
-            }
+            }?;
+            Ok::<_, AppServiceError>((prepared, admission))
         })
         .await;
-        let Some(prepared) = (match prepared {
+        let Some((prepared, _admission)) = (match prepared {
             Ok(Ok(prepared)) => Some(prepared),
             Ok(Err(_)) | Err(_) => None,
         }) else {
@@ -1369,7 +1486,7 @@ impl GalleryEngine {
             runtime.coordinator.fail_commit_with_error(permit).await;
             return;
         }
-        if self.pending_hosted_derivative(&key).is_none() {
+        if self.pending_hosted_derivative(&key).await.is_none() {
             runtime.coordinator.fail_commit(permit).await;
             return;
         }
@@ -1378,7 +1495,19 @@ impl GalleryEngine {
         // The test gate also represents the last externally observable fence:
         // re-read after it so a deterministic membership/signature mutation
         // rejects the staged bytes before either cache or catalog publication.
-        if self.pending_hosted_derivative(&key).is_none() {
+        if self.pending_hosted_derivative(&key).await.is_none() {
+            runtime.coordinator.fail_commit(permit).await;
+            return;
+        }
+        let authorizer = self.hosted_scope_authorizer();
+        let allowed_scopes = runtime
+            .coordinator
+            .authorized_waiter_scopes(ticket, &authorizer)
+            .await;
+        if allowed_scopes.is_empty() {
+            // No current waiter can still see this asset. Do not create a
+            // cache row or group link for a scope that disappeared while the
+            // encoder was running.
             runtime.coordinator.fail_commit(permit).await;
             return;
         }
@@ -1435,7 +1564,7 @@ impl GalleryEngine {
             // Keep a final defensive fence for mutations made through a
             // separate Catalog connection. If it trips, leave immutable
             // shared state intact and suppress this request's publication.
-            if self.pending_hosted_derivative(&key).is_none() {
+            if self.pending_hosted_derivative(&key).await.is_none() {
                 let _ = self.rollback_hosted_publication(&generated, group);
                 runtime.coordinator.fail_commit(permit).await;
                 return;
@@ -1453,14 +1582,14 @@ impl GalleryEngine {
                 .await;
             runtime
                 .coordinator
-                .complete_commit_authorized(permit, reference, self.hosted_scope_authorizer())
+                .complete_commit_authorized(permit, reference, authorizer)
                 .await;
         } else {
             runtime.coordinator.fail_commit_with_error(permit).await;
         }
     }
 
-    fn pending_hosted_derivative(
+    async fn pending_hosted_derivative(
         &self,
         key: &WorkKey,
     ) -> Option<(
@@ -1468,48 +1597,68 @@ impl GalleryEngine {
         PathBuf,
         photo_cache::DerivativeSpec,
     )> {
-        let state = self.state.lock().ok()?;
-        let asset = state.libraries.catalog().find_asset(key.asset_id).ok()??;
-        if asset.media_kind == photo_domain::MediaKind::Video
-            || asset.availability != photo_domain::Availability::Available
-            || asset.availability != key.availability
+        let (asset, source, spec, wall_record) = {
+            let state = self.state.lock().ok()?;
+            let asset = state.libraries.catalog().find_asset(key.asset_id).ok()??;
+            if asset.media_kind == photo_domain::MediaKind::Video
+                || asset.availability != photo_domain::Availability::Available
+                || asset.availability != key.availability
+            {
+                return None;
+            }
+            let spec = derivative_spec_for_gallery(&asset, key.class);
+            if DerivativeKey::compute(&spec).as_str() != key.cache_key {
+                return None;
+            }
+            let wall_record = if key.class == DerivativeClass::ScreenPreview {
+                let wall = derivative_spec_for_gallery(&asset, DerivativeClass::WallThumbnail);
+                let wall_key = DerivativeKey::compute(&wall);
+                Some(
+                    state
+                        .libraries
+                        .catalog()
+                        .find_derivative(asset.id, "wall_thumbnail", wall_key.as_str())
+                        .ok()??,
+                )
+            } else {
+                None
+            };
+            let library = state
+                .libraries
+                .catalog()
+                .find_library(key.selection.library_id)
+                .ok()??;
+            let root = library.canonical_root_key.to_path_buf().ok()?;
+            let relative = asset.relative_path.to_path_buf().ok()?;
+            (asset, root.join(relative), spec, wall_record)
+        };
+        if let Some(wall_record) = wall_record
+            && !self.derivative_record_is_valid_async(&wall_record).await
         {
             return None;
         }
-        let spec = derivative_spec_for_gallery(&asset, key.class);
-        if DerivativeKey::compute(&spec).as_str() != key.cache_key {
-            return None;
-        }
-        if key.class == DerivativeClass::ScreenPreview {
-            let wall = derivative_spec_for_gallery(&asset, DerivativeClass::WallThumbnail);
-            let wall_key = DerivativeKey::compute(&wall);
-            let ready = state
-                .libraries
-                .catalog()
-                .find_derivative(asset.id, "wall_thumbnail", wall_key.as_str())
-                .ok()??;
-            if !derivative_record_is_valid(&self.cache_root, &ready) {
-                return None;
-            }
-        }
-        let library = state
-            .libraries
-            .catalog()
-            .find_library(key.selection.library_id)
-            .ok()??;
-        let root = library.canonical_root_key.to_path_buf().ok()?;
-        let relative = asset.relative_path.to_path_buf().ok()?;
-        let source = root.join(relative);
         if !std::fs::symlink_metadata(&source).ok()?.is_file() {
             return None;
         }
         Some((asset, source, spec))
     }
 
+    async fn derivative_record_is_valid_async(
+        &self,
+        record: &photo_catalog::DerivativeRecord,
+    ) -> bool {
+        let root = self.cache_root.clone();
+        let record = record.clone();
+        tokio::task::spawn_blocking(move || derivative_record_is_valid(&root, &record))
+            .await
+            .unwrap_or(false)
+    }
+
     /// Removes only this requester's link when a post-publication fence finds
     /// that the staged result is no longer authorized. Shared immutable bytes
-    /// remain available to any other group link; an unlinked row is removed
-    /// before physical cleanup so an orphaned file can never be served by key.
+    /// remain available to any other group link. When this is the final link,
+    /// physical cleanup happens first and the bytes are restored if catalog
+    /// link removal fails.
     fn rollback_hosted_publication(
         &self,
         generated: &photo_cache::GeneratedDerivative,
@@ -1519,14 +1668,66 @@ impl GalleryEngine {
         let Some(record) = catalog.find_derivative_by_cache_key(generated.key.as_str())? else {
             return Ok(());
         };
-        catalog.remove_derivative_group_links(&[record.id], &[group])?;
-        if catalog
-            .find_derivative_by_cache_key(generated.key.as_str())?
-            .is_none()
-        {
-            CacheWriter::new(&self.cache_root)?.remove_checked(&record.relative_cache_path)?;
+        let shared = catalog.derivative_has_other_group_links(record.id, group)?;
+        let old_bytes = if shared {
+            None
+        } else {
+            match self
+                .cache_writer
+                .read_checked_limited(&record.relative_cache_path, MAX_MANAGED_DERIVATIVE_BYTES)
+            {
+                Ok(bytes) => Some(bytes),
+                Err(photo_cache::CacheError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        if !shared {
+            self.cache_writer
+                .remove_checked(&record.relative_cache_path)?;
+        }
+        if let Err(error) = catalog.remove_derivative_group_links(&[record.id], &[group]) {
+            if self
+                .restore_or_delete_removed_derivative(
+                    &mut catalog,
+                    record.id,
+                    &record.relative_cache_path,
+                    old_bytes.as_deref(),
+                )
+                .is_err()
+            {
+                return Err(AppServiceError::DerivativeFailed);
+            }
+            return Err(error.into());
         }
         Ok(())
+    }
+
+    fn restore_or_delete_removed_derivative(
+        &self,
+        catalog: &mut Catalog,
+        record_id: photo_domain::DerivativeId,
+        relative_path: &Path,
+        old_bytes: Option<&[u8]>,
+    ) -> Result<(), AppServiceError> {
+        if let Some(old_bytes) = old_bytes
+            && self
+                .cache_writer
+                .replace_atomic(relative_path.to_owned(), |file| {
+                    std::io::Write::write_all(file, old_bytes)
+                })
+                .is_ok()
+        {
+            return Ok(());
+        }
+        // There is no safely restorable file. Remove the now-unlinked row so
+        // a failed rollback cannot leave a catalog link pointing outside a
+        // physically consistent derivative state.
+        catalog.delete_derivatives(&[record_id])?;
+        Err(AppServiceError::DerivativeFailed)
     }
 
     #[cfg(debug_assertions)]
@@ -1541,6 +1742,30 @@ impl GalleryEngine {
     #[doc(hidden)]
     pub async fn install_hosted_derivative_panic_before_admission_test_hook(&self) {
         *self.hosted_panic_before_admission.lock().await = true;
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_hosted_encode_test_gate(
+        &self,
+        entered: Arc<Notify>,
+        release: Arc<AtomicBool>,
+    ) {
+        *self.hosted_encode_test_gate.lock().await =
+            Some(HostedEncodeTestGate { entered, release });
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn fail_next_hosted_cleanup_for_test(&self) {
+        self.cache_writer.fail_next_cleanup_for_test();
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn fail_next_hosted_link_removal_for_test(&self) {
+        self.hosted_link_removal_failure_test_hook
+            .store(true, Ordering::Release);
     }
 
     #[cfg(debug_assertions)]
@@ -1601,6 +1826,19 @@ impl GalleryEngine {
             content_length,
             etag: format!("\"{}\"", record.cache_key),
         })
+    }
+
+    /// Performs catalog lookup and bounded cache validation on a blocking
+    /// worker. The returned descriptor is ready for async chunk streaming.
+    pub async fn open_derivative_async(
+        &self,
+        opaque_id: &str,
+    ) -> Result<ManagedDerivative, AppServiceError> {
+        let engine = self.clone();
+        let opaque_id = opaque_id.to_owned();
+        tokio::task::spawn_blocking(move || engine.open_derivative(&opaque_id))
+            .await
+            .map_err(|_| AppServiceError::DerivativeUnavailable)?
     }
 
     pub fn subscribe(

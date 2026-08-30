@@ -1,7 +1,7 @@
 use std::fs::File;
 #[cfg(not(unix))]
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 #[cfg(any(test, debug_assertions))]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +33,9 @@ pub struct CacheWriter {
     replace_failure_test_hook: std::sync::Arc<AtomicBool>,
     #[cfg(any(test, debug_assertions))]
     cleanup_failure_test_hook: std::sync::Arc<AtomicBool>,
+    #[cfg(any(test, debug_assertions))]
+    replacement_test_hook:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>>,
 }
 
 impl std::fmt::Debug for CacheWriter {
@@ -58,6 +61,8 @@ impl CacheWriter {
             replace_failure_test_hook: std::sync::Arc::new(AtomicBool::new(false)),
             #[cfg(any(test, debug_assertions))]
             cleanup_failure_test_hook: std::sync::Arc::new(AtomicBool::new(false)),
+            #[cfg(any(test, debug_assertions))]
+            replacement_test_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -343,6 +348,28 @@ impl CacheWriter {
             .store(true, Ordering::Release);
     }
 
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn install_replacement_test_hook(&self, hook: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .replacement_test_hook
+            .lock()
+            .expect("cache replacement hook poisoned") = Some(hook);
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    #[allow(dead_code)]
+    fn run_replacement_test_hook(&self) {
+        let hook = self
+            .replacement_test_hook
+            .lock()
+            .expect("cache replacement hook poisoned")
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     pub fn write_atomic<F>(
         &self,
         relative_path: PathBuf,
@@ -423,12 +450,31 @@ impl CacheWriter {
             let size_bytes = partial.metadata()?.len();
             drop(partial);
 
+            #[cfg(windows)]
+            if replace_existing {
+                if let Err(error) = self.validate_windows_replacement_destination(&final_path) {
+                    let _ = std::fs::remove_file(&partial_path);
+                    return Err(error);
+                }
+            }
+
             #[cfg(any(test, debug_assertions))]
             if replace_existing && self.should_fail_replace_for_test() {
                 let _ = std::fs::remove_file(&partial_path);
                 return Err(CacheError::Write(std::io::Error::other(
                     "injected atomic replacement failure",
                 )));
+            }
+            #[cfg(any(test, debug_assertions))]
+            if replace_existing {
+                self.run_replacement_test_hook();
+            }
+            #[cfg(windows)]
+            if replace_existing {
+                if let Err(error) = self.validate_windows_replacement_destination(&final_path) {
+                    let _ = std::fs::remove_file(&partial_path);
+                    return Err(error);
+                }
             }
             let publish = if replace_existing {
                 match std::fs::rename(&partial_path, &final_path) {
@@ -535,6 +581,25 @@ impl CacheWriter {
         let mut file = self.open_checked(relative_path)?;
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut file, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    pub fn read_checked_limited(
+        &self,
+        relative_path: &Path,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, CacheError> {
+        let mut file = self.open_checked(relative_path)?;
+        let length = file.metadata()?.len();
+        if length > max_bytes {
+            return Err(CacheError::SizeOutOfRange);
+        }
+        let capacity = usize::try_from(length).map_err(|_| CacheError::SizeOutOfRange)?;
+        let mut bytes = Vec::with_capacity(capacity);
+        std::io::Read::take(&mut file, max_bytes.saturating_add(1)).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(CacheError::SizeOutOfRange);
+        }
         Ok(bytes)
     }
 
@@ -934,6 +999,26 @@ impl CacheWriter {
         }
         Ok(())
     }
+
+    #[cfg(windows)]
+    fn validate_windows_replacement_destination(&self, path: &Path) -> Result<(), CacheError> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(CacheError::PathEscape);
+        }
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() || !descriptor_is_contained(&file, &self.root) {
+            return Err(CacheError::PathEscape);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -1026,16 +1111,9 @@ fn replace_file_windows(partial: &Path, destination: &Path) -> Result<(), std::i
             exclude: *mut std::ffi::c_void,
             reserved: *mut std::ffi::c_void,
         ) -> i32;
-        fn MoveFileExW(
-            existing_file_name: *const u16,
-            new_file_name: *const u16,
-            flags: u32,
-        ) -> i32;
         fn GetLastError() -> u32;
     }
     const REPLACEFILE_WRITE_THROUGH: u32 = 1;
-    const MOVEFILE_REPLACE_EXISTING: u32 = 2;
-    const MOVEFILE_WRITE_THROUGH: u32 = 8;
     let mut old = destination.as_os_str().encode_wide().collect::<Vec<_>>();
     let mut new = partial.as_os_str().encode_wide().collect::<Vec<_>>();
     old.push(0);
@@ -1053,23 +1131,9 @@ fn replace_file_windows(partial: &Path, destination: &Path) -> Result<(), std::i
     if replaced != 0 {
         return Ok(());
     }
-    let error = std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32);
-    if error.kind() == std::io::ErrorKind::NotFound {
-        let moved = unsafe {
-            MoveFileExW(
-                new.as_ptr(),
-                old.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        if moved != 0 {
-            return Ok(());
-        }
-        return Err(std::io::Error::from_raw_os_error(
-            unsafe { GetLastError() } as i32
-        ));
-    }
-    Err(error)
+    Err(std::io::Error::from_raw_os_error(
+        unsafe { GetLastError() } as i32
+    ))
 }
 
 pub(crate) fn validate_relative(path: &Path) -> Result<(), CacheError> {

@@ -325,6 +325,43 @@ fn windows_replacement_failure_preserves_shared_derivative_bytes() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_replacement_boundary_rejects_a_final_reparse_swap() {
+    use std::os::windows::fs::symlink_file;
+
+    let temp = tempfile::tempdir().unwrap();
+    let writer = CacheWriter::new(temp.path()).unwrap();
+    let destination = temp.path().join("item.bin");
+    let outside = temp.path().join("outside.bin");
+    let backup = temp.path().join("item.old");
+    std::fs::write(&outside, b"outside sentinel").unwrap();
+    writer
+        .write_atomic(PathBuf::from("item.bin"), |file| file.write_all(b"old"))
+        .unwrap();
+
+    let hook_destination = destination.clone();
+    let hook_backup = backup.clone();
+    let hook_outside = outside.clone();
+    writer.install_replacement_test_hook(Arc::new(move || {
+        std::fs::rename(&hook_destination, &hook_backup).unwrap();
+        symlink_file(&hook_outside, &hook_destination).unwrap();
+    }));
+    assert!(
+        writer
+            .replace_atomic(PathBuf::from("item.bin"), |file| file.write_all(b"new"))
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside sentinel");
+    assert_eq!(std::fs::read(&backup).unwrap(), b"old");
+    assert!(
+        std::fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
 #[test]
 fn concurrent_writers_publish_exactly_one_immutable_output() {
     let temp = tempfile::tempdir().unwrap();

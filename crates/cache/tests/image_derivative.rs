@@ -96,6 +96,45 @@ fn repairs_a_wall_thumbnail_from_a_cached_screen_preview() {
 }
 
 #[test]
+fn cached_preview_repair_replaces_an_orphaned_corrupt_regular_file() {
+    let fixture = fixture();
+    let cache = tempfile::tempdir().unwrap();
+    let cached_screen = cache.path().join("legacy-screen.jpg");
+    std::fs::copy(fixture.path(), &cached_screen).unwrap();
+    let requested = spec(DerivativeKind::WallThumbnail, 1024, 1);
+    let key = photo_cache::DerivativeKey::compute(&requested);
+    let relative = key.sharded_path("jpg");
+    std::fs::create_dir_all(cache.path().join(relative.parent().unwrap())).unwrap();
+    std::fs::write(cache.path().join(&relative), b"orphaned corrupt bytes").unwrap();
+    let generator = ImageDerivativeGenerator::new(cache.path()).unwrap();
+
+    generator
+        .generate_wall_thumbnail_from_cached_preview(
+            std::path::Path::new("legacy-screen.jpg"),
+            &requested,
+        )
+        .unwrap();
+    assert!(image::load_from_memory(&std::fs::read(cache.path().join(relative)).unwrap()).is_ok());
+}
+
+#[test]
+fn generate_replaces_an_orphaned_corrupt_regular_file() {
+    let fixture = fixture();
+    let cache = tempfile::tempdir().unwrap();
+    let requested = spec(DerivativeKind::WallThumbnail, 1024, 1);
+    let key = photo_cache::DerivativeKey::compute(&requested);
+    let relative = key.sharded_path("jpg");
+    std::fs::create_dir_all(cache.path().join(relative.parent().unwrap())).unwrap();
+    std::fs::write(cache.path().join(&relative), b"orphaned corrupt bytes").unwrap();
+    let generator = ImageDerivativeGenerator::new(cache.path()).unwrap();
+
+    let generated = generator.generate(&fixture.path(), &requested).unwrap();
+
+    assert!(!generated.reused);
+    assert!(image::load_from_memory(&std::fs::read(cache.path().join(relative)).unwrap()).is_ok());
+}
+
+#[test]
 fn a_second_identical_request_reuses_the_atomic_cache_file_and_source() {
     let fixture = fixture();
     let before = std::fs::read(fixture.path()).unwrap();

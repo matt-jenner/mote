@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -14,6 +15,7 @@ use crate::{
 };
 
 pub const DECODER_VERSION: &str = "image-0.25-v1";
+const MAX_CACHED_DERIVATIVE_BYTES: u64 = 64 * 1024 * 1024;
 
 fn record_timing_stage(stage: &'static str, started: Instant) {
     tracing::debug!(
@@ -126,7 +128,9 @@ impl ImageDerivativeGenerator {
             _ => return Err(ImageDerivativeError::UnsupportedTarget),
         };
         let read_started = Instant::now();
-        let bytes = self.writer.read_checked(cached_relative_path)?;
+        let bytes = self
+            .writer
+            .read_checked_limited(cached_relative_path, MAX_CACHED_DERIVATIVE_BYTES)?;
         let image = image::load_from_memory(&bytes)?;
         record_timing_stage("cached_preview_read_decode", read_started);
         let transform_started = Instant::now();
@@ -144,7 +148,7 @@ impl ImageDerivativeGenerator {
         let key = DerivativeKey::compute(spec);
         let relative_path = key.sharded_path("jpg");
         let write_started = Instant::now();
-        let write_result = self.writer.write_atomic(relative_path.clone(), |file| {
+        let write_result = self.writer.replace_atomic(relative_path.clone(), |file| {
             std::io::Write::write_all(file, &encoded)
         });
         record_timing_stage("managed_cache_write", write_started);
@@ -336,6 +340,7 @@ impl ImageDerivativeGenerator {
         )?;
         let key = DerivativeKey::compute(spec);
         let relative_path = key.sharded_path("jpg");
+        let replace_existing = replace_existing || !self.cached_jpeg_is_valid(&relative_path);
         let write_started = Instant::now();
         let write_result = if replace_existing {
             self.writer.replace_atomic(relative_path.clone(), |file| {
@@ -416,9 +421,19 @@ impl ImageDerivativeGenerator {
         record_timing_stage("transform_encode", transform_started);
         let (encoded, representative_rgb) = transformed?;
         let write_started = Instant::now();
-        let write_result = self.writer.write_atomic(relative_path.clone(), |file| {
-            std::io::Write::write_all(file, &encoded)
-        });
+        // The generic writer intentionally reuses an existing regular file,
+        // but an orphaned file at an immutable derivative key may be corrupt.
+        // Validate it before allowing that reuse; otherwise publish through
+        // the replacement primitive so repair never accepts stale bytes.
+        let write_result = if self.cached_jpeg_is_valid(&relative_path) {
+            self.writer.write_atomic(relative_path.clone(), |file| {
+                std::io::Write::write_all(file, &encoded)
+            })
+        } else {
+            self.writer.replace_atomic(relative_path.clone(), |file| {
+                std::io::Write::write_all(file, &encoded)
+            })
+        };
         record_timing_stage("managed_cache_write", write_started);
         let write = write_result?;
         Ok(GeneratedDerivative {
@@ -430,6 +445,25 @@ impl ImageDerivativeGenerator {
             representative_rgb,
             content_type: "image/jpeg",
         })
+    }
+
+    fn cached_jpeg_is_valid(&self, relative_path: &Path) -> bool {
+        let Ok(bytes) = self
+            .writer
+            .read_checked_limited(relative_path, MAX_CACHED_DERIVATIVE_BYTES)
+        else {
+            return false;
+        };
+        let mut reader = ImageReader::new(Cursor::new(bytes));
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(65_536);
+        limits.max_image_height = Some(65_536);
+        limits.max_alloc = Some(MAX_CACHED_DERIVATIVE_BYTES);
+        reader.limits(limits);
+        let Ok(reader) = reader.with_guessed_format() else {
+            return false;
+        };
+        reader.decode().is_ok()
     }
 }
 
