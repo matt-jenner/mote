@@ -210,3 +210,63 @@ The final full workspace output included hosted runtime (15), hosted selections 
 The scheduler family reservation closes the cross-selection dequeue race, but the bounded admission check is still cooperative: work already encoding cannot be preempted when a higher-priority request arrives. The post-encode stale-key cleanup prevents reusable stale cache/catalog state after the final check, but a scan mutation racing exactly between that check and publication is not protected by one shared catalog/cache admission lock. Hosted worker failures still settle through the existing `Option<DerivativeReference>` coordinator channel, so an underlying encode/join/cache cause is not preserved distinctly as `DerivativeFailed`; route mapping exists, but the hosted path currently reports unavailable for that class of failure. Windows ancestor traversal remains the documented platform boundary described above. These are explicit residual concerns, not claims of complete linearized publication or cause-preserving settlement.
 
 Source-media audit: hosted derivative writes, deletes, and cleanup target only managed cache paths; source roots are read-only. Browser-visible derivative responses use opaque cache keys and path-free error envelopes. No Cargo/rustc process was left running after the final gate; process enumeration is restricted on this host, so this statement is based on the foreground command's exit and the absence of any background launch.
+
+## Task 5 fix round 4
+
+Implementation/test commit: `19abd4a` (`fix: harden hosted derivative supervision and publication`), based on `a3fce15`.
+
+Round-4 RED evidence was collected before the coordinator settlement implementation:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --lib coalesced_waiters_are_filtered_by_their_own_scope_at_settlement --jobs 2
+  RED: compile failed because the new direct hosted coordinator test referenced the not-yet-implemented complete_commit_filtered method
+```
+
+The fix keeps immutable work identity independent of scope but stores each waiter’s requested `GalleryScope`, filters commit settlement per waiter, and retains runtime subscription filtering for events. Hosted driver ownership is now a coordinator-locked generation token rather than a runtime boolean. One durable supervisor reserves a bounded slot before removing work from the global scheduler family, waits on coordinator/scheduler/admission generations, and catches attempt panics so queued work and all waiters are settled deterministically. The scheduler’s family reservation and global priority hint preserve visible > near-viewport > background ordering across hosted selections without placing a dequeued low-priority job behind a FIFO semaphore.
+
+Encoded bytes remain private until a final current-key/membership fence. The hosted publication fence is shared with hosted scan batch, generation completion, source-unavailable, and existing-record catalog writes. A deterministic direct hosted test changes the catalog signature at the fence and verifies `DerivativeUnavailable`, no derivative row, and no publication. Stale-record repair removes a requester’s link before considering physical deletion and leaves shared immutable rows/files linked to another group intact. Encode, join, cache, and catalog failures record a failure outcome and reach the request as `DerivativeFailed`; membership/cancellation/offline gaps remain `DerivativeUnavailable`. Non-ASCII decoded route IDs are rejected as `invalidRequest` before catalog access.
+
+Exact fix-round commands/results (the required workspace gate was run once after the initial focused gates; the final publication-fence tightening was then checked with focused hosted gates):
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-indexer --test scheduler_priority --jobs 2
+  PASS: 12 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --lib --jobs 2
+  PASS: 95 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections --jobs 2
+  PASS: 10 passed, 0 failed (before final fence test)
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --test derivative_api --jobs 2
+  PASS: 2 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test cache_policy --jobs 2
+  PASS: 17 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test progressive_wall --jobs 2
+  PASS: 57 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test task7_source_safety --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test --offline --workspace --jobs 2
+  PASS: all workspace tests and doc-tests; 0 failures
+CARGO_BUILD_JOBS=2 cargo fmt --all -- --check
+  PASS: no formatting differences
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections hosted_encode_failure_reaches_the_request_as_derivative_failed --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections corrupt_hosted_thumbnail_is_repaired_before_it_is_reused --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections hosted_membership_fence_rejects_staged_bytes_before_publication --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections --jobs 2
+  PASS: 11 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_runtime --jobs 2
+  PASS: 15 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test progressive_wall admitted_preview_panic_fails_waiters_and_releases_invalidation --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo fmt --all
+  PASS: formatting completed
+git diff --check
+  PASS: no whitespace errors
+```
+
+All Cargo commands were foreground, serial, offline, and used `CARGO_BUILD_JOBS=2` plus `--jobs 2`; no `cargo clean` or background build was used. The full workspace gate exited successfully before the final focused fence-only review. The final focused hosted tests exited successfully afterward. Process enumeration is restricted on this host (`pgrep` cannot access the process table); every foreground Cargo command returned, and no rustc child was intentionally left behind.
+
+## Round-4 evidence limits
+
+The generation fence and deterministic test establish rejection before publication for the exercised in-process and direct-catalog mutation window; they do not claim a universal transaction covering arbitrary external processes after the final recheck. The durable owner and attempt join handling are covered by coordinator owner tests and the hosted panic regression, but an OS-level crash is outside the process contract. Existing cache containment coverage remains Unix/macOS descriptor-relative plus Windows final-handle validation; no new Windows ancestor traversal guarantee is claimed. Existing source snapshot and HTTP path/error tests remain covered by the workspace gate; this round adds no claim beyond those passing tests.
