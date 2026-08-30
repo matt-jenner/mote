@@ -1,7 +1,7 @@
 use axum::body::Body;
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_ENCODING, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
-    LOCATION, REFERRER_POLICY, VARY, X_CONTENT_TYPE_OPTIONS,
+    CACHE_CONTROL, CONTENT_ENCODING, CONTENT_RANGE, CONTENT_SECURITY_POLICY, CONTENT_TYPE, ETAG,
+    IF_NONE_MATCH, LOCATION, RANGE, REFERRER_POLICY, VARY, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
@@ -13,6 +13,8 @@ use tower::ServiceExt;
 const INDEX: &str = r#"<!doctype html><title>Photo Viewer</title><script type="module" src="/assets/app-immutable.js"></script>"#;
 const JAVASCRIPT: &str = "globalThis.photoViewer = true;";
 const BROTLI_JAVASCRIPT: &[u8] = b"precompressed-javascript";
+const BROTLI_INDEX: &[u8] = b"precompressed-index";
+const GZIP_JAVASCRIPT: &[u8] = b"gzip-precompressed-javascript";
 const CSP: &str = "default-src 'self'; img-src 'self' data: blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
 
 fn app() -> (TempDir, axum::Router) {
@@ -23,8 +25,10 @@ fn app() -> (TempDir, axum::Router) {
     std::fs::create_dir_all(&assets).unwrap();
     std::fs::create_dir(&cache).unwrap();
     std::fs::write(web.join("index.html"), INDEX).unwrap();
+    std::fs::write(web.join("index.html.br"), BROTLI_INDEX).unwrap();
     std::fs::write(assets.join("app-immutable.js"), JAVASCRIPT).unwrap();
     std::fs::write(assets.join("app-immutable.js.br"), BROTLI_JAVASCRIPT).unwrap();
+    std::fs::write(assets.join("app-immutable.js.gz"), GZIP_JAVASCRIPT).unwrap();
     let state = AppState::new(Catalog::open_in_memory().unwrap(), cache);
     let app = build_router(state, web);
     (temp, app)
@@ -130,6 +134,7 @@ async fn immutable_assets_support_etags_and_precompressed_delivery() {
     assert!(body_bytes(response).await.is_empty());
 
     let response = app
+        .clone()
         .oneshot(
             Request::get("/assets/app-immutable.js")
                 .header("accept-encoding", "br")
@@ -151,6 +156,19 @@ async fn immutable_assets_support_etags_and_precompressed_delivery() {
         "public, max-age=31536000, immutable"
     );
     assert_eq!(body_bytes(response).await, BROTLI_JAVASCRIPT);
+
+    let response = app
+        .oneshot(
+            Request::get("/assets/app-immutable.js")
+                .header("accept-encoding", "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_ENCODING], "gzip");
+    assert_eq!(body_bytes(response).await, GZIP_JAVASCRIPT);
 }
 
 #[tokio::test]
@@ -186,4 +204,185 @@ async fn file_api_and_health_misses_never_fall_back_to_the_interface_shell() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     assert_ne!(body_bytes(response).await, INDEX);
+}
+
+#[tokio::test]
+async fn encoded_or_malformed_paths_are_rejected_before_file_or_spa_routing() {
+    let (_temp, app) = app();
+    for uri in [
+        "/missing%2Etxt",
+        "/api%2Fv1%2Funknown",
+        "/healthz%2Funknown",
+        "/%2e%2e/source-original.jpg",
+        "/gallery/%ZZ",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(hostile_request(Method::GET, uri))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        assert_ne!(body_bytes(response).await, INDEX, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn nested_fallback_preserves_precompression_and_head_headers() {
+    let (_temp, app) = app();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/gallery/selection-id")
+                .header("accept-encoding", "br")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_ENCODING], "br");
+    assert_eq!(response.headers()[CACHE_CONTROL], "no-cache");
+    assert_eq!(body_bytes(response).await, BROTLI_INDEX);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::HEAD)
+                .uri("/gallery/selection-id")
+                .header("accept-encoding", "br")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_ENCODING], "br");
+    assert_eq!(
+        response.headers()[axum::http::header::CONTENT_LENGTH],
+        BROTLI_INDEX.len().to_string()
+    );
+    assert_eq!(body_bytes(response).await.len(), 0);
+}
+
+#[tokio::test]
+async fn nested_fallback_preserves_conditional_and_range_headers() {
+    let (_temp, app) = app();
+    let response = app
+        .clone()
+        .oneshot(hostile_request(Method::GET, "/gallery/selection-id"))
+        .await
+        .unwrap();
+    let etag = response.headers()[ETAG].clone();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/gallery/selection-id")
+                .header(IF_NONE_MATCH, etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(response.headers()[CACHE_CONTROL], "no-cache");
+    assert!(body_bytes(response).await.is_empty());
+
+    let response = app
+        .oneshot(
+            Request::get("/gallery/selection-id")
+                .header(RANGE, "bytes=0-3")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()[CACHE_CONTROL], "no-cache");
+    assert_eq!(
+        response.headers()[CONTENT_RANGE],
+        format!("bytes 0-3/{}", INDEX.len())
+    );
+    assert_eq!(body_bytes(response).await, &INDEX.as_bytes()[..=3]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_asset_never_serves_a_source_sentinel() {
+    use std::os::unix::fs::symlink;
+
+    let (temp, app) = app();
+    let source_asset = temp.path().join("source-original.jpg");
+    std::fs::write(&source_asset, b"SOURCE ORIGINAL ASSET").unwrap();
+    let asset = temp.path().join("web/assets/app-immutable.js");
+    std::fs::remove_file(&asset).unwrap();
+    symlink(&source_asset, &asset).unwrap();
+
+    let response = app
+        .oneshot(hostile_request(Method::GET, "/assets/app-immutable.js"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_ne!(
+        body_bytes(response).await,
+        b"SOURCE ORIGINAL ASSET".as_slice()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_index_never_serves_a_source_sentinel() {
+    use std::os::unix::fs::symlink;
+
+    let (temp, app) = app();
+    let source_index = temp.path().join("source-index.html");
+    std::fs::write(&source_index, b"SOURCE ORIGINAL INDEX").unwrap();
+    let index = temp.path().join("web/index.html");
+    std::fs::remove_file(&index).unwrap();
+    symlink(&source_index, &index).unwrap();
+
+    let response = app
+        .oneshot(hostile_request(Method::GET, "/gallery/selection-id"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_ne!(
+        body_bytes(response).await,
+        b"SOURCE ORIGINAL INDEX".as_slice()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_precompressed_sidecars_never_serve_source_sentinels() {
+    use std::os::unix::fs::symlink;
+
+    for (extension, encoding) in [("br", "br"), ("gz", "gzip")] {
+        let (temp, app) = app();
+        let source_sidecar = temp.path().join(format!("source-sidecar.{extension}"));
+        std::fs::write(&source_sidecar, b"SOURCE ORIGINAL SIDECAR").unwrap();
+        let sidecar = temp
+            .path()
+            .join(format!("web/assets/app-immutable.js.{extension}"));
+        std::fs::remove_file(&sidecar).unwrap();
+        symlink(&source_sidecar, &sidecar).unwrap();
+
+        let response = app
+            .oneshot(
+                Request::get("/assets/app-immutable.js")
+                    .header("accept-encoding", encoding)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{extension}");
+        assert!(
+            response.headers().get(CONTENT_ENCODING).is_none(),
+            "{extension}"
+        );
+        let body = body_bytes(response).await;
+        assert_eq!(body, JAVASCRIPT, "{extension}");
+        assert_ne!(body, b"SOURCE ORIGINAL SIDECAR".as_slice(), "{extension}");
+    }
 }

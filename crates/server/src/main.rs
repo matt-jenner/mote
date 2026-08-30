@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!(
             warning_code = "broad_bind",
             bind = %config.bind(),
-            "health service is exposed beyond loopback"
+            "photo viewer server is exposed beyond loopback"
         );
     }
 

@@ -12,6 +12,7 @@ photo-core = { path = "../core" }
 photo-app-service = { path = "../app-service" }
 axum.workspace = true
 futures-util.workspace = true
+libc = "0.2.189"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
