@@ -121,3 +121,24 @@ Fix round 6 focused verification passed:
 - `cargo fmt --all -- --check` and `git diff --check` passed.
 
 The round-6 implementation and report remain separate commits; this report-only commit is the branch HEAD after the implementation commit.
+
+## Fix round 7 evidence
+
+RED/GREEN evidence: the startup, source-check, persistence, and deterministic unsuccessful-join bridge regressions first failed because a Failed scan published no terminal warning; the startup regression observed the expected timeout before the shared helper was implemented. They pass after all Failed transitions publish the exact path-free warning envelope once. Each regression then waits for bridge termination and zero desktop/runtime/active-marker state, drains pending warnings, retries the same token, and observes zero old warnings plus one settlement.
+
+Round 7 centralizes Failed-scan warning publication in `SelectionRuntime::finish_scan`. Under the scan-control and publication critical sections it emits exactly one `Warning { asset_id: None, code: "catalogUnavailable", retryable: true }`, records that warning as the failed event watermark, and only then publishes the atomic Failed lifecycle transition. Source-check/preflight errors, runtime startup errors, unsuccessful non-cancelled `ScanHandle` joins, and catalog/persistence failures all use this path. Cancelled scans skip the warning; generation fencing, terminal idempotence, publication ordering, and retry suppression remain intact. A test-only join-failure seam exercises the unsuccessful join path without sleeps or filesystem-dependent fault injection.
+
+Fix round 7 implementation commit: `a79232e` (`fix: publish terminal warnings for hosted scan failures`).
+
+Fix round 7 focused verification passed:
+
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-app-service service::tests::failed_ -- --nocapture` (4/4 failed-scan bridge regressions).
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-app-service hosted_runtime::tests:: -- --nocapture` (9/9).
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-app-service --test hosted_selections --test hosted_runtime --test desktop_gallery_wrapper` (6 + 12 + 1).
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-app-service --test progressive_wall` (57/57).
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-indexer --test scheduler_priority` (11/11).
+- `CARGO_TARGET_DIR=/Users/jennerm/repos/photo_viewer/target cargo test -p photo-app-service` (92 unit tests; integration suites 1 + 12 + 6 + 7 + 57 + 1; doc tests passed).
+- `CARGO_TARGET_DIR=/private/tmp/photo-viewer-hosted-workspace-target CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test --workspace --jobs 2` (all workspace unit, integration, and doc tests passed; isolated target avoids stale artifacts from other linked worktrees).
+- `cargo fmt --all -- --check` and `git diff --check` passed.
+
+The implementation and this evidence report are separate commits. The report-only commit is the branch HEAD after this append.
