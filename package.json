@@ -13,7 +13,9 @@
     "desktop:build": "npm exec --workspace @photo-viewer/desktop -- tauri build",
     "typecheck": "npm run typecheck --workspace @photo-viewer/interface",
     "test": "npm run test --workspace @photo-viewer/interface",
-    "test:browser": "npm run test:browser --workspace @photo-viewer/interface"
+    "test:browser": "npm run test:browser --workspace @photo-viewer/interface",
+    "web:build": "npm run build --workspace @photo-viewer/interface -- --mode hosted",
+    "web:dev": "npm run dev --workspace @photo-viewer/interface -- --mode hosted"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "7.0.1",

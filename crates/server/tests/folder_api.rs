@@ -7,6 +7,12 @@ use photo_server::{
 };
 use tower::ServiceExt;
 
+fn web_root(temp: &tempfile::TempDir) -> std::path::PathBuf {
+    let web = temp.path().join("web");
+    std::fs::create_dir_all(&web).unwrap();
+    web
+}
+
 #[test]
 fn config_canonicalizes_source_and_folder_paths_stay_mount_relative() {
     let temp = tempfile::tempdir().unwrap();
@@ -20,7 +26,7 @@ fn config_canonicalizes_source_and_folder_paths_stay_mount_relative() {
         temp.path().join("cache"),
         None,
         source.clone(),
-        temp.path().join("web"),
+        web_root(&temp),
     )
     .unwrap();
     let root = ContainedFolderRoot::new(source.clone()).unwrap();
@@ -206,7 +212,7 @@ async fn folder_api_returns_bootstrap_and_rejects_oversized_or_repeated_paths() 
         source,
     )
     .unwrap();
-    let app = build_router(state);
+    let app = build_router(state, web_root(&temp));
 
     let response = app
         .clone()
@@ -295,7 +301,7 @@ async fn invalid_folder_queries_are_rejected_before_filesystem_access() {
     )
     .unwrap();
     std::fs::remove_dir(&source).unwrap();
-    let app = build_router(state);
+    let app = build_router(state, web_root(&temp));
 
     let oversized = format!("/api/v1/folders?path={}", "x".repeat(4097));
     let response = app
@@ -343,7 +349,7 @@ async fn mounted_root_missing_file_and_unreadable_fail_as_source_unavailable() {
     )
     .unwrap();
     std::fs::remove_dir(&source).unwrap();
-    let app = build_router(state);
+    let app = build_router(state, web_root(&temp));
     let response = app
         .oneshot(
             Request::builder()
@@ -368,7 +374,7 @@ async fn mounted_root_missing_file_and_unreadable_fail_as_source_unavailable() {
     .unwrap();
     std::fs::remove_dir(&source).unwrap();
     std::fs::write(&source, b"not a directory").unwrap();
-    let app = build_router(state);
+    let app = build_router(state, web_root(&temp));
     let response = app
         .oneshot(
             Request::builder()
@@ -405,7 +411,7 @@ async fn mounted_root_missing_file_and_unreadable_fail_as_source_unavailable() {
     }
     #[cfg(not(unix))]
     return;
-    let app = build_router(state);
+    let app = build_router(state, web_root(&temp));
     let response = app
         .oneshot(
             Request::builder()
@@ -426,12 +432,13 @@ async fn mounted_root_missing_file_and_unreadable_fail_as_source_unavailable() {
 #[test]
 fn config_rejects_a_source_that_is_missing_or_overlaps_local_state() {
     let temp = tempfile::tempdir().unwrap();
+    let web = web_root(&temp);
     let missing = ServerConfig::new(
         temp.path().join("data"),
         temp.path().join("cache"),
         None,
         temp.path().join("missing"),
-        temp.path().join("web"),
+        web.clone(),
     );
     assert!(matches!(missing, Err(ConfigError::Io(_))));
 
@@ -442,7 +449,7 @@ fn config_rejects_a_source_that_is_missing_or_overlaps_local_state() {
         temp.path().join("cache"),
         None,
         source,
-        temp.path().join("web"),
+        web,
     );
     assert!(matches!(overlap, Err(ConfigError::InsideSourceRoot)));
 }

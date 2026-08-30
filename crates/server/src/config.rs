@@ -24,6 +24,10 @@ pub enum ConfigError {
     InsideSourceRoot,
     #[error("configured source root is not a directory")]
     SourceRootNotDirectory,
+    #[error("configured web root is unavailable")]
+    WebRootUnavailable,
+    #[error("configured web root must not overlap the source root")]
+    WebRootOverlapsSourceRoot,
     #[error("configuration filesystem operation failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -40,9 +44,18 @@ impl ServerConfig {
         if !source_root.is_dir() {
             return Err(ConfigError::SourceRootNotDirectory);
         }
+        let web_root = web_root
+            .canonicalize()
+            .map_err(|_| ConfigError::WebRootUnavailable)?;
+        if !web_root.is_dir() {
+            return Err(ConfigError::WebRootUnavailable);
+        }
+        if web_root.starts_with(&source_root) || source_root.starts_with(&web_root) {
+            return Err(ConfigError::WebRootOverlapsSourceRoot);
+        }
         let local = LocalStatePaths::new(data_dir, cache_dir);
         local
-            .validate_source_roots(std::slice::from_ref(&source_root))
+            .validate_source_roots(&[source_root.clone(), web_root.clone()])
             .map_err(ConfigError::from_local_state)?;
         Ok(Self {
             local,

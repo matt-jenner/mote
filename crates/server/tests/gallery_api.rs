@@ -14,6 +14,7 @@ const MOUNTAIN: &[u8] = include_bytes!("../../../apps/interface/public/demo-phot
 fn app() -> (TempDir, axum::Router) {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");
+    let web = web_root(&temp);
     std::fs::create_dir(&source).unwrap();
     std::fs::create_dir(source.join("Trips")).unwrap();
     let config = ServerConfig::new(
@@ -21,16 +22,17 @@ fn app() -> (TempDir, axum::Router) {
         temp.path().join("cache"),
         None,
         source,
-        temp.path().join("web"),
+        web.clone(),
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    (temp, build_router(state))
+    (temp, build_router(state, web))
 }
 
 fn app_with_photos() -> (TempDir, AppState, axum::Router) {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");
+    let web = web_root(&temp);
     std::fs::create_dir(&source).unwrap();
     for (name, captured_at) in [
         ("oldest.jpg", "2020:01:01 00:00:00"),
@@ -44,11 +46,11 @@ fn app_with_photos() -> (TempDir, AppState, axum::Router) {
         temp.path().join("cache"),
         None,
         source,
-        temp.path().join("web"),
+        web.clone(),
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    (temp, state.clone(), build_router(state))
+    (temp, state.clone(), build_router(state, web))
 }
 
 fn jpeg_with_capture_date(captured_at: &str) -> Vec<u8> {
@@ -110,6 +112,7 @@ async fn wait_for_metadata_settled(
 fn app_with_state() -> (TempDir, AppState, axum::Router) {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");
+    let web = web_root(&temp);
     std::fs::create_dir(&source).unwrap();
     std::fs::create_dir(source.join("Trips")).unwrap();
     let config = ServerConfig::new(
@@ -117,16 +120,22 @@ fn app_with_state() -> (TempDir, AppState, axum::Router) {
         temp.path().join("cache"),
         None,
         source,
-        temp.path().join("web"),
+        web.clone(),
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    let app = build_router(state.clone());
+    let app = build_router(state.clone(), web);
     (temp, state, app)
 }
 
 async fn json_body(response: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+}
+
+fn web_root(temp: &TempDir) -> std::path::PathBuf {
+    let web = temp.path().join("web");
+    std::fs::create_dir_all(&web).unwrap();
+    web
 }
 
 #[tokio::test]
@@ -157,7 +166,7 @@ async fn create_and_restore_selection_returns_stable_summary() {
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    let restored = build_router(state)
+    let restored = build_router(state, config.web_root().to_owned())
         .oneshot(
             Request::get(format!("/api/v1/selections/{selection_id}"))
                 .body(Body::empty())

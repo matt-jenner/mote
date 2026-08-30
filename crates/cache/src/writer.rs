@@ -10,6 +10,9 @@ use photo_catalog::Catalog;
 
 use crate::CacheError;
 
+#[cfg(any(test, debug_assertions))]
+type TestHook = std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>>;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CacheWrite {
     pub relative_path: PathBuf,
@@ -27,15 +30,13 @@ pub struct CacheReconcileReport {
 pub struct CacheWriter {
     root: PathBuf,
     #[cfg(any(test, debug_assertions))]
-    path_race_test_hook:
-        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>>,
+    path_race_test_hook: TestHook,
     #[cfg(any(test, debug_assertions))]
     replace_failure_test_hook: std::sync::Arc<AtomicBool>,
     #[cfg(any(test, debug_assertions))]
     cleanup_failure_test_hook: std::sync::Arc<AtomicBool>,
     #[cfg(any(test, debug_assertions))]
-    replacement_test_hook:
-        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>>,
+    replacement_test_hook: TestHook,
 }
 
 impl std::fmt::Debug for CacheWriter {
@@ -406,7 +407,7 @@ impl CacheWriter {
     {
         #[cfg(unix)]
         {
-            return self.write_atomic_unix(relative_path, write, replace_existing);
+            self.write_atomic_unix(relative_path, write, replace_existing)
         }
 
         #[cfg(not(unix))]
@@ -612,7 +613,7 @@ impl CacheWriter {
         validate_relative(relative_path)?;
         #[cfg(unix)]
         {
-            return self.open_checked_unix(relative_path);
+            self.open_checked_unix(relative_path)
         }
         #[cfg(not(unix))]
         {
@@ -651,7 +652,7 @@ impl CacheWriter {
         }
         #[cfg(unix)]
         {
-            return self.remove_checked_unix(relative_path);
+            self.remove_checked_unix(relative_path)
         }
         #[cfg(not(unix))]
         {
@@ -1016,10 +1017,9 @@ fn descriptor_is_contained(file: &File, root: &Path) -> bool {
             return false;
         }
         let path = unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) };
-        return path
-            .to_str()
+        path.to_str()
             .ok()
-            .is_some_and(|path| Path::new(path).starts_with(root));
+            .is_some_and(|path| Path::new(path).starts_with(root))
     }
     #[cfg(not(target_os = "macos"))]
     {

@@ -30,6 +30,14 @@ pub(crate) fn invalid_request() -> ApiError {
     )
 }
 
+pub(crate) async fn route_not_found() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "notFound",
+        "That route is unavailable.",
+    )
+}
+
 pub(crate) fn guard_query_shape(raw_query: Option<&str>) -> Result<(), ApiError> {
     let Some(raw_query) = raw_query else {
         return Ok(());
@@ -181,17 +189,6 @@ fn invalid_folder_path() -> ApiError {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn derivative_identifier_limit_is_decoded_and_fixed() {
-        assert!(validate_decoded_identifier(&"x".repeat(512), 512).is_ok());
-        assert!(validate_decoded_identifier(&"x".repeat(513), 512).is_err());
-    }
-}
-
 fn map_folder_error(error: FolderError, mounted_root: bool) -> ApiError {
     match error {
         FolderError::InvalidPath | FolderError::OutsideRoot => invalid_folder_path(),
@@ -214,5 +211,16 @@ fn map_folder_error(error: FolderError, mounted_root: bool) -> ApiError {
             "folderUnreadable",
             "That folder cannot be read.",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derivative_identifier_limit_is_decoded_and_fixed() {
+        assert!(validate_decoded_identifier(&"x".repeat(512), 512).is_ok());
+        assert!(validate_decoded_identifier(&"x".repeat(513), 512).is_err());
     }
 }

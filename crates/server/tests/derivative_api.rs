@@ -12,18 +12,20 @@ const JPEG: &[u8] = include_bytes!("../../../apps/interface/public/demo-photos/m
 fn make_app() -> (TempDir, axum::Router) {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");
+    let web = temp.path().join("web");
     std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&web).unwrap();
     std::fs::write(source.join("photo.jpg"), JPEG).unwrap();
     let config = ServerConfig::new(
         temp.path().join("data"),
         temp.path().join("cache"),
         None,
         source,
-        temp.path().join("web"),
+        web.clone(),
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    (temp, build_router(state))
+    (temp, build_router(state, web))
 }
 
 async fn body(response: axum::response::Response) -> serde_json::Value {

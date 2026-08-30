@@ -48,10 +48,10 @@ async fn separate_selection_runtimes_publish_only_their_selection() {
     let child_id = child.id.clone();
     let parent_seen = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if let Some(event) = parent_events.recv().await {
-                if matches!(event.update, WallUpdate::CatalogBatch { .. }) {
-                    break event;
-                }
+            if let Some(event) = parent_events.recv().await
+                && matches!(event.update, WallUpdate::CatalogBatch { .. })
+            {
+                break event;
             }
         }
     })
@@ -59,10 +59,10 @@ async fn separate_selection_runtimes_publish_only_their_selection() {
     .unwrap();
     let child_seen = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if let Some(event) = child_events.recv().await {
-                if matches!(event.update, WallUpdate::CatalogBatch { .. }) {
-                    break event;
-                }
+            if let Some(event) = child_events.recv().await
+                && matches!(event.update, WallUpdate::CatalogBatch { .. })
+            {
+                break event;
             }
         }
     })

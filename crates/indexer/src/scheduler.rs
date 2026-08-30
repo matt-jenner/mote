@@ -303,15 +303,13 @@ impl IndexScheduler {
         state
             .heap
             .iter()
+            .filter(|entry| entry.name.starts_with(family_prefix))
             .filter_map(|entry| {
-                (entry.name.starts_with(family_prefix)).then(|| {
-                    state.queued.get(&entry.name).and_then(|queued| {
-                        (queued.sequence == entry.sequence && queued.job.priority == entry.priority)
-                            .then_some(entry.priority)
-                    })
+                state.queued.get(&entry.name).and_then(|queued| {
+                    (queued.sequence == entry.sequence && queued.job.priority == entry.priority)
+                        .then_some(entry.priority)
                 })
             })
-            .flatten()
             .max()
     }
 

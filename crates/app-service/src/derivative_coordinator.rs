@@ -762,13 +762,15 @@ impl DerivativeCoordinator {
                 } else {
                     queue_new_job(
                         &mut state,
-                        key,
-                        lane,
-                        prerequisite_key,
+                        NewJob {
+                            key,
+                            lane,
+                            prerequisite_key,
+                            authorized: waiter_authorized,
+                        },
                         &mut sender,
                         &mut schedule,
                         &self.owner_prefix,
-                        waiter_authorized,
                     );
                 }
             }
@@ -2289,16 +2291,26 @@ fn remember_completed(
     }
 }
 
-fn queue_new_job(
-    state: &mut CoordinatorState,
+struct NewJob {
     key: WorkKey,
     lane: WorkLane,
     prerequisite_key: Option<String>,
+    authorized: bool,
+}
+
+fn queue_new_job(
+    state: &mut CoordinatorState,
+    new_job: NewJob,
     sender: &mut Option<oneshot::Sender<DerivativeResult>>,
     schedule: &mut Option<(String, JobPriority)>,
     owner_prefix: &str,
-    authorized: bool,
 ) {
+    let NewJob {
+        key,
+        lane,
+        prerequisite_key,
+        authorized,
+    } = new_job;
     let job_id = state.next_job_id;
     state.next_job_id = state.next_job_id.wrapping_add(1).max(1);
     let job_name = format!("{owner_prefix}{job_id}");

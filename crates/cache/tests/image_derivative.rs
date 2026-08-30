@@ -128,7 +128,7 @@ fn generate_replaces_an_orphaned_corrupt_regular_file() {
     std::fs::write(cache.path().join(&relative), b"orphaned corrupt bytes").unwrap();
     let generator = ImageDerivativeGenerator::new(cache.path()).unwrap();
 
-    let generated = generator.generate(&fixture.path(), &requested).unwrap();
+    let generated = generator.generate(fixture.path(), &requested).unwrap();
 
     assert!(!generated.reused);
     assert!(image::load_from_memory(&std::fs::read(cache.path().join(relative)).unwrap()).is_ok());
@@ -176,7 +176,7 @@ fn commit_wall_thumbnail_replaces_corrupt_bytes_under_an_immutable_key() {
     let cache = tempfile::tempdir().unwrap();
     let generator = ImageDerivativeGenerator::new(cache.path()).unwrap();
     let requested = spec(DerivativeKind::WallThumbnail, 1024, 1);
-    let first = generator.generate(&fixture.path(), &requested).unwrap();
+    let first = generator.generate(fixture.path(), &requested).unwrap();
     std::fs::write(cache.path().join(&first.relative_path), b"corrupt").unwrap();
     let encoded = generator
         .encode_wall_thumbnail(fixture.path(), &requested)

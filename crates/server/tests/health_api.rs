@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -19,7 +19,10 @@ async fn health_reports_database_cache_and_source_counts_without_paths() {
         "/Volumes/offline-family",
         Availability::RootOffline,
     );
-    let app = build_router(AppState::new(catalog, cache.path().to_owned()));
+    let app = build_router(
+        AppState::new(catalog, cache.path().to_owned()),
+        cache.path().join("web"),
+    );
 
     let response = app
         .oneshot(
@@ -50,7 +53,7 @@ async fn unwritable_cache_is_unhealthy_and_returns_service_unavailable() {
     let not_a_directory = temp.path().join("cache-file");
     std::fs::write(&not_a_directory, b"not a directory").unwrap();
     let catalog = Catalog::open_in_memory().unwrap();
-    let app = build_router(AppState::new(catalog, not_a_directory));
+    let app = build_router(AppState::new(catalog, not_a_directory), web_root(&temp));
 
     let response = app
         .oneshot(
@@ -79,7 +82,7 @@ fn config_defaults_to_loopback_and_rejects_local_state_inside_a_source() {
         temp.path().join("cache"),
         None,
         source.clone(),
-        temp.path().join("web"),
+        web_root(&temp),
     );
 
     assert!(matches!(config, Err(ConfigError::InsideSourceRoot)));
@@ -96,10 +99,71 @@ fn server_config_translates_shared_local_state_overlap_errors() {
         temp.path().join("cache"),
         None,
         source.clone(),
-        temp.path().join("web"),
+        web_root(&temp),
     );
 
     assert!(matches!(config, Err(ConfigError::InsideSourceRoot)));
+}
+
+#[test]
+fn server_config_requires_an_existing_web_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let web = temp.path().join("web");
+    let web_file = temp.path().join("web-file");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&web).unwrap();
+    std::fs::write(&web_file, b"not a directory").unwrap();
+
+    let config = ServerConfig::new(
+        temp.path().join("data"),
+        temp.path().join("cache"),
+        None,
+        source.clone(),
+        web.clone(),
+    )
+    .unwrap();
+    assert_eq!(config.web_root(), web.canonicalize().unwrap());
+
+    for invalid_web_root in [temp.path().join("missing-web"), web_file] {
+        let result = ServerConfig::new(
+            temp.path().join("other-data"),
+            temp.path().join("other-cache"),
+            None,
+            source.clone(),
+            invalid_web_root,
+        );
+        assert!(result.is_err());
+    }
+}
+
+#[test]
+fn server_config_rejects_web_root_overlap_with_source_or_private_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let web_inside_source = source.join("web");
+    std::fs::create_dir_all(&web_inside_source).unwrap();
+    let source_overlap = ServerConfig::new(
+        temp.path().join("data"),
+        temp.path().join("cache"),
+        None,
+        source,
+        web_inside_source,
+    );
+    assert!(source_overlap.is_err());
+
+    let source = temp.path().join("other-photos");
+    let web = temp.path().join("public-web");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&web).unwrap();
+    let private_state_overlap = ServerConfig::new(
+        web.join("data"),
+        temp.path().join("other-cache"),
+        None,
+        source,
+        web,
+    );
+    assert!(private_state_overlap.is_err());
 }
 
 #[cfg(unix)]
@@ -117,7 +181,7 @@ fn config_rejects_a_symlink_alias_into_a_source_root() {
         temp.path().join("cache"),
         None,
         alias,
-        temp.path().join("web"),
+        web_root(&temp),
     );
 
     assert!(matches!(config, Err(ConfigError::InsideSourceRoot)));
@@ -137,7 +201,7 @@ fn config_creates_private_local_directories() {
         temp.path().join("cache"),
         Some("127.0.0.1:0"),
         source,
-        temp.path().join("web"),
+        web_root(&temp),
     )
     .unwrap();
     config.prepare().unwrap();
@@ -168,14 +232,8 @@ fn application_startup_repairs_cache_before_serving() {
     let cache = temp.path().join("cache");
     std::fs::create_dir(&source).unwrap();
     std::fs::create_dir(&cache).unwrap();
-    let config = ServerConfig::new(
-        data,
-        cache.clone(),
-        None,
-        source.clone(),
-        temp.path().join("web"),
-    )
-    .unwrap();
+    let config =
+        ServerConfig::new(data, cache.clone(), None, source.clone(), web_root(&temp)).unwrap();
     let (group, missing_id) = catalog_with_missing_derivative(&config, &source);
     std::fs::write(cache.join("orphan.partial-test"), b"partial").unwrap();
 
@@ -209,7 +267,7 @@ fn application_preflights_cataloged_roots_before_creating_cache_state() {
         cache.clone(),
         None,
         configured_source,
-        temp.path().join("web"),
+        web_root(&temp),
     )
     .unwrap();
     let mut catalog = Catalog::open(&config.catalog_path()).unwrap();
@@ -254,7 +312,7 @@ fn application_rejects_a_catalog_symlink_into_a_source_root() {
         cache.clone(),
         None,
         configured_source,
-        temp.path().join("web"),
+        web_root(&temp),
     )
     .unwrap();
 
@@ -280,14 +338,7 @@ fn application_rejects_a_source_nested_inside_the_cache_root() {
     std::fs::create_dir_all(&source).unwrap();
     std::fs::create_dir(&configured_source).unwrap();
     std::fs::write(&source_file, b"source").unwrap();
-    let config = ServerConfig::new(
-        data,
-        cache,
-        None,
-        configured_source,
-        temp.path().join("web"),
-    )
-    .unwrap();
+    let config = ServerConfig::new(data, cache, None, configured_source, web_root(&temp)).unwrap();
     let mut catalog = Catalog::open(&config.catalog_path()).unwrap();
     catalog
         .add_library(&NewLibrary::configured("Photos", &source))
@@ -311,6 +362,12 @@ fn add_library(catalog: &mut Catalog, root: &str, availability: Availability) {
     catalog
         .set_library_availability(library.id, availability)
         .unwrap();
+}
+
+fn web_root(temp: &tempfile::TempDir) -> PathBuf {
+    let web = temp.path().join("web");
+    std::fs::create_dir_all(&web).unwrap();
+    web
 }
 
 fn catalog_with_missing_derivative(

@@ -94,8 +94,7 @@ fn validate_managed_jpeg(file: &mut std::fs::File, expected_size: u64) -> std::i
 
     let metadata = file.metadata()?;
     if metadata.len() != expected_size
-        || expected_size < 16
-        || expected_size > MAX_MANAGED_DERIVATIVE_BYTES
+        || !(16..=MAX_MANAGED_DERIVATIVE_BYTES).contains(&expected_size)
     {
         return Ok(false);
     }
@@ -221,6 +220,9 @@ struct HostedEncodeRegistrationTestGate {
     registered: Arc<Notify>,
     rejected: Arc<Notify>,
 }
+
+#[cfg(debug_assertions)]
+type HostedAsyncTestGate = Arc<TokioMutex<Option<(Arc<Notify>, Arc<Notify>)>>>;
 
 impl Drop for HostedDriverOwner {
     fn drop(&mut self) {
@@ -420,11 +422,11 @@ pub struct GalleryEngine {
     #[cfg(test)]
     fail_next_join: Arc<AtomicBool>,
     #[cfg(debug_assertions)]
-    hosted_commit_publication_test_gate: Arc<TokioMutex<Option<(Arc<Notify>, Arc<Notify>)>>>,
+    hosted_commit_publication_test_gate: HostedAsyncTestGate,
     #[cfg(debug_assertions)]
-    hosted_commit_post_publication_test_gate: Arc<TokioMutex<Option<(Arc<Notify>, Arc<Notify>)>>>,
+    hosted_commit_post_publication_test_gate: HostedAsyncTestGate,
     #[cfg(debug_assertions)]
-    hosted_authorized_publication_test_gate: Arc<TokioMutex<Option<(Arc<Notify>, Arc<Notify>)>>>,
+    hosted_authorized_publication_test_gate: HostedAsyncTestGate,
     #[cfg(debug_assertions)]
     hosted_driver_abort_handle: Arc<TokioMutex<Option<tokio::task::AbortHandle>>>,
     #[cfg(debug_assertions)]
@@ -439,9 +441,9 @@ pub struct GalleryEngine {
     #[cfg(debug_assertions)]
     hosted_encode_registration_test_gate: Arc<TokioMutex<Option<HostedEncodeRegistrationTestGate>>>,
     #[cfg(debug_assertions)]
-    hosted_empty_authorization_test_gate: Arc<TokioMutex<Option<(Arc<Notify>, Arc<Notify>)>>>,
+    hosted_empty_authorization_test_gate: HostedAsyncTestGate,
     #[cfg(debug_assertions)]
-    hosted_pre_enqueue_test_gate: Arc<TokioMutex<Option<(Arc<Notify>, Arc<Notify>)>>>,
+    hosted_pre_enqueue_test_gate: HostedAsyncTestGate,
     #[cfg(debug_assertions)]
     hosted_link_removal_failure_test_hook: Arc<AtomicBool>,
 }
@@ -1412,10 +1414,10 @@ impl GalleryEngine {
                 let observed_coordinator = coordinator.change_generation();
                 let observed_scheduler = engine.scheduler.change_generation();
                 let Some((ticket, admission)) = engine.try_admit_hosted_work(&runtime).await else {
-                    if coordinator.pending_job_count().await == 0 {
-                        if coordinator.release_driver_owner_if_idle(generation).await {
-                            break;
-                        }
+                    if coordinator.pending_job_count().await == 0
+                        && coordinator.release_driver_owner_if_idle(generation).await
+                    {
+                        break;
                     }
                     let coordinator_wake = coordinator.wait_for_change_since(observed_coordinator);
                     let scheduler_wake = engine.scheduler.wait_for_change_since(observed_scheduler);
@@ -1750,10 +1752,7 @@ impl GalleryEngine {
                 }
             }
         })();
-        let result = match result {
-            Ok(generated) => Some(generated),
-            Err(_) => None,
-        };
+        let result = result.ok();
         if let Some(generated) = result {
             if publication.was_cancelled() {
                 let _ = self.rollback_hosted_publication(&generated, group);
@@ -2208,7 +2207,7 @@ impl GalleryEngine {
         let head = runtime.next_event_id.load(Ordering::Acquire);
         let oldest = history.front().map(|event| event.id);
         let (backlog, lagged, resync_after) = match after_event_id {
-            None => (history.into(), false, None),
+            None => (history, false, None),
             Some(after)
                 if after > head || oldest.is_some_and(|first| after.saturating_add(1) < first) =>
             {
@@ -2436,11 +2435,10 @@ impl GalleryEngine {
                     photo_core::AddLibraryError::InvalidSelection,
                 ));
             }
-            let generation = state.libraries.catalog_mut().begin_generation_for_group(
+            state.libraries.catalog_mut().begin_generation_for_group(
                 runtime.selection.library_id,
                 runtime.selection.group_id,
-            )?;
-            generation
+            )?
         };
         let indexer = Indexer::with_scheduler(
             self.metadata_reader.clone(),
@@ -2555,10 +2553,9 @@ impl GalleryEngine {
                     .catalog_mut()
                     .mark_root_offline(runtime.selection.library_id)?;
             }
-            runtime
+            !runtime
                 .source_unavailable_reported
                 .swap(true, Ordering::AcqRel)
-                == false
         };
         if should_publish {
             runtime
@@ -2791,7 +2788,7 @@ impl GalleryEngine {
                     None
                 }
             })
-            .last();
+            .next_back();
         let shaped = events
             .iter()
             .filter_map(|e| match e {
@@ -2829,22 +2826,19 @@ impl GalleryEngine {
                 runtime.selection.group_id,
                 GalleryScope::IncludeSubfolders,
                 &shaped,
-            ) {
-                if let Ok(assets) = crate::service::wall_assets_with_derivatives(
-                    state.libraries.catalog(),
-                    &records,
-                    OrderState::Provisional,
-                ) {
-                    if !assets.is_empty() {
-                        updates.push(WallUpdate::CatalogBatch {
-                            selection_id: runtime.selection.id().to_owned(),
-                            assets,
-                            order_state: OrderState::Provisional,
-                            generation,
-                            progress: progress.map(crate::scan::progress_dto).unwrap_or_default(),
-                        });
-                    }
-                }
+            ) && let Ok(assets) = crate::service::wall_assets_with_derivatives(
+                state.libraries.catalog(),
+                &records,
+                OrderState::Provisional,
+            ) && !assets.is_empty()
+            {
+                updates.push(WallUpdate::CatalogBatch {
+                    selection_id: runtime.selection.id().to_owned(),
+                    assets,
+                    order_state: OrderState::Provisional,
+                    generation,
+                    progress: progress.map(crate::scan::progress_dto).unwrap_or_default(),
+                });
             }
             updates
         };

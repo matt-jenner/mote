@@ -28,7 +28,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let listener = tokio::net::TcpListener::bind(config.bind()).await?;
-    tracing::info!(bind = %config.bind(), "photo catalog health service started");
-    axum::serve(listener, build_router(state)).await?;
+    tracing::info!(bind = %config.bind(), "photo viewer server started");
+    axum::serve(
+        listener,
+        build_router(state, config.web_root().to_owned())
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

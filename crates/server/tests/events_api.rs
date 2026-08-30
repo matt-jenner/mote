@@ -4,7 +4,7 @@ use http_body_util::BodyExt;
 use photo_app_service::{GalleryScope, OrderState, WallUpdate};
 use photo_server::{AppState, ServerConfig, build_router};
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tower::ServiceExt;
 
 async fn next_sse_frame(body: &mut Body) -> String {
@@ -33,6 +33,12 @@ async fn create_selection(app: &axum::Router, path: &str) -> String {
     value["id"].as_str().unwrap().to_owned()
 }
 
+fn web_root(temp: &tempfile::TempDir) -> PathBuf {
+    let web = temp.path().join("web");
+    std::fs::create_dir_all(&web).unwrap();
+    web
+}
+
 fn test_state() -> (tempfile::TempDir, AppState, axum::Router) {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");
@@ -42,11 +48,11 @@ fn test_state() -> (tempfile::TempDir, AppState, axum::Router) {
         temp.path().join("cache"),
         None,
         source,
-        temp.path().join("web"),
+        web_root(&temp),
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    let app = build_router(state.clone());
+    let app = build_router(state.clone(), config.web_root().to_owned());
     (temp, state, app)
 }
 
@@ -69,11 +75,11 @@ fn nested_state() -> (tempfile::TempDir, AppState, axum::Router) {
         temp.path().join("cache"),
         None,
         source,
-        temp.path().join("web"),
+        web_root(&temp),
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    let app = build_router(state.clone());
+    let app = build_router(state.clone(), config.web_root().to_owned());
     (temp, state, app)
 }
 
@@ -133,11 +139,11 @@ async fn events_route_declares_sse_headers() {
         temp.path().join("cache"),
         None,
         source,
-        temp.path().join("web"),
+        web_root(&temp),
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    let app = build_router(state);
+    let app = build_router(state, config.web_root().to_owned());
     let created = app
         .clone()
         .oneshot(
@@ -179,12 +185,12 @@ async fn future_replay_uses_authoritative_head_and_sse_framing() {
         temp.path().join("cache"),
         None,
         source,
-        temp.path().join("web"),
+        web_root(&temp),
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
     let gallery = state.gallery_for_test().unwrap();
-    let app = build_router(state);
+    let app = build_router(state, config.web_root().to_owned());
     let created = app
         .clone()
         .oneshot(
@@ -198,7 +204,7 @@ async fn future_replay_uses_authoritative_head_and_sse_framing() {
     let value: serde_json::Value =
         serde_json::from_slice(&created.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let id = value["id"].as_str().unwrap();
-    let selection = gallery.resolve_selection(&id).unwrap();
+    let selection = gallery.resolve_selection(id).unwrap();
     let response = app
         .clone()
         .oneshot(
@@ -222,14 +228,14 @@ async fn future_replay_uses_authoritative_head_and_sse_framing() {
     assert!(text.contains("resyncRequired"));
     let head = sse_id(&text);
     let next = gallery
-        .publish_update_for_test(&selection, progress(&id, 1))
+        .publish_update_for_test(&selection, progress(id, 1))
         .await;
     let live = next_sse_frame(&mut body).await;
     assert_eq!(sse_id(&live), next.id);
     assert!(next.id > head);
     drop(body);
 
-    let mut reconnect = event_body(&app, &id, "reconnect", "currentFolder", head).await;
+    let mut reconnect = event_body(&app, id, "reconnect", "currentFolder", head).await;
     assert_eq!(sse_id(&next_sse_frame(&mut reconnect).await), next.id);
 }
 
@@ -244,11 +250,11 @@ async fn interaction_for_an_unknown_client_is_an_idempotent_no_content() {
             temp.path().join("cache"),
             None,
             source,
-            temp.path().join("web"),
+            web_root(&temp),
         )
         .unwrap();
         let (state, _) = AppState::open(&config).unwrap();
-        (temp, build_router(state))
+        (temp, build_router(state, config.web_root().to_owned()))
     };
     let created = app
         .clone()
@@ -292,11 +298,11 @@ async fn event_query_and_identifier_limits_use_invalid_request() {
         temp.path().join("cache"),
         None,
         source,
-        temp.path().join("web"),
+        web_root(&temp),
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    let app = build_router(state);
+    let app = build_router(state, config.web_root().to_owned());
     for query in [
         "clientId=x&scope=currentFolder&scope=currentFolder",
         &format!("clientId={}&scope=currentFolder", "x".repeat(129)),
