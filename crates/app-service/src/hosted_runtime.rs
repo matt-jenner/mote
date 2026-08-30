@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use photo_domain::GalleryScope;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{Notify, broadcast, watch};
 
 use crate::{GalleryEngine, GallerySelection, InteractionState, WallUpdate};
 
@@ -66,6 +66,8 @@ pub(crate) struct SelectionRuntime {
     pub(crate) settled: std::sync::atomic::AtomicBool,
     pub(crate) source_unavailable_reported: std::sync::atomic::AtomicBool,
     pub(crate) client_demand: Mutex<HashMap<u64, ClientDemand>>,
+    pub(crate) lease_wake: Arc<Notify>,
+    pub(crate) lease_reaper_started: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(crate) cancel_attempt_test_hook: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
@@ -75,10 +77,17 @@ pub(crate) struct SelectionRuntime {
 #[derive(Clone)]
 pub(crate) struct ClientDemand {
     pub(crate) client_id: String,
+    pub(crate) origin: SubscriptionOrigin,
     pub(crate) scope: GalleryScope,
     pub(crate) interaction: InteractionState,
     pub(crate) lease_until: tokio::time::Instant,
     pub(crate) scope_sender: watch::Sender<GalleryScope>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SubscriptionOrigin {
+    Hosted,
+    Desktop,
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +140,8 @@ impl SelectionRuntime {
             settled: std::sync::atomic::AtomicBool::new(settled),
             source_unavailable_reported: std::sync::atomic::AtomicBool::new(false),
             client_demand: Mutex::new(HashMap::new()),
+            lease_wake: Arc::new(Notify::new()),
+            lease_reaper_started: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             cancel_attempt_test_hook: Mutex::new(None),
             #[cfg(test)]
@@ -343,12 +354,13 @@ impl SelectionRuntime {
         &self,
         client_id: String,
         scope: GalleryScope,
+        origin: SubscriptionOrigin,
     ) -> (u64, watch::Receiver<GalleryScope>) {
         let token = self.next_client_token.fetch_add(1, Ordering::AcqRel);
-        let interaction = if client_id.starts_with("desktop-") {
-            InteractionState::Idle
-        } else {
+        let interaction = if origin == SubscriptionOrigin::Hosted {
             InteractionState::Active
+        } else {
+            InteractionState::Idle
         };
         let (scope_sender, scope_receiver) = watch::channel(scope);
         let mut demand = self.client_demand.lock().expect("client demand poisoned");
@@ -356,6 +368,7 @@ impl SelectionRuntime {
             token,
             ClientDemand {
                 client_id,
+                origin,
                 scope,
                 interaction,
                 lease_until: tokio::time::Instant::now()
@@ -370,10 +383,14 @@ impl SelectionRuntime {
         (token, scope_receiver)
     }
 
-    pub(crate) fn remove(&self, client_id: &str, token: u64) {
+    pub(crate) fn remove(&self, client_id: &str, token: u64) -> bool {
         let mut demand = self.client_demand.lock().expect("client demand poisoned");
         let _ = client_id;
-        demand.remove(&token);
+        let hosted = demand
+            .remove(&token)
+            .is_some_and(|value| value.origin == SubscriptionOrigin::Hosted);
+        self.lease_wake.notify_waiters();
+        hosted
     }
 
     pub(crate) fn aggregate_scope(&self) -> GalleryScope {
@@ -394,7 +411,74 @@ impl SelectionRuntime {
             .lock()
             .expect("client demand poisoned")
             .values()
-            .any(|value| value.interaction == InteractionState::Active && value.lease_until > now)
+            .any(|value| {
+                value.origin == SubscriptionOrigin::Hosted
+                    && value.interaction == InteractionState::Active
+                    && value.lease_until > now
+            })
+    }
+
+    pub(crate) fn start_lease_reaper(self: &Arc<Self>, engine: GalleryEngine) {
+        if self
+            .lease_reaper_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            engine.refresh_scheduler_interaction().await;
+            loop {
+                let Some(runtime) = weak.upgrade() else {
+                    break;
+                };
+                let lease_wake = runtime.lease_wake.clone();
+                let notified = lease_wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let deadline = runtime.client_demand.lock().ok().and_then(|demand| {
+                    demand
+                        .values()
+                        .filter(|value| {
+                            value.origin == SubscriptionOrigin::Hosted
+                                && value.interaction == InteractionState::Active
+                        })
+                        .map(|value| value.lease_until)
+                        .min()
+                });
+                drop(runtime);
+                if let Some(deadline) = deadline {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(deadline) => {
+                            if let Some(runtime) = weak.upgrade() {
+                                runtime.expire_leases();
+                            }
+                            engine.refresh_scheduler_interaction().await;
+                        }
+                        _ = &mut notified => {}
+                    }
+                } else {
+                    notified.await;
+                }
+            }
+        });
+    }
+
+    pub(crate) fn expire_leases(&self) {
+        let now = tokio::time::Instant::now();
+        if let Ok(mut demand) = self.client_demand.lock() {
+            for value in demand.values_mut() {
+                if value.origin == SubscriptionOrigin::Hosted
+                    && value.interaction == InteractionState::Active
+                    && value.lease_until <= now
+                {
+                    value.interaction = InteractionState::Idle;
+                }
+            }
+        }
     }
 
     pub(crate) async fn begin_scan(
@@ -435,6 +519,12 @@ impl SelectionRuntime {
                 Err(error)
             }
         }
+    }
+}
+
+impl Drop for SelectionRuntime {
+    fn drop(&mut self) {
+        self.lease_wake.notify_waiters();
     }
 }
 
@@ -621,12 +711,10 @@ impl SelectionEventSubscription {
 
 impl Drop for SelectionEventSubscription {
     fn drop(&mut self) {
-        self.runtime.remove(&self.client_id, self.client_token);
+        let hosted = self.runtime.remove(&self.client_id, self.client_token);
         self.engine
             .remove_runtime_if_dead(self.runtime.selection.group_id, &self.runtime);
-        if !self.client_id.starts_with("desktop-")
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
-        {
+        if hosted && let Ok(handle) = tokio::runtime::Handle::try_current() {
             let engine = self.engine.clone();
             handle.spawn(async move {
                 engine.refresh_scheduler_interaction().await;
@@ -703,8 +791,11 @@ mod tests {
             Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
             false,
         );
-        let (token, _scope) =
-            runtime.register("client".to_owned(), GalleryScope::IncludeSubfolders);
+        let (token, _scope) = runtime.register(
+            "client".to_owned(),
+            GalleryScope::IncludeSubfolders,
+            SubscriptionOrigin::Hosted,
+        );
         runtime
             .client_demand
             .lock()

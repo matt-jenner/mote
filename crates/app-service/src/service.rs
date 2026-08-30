@@ -993,7 +993,7 @@ impl AppService {
             if let Ok(selection_value) = self.gallery.selection_from_token(selection) {
                 let _ = self
                     .gallery
-                    .update_client_interaction(
+                    .update_client_interaction_desktop(
                         &selection_value,
                         &format!("desktop-{}", selection_value.id()),
                         scope,

@@ -1,5 +1,6 @@
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode};
+use futures_util::stream;
 use http_body_util::BodyExt;
 use photo_server::{AppState, ServerConfig, build_router};
 use serde_json::json;
@@ -111,4 +112,104 @@ async fn wall_limit_zero_and_above_maximum_use_specific_error() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json_body(response).await["code"], "invalidLimit");
     }
+}
+
+#[tokio::test]
+async fn gallery_routes_apply_shared_query_guard_before_lookup() {
+    let (_temp, app) = app();
+    let cases = [
+        Request::post("/api/v1/selections?unexpected=value"),
+        Request::get("/api/v1/selections/not-found?unexpected=value"),
+        Request::post("/api/v1/selections/not-found/interaction?unexpected=value"),
+    ];
+    for builder in cases {
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["code"], "invalidRequest");
+    }
+
+    let response = app
+        .oneshot(
+            Request::get("/api/v1/selections/not-found?scope=currentFolder&scope=currentFolder")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(response).await["code"], "invalidRequest");
+}
+
+#[tokio::test]
+async fn selection_bodies_are_rejected_at_the_64k_boundary() {
+    let (_temp, app) = app();
+    for body in [
+        Body::from(Bytes::from(vec![b'x'; 64 * 1024 + 1])),
+        Body::from(Bytes::from(vec![b'x'; 2 * 1024 * 1024 + 1])),
+        Body::from_stream(stream::iter(vec![Ok::<_, std::convert::Infallible>(
+            Bytes::from(vec![b'x'; 64 * 1024]),
+        )])),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/selections")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_body(response).await["code"], "invalidRequest");
+    }
+
+    let response = app
+        .oneshot(
+            Request::post("/api/v1/selections/not-found/interaction")
+                .header("content-type", "application/json")
+                .body(Body::from(Bytes::from(vec![b'x'; 64 * 1024 + 1])))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(response).await["code"], "invalidRequest");
+}
+
+#[tokio::test]
+async fn unavailable_child_selection_is_not_reported_as_mount_failure() {
+    let (_temp, app) = app();
+    let response = app
+        .oneshot(
+            Request::post("/api/v1/selections")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"path": "Trips/Missing"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(json_body(response).await["code"], "folderUnavailable");
+}
+
+#[tokio::test]
+async fn unknown_selection_errors_do_not_echo_the_path_or_id() {
+    let (_temp, app) = app();
+    let response = app
+        .oneshot(
+            Request::get("/api/v1/selections/does-not-exist")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = json_body(response).await;
+    assert_eq!(body["code"], "notFound");
+    assert!(!body.to_string().contains("does-not-exist"));
 }

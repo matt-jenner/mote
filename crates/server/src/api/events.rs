@@ -102,7 +102,9 @@ fn event_stream(
         |mut state| async move {
             tokio::select! {
                 event = state.subscription.recv() => {
-                    event.map(|event| (Ok(Bytes::from(format_event(&event))), state))
+                    event.and_then(|event| {
+                        format_event(&event).map(|data| (Ok(Bytes::from(data)), state))
+                    })
                 }
                 _ = &mut state.heartbeat => {
                     state.heartbeat.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(15));
@@ -113,7 +115,10 @@ fn event_stream(
     )
 }
 
-fn format_event(event: &photo_app_service::SequencedWallUpdate) -> String {
-    let data = serde_json::to_string(&event.update).unwrap_or_else(|_| "{}".to_owned());
-    format!("event: wallUpdate\nid: {}\ndata: {data}\n\n", event.id)
+fn format_event(event: &photo_app_service::SequencedWallUpdate) -> Option<String> {
+    let data = serde_json::to_string(&event.update).ok()?;
+    Some(format!(
+        "event: wallUpdate\nid: {}\ndata: {data}\n\n",
+        event.id
+    ))
 }

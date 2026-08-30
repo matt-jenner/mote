@@ -66,7 +66,7 @@ impl AppService {
         selection_token: SelectionToken,
     ) {
         let after_event_id = self.gallery.current_event_id(selection);
-        let mut subscription = self.gallery.subscribe(
+        let mut subscription = self.gallery.subscribe_desktop(
             selection,
             format!("desktop-{}", selection.id()),
             scope,

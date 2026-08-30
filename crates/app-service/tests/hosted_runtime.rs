@@ -788,11 +788,54 @@ async fn replay_retained_edges_and_live_boundary_are_serialized() {
         &selection,
         "too-new".to_owned(),
         GalleryScope::CurrentFolder,
-        Some(300),
+        Some(u64::MAX),
     );
     let new = too_new.recv().await.unwrap();
-    assert_eq!(new.id, 300);
+    assert_eq!(new.id, 257);
     assert!(matches!(new.update, WallUpdate::ResyncRequired { .. }));
+    engine
+        .publish_update_for_test(&selection, progress(selection.id(), 257))
+        .await;
+    assert_eq!(too_new.recv().await.unwrap().id, 258);
+    drop(too_new);
+
+    let mut reconnect = engine.subscribe(
+        &selection,
+        "reconnect".to_owned(),
+        GalleryScope::CurrentFolder,
+        Some(257),
+    );
+    assert_eq!(reconnect.recv().await.unwrap().id, 258);
+}
+
+#[tokio::test(start_paused = true)]
+async fn hosted_lease_expires_automatically_without_losing_connected_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config, source).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    let stream = engine.subscribe(
+        &selection,
+        "lease-client".to_owned(),
+        GalleryScope::IncludeSubfolders,
+        None,
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(engine.scheduler_permits_for_test(), 1);
+
+    tokio::time::advance(Duration::from_secs(31)).await;
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(engine.scheduler_permits_for_test(), 4);
+    assert_eq!(
+        engine.aggregate_scope_for_test(&selection).await,
+        GalleryScope::IncludeSubfolders
+    );
+    drop(stream);
 }
 
 #[tokio::test]

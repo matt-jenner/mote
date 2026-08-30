@@ -1,6 +1,5 @@
 use axum::Json;
-use axum::body::Bytes;
-use axum::extract::{Path, RawQuery, State};
+use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use photo_app_service::{AppServiceError, GalleryScope, SortDirection, WallQueryRequest};
@@ -12,11 +11,13 @@ use crate::{AppState, FolderError};
 
 pub(crate) async fn create_selection(
     State(state): State<AppState>,
-    body: Bytes,
+    RawQuery(raw_query): RawQuery,
+    request: Request,
 ) -> Result<impl IntoResponse, super::ApiError> {
-    if body.len() > 64 * 1024 {
-        return Err(invalid_request());
-    }
+    require_no_query(raw_query.as_deref())?;
+    let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+        .await
+        .map_err(|_| invalid_request())?;
     let request: CreateSelectionRequest =
         serde_json::from_slice(&body).map_err(|_| invalid_request())?;
     validate_decoded_identifier(&request.path, 4096).map_err(|_| {
@@ -34,7 +35,7 @@ pub(crate) async fn create_selection(
         )
     })?;
     root.resolve(&request.path)
-        .map_err(|error| map_folder_error(error, true))?;
+        .map_err(|error| map_folder_error(error, request.path.is_empty()))?;
     let engine = state.gallery.as_ref().ok_or_else(|| {
         super::ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -59,7 +60,9 @@ pub(crate) async fn create_selection(
 pub(crate) async fn selection_summary(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<impl IntoResponse, super::ApiError> {
+    require_no_query(raw_query.as_deref())?;
     validate_ascii_identifier(&id, 128)?;
     let engine = gallery(&state)?;
     let selection = engine.resolve_selection(&id).map_err(map_service_error)?;
@@ -100,12 +103,14 @@ pub(crate) async fn wall(
 pub(crate) async fn interaction(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    body: Bytes,
+    RawQuery(raw_query): RawQuery,
+    request: Request,
 ) -> Result<impl IntoResponse, super::ApiError> {
+    require_no_query(raw_query.as_deref())?;
     validate_ascii_identifier(&id, 128)?;
-    if body.len() > 64 * 1024 {
-        return Err(invalid_request());
-    }
+    let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+        .await
+        .map_err(|_| invalid_request())?;
     let request: InteractionRequest =
         serde_json::from_slice(&body).map_err(|_| invalid_request())?;
     validate_ascii_identifier(&request.client_id, 128)?;
@@ -153,6 +158,14 @@ fn parse_wall_params(raw_query: Option<&str>) -> Result<WallParams, super::ApiEr
         cursor,
         limit: limit.ok_or_else(invalid_request)?,
     })
+}
+
+fn require_no_query(raw_query: Option<&str>) -> Result<(), super::ApiError> {
+    if query_pairs(raw_query)?.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid_request())
+    }
 }
 
 fn parse_enum<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, super::ApiError> {

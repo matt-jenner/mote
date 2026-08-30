@@ -11,7 +11,7 @@ use photo_core::{LibraryService, RealSourceFs};
 use photo_domain::{FolderGroupId, GalleryScope, LibraryId, RelativePathKey};
 use photo_indexer::{DefaultMetadataReader, IndexEvent, Indexer, MetadataReader, ScanRequest};
 
-use crate::hosted_runtime::{SelectionEventSubscription, SelectionRuntime};
+use crate::hosted_runtime::{SelectionEventSubscription, SelectionRuntime, SubscriptionOrigin};
 use crate::service::{ReaderAdapter, ServiceState};
 use crate::{
     AppConfig, AppServiceError, InteractionState, OrderState, SourceAvailability, WallPage,
@@ -567,13 +567,46 @@ impl GalleryEngine {
         scope: GalleryScope,
         after_event_id: Option<u64>,
     ) -> SelectionEventSubscription {
+        self.subscribe_with_origin(
+            selection,
+            client_id,
+            scope,
+            after_event_id,
+            SubscriptionOrigin::Hosted,
+        )
+    }
+
+    pub(crate) fn subscribe_desktop(
+        &self,
+        selection: &GallerySelection,
+        client_id: String,
+        scope: GalleryScope,
+        after_event_id: Option<u64>,
+    ) -> SelectionEventSubscription {
+        self.subscribe_with_origin(
+            selection,
+            client_id,
+            scope,
+            after_event_id,
+            SubscriptionOrigin::Desktop,
+        )
+    }
+
+    fn subscribe_with_origin(
+        &self,
+        selection: &GallerySelection,
+        client_id: String,
+        scope: GalleryScope,
+        after_event_id: Option<u64>,
+        origin: SubscriptionOrigin,
+    ) -> SelectionEventSubscription {
         let runtime = self.runtime(selection);
         let _publication = runtime
             .publication
             .lock()
             .expect("runtime publication poisoned");
         let receiver = runtime.updates.subscribe();
-        let (client_token, scope_receiver) = runtime.register(client_id.clone(), scope);
+        let (client_token, scope_receiver) = runtime.register(client_id.clone(), scope, origin);
         let lifecycle = runtime.lifecycle_receiver();
         let history = runtime
             .history
@@ -587,7 +620,7 @@ impl GalleryEngine {
             Some(after)
                 if after > head || oldest.is_some_and(|first| after.saturating_add(1) < first) =>
             {
-                (VecDeque::new(), true, Some(after))
+                (VecDeque::new(), true, Some(head))
             }
             Some(after) => (
                 history
@@ -599,6 +632,9 @@ impl GalleryEngine {
             ),
         };
         drop(_publication);
+        if origin == SubscriptionOrigin::Hosted {
+            runtime.start_lease_reaper(self.clone());
+        }
         SelectionEventSubscription {
             backlog,
             receiver,
@@ -613,7 +649,9 @@ impl GalleryEngine {
             engine: self.clone(),
             terminal: None,
             terminal_event_id: None,
-            last_seen_event_id: after_event_id.unwrap_or_default(),
+            last_seen_event_id: after_event_id
+                .filter(|after| *after <= head)
+                .unwrap_or(head),
         }
     }
 
@@ -624,6 +662,41 @@ impl GalleryEngine {
         scope: GalleryScope,
         interaction: InteractionState,
     ) -> Result<bool, AppServiceError> {
+        self.update_client_interaction_with_origin(
+            selection,
+            client_id,
+            scope,
+            interaction,
+            SubscriptionOrigin::Hosted,
+        )
+        .await
+    }
+
+    pub(crate) async fn update_client_interaction_desktop(
+        &self,
+        selection: &GallerySelection,
+        client_id: &str,
+        scope: GalleryScope,
+        interaction: InteractionState,
+    ) -> Result<bool, AppServiceError> {
+        self.update_client_interaction_with_origin(
+            selection,
+            client_id,
+            scope,
+            interaction,
+            SubscriptionOrigin::Desktop,
+        )
+        .await
+    }
+
+    async fn update_client_interaction_with_origin(
+        &self,
+        selection: &GallerySelection,
+        client_id: &str,
+        scope: GalleryScope,
+        interaction: InteractionState,
+        origin: SubscriptionOrigin,
+    ) -> Result<bool, AppServiceError> {
         let runtime = self.runtime(selection);
         let found = {
             let mut demand = runtime
@@ -632,7 +705,7 @@ impl GalleryEngine {
                 .map_err(|_| AppServiceError::StatePoisoned)?;
             let token = demand
                 .iter()
-                .filter(|(_, value)| value.client_id == client_id)
+                .filter(|(_, value)| value.client_id == client_id && value.origin == origin)
                 .map(|(token, _)| *token)
                 .max();
             let Some(token) = token else {
@@ -642,23 +715,22 @@ impl GalleryEngine {
             value.scope = scope;
             let _ = value.scope_sender.send(scope);
             value.interaction = interaction;
-            value.lease_until = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            value.lease_until = if origin == SubscriptionOrigin::Hosted
+                && interaction == InteractionState::Active
+            {
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30)
+            } else {
+                tokio::time::Instant::now()
+            };
             true
         };
         if !found {
             return Ok(false);
         }
-        self.refresh_scheduler_interaction().await;
-        if interaction == InteractionState::Active {
-            let runtime_for_lease = Arc::downgrade(&runtime);
-            let engine = self.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                if runtime_for_lease.upgrade().is_some() {
-                    engine.refresh_scheduler_interaction().await;
-                }
-            });
+        if origin == SubscriptionOrigin::Hosted {
+            self.refresh_scheduler_interaction().await;
         }
+        runtime.lease_wake.notify_waiters();
         Ok(true)
     }
 
