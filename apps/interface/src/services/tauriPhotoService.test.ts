@@ -75,6 +75,31 @@ const recordingInvoke =
 	};
 
 describe("Tauri PhotoService", () => {
+	it("keeps native folder selection isolated from hosted browser methods", async () => {
+		const service = createTauriPhotoService(recordingInvoke([]));
+
+		expect(service.capabilities).toEqual({
+			chooseFolder: true,
+			folderSelection: "native",
+			locateFolder: false,
+		});
+		expect(service.folderBrowserState()).toEqual({
+			breadcrumbs: [],
+			initialPath: "",
+		});
+		expect(service.initialSortDirection()).toBe("oldestFirst");
+		service.rememberSortDirection("newestFirst");
+		expect(service.initialSortDirection()).toBe("newestFirst");
+		await expect(service.listFolders("Trips")).rejects.toMatchObject({
+			code: "unsupportedCapability",
+			message: "This host uses its system folder picker.",
+		});
+		await expect(service.selectFolder("Trips")).rejects.toMatchObject({
+			code: "unsupportedCapability",
+			message: "This host uses its system folder picker.",
+		});
+	});
+
 	it("maps persisted settings to their native commands", async () => {
 		const responses: unknown[] = [
 			{

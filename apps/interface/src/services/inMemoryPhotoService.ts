@@ -7,6 +7,7 @@ import type {
 	GalleryScope,
 	PhotoService,
 	ScanProgressDto,
+	SortDirection,
 	WallAsset,
 	WallPage,
 	WallQueryRequest,
@@ -69,6 +70,7 @@ export function createInMemoryPhotoService(
 	let sourceWarnings: WallWarningState[] = [...(options.sourceWarnings ?? [])];
 	const derivativeRequests: DerivativeRequest[] = [];
 	const interactionCalls: boolean[] = [];
+	let sortDirection: SortDirection = "oldestFirst";
 	let state: BootstrapState = {
 		settings: { appearance: "system", galleryScope: "includeSubfolders" },
 		activeSource: null,
@@ -116,7 +118,11 @@ export function createInMemoryPhotoService(
 		);
 
 	const service: InMemoryPhotoService = {
-		capabilities: { chooseFolder: true, locateFolder: false },
+		capabilities: {
+			chooseFolder: true,
+			folderSelection: "native",
+			locateFolder: false,
+		},
 		derivativeRequests,
 		interactionCalls,
 		async getBootstrapState() {
@@ -233,6 +239,27 @@ export function createInMemoryPhotoService(
 				);
 			}
 			return url;
+		},
+		async listFolders() {
+			throw new PhotoServiceError(
+				"unsupportedCapability",
+				"This host uses its system folder picker.",
+			);
+		},
+		async selectFolder() {
+			throw new PhotoServiceError(
+				"unsupportedCapability",
+				"This host uses its system folder picker.",
+			);
+		},
+		folderBrowserState() {
+			return { breadcrumbs: [], initialPath: "" };
+		},
+		initialSortDirection() {
+			return sortDirection;
+		},
+		rememberSortDirection(direction: SortDirection) {
+			sortDirection = direction;
 		},
 		startFixtureScan() {
 			if (scanPromise && !settled) return scanPromise;

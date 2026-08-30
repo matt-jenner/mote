@@ -19,6 +19,27 @@ export interface SourceSummary {
 	availability: SourceAvailability;
 }
 
+export interface FolderBreadcrumb {
+	name: string;
+	path: string;
+}
+
+export interface FolderEntry {
+	name: string;
+	path: string;
+}
+
+export interface FolderListing {
+	path: string;
+	breadcrumbs: FolderBreadcrumb[];
+	children: FolderEntry[];
+}
+
+export interface FolderBrowserState {
+	breadcrumbs: FolderBreadcrumb[];
+	initialPath: string;
+}
+
 export interface BootstrapState {
 	settings: SettingsState;
 	activeSource: SourceSummary | null;
@@ -30,6 +51,7 @@ export type ChooseFolderResult =
 
 export interface PhotoServiceCapabilities {
 	chooseFolder: boolean;
+	folderSelection: "native" | "hosted";
 	locateFolder: boolean;
 }
 
@@ -165,6 +187,11 @@ export interface PhotoService {
 	setWallInteraction(active: boolean): Promise<void>;
 	watchWallUpdates(listener: (update: WallUpdate) => void): () => void;
 	derivativeUrl(reference: DerivativeReference): string;
+	listFolders(path: string): Promise<FolderListing>;
+	selectFolder(path: string): Promise<ChooseFolderResult>;
+	folderBrowserState(): FolderBrowserState;
+	initialSortDirection(): SortDirection;
+	rememberSortDirection(direction: SortDirection): void;
 }
 
 export class PhotoServiceError extends Error {

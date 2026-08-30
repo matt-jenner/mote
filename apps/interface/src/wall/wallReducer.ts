@@ -682,6 +682,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 		case "resetSource":
 			return {
 				...initialWallState,
+				direction: state.direction,
 				sourceGeneration: action.sourceGeneration,
 				selectionId: action.selectionId ?? null,
 			};

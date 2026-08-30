@@ -70,6 +70,27 @@ const sampleProgressUpdate: WallUpdate = {
 };
 
 describe("PhotoService contract", () => {
+	it("keeps memory mode on the native picker contract and remembers sort in memory", async () => {
+		const service = createInMemoryPhotoService();
+
+		expect(service.capabilities.folderSelection).toBe("native");
+		expect(service.folderBrowserState()).toEqual({
+			breadcrumbs: [],
+			initialPath: "",
+		});
+		expect(service.initialSortDirection()).toBe("oldestFirst");
+		service.rememberSortDirection("newestFirst");
+		expect(service.initialSortDirection()).toBe("newestFirst");
+		await expect(service.listFolders("Trips")).rejects.toMatchObject({
+			code: "unsupportedCapability",
+			message: "This host uses its system folder picker.",
+		});
+		await expect(service.selectFolder("Trips")).rejects.toMatchObject({
+			code: "unsupportedCapability",
+			message: "This host uses its system folder picker.",
+		});
+	});
+
 	it("persists a selected source and appearance for the adapter lifetime", async () => {
 		const service = createInMemoryPhotoService({
 			selectedFolderName: "Iceland 2025",

@@ -8,6 +8,7 @@ import {
 	type GalleryScope,
 	type PhotoService,
 	PhotoServiceError,
+	type SortDirection,
 	type WallQueryRequest,
 	type WallUpdate,
 } from "./photoService";
@@ -52,8 +53,13 @@ export function createTauriPhotoService(
 	invokeCommand: InvokeCommand = invoke,
 	channelFactory: ChannelFactory = (listener) => new Channel(listener),
 ): PhotoService {
+	let sortDirection: SortDirection = "oldestFirst";
 	return {
-		capabilities: { chooseFolder: true, locateFolder: false },
+		capabilities: {
+			chooseFolder: true,
+			folderSelection: "native",
+			locateFolder: false,
+		},
 		getBootstrapState: () =>
 			invokePhotoCommand<BootstrapState>(
 				invokeCommand,
@@ -165,6 +171,27 @@ export function createTauriPhotoService(
 		},
 		derivativeUrl(reference: DerivativeReference) {
 			return `photo-derivative://localhost/${reference.assetId}/${reference.kind}/${reference.key}`;
+		},
+		async listFolders() {
+			throw new PhotoServiceError(
+				"unsupportedCapability",
+				"This host uses its system folder picker.",
+			);
+		},
+		async selectFolder() {
+			throw new PhotoServiceError(
+				"unsupportedCapability",
+				"This host uses its system folder picker.",
+			);
+		},
+		folderBrowserState() {
+			return { breadcrumbs: [], initialPath: "" };
+		},
+		initialSortDirection() {
+			return sortDirection;
+		},
+		rememberSortDirection(direction: SortDirection) {
+			sortDirection = direction;
 		},
 	};
 }

@@ -14,6 +14,7 @@ import type {
 	DerivativeRequest,
 	GalleryScope,
 	PhotoService,
+	SortDirection,
 	WallAsset,
 	WallPage,
 	WallQueryRequest,
@@ -135,19 +136,27 @@ class TestIntersectionObserver {
 }
 
 class ControlledWallService implements PhotoService {
-	readonly capabilities = { chooseFolder: true, locateFolder: false };
+	readonly capabilities = {
+		chooseFolder: true,
+		folderSelection: "native" as const,
+		locateFolder: false,
+	};
 	readonly queryRequests: WallQueryRequest[] = [];
 	readonly derivativeRequests: DerivativeRequest[] = [];
 	derivativeRejectsRemaining = 0;
 	derivativeHoldPriority: DerivativeRequest["priority"] | null = null;
 	readonly heldDerivativeRequests: Array<Gate<void>> = [];
 	readonly interactionCalls: boolean[] = [];
+	readonly rememberedDirections: SortDirection[] = [];
 	readonly gates: Gate<WallPage>[] = [];
 	private readonly listeners = new Set<(update: WallUpdate) => void>();
 	private readonly urls = new Map<string, string>();
 	private readonly sourceState: BootstrapState;
 
-	constructor(sourceId = "source-a") {
+	constructor(
+		sourceId = "source-a",
+		private readonly restoredDirection: SortDirection = "oldestFirst",
+	) {
 		this.sourceState = {
 			settings: { appearance: "system", galleryScope: "includeSubfolders" },
 			activeSource: {
@@ -163,6 +172,17 @@ class ControlledWallService implements PhotoService {
 		kind: "selected",
 		state: structuredClone(this.sourceState),
 	});
+	listFolders = async () => {
+		throw new Error("native picker fixture");
+	};
+	selectFolder = async () => {
+		throw new Error("native picker fixture");
+	};
+	folderBrowserState = () => ({ breadcrumbs: [], initialPath: "" });
+	initialSortDirection = () => this.restoredDirection;
+	rememberSortDirection = (direction: SortDirection) => {
+		this.rememberedDirections.push(direction);
+	};
 	updateAppearance = async (appearance: Appearance) => ({
 		...this.sourceState,
 		settings: { ...this.sourceState.settings, appearance },
@@ -446,6 +466,19 @@ afterEach(() => {
 });
 
 describe("progressive photo wall", () => {
+	it("uses the restored direction for the first wall request and remembers changes", async () => {
+		const service = new ControlledWallService("source-a", "newestFirst");
+		const screen = await renderWall(service);
+
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		expect(service.queryRequests[0]?.direction).toBe("newestFirst");
+		service.releaseQuery(0, pageOf(settledFixtures, "settled"));
+		await screen.getByRole("button", { name: "Oldest first" }).click();
+
+		await expect.poll(() => service.queryRequests.length).toBe(2);
+		expect(service.rememberedDirections).toEqual(["oldestFirst"]);
+	});
+
 	it("shows a complete row before metadata settles and preserves exact geometry through JPEG refinement", async () => {
 		await page.viewport(1440, 1024);
 		const service = new ControlledWallService();

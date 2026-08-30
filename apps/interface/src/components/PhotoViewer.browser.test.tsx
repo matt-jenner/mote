@@ -305,7 +305,11 @@ function previewService(
 	requestDerivatives: PhotoService["requestDerivatives"],
 ): PhotoService {
 	return {
-		capabilities: { chooseFolder: false, locateFolder: false },
+		capabilities: {
+			chooseFolder: false,
+			folderSelection: "native",
+			locateFolder: false,
+		},
 		getBootstrapState: async () => ({
 			settings: { appearance: "system", galleryScope: "includeSubfolders" },
 			activeSource: null,
@@ -330,6 +334,15 @@ function previewService(
 		watchWallUpdates: () => () => undefined,
 		derivativeUrl: (reference) =>
 			`data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==#${reference.assetId}-${reference.kind}`,
+		listFolders: async () => {
+			throw new Error("native picker fixture");
+		},
+		selectFolder: async () => {
+			throw new Error("native picker fixture");
+		},
+		folderBrowserState: () => ({ breadcrumbs: [], initialPath: "" }),
+		initialSortDirection: () => "oldestFirst",
+		rememberSortDirection: () => undefined,
 	};
 }
 

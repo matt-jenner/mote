@@ -134,7 +134,10 @@ export function usePhotoWall(
 	galleryScope: GalleryScope = "includeSubfolders",
 ): PhotoWallController {
 	const service = usePhotoService();
-	const [state, dispatch] = useReducer(wallReducer, initialWallState);
+	const [state, dispatch] = useReducer(wallReducer, {
+		...initialWallState,
+		direction: service.initialSortDirection(),
+	});
 	const stateRef = useRef(state);
 	stateRef.current = state;
 	const requestNumber = useRef(0);
@@ -218,9 +221,7 @@ export function usePhotoWall(
 				.queryWall({
 					cursor,
 					limit: 100,
-					direction: initialSourceQuery
-						? "oldestFirst"
-						: stateRef.current.direction,
+					direction: stateRef.current.direction,
 				})
 				.then((page) => {
 					if (
@@ -443,6 +444,7 @@ export function usePhotoWall(
 
 	const setDirection = useCallback(
 		(direction: SortDirection) => {
+			if (stateRef.current.direction === direction) return;
 			ownerRef.current = null;
 			settlementPending.current = null;
 			cancelDerivativeRetry();
@@ -450,8 +452,9 @@ export function usePhotoWall(
 				if (!asset.wallThumbnail) derivativeRequests.current.delete(asset.id);
 			}
 			dispatch({ type: "setDirection", direction });
+			service.rememberSortDirection(direction);
 		},
-		[cancelDerivativeRetry],
+		[cancelDerivativeRetry, service],
 	);
 
 	const loadMore = useCallback(() => {

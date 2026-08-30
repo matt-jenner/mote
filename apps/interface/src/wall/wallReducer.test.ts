@@ -217,6 +217,22 @@ describe("wallReducer", () => {
 		expect(stale.items).toEqual([]);
 	});
 
+	it("preserves the accepted sort direction when the source resets", () => {
+		const newest = reduce(initialWallState, {
+			type: "setDirection",
+			direction: "newestFirst",
+		});
+
+		const reset = reduce(newest, {
+			type: "resetSource",
+			sourceGeneration: 2,
+			selectionId: "selection-b",
+		});
+
+		expect(reset.direction).toBe("newestFirst");
+		expect(reset.selectionId).toBe("selection-b");
+	});
+
 	it("accepts a generation-fenced first page after source reset", () => {
 		const reset = reduce(initialWallState, {
 			type: "resetSource",
