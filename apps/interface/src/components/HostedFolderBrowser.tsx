@@ -63,6 +63,8 @@ export function HostedFolderBrowser({
 	const titleId = useId();
 	const dialogRef = useRef<HTMLElement>(null);
 	const closeRef = useRef<HTMLButtonElement>(null);
+	const openRef = useRef<HTMLButtonElement>(null);
+	const restoreOpenFocusRef = useRef(false);
 	const restoreFocusRef = useRef<HTMLElement | null>(
 		document.activeElement instanceof HTMLElement
 			? document.activeElement
@@ -113,6 +115,12 @@ export function HostedFolderBrowser({
 		};
 	}, []);
 
+	useLayoutEffect(() => {
+		if (selecting || !restoreOpenFocusRef.current) return;
+		restoreOpenFocusRef.current = false;
+		openRef.current?.focus();
+	}, [selecting]);
+
 	useEffect(() => {
 		const requestId = ++requestIdRef.current;
 		setLoadingPath(initialBreadcrumbs.at(-1)?.path ?? "");
@@ -122,6 +130,7 @@ export function HostedFolderBrowser({
 		void (async () => {
 			let lastError: unknown = null;
 			for (const path of uniqueRecoveryPaths(initialBreadcrumbs)) {
+				if (!mountedRef.current || requestId !== requestIdRef.current) return;
 				try {
 					const recovered = await service.listFolders(path);
 					if (!mountedRef.current || requestId !== requestIdRef.current) return;
@@ -129,6 +138,7 @@ export function HostedFolderBrowser({
 					setLoadingPath(null);
 					return;
 				} catch (reason) {
+					if (!mountedRef.current || requestId !== requestIdRef.current) return;
 					lastError = reason;
 				}
 			}
@@ -149,24 +159,41 @@ export function HostedFolderBrowser({
 		setSelecting(true);
 		setError(null);
 		setRetryPath(null);
+		dialogRef.current?.focus({ preventScroll: true });
+		let result: ChooseFolderResult;
 		try {
-			const result = await service.selectFolder(listing.path);
-			if (!mountedRef.current) return;
-			if (result.kind === "selected") onSelected(result);
+			result = await service.selectFolder(listing.path);
 		} catch (reason) {
-			if (mountedRef.current) setError(errorMessage(reason));
-		} finally {
-			if (mountedRef.current) setSelecting(false);
+			if (mountedRef.current) {
+				setError(errorMessage(reason));
+				restoreOpenFocusRef.current = true;
+				setSelecting(false);
+			}
+			return;
+		}
+		if (result.kind === "selected") {
+			onSelected(result);
+			return;
+		}
+		if (mountedRef.current) {
+			restoreOpenFocusRef.current = true;
+			setSelecting(false);
 		}
 	};
 
 	const handleKeyDown = (event: KeyboardEvent<HTMLElement>) => {
 		if (event.key === "Escape") {
 			event.preventDefault();
+			if (selecting) return;
 			onClose();
 			return;
 		}
 		if (event.key !== "Tab") return;
+		if (selecting) {
+			event.preventDefault();
+			dialogRef.current?.focus();
+			return;
+		}
 
 		const focusable = Array.from(
 			dialogRef.current?.querySelectorAll<HTMLElement>(
@@ -198,6 +225,7 @@ export function HostedFolderBrowser({
 				onKeyDown={handleKeyDown}
 				ref={dialogRef}
 				role="dialog"
+				tabIndex={-1}
 			>
 				<header className={styles.hostedFolderHeader}>
 					<div>
@@ -209,7 +237,10 @@ export function HostedFolderBrowser({
 					<button
 						aria-label="Close folder browser"
 						className={styles.iconButton}
-						onClick={onClose}
+						disabled={selecting}
+						onClick={() => {
+							if (!selecting) onClose();
+						}}
 						ref={closeRef}
 						type="button"
 					>
@@ -328,6 +359,7 @@ export function HostedFolderBrowser({
 						className={styles.primaryButton}
 						disabled={busy || !listing}
 						onClick={() => void openCurrentFolder()}
+						ref={openRef}
 						type="button"
 					>
 						Open this folder

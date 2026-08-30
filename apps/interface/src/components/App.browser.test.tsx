@@ -292,6 +292,42 @@ describe("open and return shell", () => {
 		await expect.poll(() => document.activeElement).toBe(sources.element());
 	});
 
+	it("completes hosted selection into the wall and viewer at phone width", async () => {
+		await page.viewport(390, 844);
+		const { service, memory } = hostedGalleryService();
+		const screen = await renderApp(service);
+
+		await screen.getByRole("button", { name: "Open sources" }).click();
+		await screen.getByRole("button", { name: "Folders", exact: true }).click();
+		await screen.getByRole("button", { name: "Trips" }).click();
+		await screen.getByRole("button", { name: "Iceland" }).click();
+		await screen.getByRole("button", { name: "Open this folder" }).click();
+
+		expect(
+			screen.getByRole("dialog", { name: "Choose a folder" }).query(),
+		).toBeNull();
+		await expect
+			.element(
+				screen
+					.getByRole("region", { name: "Photo workspace" })
+					.getByText("Iceland", { exact: true }),
+			)
+			.toBeVisible();
+
+		await memory.finishFixtureScan();
+		const photo = screen.getByRole("button", {
+			name: "Open Aurora",
+			exact: true,
+		});
+		await expect.element(photo).toBeVisible();
+		await photo.click();
+		await expect
+			.element(screen.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		await screen.getByRole("button", { name: "Back to photos" }).click();
+		await expect.element(photo).toBeVisible();
+	});
+
 	it("applies an explicit dark override", async () => {
 		const screen = await renderApp();
 		await screen.getByRole("button", { name: "Appearance" }).click();

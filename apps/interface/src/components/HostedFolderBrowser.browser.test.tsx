@@ -327,6 +327,36 @@ describe("hosted folder browser", () => {
 		expect(calls).toEqual(["saved-iceland", "saved-trips", ""]);
 	});
 
+	it("does not issue more recovery requests after unmount", async () => {
+		const pending = gate<FolderListing>();
+		const calls: string[] = [];
+		const service = folderService({
+			listFolders: async (path) => {
+				calls.push(path);
+				if (path === "saved-iceland") return pending.promise;
+				throw new Error("A later recovery request should not run");
+			},
+		});
+		const screen = await render(
+			<HostedFolderBrowser
+				initialBreadcrumbs={[
+					{ name: "Trips", path: "saved-trips" },
+					{ name: "Iceland", path: "saved-iceland" },
+				]}
+				onClose={() => undefined}
+				onSelected={() => undefined}
+				service={service}
+			/>,
+		);
+		await expect.poll(() => calls).toEqual(["saved-iceland"]);
+
+		screen.unmount();
+		pending.reject(new Error("Unmounted"));
+		await new Promise((resolve) => window.setTimeout(resolve, 0));
+
+		expect(calls).toEqual(["saved-iceland"]);
+	});
+
 	it("derives Back from the server-returned breadcrumbs", async () => {
 		const calls: string[] = [];
 		const service = folderService({
@@ -404,6 +434,79 @@ describe("hosted folder browser", () => {
 
 		await open.click();
 		expect(onSelected).toHaveBeenCalledWith(selected);
+	});
+
+	it("blocks Close while a submitted selection commits and delivers the result", async () => {
+		const selection = gate<ChooseFolderResult>();
+		const onClose = vi.fn<() => void>();
+		const onSelected = vi.fn<(result: ChooseFolderResult) => void>();
+		const selected: ChooseFolderResult = {
+			kind: "selected",
+			state: {
+				settings: {
+					appearance: "system",
+					galleryScope: "includeSubfolders",
+				},
+				activeSource: {
+					id: "source-trips",
+					selectionId: "selection-trips",
+					displayName: "Trips",
+					availability: "available",
+				},
+			},
+		};
+		const screen = await render(
+			<HostedFolderBrowser
+				initialBreadcrumbs={[]}
+				onClose={onClose}
+				onSelected={onSelected}
+				service={folderService({
+					selectFolder: async () => selection.promise,
+				})}
+			/>,
+		);
+		await screen.getByRole("button", { name: "Open this folder" }).click();
+		const dialog = screen.getByRole("dialog", { name: "Choose a folder" });
+		const close = screen.getByRole("button", { name: "Close folder browser" });
+		expect(dialog.element().getAttribute("aria-busy")).toBe("true");
+		await expect.element(close).toBeDisabled();
+		(close.element() as HTMLButtonElement).click();
+		expect(onClose).not.toHaveBeenCalled();
+
+		selection.resolve(selected);
+		await expect.poll(() => onSelected.mock.calls).toEqual([[selected]]);
+		expect(onClose).not.toHaveBeenCalled();
+	});
+
+	it("blocks Escape while selection is pending and restores interaction on cancellation", async () => {
+		const selection = gate<ChooseFolderResult>();
+		const onClose = vi.fn<() => void>();
+		const screen = await render(
+			<HostedFolderBrowser
+				initialBreadcrumbs={[]}
+				onClose={onClose}
+				onSelected={() => undefined}
+				service={folderService({
+					selectFolder: async () => selection.promise,
+				})}
+			/>,
+		);
+		const open = screen.getByRole("button", { name: "Open this folder" });
+		await open.click();
+		screen
+			.getByRole("dialog", { name: "Choose a folder" })
+			.element()
+			.dispatchEvent(
+				new KeyboardEvent("keydown", { bubbles: true, key: "Escape" }),
+			);
+		expect(onClose).not.toHaveBeenCalled();
+
+		selection.resolve({ kind: "cancelled" });
+		await expect.element(open).toBeEnabled();
+		await expect
+			.element(screen.getByRole("button", { name: "Close folder browser" }))
+			.toBeEnabled();
+		await expect.element(open).toHaveFocus();
 	});
 
 	it("suppresses its transition in reduced-motion mode and passes axe", async () => {

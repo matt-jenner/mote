@@ -72,6 +72,7 @@
 }
 
 .railButton:disabled,
+.iconButton:disabled,
 .primaryButton:disabled {
 	color: var(--unavailable);
 	cursor: default;
