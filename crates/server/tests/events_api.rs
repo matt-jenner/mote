@@ -4,6 +4,7 @@ use http_body_util::BodyExt;
 use photo_app_service::{GalleryScope, OrderState, WallUpdate};
 use photo_server::{AppState, ServerConfig, build_router};
 use serde_json::json;
+use tokio::sync::mpsc;
 use tower::ServiceExt;
 
 async fn next_sse_frame(body: &mut Body) -> String {
@@ -128,6 +129,7 @@ async fn events_route_declares_sse_headers() {
         serde_json::from_slice(&created.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let id = value["id"].as_str().unwrap();
     let response = app
+        .clone()
         .oneshot(
             Request::get(format!(
                 "/api/v1/selections/{id}/events?clientId=browser&scope=currentFolder"
@@ -157,6 +159,7 @@ async fn future_replay_uses_authoritative_head_and_sse_framing() {
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
+    let gallery = state.gallery_for_test().unwrap();
     let app = build_router(state);
     let created = app
         .clone()
@@ -171,7 +174,9 @@ async fn future_replay_uses_authoritative_head_and_sse_framing() {
     let value: serde_json::Value =
         serde_json::from_slice(&created.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let id = value["id"].as_str().unwrap();
+    let selection = gallery.resolve_selection(&id).unwrap();
     let response = app
+        .clone()
         .oneshot(
             Request::get(format!(
                 "/api/v1/selections/{id}/events?clientId=browser&scope=currentFolder&afterEventId=0"
@@ -191,6 +196,17 @@ async fn future_replay_uses_authoritative_head_and_sse_framing() {
     assert!(text.contains("\ndata: "));
     assert!(text.ends_with("\n\n"));
     assert!(text.contains("resyncRequired"));
+    let head = sse_id(&text);
+    let next = gallery
+        .publish_update_for_test(&selection, progress(&id, 1))
+        .await;
+    let live = next_sse_frame(&mut body).await;
+    assert_eq!(sse_id(&live), next.id);
+    assert!(next.id > head);
+    drop(body);
+
+    let mut reconnect = event_body(&app, &id, "reconnect", "currentFolder", head).await;
+    assert_eq!(sse_id(&next_sse_frame(&mut reconnect).await), next.id);
 }
 
 #[tokio::test]
@@ -261,6 +277,7 @@ async fn event_query_and_identifier_limits_use_invalid_request() {
         "clientId=x&scope=currentFolder&scope=currentFolder",
         &format!("clientId={}&scope=currentFolder", "x".repeat(129)),
         "clientId=x&scope=currentFolder&afterEventId=123456789012345678901",
+        "clientId=x&scope=currentFolder&afterEventId=000000000000000000001",
     ] {
         let response = app
             .clone()
@@ -286,6 +303,9 @@ async fn http_replay_supports_header_query_and_old_history_recovery() {
     let id = create_selection(&app, "").await;
     let selection = gallery.resolve_selection(&id).unwrap();
     let base = gallery.current_event_id_for_test(&selection);
+    let retained = gallery
+        .publish_update_for_test(&selection, progress(&id, 1))
+        .await;
 
     let response = app
         .clone()
@@ -299,14 +319,15 @@ async fn http_replay_supports_header_query_and_old_history_recovery() {
         .await
         .unwrap();
     let mut normal = response.into_body();
-    gallery
-        .publish_update_for_test(&selection, progress(&id, 1))
-        .await;
     let first = next_sse_frame(&mut normal).await;
     let first_id = sse_id(&first);
+    assert_eq!(first_id, retained.id);
     assert!(first_id > base);
     drop(normal);
 
+    let retained_query = gallery
+        .publish_update_for_test(&selection, progress(&id, 2))
+        .await;
     let response = app
         .clone()
         .oneshot(
@@ -319,13 +340,14 @@ async fn http_replay_supports_header_query_and_old_history_recovery() {
         .await
         .unwrap();
     let mut query = response.into_body();
-    gallery
-        .publish_update_for_test(&selection, progress(&id, 2))
-        .await;
     let query_id = sse_id(&next_sse_frame(&mut query).await);
+    assert_eq!(query_id, retained_query.id);
     assert!(query_id > first_id);
     drop(query);
 
+    let retained_header = gallery
+        .publish_update_for_test(&selection, progress(&id, 3))
+        .await;
     let response = app
         .clone()
         .oneshot(
@@ -339,10 +361,8 @@ async fn http_replay_supports_header_query_and_old_history_recovery() {
         .await
         .unwrap();
     let mut header = response.into_body();
-    gallery
-        .publish_update_for_test(&selection, progress(&id, 3))
-        .await;
     let header_id = sse_id(&next_sse_frame(&mut header).await);
+    assert_eq!(header_id, retained_header.id);
     assert!(header_id > query_id);
     drop(header);
 
@@ -424,19 +444,27 @@ async fn sse_heartbeat_is_a_framed_comment_after_fifteen_seconds() {
         .await
         .unwrap();
     let mut body = response.into_body();
+    let (sender, mut received) = mpsc::unbounded_channel();
     let reader = tokio::spawn(async move {
         loop {
             let frame = next_sse_frame(&mut body).await;
-            if frame == ": heartbeat\n\n" {
-                return frame;
-            }
+            sender.send(frame).unwrap();
         }
     });
     for _ in 0..3 {
         tokio::task::yield_now().await;
     }
-    tokio::time::advance(std::time::Duration::from_secs(15)).await;
-    assert_eq!(reader.await.unwrap(), ": heartbeat\n\n");
+    while received.try_recv().is_ok() {}
+    tokio::time::advance(std::time::Duration::from_millis(14_999)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        received.try_recv().is_err(),
+        "heartbeat arrived before 15 seconds"
+    );
+    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(received.recv().await.unwrap(), ": heartbeat\n\n");
+    reader.abort();
 }
 
 #[tokio::test]
@@ -619,12 +647,19 @@ async fn http_leases_aggregate_and_expire_after_thirty_seconds() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(gallery.scheduler_permits_for_test(), 1);
-    drop(broad);
     tokio::time::advance(std::time::Duration::from_secs(31)).await;
     for _ in 0..6 {
         tokio::task::yield_now().await;
     }
     assert_eq!(gallery.scheduler_permits_for_test(), 4);
+    assert_eq!(
+        gallery.aggregate_scope_for_test(&selection).await,
+        GalleryScope::IncludeSubfolders
+    );
+    drop(broad);
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
     assert_eq!(
         gallery.aggregate_scope_for_test(&selection).await,
         GalleryScope::CurrentFolder

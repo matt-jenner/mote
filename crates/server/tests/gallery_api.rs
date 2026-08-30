@@ -45,6 +45,24 @@ fn app_with_photos() -> (TempDir, axum::Router) {
     (temp, build_router(state))
 }
 
+fn app_with_state() -> (TempDir, AppState, axum::Router) {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(source.join("Trips")).unwrap();
+    let config = ServerConfig::new(
+        temp.path().join("data"),
+        temp.path().join("cache"),
+        None,
+        source,
+        temp.path().join("web"),
+    )
+    .unwrap();
+    let (state, _) = AppState::open(&config).unwrap();
+    let app = build_router(state.clone());
+    (temp, state, app)
+}
+
 async fn json_body(response: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
 }
@@ -108,7 +126,35 @@ async fn invalid_request_limits_are_rejected_before_lookup() {
 
     let oversized_id = format!("/api/v1/selections/{}", "x".repeat(129));
     let response = app
+        .clone()
         .oneshot(Request::get(oversized_id).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(response).await["code"], "invalidRequest");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/folders?a=1&b=2&c=3&d=4&e=5&f=6&g=7&h=8")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let oversized_target = (b'a'..=b'h')
+        .enumerate()
+        .map(|(index, _)| format!("p{index}={}", "x".repeat(1_030)))
+        .collect::<Vec<_>>()
+        .join("&");
+    assert!(oversized_target.len() > 8_192);
+    let response = app
+        .oneshot(
+            Request::get(format!("/api/v1/folders?{oversized_target}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -180,13 +226,23 @@ async fn gallery_routes_apply_shared_query_guard_before_lookup() {
 
 #[tokio::test]
 async fn selection_bodies_are_rejected_at_the_64k_boundary() {
-    let (_temp, app) = app();
+    let (_temp, state, app) = app_with_state();
+    let gallery = state.gallery_for_test().unwrap();
+    assert_eq!(gallery.runtime_count_for_test(), 0);
+    let valid_create = |padding: usize| {
+        serde_json::to_vec(&json!({
+            "path": "",
+            "padding": "x".repeat(padding)
+        }))
+        .unwrap()
+    };
+    let chunked = valid_create(64 * 1024);
     for body in [
-        Body::from(Bytes::from(vec![b'x'; 64 * 1024 + 1])),
-        Body::from(Bytes::from(vec![b'x'; 2 * 1024 * 1024 + 1])),
+        Body::from(Bytes::from(valid_create(64 * 1024))),
+        Body::from(Bytes::from(valid_create(2 * 1024 * 1024))),
         Body::from_stream(stream::iter(vec![
-            Ok::<_, std::convert::Infallible>(Bytes::from(vec![b'x'; 32 * 1024])),
-            Ok(Bytes::from(vec![b'x'; 32 * 1024 + 1])),
+            Ok::<_, std::convert::Infallible>(Bytes::copy_from_slice(&chunked[..32 * 1024])),
+            Ok(Bytes::copy_from_slice(&chunked[32 * 1024..])),
         ])),
     ] {
         let response = app
@@ -201,19 +257,41 @@ async fn selection_bodies_are_rejected_at_the_64k_boundary() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(json_body(response).await["code"], "invalidRequest");
+        assert_eq!(gallery.runtime_count_for_test(), 0);
     }
 
-    let response = app
+    let created = app
+        .clone()
         .oneshot(
-            Request::post("/api/v1/selections/not-found/interaction")
+            Request::post("/api/v1/selections")
                 .header("content-type", "application/json")
-                .body(Body::from(Bytes::from(vec![b'x'; 64 * 1024 + 1])))
+                .body(Body::from(json!({"path": ""}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let id = json_body(created).await["id"].as_str().unwrap().to_owned();
+    let runtime_count = gallery.runtime_count_for_test();
+    let interaction = serde_json::to_vec(&json!({
+        "clientId": "client",
+        "scope": "currentFolder",
+        "state": "idle",
+        "padding": "x".repeat(64 * 1024)
+    }))
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/selections/{id}/interaction"))
+                .header("content-type", "application/json")
+                .body(Body::from(interaction))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json_body(response).await["code"], "invalidRequest");
+    assert_eq!(gallery.runtime_count_for_test(), runtime_count);
 }
 
 #[tokio::test]
