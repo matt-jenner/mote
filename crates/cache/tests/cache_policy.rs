@@ -145,6 +145,166 @@ fn remove_checked_rejects_a_symlinked_ancestor_without_touching_outside() {
     assert_eq!(std::fs::read(outside.join("item.bin")).unwrap(), b"outside");
 }
 
+#[cfg(unix)]
+#[test]
+fn open_checked_survives_an_ancestor_swap_at_the_final_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let writer = CacheWriter::new(&cache).unwrap();
+    writer
+        .write_atomic(PathBuf::from("ab/cd/item.bin"), |file| {
+            file.write_all(b"managed")
+        })
+        .unwrap();
+    std::fs::write(outside.join("item.bin"), b"outside").unwrap();
+
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let hook_entered = entered.clone();
+    let hook_release = release.clone();
+    writer.install_path_race_test_hook(Arc::new(move || {
+        hook_entered.wait();
+        hook_release.wait();
+    }));
+    let reader = writer.clone();
+    let opened = thread::spawn(move || reader.open_checked(std::path::Path::new("ab/cd/item.bin")));
+    entered.wait();
+    std::fs::rename(cache.join("ab"), cache.join("ab-moved")).unwrap();
+    std::os::unix::fs::symlink(&outside, cache.join("ab")).unwrap();
+    release.wait();
+    let mut file = opened.join().unwrap().unwrap();
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).unwrap();
+    assert_eq!(bytes, b"managed");
+    assert_eq!(std::fs::read(outside.join("item.bin")).unwrap(), b"outside");
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_checked_survives_an_ancestor_swap_at_the_final_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let writer = CacheWriter::new(&cache).unwrap();
+    writer
+        .write_atomic(PathBuf::from("ab/cd/item.bin"), |file| {
+            file.write_all(b"managed")
+        })
+        .unwrap();
+    std::fs::write(outside.join("item.bin"), b"outside").unwrap();
+
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let hook_entered = entered.clone();
+    let hook_release = release.clone();
+    writer.install_path_race_test_hook(Arc::new(move || {
+        hook_entered.wait();
+        hook_release.wait();
+    }));
+    let remover = writer.clone();
+    let removed =
+        thread::spawn(move || remover.remove_checked(std::path::Path::new("ab/cd/item.bin")));
+    entered.wait();
+    std::fs::rename(cache.join("ab"), cache.join("ab-moved")).unwrap();
+    std::os::unix::fs::symlink(&outside, cache.join("ab")).unwrap();
+    release.wait();
+    removed.join().unwrap().unwrap();
+    assert!(!cache.join("ab-moved/cd/item.bin").exists());
+    assert_eq!(std::fs::read(outside.join("item.bin")).unwrap(), b"outside");
+}
+
+#[cfg(unix)]
+#[test]
+fn open_checked_rejects_a_final_component_swap_to_a_symlink() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let writer = CacheWriter::new(&cache).unwrap();
+    writer
+        .write_atomic(PathBuf::from("ab/cd/item.bin"), |file| {
+            file.write_all(b"managed")
+        })
+        .unwrap();
+    std::fs::write(outside.join("item.bin"), b"outside").unwrap();
+
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let hook_entered = entered.clone();
+    let hook_release = release.clone();
+    writer.install_path_race_test_hook(Arc::new(move || {
+        hook_entered.wait();
+        hook_release.wait();
+    }));
+    let reader = writer.clone();
+    let opened = thread::spawn(move || reader.open_checked(std::path::Path::new("ab/cd/item.bin")));
+    entered.wait();
+    std::fs::remove_file(cache.join("ab/cd/item.bin")).unwrap();
+    std::os::unix::fs::symlink(outside.join("item.bin"), cache.join("ab/cd/item.bin")).unwrap();
+    release.wait();
+    assert!(matches!(
+        opened.join().unwrap(),
+        Err(CacheError::Io(_)) | Err(CacheError::PathEscape)
+    ));
+    assert_eq!(std::fs::read(outside.join("item.bin")).unwrap(), b"outside");
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_checked_rejects_a_final_component_swap_to_a_symlink() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let writer = CacheWriter::new(&cache).unwrap();
+    writer
+        .write_atomic(PathBuf::from("ab/cd/item.bin"), |file| {
+            file.write_all(b"managed")
+        })
+        .unwrap();
+    std::fs::write(outside.join("item.bin"), b"outside").unwrap();
+
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let hook_entered = entered.clone();
+    let hook_release = release.clone();
+    writer.install_path_race_test_hook(Arc::new(move || {
+        hook_entered.wait();
+        hook_release.wait();
+    }));
+    let remover = writer.clone();
+    let removed =
+        thread::spawn(move || remover.remove_checked(std::path::Path::new("ab/cd/item.bin")));
+    entered.wait();
+    std::fs::remove_file(cache.join("ab/cd/item.bin")).unwrap();
+    std::os::unix::fs::symlink(outside.join("item.bin"), cache.join("ab/cd/item.bin")).unwrap();
+    release.wait();
+    assert!(matches!(
+        removed.join().unwrap(),
+        Err(CacheError::PathEscape)
+    ));
+    assert_eq!(std::fs::read(outside.join("item.bin")).unwrap(), b"outside");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_open_checked_rejects_a_reparse_point_final_component() {
+    use std::os::windows::fs::symlink_file;
+
+    let temp = tempfile::tempdir().unwrap();
+    let writer = CacheWriter::new(temp.path()).unwrap();
+    let outside = temp.path().join("outside.bin");
+    std::fs::write(&outside, b"outside").unwrap();
+    symlink_file(&outside, temp.path().join("item.bin")).unwrap();
+    assert!(matches!(
+        writer.open_checked(std::path::Path::new("item.bin")),
+        Err(CacheError::PathEscape) | Err(CacheError::Io(_))
+    ));
+}
+
 #[test]
 fn concurrent_writers_publish_exactly_one_immutable_output() {
     let temp = tempfile::tempdir().unwrap();

@@ -9,7 +9,7 @@ use tower::ServiceExt;
 
 const JPEG: &[u8] = include_bytes!("../../../apps/interface/public/demo-photos/mountain.jpg");
 
-fn app() -> (TempDir, axum::Router) {
+fn make_app() -> (TempDir, axum::Router) {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");
     std::fs::create_dir(&source).unwrap();
@@ -30,9 +30,49 @@ async fn body(response: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
 }
 
+async fn selection_and_asset(app: &axum::Router) -> (String, String) {
+    let selected = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/selections")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"path": ""}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.status(), StatusCode::CREATED);
+    let selection_id = body(selected).await["id"].as_str().unwrap().to_owned();
+    let asset_id = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!(
+                        "/api/v1/selections/{selection_id}/wall?scope=currentFolder&direction=oldestFirst&limit=50"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            if response.status() == StatusCode::OK {
+                let value = body(response).await;
+                if let Some(item) = value["items"].as_array().and_then(|items| items.first()) {
+                    break item["id"].as_str().unwrap().to_owned();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    (selection_id, asset_id)
+}
+
 #[tokio::test]
 async fn derivative_route_delivers_managed_jpeg_with_immutable_headers() {
-    let (temp, app) = app();
+    let (temp, app) = make_app();
     let selected = app
         .clone()
         .oneshot(
@@ -154,6 +194,7 @@ async fn derivative_route_delivers_managed_jpeg_with_immutable_headers() {
     assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
 
     let response = app
+        .clone()
         .oneshot(
             Request::get(format!("/api/v1/derivatives/{key}"))
                 .header("range", "bytes=0-2")
@@ -163,11 +204,44 @@ async fn derivative_route_delivers_managed_jpeg_with_immutable_headers() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+
+    let catalog = photo_catalog::Catalog::open(&temp.path().join("data/catalog.sqlite")).unwrap();
+    let record = catalog.find_derivative_by_cache_key(&key).unwrap().unwrap();
+    let managed_path = temp.path().join("cache").join(record.relative_cache_path);
+    std::fs::remove_file(&managed_path).unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/derivatives/{key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body(response).await["code"], "notFound");
+
+    #[cfg(unix)]
+    {
+        let outside = temp.path().join("outside.jpg");
+        std::fs::write(&outside, JPEG).unwrap();
+        std::os::unix::fs::symlink(&outside, &managed_path).unwrap();
+        let response = app
+            .oneshot(
+                Request::get(format!("/api/v1/derivatives/{key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body(response).await["code"], "notFound");
+    }
 }
 
 #[tokio::test]
 async fn derivative_route_rejects_oversized_decoded_id_and_query_before_lookup() {
-    let (_temp, app) = app();
+    let (_temp, app) = make_app();
     let oversized_id = "a".repeat(513);
     let response = app
         .clone()
@@ -193,4 +267,105 @@ async fn derivative_route_rejects_oversized_decoded_id_and_query_before_lookup()
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(body(response).await["code"], "invalidRequest");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/selections/missing/derivatives")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "scope": "currentFolder",
+                        "request": {
+                            "assetIds": vec!["x"; 251],
+                            "priority": "visible",
+                            "kind": "wallThumbnail"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body(response).await["code"], "invalidRequest");
+}
+
+#[tokio::test]
+async fn derivative_request_exposes_invalid_unavailable_and_failed_envelopes() {
+    let (temp, app) = make_app();
+    let (selection_id, asset_id) = selection_and_asset(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/selections/{selection_id}/derivatives"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "scope": "currentFolder",
+                        "request": {
+                            "assetIds": [],
+                            "priority": "visible",
+                            "kind": "wallThumbnail"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body(response).await["code"], "invalidRequest");
+
+    std::fs::remove_file(temp.path().join("photos/photo.jpg")).unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/selections/{selection_id}/derivatives"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "scope": "currentFolder",
+                        "request": {
+                            "assetIds": [asset_id],
+                            "priority": "visible",
+                            "kind": "wallThumbnail"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body(response).await["code"], "derivativeUnavailable");
+
+    let (temp2, app2) = make_app();
+    let (selection_id, asset_id) = selection_and_asset(&app2).await;
+    std::fs::write(temp2.path().join("photos/photo.jpg"), b"not a jpeg").unwrap();
+    let response = app2
+        .oneshot(
+            Request::post(format!("/api/v1/selections/{selection_id}/derivatives"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "scope": "currentFolder",
+                        "request": {
+                            "assetIds": [asset_id],
+                            "priority": "visible",
+                            "kind": "wallThumbnail"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body(response).await["code"], "derivativeFailed");
 }

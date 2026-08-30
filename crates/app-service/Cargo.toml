@@ -11,6 +11,7 @@ photo-core = { path = "../core" }
 photo-domain = { path = "../domain" }
 photo-indexer = { path = "../indexer" }
 photo-metadata = { path = "../metadata" }
+image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

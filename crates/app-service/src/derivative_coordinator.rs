@@ -13,7 +13,7 @@ use photo_indexer::{IndexJob, IndexScheduler, JobPriority};
 use tokio::sync::{Mutex, Notify, oneshot};
 
 pub(crate) const RECENT_CAPACITY: usize = 250;
-const SCHEDULER_OWNER_PREFIX: &str = "photo-derivative-coordinator:";
+pub(crate) const SCHEDULER_OWNER_PREFIX: &str = "photo-derivative-coordinator:";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum WorkLane {
@@ -100,7 +100,29 @@ impl CommitPermit {
     }
 }
 
-pub(crate) type WorkResultReceiver = oneshot::Receiver<Option<DerivativeReference>>;
+/// The coordinator's settlement is intentionally typed.  A missing source,
+/// cancellation, or authorization change is different from an encode/cache
+/// failure, and callers must be able to preserve that distinction through
+/// coalescing and completion history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DerivativeResult {
+    Ready(DerivativeReference),
+    Failed,
+    Unavailable,
+}
+
+impl PartialEq<Option<DerivativeReference>> for DerivativeResult {
+    fn eq(&self, other: &Option<DerivativeReference>) -> bool {
+        match (self, other) {
+            (Self::Ready(reference), Some(expected)) => reference == expected,
+            (Self::Failed | Self::Unavailable, None) => true,
+            _ => false,
+        }
+    }
+}
+
+pub(crate) type WorkResultReceiver = oneshot::Receiver<DerivativeResult>;
+pub(crate) type ScopeAuthorizer = Arc<dyn Fn(&WorkKey, GalleryScope) -> bool + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CollectionPhase {
@@ -161,8 +183,7 @@ struct JobState {
     background_generation: u64,
     commit_background: bool,
     commit_finishing: bool,
-    commit_result: Option<Option<DerivativeReference>>,
-    commit_failure: bool,
+    commit_result: Option<DerivativeResult>,
     commit_allowed_scopes: Option<Vec<GalleryScope>>,
     commit_supervisor_state: Arc<AtomicU8>,
     prerequisite_key: Option<String>,
@@ -173,23 +194,22 @@ struct JobState {
 
 struct WorkWaiter {
     scope: GalleryScope,
-    sender: oneshot::Sender<Option<DerivativeReference>>,
+    authorized: bool,
+    sender: oneshot::Sender<DerivativeResult>,
 }
 
 #[derive(Clone)]
 struct CompletedCommit {
     background_generation: u64,
     completion_generation: u64,
-    result: Option<DerivativeReference>,
-    failure: bool,
+    result: DerivativeResult,
 }
 
 struct CommitDelivery {
     permit: CommitPermit,
     key: WorkKey,
     completion: Arc<Notify>,
-    result: Option<DerivativeReference>,
-    failure: bool,
+    result: DerivativeResult,
     allowed_scopes: Option<Vec<GalleryScope>>,
     waiters: Vec<WorkWaiter>,
 }
@@ -353,6 +373,26 @@ impl DerivativeCoordinator {
             prerequisite_key,
             observed_completion_generation,
             None,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn enqueue_hosted_with_prerequisite_observed(
+        &self,
+        key: WorkKey,
+        lane: WorkLane,
+        prerequisite_key: Option<String>,
+        observed_completion_generation: Option<u64>,
+        authorizer: ScopeAuthorizer,
+    ) -> WorkResultReceiver {
+        self.enqueue_with_prerequisite_observed_guarded(
+            key,
+            lane,
+            prerequisite_key,
+            observed_completion_generation,
+            None,
+            Some(authorizer),
         )
         .await
     }
@@ -375,6 +415,7 @@ impl DerivativeCoordinator {
             prerequisite_key,
             observed_completion_generation,
             Some(token),
+            None,
         )
         .await
     }
@@ -386,6 +427,7 @@ impl DerivativeCoordinator {
         prerequisite_key: Option<String>,
         observed_completion_generation: Option<u64>,
         collection_token: Option<&CollectionProgressToken>,
+        authorizer: Option<ScopeAuthorizer>,
     ) -> WorkResultReceiver {
         let (sender, receiver) = oneshot::channel();
         let mut sender = Some(sender);
@@ -410,7 +452,12 @@ impl DerivativeCoordinator {
             }
 
             if !immediate_none {
-                if let Some(completed) = observed_completion_generation
+                let waiter_authorized = authorizer
+                    .as_ref()
+                    .is_none_or(|authorizer| authorizer(&key, key.scope));
+                if !waiter_authorized {
+                    immediate_none = true;
+                } else if let Some(completed) = observed_completion_generation
                     .and_then(|observed| completed_after(&state, &key, observed))
                 {
                     immediate_result = Some(completed.result);
@@ -433,24 +480,31 @@ impl DerivativeCoordinator {
                         }
                         if !immediate_none {
                             if work.status == JobStatus::Committing && work.commit_finishing {
-                                let admitted = work
-                                    .commit_allowed_scopes
-                                    .as_ref()
-                                    .is_none_or(|allowed| allowed.contains(&key.scope));
+                                let admitted =
+                                    work.commit_allowed_scopes.as_ref().is_none_or(|allowed| {
+                                        allowed.contains(&key.scope)
+                                            || authorizer.as_ref().is_some_and(|authorizer| {
+                                                authorizer(&key, key.scope)
+                                            })
+                                    });
                                 immediate_result = Some(if admitted {
-                                    work.commit_result.clone().unwrap_or(None)
+                                    work.commit_result
+                                        .clone()
+                                        .unwrap_or(DerivativeResult::Unavailable)
                                 } else {
-                                    None
+                                    DerivativeResult::Unavailable
                                 });
                             } else {
                                 if lane.is_foreground() {
                                     work.foreground_waiters.push(WorkWaiter {
                                         scope: key.scope,
+                                        authorized: waiter_authorized,
                                         sender: sender.take().expect("waiter was not consumed"),
                                     });
                                 } else {
                                     work.background_waiters.push(WorkWaiter {
                                         scope: key.scope,
+                                        authorized: waiter_authorized,
                                         sender: sender.take().expect("waiter was not consumed"),
                                     });
                                 }
@@ -489,6 +543,7 @@ impl DerivativeCoordinator {
                         &mut sender,
                         &mut schedule,
                         &self.owner_prefix,
+                        waiter_authorized,
                     );
                 }
             }
@@ -497,7 +552,7 @@ impl DerivativeCoordinator {
             let _ = sender
                 .take()
                 .expect("rejected waiter was not consumed")
-                .send(None);
+                .send(DerivativeResult::Unavailable);
         } else if let Some(result) = immediate_result {
             let _ = sender
                 .take()
@@ -619,15 +674,72 @@ impl DerivativeCoordinator {
     pub(crate) async fn complete(&self, ticket: WorkTicket, reference: DerivativeReference) {
         let waiters = self.finish_running(ticket).await;
         for waiter in waiters {
-            let _ = waiter.sender.send(Some(reference.clone()));
+            let _ = waiter
+                .sender
+                .send(DerivativeResult::Ready(reference.clone()));
         }
     }
 
     pub(crate) async fn discard(&self, ticket: WorkTicket) {
         let waiters = self.finish_running(ticket).await;
         for waiter in waiters {
-            let _ = waiter.sender.send(None);
+            let _ = waiter.sender.send(DerivativeResult::Unavailable);
         }
+    }
+
+    /// Settles a running attempt as a real generation failure.  This is used
+    /// by the supervisor when an attempt panics before commit admission; a
+    /// dropped or cancelled attempt remains an ordinary unavailable outcome.
+    pub(crate) async fn fail_running(&self, ticket: WorkTicket) {
+        let (waiters, key, background_generation) = {
+            let mut state = self.state.lock().await;
+            let Some(ticket_state) = state.tickets.get(&ticket) else {
+                return;
+            };
+            if ticket_state.status != TicketStatus::Running {
+                return;
+            }
+            let key = ticket_state.key.clone();
+            let Some(work) = state.jobs.get(&key) else {
+                state.tickets.remove(&ticket);
+                return;
+            };
+            if work.ticket != Some(ticket) || work.status != JobStatus::Running {
+                return;
+            }
+            let background_generation = work.background_generation;
+            let work = state.jobs.remove(&key).expect("job was present");
+            state.job_names.remove(&work.job_name);
+            state.tickets.remove(&ticket);
+            (
+                work.foreground_waiters
+                    .into_iter()
+                    .chain(work.background_waiters)
+                    .collect::<Vec<_>>(),
+                key,
+                background_generation,
+            )
+        };
+        let completion_generation = self
+            .commit_completion_generation
+            .fetch_add(1, AtomicOrdering::AcqRel)
+            .wrapping_add(1);
+        {
+            let mut state = self.state.lock().await;
+            if state.selection == Some(key.selection) {
+                remember_completed(
+                    &mut state,
+                    key,
+                    background_generation,
+                    completion_generation,
+                    DerivativeResult::Failed,
+                );
+            }
+        }
+        for waiter in waiters {
+            let _ = waiter.sender.send(DerivativeResult::Failed);
+        }
+        self.notify_waiters();
     }
 
     /// Returns a running attempt to the coordinator-owned scheduler after a driver
@@ -733,7 +845,7 @@ impl DerivativeCoordinator {
                 hook.notify_one();
             }
             for waiter in waiters {
-                let _ = waiter.sender.send(None);
+                let _ = waiter.sender.send(DerivativeResult::Unavailable);
             }
             self.notify_waiters();
             if completion_waits.is_empty() {
@@ -790,7 +902,7 @@ impl DerivativeCoordinator {
         reference: DerivativeReference,
     ) {
         let Some(delivery) = self
-            .begin_commit_delivery(permit, Some(reference), false, None)
+            .begin_commit_delivery(permit, DerivativeResult::Ready(reference), None)
             .await
         else {
             return;
@@ -803,7 +915,8 @@ impl DerivativeCoordinator {
     }
 
     pub(crate) async fn fail_commit(&self, permit: CommitPermit) {
-        self.fail_commit_with_kind(permit, false, None).await;
+        self.fail_commit_with_result(permit, DerivativeResult::Unavailable, None)
+            .await;
     }
 
     /// Settles a committed attempt while retaining the authorization scope of
@@ -818,8 +931,7 @@ impl DerivativeCoordinator {
         let Some(delivery) = self
             .begin_commit_delivery(
                 permit,
-                Some(reference),
-                false,
+                DerivativeResult::Ready(reference),
                 Some(allowed_scopes.to_vec()),
             )
             .await
@@ -836,19 +948,20 @@ impl DerivativeCoordinator {
     /// Fails a commit and records whether the operation itself failed. A
     /// missing membership or cancellation remains an unavailable result; an
     /// encode/join/cache/catalog failure is surfaced as `DerivativeFailed` by
-    /// the hosted request boundary without changing the legacy receiver type.
+    /// the hosted request boundary and remains typed in completion history.
     pub(crate) async fn fail_commit_with_error(&self, permit: CommitPermit) {
-        self.fail_commit_with_kind(permit, true, None).await;
+        self.fail_commit_with_result(permit, DerivativeResult::Failed, None)
+            .await;
     }
 
-    async fn fail_commit_with_kind(
+    async fn fail_commit_with_result(
         &self,
         permit: CommitPermit,
-        failure: bool,
+        result: DerivativeResult,
         allowed_scopes: Option<Vec<GalleryScope>>,
     ) {
         let Some(delivery) = self
-            .begin_commit_delivery(permit, None, failure, allowed_scopes)
+            .begin_commit_delivery(permit, result, allowed_scopes)
             .await
         else {
             return;
@@ -898,7 +1011,7 @@ impl DerivativeCoordinator {
             (waiters, completion)
         };
         for waiter in waiters {
-            let _ = waiter.sender.send(None);
+            let _ = waiter.sender.send(DerivativeResult::Unavailable);
         }
         completion.notify_waiters();
         self.notify_waiters();
@@ -906,10 +1019,11 @@ impl DerivativeCoordinator {
     }
 
     pub(crate) async fn abort_attempt(&self, ticket: WorkTicket) {
-        self.abort_attempt_with_failure(ticket, false).await;
+        self.abort_attempt_with_result(ticket, DerivativeResult::Unavailable)
+            .await;
     }
 
-    async fn abort_attempt_with_failure(&self, ticket: WorkTicket, failure: bool) {
+    async fn abort_attempt_with_result(&self, ticket: WorkTicket, result: DerivativeResult) {
         let status = {
             let state = self.state.lock().await;
             state.tickets.get(&ticket).map(|ticket_state| {
@@ -926,9 +1040,12 @@ impl DerivativeCoordinator {
             })
         };
         match status {
-            Some((TicketStatus::Running, _, _)) => {
-                self.discard(ticket).await;
-            }
+            Some((TicketStatus::Running, _, _)) => match &result {
+                DerivativeResult::Failed => self.fail_running(ticket).await,
+                DerivativeResult::Ready(_) | DerivativeResult::Unavailable => {
+                    self.discard(ticket).await
+                }
+            },
             Some((TicketStatus::Committing, selection, supervisor_state)) => {
                 let permit = CommitPermit {
                     job_id: ticket.job_id,
@@ -937,15 +1054,16 @@ impl DerivativeCoordinator {
                     supervisor_state,
                 };
                 if permit.claim_abort() {
-                    if failure {
-                        self.fail_commit_with_error(permit).await;
-                    } else {
-                        self.fail_commit(permit).await;
-                    }
+                    self.fail_commit_with_result(permit, result, None).await;
                 }
             }
             None => {}
         }
+    }
+
+    pub(crate) async fn abort_attempt_as_failure(&self, ticket: WorkTicket) {
+        self.abort_attempt_with_result(ticket, DerivativeResult::Failed)
+            .await;
     }
 
     pub(crate) async fn abort_all_attempts(&self) {
@@ -958,15 +1076,15 @@ impl DerivativeCoordinator {
             .copied()
             .collect::<Vec<_>>();
         for ticket in tickets {
-            self.abort_attempt_with_failure(ticket, true).await;
+            self.abort_attempt_with_result(ticket, DerivativeResult::Failed)
+                .await;
         }
     }
 
     async fn begin_commit_delivery(
         &self,
         permit: CommitPermit,
-        result: Option<DerivativeReference>,
-        failure: bool,
+        result: DerivativeResult,
         allowed_scopes: Option<Vec<GalleryScope>>,
     ) -> Option<CommitDelivery> {
         let delivery = {
@@ -990,7 +1108,6 @@ impl DerivativeCoordinator {
                 return None;
             }
             work.commit_result = Some(result.clone());
-            work.commit_failure = failure;
             work.commit_allowed_scopes = allowed_scopes.clone();
             work.commit_finishing = true;
             CommitDelivery {
@@ -998,7 +1115,6 @@ impl DerivativeCoordinator {
                 key,
                 completion: work.completion.clone(),
                 result,
-                failure,
                 allowed_scopes,
                 waiters: work
                     .foreground_waiters
@@ -1017,7 +1133,6 @@ impl DerivativeCoordinator {
             key,
             completion,
             result,
-            failure,
             allowed_scopes,
             waiters,
         } = delivery;
@@ -1030,12 +1145,15 @@ impl DerivativeCoordinator {
             release.await;
         }
         for waiter in waiters {
-            let admitted = allowed_scopes
-                .as_ref()
-                .is_none_or(|allowed| allowed.contains(&waiter.scope));
-            let _ = waiter
-                .sender
-                .send(if admitted { result.clone() } else { None });
+            let admitted = waiter.authorized
+                && allowed_scopes
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.contains(&waiter.scope));
+            let _ = waiter.sender.send(if admitted {
+                result.clone()
+            } else {
+                DerivativeResult::Unavailable
+            });
         }
         #[cfg(any(test, debug_assertions))]
         if let Some(gate) = self.commit_waiter_delivery_test_gate.lock().await.take() {
@@ -1050,7 +1168,6 @@ impl DerivativeCoordinator {
             key,
             completion,
             result,
-            failure,
             allowed_scopes,
             waiters: Vec::new(),
         })
@@ -1096,7 +1213,6 @@ impl DerivativeCoordinator {
                     work.background_generation,
                     completion_generation,
                     delivery.result.clone(),
-                    delivery.failure,
                 );
             }
             #[cfg(any(test, debug_assertions))]
@@ -1214,7 +1330,7 @@ impl DerivativeCoordinator {
             waiters
         };
         for waiter in waiters {
-            let _ = waiter.sender.send(None);
+            let _ = waiter.sender.send(DerivativeResult::Unavailable);
         }
         self.notify_waiters();
     }
@@ -1454,7 +1570,7 @@ impl DerivativeCoordinator {
                 .collect::<Vec<_>>()
         };
         for waiter in waiters {
-            let _ = waiter.sender.send(None);
+            let _ = waiter.sender.send(DerivativeResult::Unavailable);
         }
         self.notify_waiters();
         true
@@ -1530,9 +1646,9 @@ impl DerivativeCoordinator {
     pub(crate) async fn completed_failure(&self, key: &WorkKey) -> bool {
         let state = self.state.lock().await;
         current_completed(&state, key)
-            .is_some_and(|completed| completed.failure && completed.result.is_none())
+            .is_some_and(|completed| completed.result == DerivativeResult::Failed)
             || state.jobs.get(key).is_some_and(|work| {
-                work.commit_finishing && work.commit_failure && work.commit_result == Some(None)
+                work.commit_finishing && work.commit_result == Some(DerivativeResult::Failed)
             })
     }
 
@@ -1669,8 +1785,7 @@ fn remember_completed(
     key: WorkKey,
     background_generation: u64,
     completion_generation: u64,
-    result: Option<DerivativeReference>,
-    failure: bool,
+    result: DerivativeResult,
 ) {
     state
         .completed
@@ -1680,7 +1795,6 @@ fn remember_completed(
             background_generation,
             completion_generation,
             result,
-            failure,
         });
     state
         .completed_order
@@ -1708,9 +1822,10 @@ fn queue_new_job(
     key: WorkKey,
     lane: WorkLane,
     prerequisite_key: Option<String>,
-    sender: &mut Option<oneshot::Sender<Option<DerivativeReference>>>,
+    sender: &mut Option<oneshot::Sender<DerivativeResult>>,
     schedule: &mut Option<(String, JobPriority)>,
     owner_prefix: &str,
+    authorized: bool,
 ) {
     let job_id = state.next_job_id;
     state.next_job_id = state.next_job_id.wrapping_add(1).max(1);
@@ -1720,6 +1835,7 @@ fn queue_new_job(
         (
             vec![WorkWaiter {
                 scope,
+                authorized,
                 sender: sender.take().expect("waiter was not consumed"),
             }],
             Vec::new(),
@@ -1729,6 +1845,7 @@ fn queue_new_job(
             Vec::new(),
             vec![WorkWaiter {
                 scope,
+                authorized,
                 sender: sender.take().expect("waiter was not consumed"),
             }],
         )
@@ -1746,7 +1863,6 @@ fn queue_new_job(
             commit_background: false,
             commit_finishing: false,
             commit_result: None,
-            commit_failure: false,
             commit_allowed_scopes: None,
             commit_supervisor_state: Arc::new(AtomicU8::new(0)),
             prerequisite_key,
@@ -1767,7 +1883,7 @@ mod tests {
 
     use photo_catalog::WallCursorKey;
     use photo_domain::{AssetId, Availability, FolderGroupId, GalleryScope, LibraryId};
-    use photo_indexer::{IndexScheduler, SchedulerConfig};
+    use photo_indexer::{IndexJob, IndexScheduler, JobPriority, SchedulerConfig};
     use tokio::sync::Notify;
 
     use super::{
@@ -2247,6 +2363,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_waiter_uses_its_own_scope_after_commit_snapshot() {
+        let fixture = fixture();
+        // The first caller is current-folder, but the commit is admitted for
+        // the include-subfolders scope. A waiter arriving while completion is
+        // being delivered must be evaluated by its own scope, not by the
+        // immutable work key's first caller scope.
+        let mut initial_key = screen_key();
+        initial_key.scope = GalleryScope::CurrentFolder;
+        let initial = fixture
+            .coordinator
+            .enqueue(initial_key, WorkLane::VisibleWall)
+            .await;
+        let ticket = fixture.coordinator.next_work().await.unwrap();
+        let permit = fixture
+            .coordinator
+            .admit_commit(ticket, fixture.selection, None)
+            .await
+            .expect("the coalesced work should be admitted");
+        let snapshot_entered = Arc::new(Notify::new());
+        let snapshot_release = Arc::new(Notify::new());
+        fixture
+            .coordinator
+            .install_commit_waiter_snapshot_test_gate(
+                snapshot_entered.clone(),
+                snapshot_release.clone(),
+            )
+            .await;
+        let completer = {
+            let coordinator = fixture.coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .complete_commit_filtered(
+                        permit,
+                        reference(),
+                        &[GalleryScope::IncludeSubfolders],
+                    )
+                    .await;
+            })
+        };
+        snapshot_entered.notified().await;
+        let mut late_key = screen_key();
+        late_key.scope = GalleryScope::IncludeSubfolders;
+        let late = fixture
+            .coordinator
+            .enqueue(late_key, WorkLane::VisibleWall)
+            .await;
+        snapshot_release.notify_waiters();
+
+        assert_eq!(initial.await.unwrap(), None);
+        assert_eq!(late.await.unwrap(), Some(reference()));
+        completer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn settlement_preserves_failed_and_unavailable_outcomes() {
+        let fixture = fixture();
+        let failed = fixture.enqueue(screen_key(), WorkLane::VisibleWall).await;
+        let failed_ticket = fixture.coordinator.next_work().await.unwrap();
+        let failed_permit = fixture
+            .coordinator
+            .admit_commit(failed_ticket, fixture.selection, None)
+            .await
+            .unwrap();
+        fixture
+            .coordinator
+            .fail_commit_with_error(failed_permit)
+            .await;
+
+        let unavailable = fixture
+            .coordinator
+            .enqueue(
+                screen_key_for(fixture.selection, fixture_id(2), "missing"),
+                WorkLane::VisibleWall,
+            )
+            .await;
+        let unavailable_ticket = fixture.coordinator.next_work().await.unwrap();
+        fixture.coordinator.discard(unavailable_ticket).await;
+
+        assert_eq!(failed.await.unwrap(), super::DerivativeResult::Failed);
+        assert_eq!(
+            unavailable.await.unwrap(),
+            super::DerivativeResult::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn late_hosted_waiter_rechecks_authorization_at_arrival() {
+        let fixture = fixture();
+        let membership = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let authorizer_membership = membership.clone();
+        let authorizer: super::ScopeAuthorizer = Arc::new(move |_key, _scope| {
+            authorizer_membership.load(std::sync::atomic::Ordering::Acquire)
+        });
+        let mut key = screen_key();
+        key.scope = GalleryScope::CurrentFolder;
+        let initial = fixture
+            .coordinator
+            .enqueue_hosted_with_prerequisite_observed(
+                key,
+                WorkLane::VisibleWall,
+                None,
+                None,
+                authorizer.clone(),
+            )
+            .await;
+        let ticket = fixture.coordinator.next_work().await.unwrap();
+        let permit = fixture
+            .coordinator
+            .admit_commit(ticket, fixture.selection, None)
+            .await
+            .unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        fixture
+            .coordinator
+            .install_commit_waiter_snapshot_test_gate(entered.clone(), release.clone())
+            .await;
+        let coordinator = fixture.coordinator.clone();
+        let completer = tokio::spawn(async move {
+            coordinator
+                .complete_commit_filtered(permit, reference(), &[GalleryScope::IncludeSubfolders])
+                .await;
+        });
+        entered.notified().await;
+        membership.store(false, std::sync::atomic::Ordering::Release);
+        let mut late = screen_key();
+        late.scope = GalleryScope::IncludeSubfolders;
+        let late = fixture
+            .coordinator
+            .enqueue_hosted_with_prerequisite_observed(
+                late,
+                WorkLane::VisibleWall,
+                None,
+                None,
+                authorizer,
+            )
+            .await;
+        release.notify_waiters();
+        assert_eq!(initial.await.unwrap(), super::DerivativeResult::Unavailable);
+        assert_eq!(late.await.unwrap(), super::DerivativeResult::Unavailable);
+        completer.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn hosted_driver_owner_handoff_is_atomic_with_enqueue() {
         let fixture = fixture();
         let generation = fixture
@@ -2331,6 +2591,44 @@ mod tests {
         let _right_waiter = right.enqueue(right_key, WorkLane::VisibleWall).await;
         assert!(left.next_work().await.is_some());
         assert!(right.next_work().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn hosted_cross_selection_admission_respects_family_priority() {
+        let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig::default()));
+        let left_selection = selection(21);
+        let right_selection = selection(22);
+        let left = DerivativeCoordinator::with_selection(scheduler.clone(), left_selection);
+        let right = DerivativeCoordinator::with_selection(scheduler.clone(), right_selection);
+        scheduler
+            .enqueue(IndexJob::new("index:unrelated", JobPriority::Visible))
+            .await;
+
+        let low = left
+            .enqueue(
+                screen_key_for(left_selection, fixture_id(1), "left-low"),
+                WorkLane::IdlePreview,
+            )
+            .await;
+        let high = right
+            .enqueue(
+                screen_key_for(right_selection, fixture_id(2), "right-high"),
+                WorkLane::VisibleWall,
+            )
+            .await;
+        assert!(left.next_work().await.is_none());
+        let high_ticket = right
+            .next_work()
+            .await
+            .expect("visible hosted work should win family admission");
+        right.complete(high_ticket, reference()).await;
+        let low_ticket = left
+            .next_work()
+            .await
+            .expect("finite lower-priority hosted work should make progress");
+        left.complete(low_ticket, reference()).await;
+        assert_eq!(low.await.unwrap(), Some(reference()));
+        assert_eq!(high.await.unwrap(), Some(reference()));
     }
 
     #[tokio::test]

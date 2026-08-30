@@ -85,8 +85,14 @@ fn derivative_record_is_valid(root: &Path, record: &photo_catalog::DerivativeRec
     if metadata.len() != record.size_bytes {
         return false;
     }
-    let mut signature = [0_u8; 3];
-    std::io::Read::read_exact(&mut file, &mut signature).is_ok() && signature == [0xff, 0xd8, 0xff]
+    let mut bytes = Vec::new();
+    if std::io::Read::read_to_end(&mut file, &mut bytes).is_err()
+        || u64::try_from(bytes.len()).ok() != Some(record.size_bytes)
+        || bytes.get(..3) != Some(&[0xff, 0xd8, 0xff])
+    {
+        return false;
+    }
+    image::load_from_memory(&bytes).is_ok()
 }
 
 struct ProtectedGroupGuard {
@@ -97,15 +103,31 @@ struct ProtectedGroupGuard {
 struct HostedDriverOwner {
     coordinator: Arc<crate::derivative_coordinator::DerivativeCoordinator>,
     generation: u64,
+    engine: GalleryEngine,
+    runtime: Arc<SelectionRuntime>,
+    active_ticket: Arc<Mutex<Option<WorkTicket>>>,
 }
 
 impl Drop for HostedDriverOwner {
     fn drop(&mut self) {
         let coordinator = self.coordinator.clone();
         let generation = self.generation;
+        let engine = self.engine.clone();
+        let runtime = self.runtime.clone();
+        let active_ticket = self.active_ticket.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
+                let ticket = active_ticket
+                    .lock()
+                    .expect("hosted active ticket poisoned")
+                    .take();
+                if let Some(ticket) = ticket {
+                    coordinator.abort_attempt_as_failure(ticket).await;
+                }
                 coordinator.release_driver_owner(generation).await;
+                if coordinator.pending_job_count().await > 0 {
+                    engine.start_hosted_derivative_driver(runtime).await;
+                }
             });
         }
     }
@@ -215,6 +237,7 @@ pub struct GalleryEngine {
     derivative_admission: Arc<Semaphore>,
     derivative_admission_wake: Arc<Notify>,
     hosted_active: Arc<AtomicUsize>,
+    hosted_admission_owner: Arc<TokioMutex<()>>,
     hosted_publication_fence: Arc<TokioMutex<()>>,
     protected_groups: photo_cache::ProtectedGroups,
     #[cfg(debug_assertions)]
@@ -229,6 +252,12 @@ pub struct GalleryEngine {
     fail_next_join: Arc<AtomicBool>,
     #[cfg(debug_assertions)]
     hosted_commit_publication_test_gate: Arc<TokioMutex<Option<(Arc<Notify>, Arc<Notify>)>>>,
+    #[cfg(debug_assertions)]
+    hosted_commit_post_publication_test_gate: Arc<TokioMutex<Option<(Arc<Notify>, Arc<Notify>)>>>,
+    #[cfg(debug_assertions)]
+    hosted_driver_abort_handle: Arc<TokioMutex<Option<tokio::task::AbortHandle>>>,
+    #[cfg(debug_assertions)]
+    hosted_panic_before_admission: Arc<TokioMutex<bool>>,
 }
 
 impl GalleryEngine {
@@ -305,6 +334,7 @@ impl GalleryEngine {
             derivative_admission: Arc::new(Semaphore::new(4)),
             derivative_admission_wake: Arc::new(Notify::new()),
             hosted_active: Arc::new(AtomicUsize::new(0)),
+            hosted_admission_owner: Arc::new(TokioMutex::new(())),
             hosted_publication_fence: Arc::new(TokioMutex::new(())),
             protected_groups: photo_cache::ProtectedGroups::default(),
             #[cfg(debug_assertions)]
@@ -319,6 +349,9 @@ impl GalleryEngine {
             fail_next_join: Arc::new(AtomicBool::new(false)),
             #[cfg(debug_assertions)]
             hosted_commit_publication_test_gate: Arc::new(TokioMutex::new(None)),
+            hosted_commit_post_publication_test_gate: Arc::new(TokioMutex::new(None)),
+            hosted_driver_abort_handle: Arc::new(TokioMutex::new(None)),
+            hosted_panic_before_admission: Arc::new(TokioMutex::new(false)),
         })
     }
 
@@ -342,6 +375,7 @@ impl GalleryEngine {
             derivative_admission: Arc::new(Semaphore::new(4)),
             derivative_admission_wake: Arc::new(Notify::new()),
             hosted_active: Arc::new(AtomicUsize::new(0)),
+            hosted_admission_owner: Arc::new(TokioMutex::new(())),
             hosted_publication_fence: Arc::new(TokioMutex::new(())),
             protected_groups: photo_cache::ProtectedGroups::default(),
             #[cfg(debug_assertions)]
@@ -356,6 +390,9 @@ impl GalleryEngine {
             fail_next_join: Arc::new(AtomicBool::new(false)),
             #[cfg(debug_assertions)]
             hosted_commit_publication_test_gate: Arc::new(TokioMutex::new(None)),
+            hosted_commit_post_publication_test_gate: Arc::new(TokioMutex::new(None)),
+            hosted_driver_abort_handle: Arc::new(TokioMutex::new(None)),
+            hosted_panic_before_admission: Arc::new(TokioMutex::new(false)),
         }
     }
 
@@ -728,7 +765,8 @@ impl GalleryEngine {
 
         let runtime = self.runtime(selection);
         let _protected =
-            ProtectedGroupGuard::new(self.protected_groups.clone(), selection.group_id)?;
+            ProtectedGroupGuard::new(self.protected_groups.clone(), selection.group_id)
+                .map_err(|_| AppServiceError::DerivativeFailed)?;
         let classes = if request.kind == DerivativeClass::ScreenPreview {
             vec![
                 DerivativeClass::WallThumbnail,
@@ -745,7 +783,7 @@ impl GalleryEngine {
                 }
                 let spec = derivative_spec_for_gallery(asset, class);
                 let key = DerivativeKey::compute(&spec);
-                let existing = {
+                let existing = async {
                     let _publication = self.hosted_publication_fence.lock().await;
                     let mut state = self
                         .state
@@ -756,7 +794,7 @@ impl GalleryEngine {
                         derivative_kind_name_for_gallery(class),
                         key.as_str(),
                     )?;
-                    if let Some(record) = existing.as_ref() {
+                    let result = if let Some(record) = existing.as_ref() {
                         if derivative_record_is_valid(&self.cache_root, record) {
                             state
                                 .libraries
@@ -795,8 +833,11 @@ impl GalleryEngine {
                         }
                     } else {
                         None
-                    }
-                };
+                    };
+                    Ok::<_, AppServiceError>(result)
+                }
+                .await
+                .map_err(|_| AppServiceError::DerivativeFailed)?;
                 if let Some(key) = existing {
                     runtime
                         .publish(WallUpdate::DerivativesReady {
@@ -843,20 +884,28 @@ impl GalleryEngine {
                 runtime.coordinator.invalidate_completed(&work_key).await;
                 let receiver = runtime
                     .coordinator
-                    .enqueue_with_prerequisite_observed(work_key.clone(), lane, prerequisite, None)
+                    .enqueue_hosted_with_prerequisite_observed(
+                        work_key.clone(),
+                        lane,
+                        prerequisite,
+                        None,
+                        self.hosted_scope_authorizer(),
+                    )
                     .await;
                 receivers.push((receiver, work_key));
             }
             if !receivers.is_empty() {
                 self.start_hosted_derivative_driver(runtime.clone()).await;
             }
-            for (receiver, work_key) in receivers {
-                if receiver.await.ok().flatten().is_none() {
-                    return Err(if runtime.coordinator.completed_failure(&work_key).await {
-                        AppServiceError::DerivativeFailed
-                    } else {
-                        AppServiceError::DerivativeUnavailable
-                    });
+            for (receiver, _work_key) in receivers {
+                match receiver.await {
+                    Ok(crate::derivative_coordinator::DerivativeResult::Ready(_)) => {}
+                    Ok(crate::derivative_coordinator::DerivativeResult::Failed) => {
+                        return Err(AppServiceError::DerivativeFailed);
+                    }
+                    Ok(crate::derivative_coordinator::DerivativeResult::Unavailable) | Err(_) => {
+                        return Err(AppServiceError::DerivativeUnavailable);
+                    }
                 }
             }
         }
@@ -888,6 +937,51 @@ impl GalleryEngine {
         }
     }
 
+    fn hosted_scope_authorizer(&self) -> crate::derivative_coordinator::ScopeAuthorizer {
+        let engine = self.clone();
+        Arc::new(move |key, scope| engine.hosted_scope_is_current(key, scope))
+    }
+
+    fn hosted_scope_is_current(&self, key: &WorkKey, scope: GalleryScope) -> bool {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                state
+                    .libraries
+                    .catalog()
+                    .wall_records_for_assets_scoped(key.selection.group_id, scope, &[key.asset_id])
+                    .ok()
+            })
+            .is_some_and(|records| !records.is_empty())
+    }
+
+    /// Reserves one hosted capacity slot and dequeues a job while the shared
+    /// admission owner is held. This makes selection drivers contenders for
+    /// one central admission decision instead of letting each driver consume
+    /// capacity before discovering that another selection has better work.
+    async fn try_admit_hosted_work(
+        &self,
+        runtime: &Arc<SelectionRuntime>,
+    ) -> Option<(WorkTicket, HostedAdmission)> {
+        let _owner = self.hosted_admission_owner.lock().await;
+        let permit = self.derivative_admission.clone().try_acquire_owned().ok()?;
+        if !self.try_hosted_slot() {
+            drop(permit);
+            return None;
+        }
+        let admission = HostedAdmission {
+            permit: Some(permit),
+            active: self.hosted_active.clone(),
+            wake: self.derivative_admission_wake.clone(),
+        };
+        let Some(ticket) = runtime.coordinator.next_work().await else {
+            drop(admission);
+            return None;
+        };
+        Some((ticket, admission))
+    }
+
     #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub async fn install_hosted_commit_publication_test_gate(
@@ -901,6 +995,23 @@ impl GalleryEngine {
     #[cfg(debug_assertions)]
     async fn wait_hosted_commit_publication_test_gate(&self) {
         let gate = self.hosted_commit_publication_test_gate.lock().await.take();
+        let Some((entered, release)) = gate else {
+            return;
+        };
+        let notified = release.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        entered.notify_one();
+        notified.await;
+    }
+
+    #[cfg(debug_assertions)]
+    async fn wait_hosted_commit_post_publication_test_gate(&self) {
+        let gate = self
+            .hosted_commit_post_publication_test_gate
+            .lock()
+            .await
+            .take();
         let Some((entered, release)) = gate else {
             return;
         };
@@ -963,75 +1074,44 @@ impl GalleryEngine {
             return;
         };
         let engine = self.clone();
-        tokio::spawn(async move {
+        let active_ticket = Arc::new(Mutex::new(None));
+        let driver = tokio::spawn(async move {
             let _owner = HostedDriverOwner {
                 coordinator: runtime.coordinator.clone(),
                 generation,
+                engine: engine.clone(),
+                runtime: runtime.clone(),
+                active_ticket: active_ticket.clone(),
             };
             loop {
-                let admission = match engine.derivative_admission.clone().try_acquire_owned() {
-                    Ok(permit) if engine.try_hosted_slot() => HostedAdmission {
-                        permit: Some(permit),
-                        active: engine.hosted_active.clone(),
-                        wake: engine.derivative_admission_wake.clone(),
-                    },
-                    Ok(permit) => {
-                        drop(permit);
-                        let coordinator = runtime.coordinator.clone();
-                        let observed = coordinator.change_generation();
-                        let scheduler_wake = engine
-                            .scheduler
-                            .wait_for_change_since(engine.scheduler.change_generation());
-                        let admission_wake = engine.derivative_admission_wake.notified();
-                        tokio::pin!(scheduler_wake);
-                        tokio::pin!(admission_wake);
-                        tokio::select! {
-                            _ = coordinator.wait_for_change_since(observed) => {}
-                            _ = &mut scheduler_wake => {}
-                            _ = &mut admission_wake => {}
-                        }
-                        continue;
-                    }
-                    Err(_) => {
-                        let coordinator = runtime.coordinator.clone();
-                        let observed = coordinator.change_generation();
-                        let scheduler_observed = engine.scheduler.change_generation();
-                        let scheduler_wake =
-                            engine.scheduler.wait_for_change_since(scheduler_observed);
-                        let admission_wake = engine.derivative_admission_wake.notified();
-                        tokio::pin!(admission_wake);
-                        tokio::pin!(scheduler_wake);
-                        admission_wake.as_mut().enable();
-                        tokio::select! {
-                            _ = coordinator.wait_for_change_since(observed) => {}
-                            _ = &mut scheduler_wake => {}
-                            _ = &mut admission_wake => {}
-                        }
-                        continue;
-                    }
-                };
                 let coordinator = runtime.coordinator.clone();
                 let observed_coordinator = coordinator.change_generation();
                 let observed_scheduler = engine.scheduler.change_generation();
-                let Some(ticket) = coordinator.next_work().await else {
-                    drop(admission);
-                    if coordinator.release_driver_owner_if_idle(generation).await {
-                        break;
+                let Some((ticket, admission)) = engine.try_admit_hosted_work(&runtime).await else {
+                    if coordinator.pending_job_count().await == 0 {
+                        if coordinator.release_driver_owner_if_idle(generation).await {
+                            break;
+                        }
                     }
                     let coordinator_wake = coordinator.wait_for_change_since(observed_coordinator);
                     let scheduler_wake = engine.scheduler.wait_for_change_since(observed_scheduler);
+                    let admission_wake = engine.derivative_admission_wake.notified();
                     tokio::pin!(coordinator_wake);
                     tokio::pin!(scheduler_wake);
+                    tokio::pin!(admission_wake);
                     tokio::select! {
                         _ = &mut coordinator_wake => {}
                         _ = &mut scheduler_wake => {}
+                        _ = &mut admission_wake => {}
                     }
                     continue;
                 };
                 let lane = coordinator.lane(ticket).await;
                 if engine
                     .scheduler
-                    .highest_priority()
+                    .highest_priority_in_family(
+                        crate::derivative_coordinator::SCHEDULER_OWNER_PREFIX,
+                    )
                     .await
                     .is_some_and(|priority| {
                         priority > crate::derivative_coordinator::scheduler_priority(lane)
@@ -1055,6 +1135,7 @@ impl GalleryEngine {
                     drop(admission);
                     continue;
                 };
+                *active_ticket.lock().expect("hosted active ticket poisoned") = Some(ticket);
                 let attempt = tokio::spawn({
                     let engine = engine.clone();
                     let runtime = runtime.clone();
@@ -1065,10 +1146,15 @@ impl GalleryEngine {
                     }
                 });
                 if attempt.await.is_err() {
-                    runtime.coordinator.abort_all_attempts().await;
+                    runtime.coordinator.abort_attempt_as_failure(ticket).await;
                 }
+                *active_ticket.lock().expect("hosted active ticket poisoned") = None;
             }
         });
+        #[cfg(debug_assertions)]
+        {
+            *self.hosted_driver_abort_handle.lock().await = Some(driver.abort_handle());
+        }
     }
 
     async fn process_hosted_derivative(
@@ -1092,6 +1178,10 @@ impl GalleryEngine {
             runtime.coordinator.discard(ticket).await;
             return;
         };
+        #[cfg(debug_assertions)]
+        if self.consume_hosted_panic_before_admission_test_hook().await {
+            panic!("injected hosted derivative panic before commit admission");
+        }
         #[cfg(debug_assertions)]
         self.hosted_attempts.fetch_add(1, Ordering::AcqRel);
         let prerequisite = (key.class == DerivativeClass::ScreenPreview).then(|| {
@@ -1191,7 +1281,7 @@ impl GalleryEngine {
             let mut catalog = Catalog::open(&catalog_path).map_err(AppServiceError::Catalog)?;
             match prepared {
                 HostedDerivativePrepared::Screen(encoded) => generator
-                    .commit_screen_preview(
+                    .commit_screen_preview_repairing(
                         encoded,
                         &spec,
                         group,
@@ -1225,6 +1315,8 @@ impl GalleryEngine {
             Ok(Err(_)) | Err(_) => None,
         };
         if let Some(generated) = result {
+            #[cfg(debug_assertions)]
+            self.wait_hosted_commit_post_publication_test_gate().await;
             // Keep a final defensive fence for mutations made through a
             // separate Catalog connection. If it trips, leave immutable
             // shared state intact and suppress this request's publication.
@@ -1234,6 +1326,7 @@ impl GalleryEngine {
                     .pending_hosted_derivative(&key, generation_scope)
                     .is_none()
             {
+                let _ = self.rollback_hosted_publication(&generated, group);
                 runtime.coordinator.fail_commit(permit).await;
                 return;
             }
@@ -1269,6 +1362,7 @@ impl GalleryEngine {
         let state = self.state.lock().ok()?;
         let asset = state.libraries.catalog().find_asset(key.asset_id).ok()??;
         if asset.media_kind == photo_domain::MediaKind::Video
+            || asset.availability != photo_domain::Availability::Available
             || asset.availability != key.availability
             || state
                 .libraries
@@ -1302,7 +1396,34 @@ impl GalleryEngine {
             .ok()??;
         let root = library.canonical_root_key.to_path_buf().ok()?;
         let relative = asset.relative_path.to_path_buf().ok()?;
-        Some((asset, root.join(relative), spec))
+        let source = root.join(relative);
+        if !std::fs::symlink_metadata(&source).ok()?.is_file() {
+            return None;
+        }
+        Some((asset, source, spec))
+    }
+
+    /// Removes only this requester's link when a post-publication fence finds
+    /// that the staged result is no longer authorized. Shared immutable bytes
+    /// remain available to any other group link; an unlinked row is removed
+    /// before physical cleanup so an orphaned file can never be served by key.
+    fn rollback_hosted_publication(
+        &self,
+        generated: &photo_cache::GeneratedDerivative,
+        group: FolderGroupId,
+    ) -> Result<(), AppServiceError> {
+        let mut catalog = Catalog::open(&self.catalog_path)?;
+        let Some(record) = catalog.find_derivative_by_cache_key(generated.key.as_str())? else {
+            return Ok(());
+        };
+        catalog.remove_derivative_group_links(&[record.id], &[group])?;
+        if catalog
+            .find_derivative_by_cache_key(generated.key.as_str())?
+            .is_none()
+        {
+            CacheWriter::new(&self.cache_root)?.remove_checked(&record.relative_cache_path)?;
+        }
+        Ok(())
     }
 
     fn admitted_hosted_scopes(&self, key: &WorkKey, scopes: &[GalleryScope]) -> Vec<GalleryScope> {
@@ -1328,6 +1449,38 @@ impl GalleryEngine {
         admitted
     }
 
+    #[cfg(debug_assertions)]
+    async fn consume_hosted_panic_before_admission_test_hook(&self) -> bool {
+        let mut hook = self.hosted_panic_before_admission.lock().await;
+        let installed = *hook;
+        *hook = false;
+        installed
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_hosted_derivative_panic_before_admission_test_hook(&self) {
+        *self.hosted_panic_before_admission.lock().await = true;
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_hosted_commit_post_publication_test_gate(
+        &self,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    ) {
+        *self.hosted_commit_post_publication_test_gate.lock().await = Some((entered, release));
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn abort_hosted_derivative_driver_for_test(&self) {
+        if let Some(handle) = self.hosted_driver_abort_handle.lock().await.take() {
+            handle.abort();
+        }
+    }
+
     pub fn open_derivative(&self, opaque_id: &str) -> Result<ManagedDerivative, AppServiceError> {
         if opaque_id.is_empty() || opaque_id.len() > 512 || !opaque_id.is_ascii() {
             return Err(AppServiceError::UnknownAsset);
@@ -1348,10 +1501,13 @@ impl GalleryEngine {
         }
         let writer = CacheWriter::new(&self.cache_root)?;
         let mut file = writer.open_checked(&record.relative_cache_path)?;
-        let mut signature = [0_u8; 12];
-        let size = std::io::Read::read(&mut file, &mut signature)
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes)
             .map_err(|error| AppServiceError::Cache(error.into()))?;
-        if size < 3 || signature[..3] != [0xff, 0xd8, 0xff] {
+        if u64::try_from(bytes.len()).ok() != Some(record.size_bytes)
+            || bytes.get(..3) != Some(&[0xff, 0xd8, 0xff])
+            || image::load_from_memory(&bytes).is_err()
+        {
             return Err(AppServiceError::UnknownAsset);
         }
         std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))

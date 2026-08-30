@@ -132,6 +132,24 @@ fn a_second_identical_request_reuses_the_atomic_cache_file_and_source() {
 }
 
 #[test]
+fn commit_wall_thumbnail_replaces_corrupt_bytes_under_an_immutable_key() {
+    let fixture = fixture();
+    let cache = tempfile::tempdir().unwrap();
+    let generator = ImageDerivativeGenerator::new(cache.path()).unwrap();
+    let requested = spec(DerivativeKind::WallThumbnail, 1024, 1);
+    let first = generator.generate(&fixture.path(), &requested).unwrap();
+    std::fs::write(cache.path().join(&first.relative_path), b"corrupt").unwrap();
+    let encoded = generator
+        .encode_wall_thumbnail(fixture.path(), &requested)
+        .unwrap();
+
+    generator
+        .commit_wall_thumbnail(encoded, &requested)
+        .expect("repair should publish replacement bytes");
+    assert!(image::open(cache.path().join(first.relative_path)).is_ok());
+}
+
+#[test]
 fn controlled_demo_fixture_generation_leaves_source_unchanged() {
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../apps/interface/public/demo-photos/city.jpg");

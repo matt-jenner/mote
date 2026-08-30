@@ -635,7 +635,9 @@ impl AppService {
         }
         let mut ready = Vec::new();
         for receiver in receivers {
-            if let Ok(Some(reference)) = receiver.await {
+            if let Ok(crate::derivative_coordinator::DerivativeResult::Ready(reference)) =
+                receiver.await
+            {
                 ready.push(reference);
             }
         }

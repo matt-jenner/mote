@@ -239,7 +239,7 @@ impl ImageDerivativeGenerator {
         }
         let key = DerivativeKey::compute(spec);
         let relative_path = key.sharded_path("jpg");
-        let write = self.writer.write_atomic(relative_path.clone(), |file| {
+        let write = self.writer.replace_atomic(relative_path.clone(), |file| {
             std::io::Write::write_all(file, &encoded.bytes)
         })?;
         Ok(GeneratedDerivative {
@@ -263,6 +263,53 @@ impl ImageDerivativeGenerator {
         budget: CacheBudget,
         protected: &ProtectedGroups,
     ) -> Result<GeneratedDerivative, ImageDerivativeError> {
+        self.commit_screen_preview_inner(
+            encoded,
+            spec,
+            folder_group_id,
+            catalog,
+            budget,
+            protected,
+            false,
+        )
+    }
+
+    /// Commits a screen preview while replacing bytes under an already-known
+    /// immutable key. Hosted repair uses this path after validating that the
+    /// existing row's bytes are corrupt; ordinary callers retain the normal
+    /// immutable reuse behavior of [`Self::commit_screen_preview`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_screen_preview_repairing(
+        &self,
+        encoded: EncodedScreenPreview,
+        spec: &DerivativeSpec,
+        folder_group_id: FolderGroupId,
+        catalog: &mut Catalog,
+        budget: CacheBudget,
+        protected: &ProtectedGroups,
+    ) -> Result<GeneratedDerivative, ImageDerivativeError> {
+        self.commit_screen_preview_inner(
+            encoded,
+            spec,
+            folder_group_id,
+            catalog,
+            budget,
+            protected,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_screen_preview_inner(
+        &self,
+        encoded: EncodedScreenPreview,
+        spec: &DerivativeSpec,
+        folder_group_id: FolderGroupId,
+        catalog: &mut Catalog,
+        budget: CacheBudget,
+        protected: &ProtectedGroups,
+        replace_existing: bool,
+    ) -> Result<GeneratedDerivative, ImageDerivativeError> {
         validate_spec(spec)?;
         if spec.kind != DerivativeKind::ScreenPreview {
             return Err(ImageDerivativeError::UnsupportedTarget);
@@ -284,9 +331,15 @@ impl ImageDerivativeGenerator {
         let key = DerivativeKey::compute(spec);
         let relative_path = key.sharded_path("jpg");
         let write_started = Instant::now();
-        let write_result = self.writer.write_atomic(relative_path.clone(), |file| {
-            std::io::Write::write_all(file, &encoded.bytes)
-        });
+        let write_result = if replace_existing {
+            self.writer.replace_atomic(relative_path.clone(), |file| {
+                std::io::Write::write_all(file, &encoded.bytes)
+            })
+        } else {
+            self.writer.write_atomic(relative_path.clone(), |file| {
+                std::io::Write::write_all(file, &encoded.bytes)
+            })
+        };
         record_timing_stage("managed_cache_write", write_started);
         let write = write_result?;
         let generated = GeneratedDerivative {

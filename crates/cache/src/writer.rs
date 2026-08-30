@@ -19,9 +19,21 @@ pub struct CacheReconcileReport {
     pub missing_rows_removed: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CacheWriter {
     root: PathBuf,
+    #[cfg(any(test, debug_assertions))]
+    path_race_test_hook:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>>,
+}
+
+impl std::fmt::Debug for CacheWriter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CacheWriter")
+            .field("root", &self.root)
+            .finish()
+    }
 }
 
 impl CacheWriter {
@@ -32,7 +44,34 @@ impl CacheWriter {
         std::fs::create_dir_all(root)?;
         Ok(Self {
             root: root.canonicalize()?,
+            #[cfg(any(test, debug_assertions))]
+            path_race_test_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    /// Installs a one-shot callback immediately before the final path
+    /// component is opened or unlinked.  This narrow seam is only available
+    /// in test/debug builds so Unix/macOS race behavior can be exercised
+    /// deterministically without weakening normal path handling.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn install_path_race_test_hook(&self, hook: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .path_race_test_hook
+            .lock()
+            .expect("cache path race hook poisoned") = Some(hook);
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn run_path_race_test_hook(&self) {
+        let hook = self
+            .path_race_test_hook
+            .lock()
+            .expect("cache path race hook poisoned")
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     pub fn write_atomic<F>(
@@ -43,8 +82,34 @@ impl CacheWriter {
     where
         F: FnOnce(&mut File) -> std::io::Result<()>,
     {
+        self.write_atomic_inner(relative_path, write, false)
+    }
+
+    /// Atomically replaces the bytes at an immutable key. This is reserved
+    /// for repair: a key can still have a regular but corrupt file, and
+    /// treating mere existence as reuse would preserve that corruption.
+    pub fn replace_atomic<F>(
+        &self,
+        relative_path: PathBuf,
+        write: F,
+    ) -> Result<CacheWrite, CacheError>
+    where
+        F: FnOnce(&mut File) -> std::io::Result<()>,
+    {
+        self.write_atomic_inner(relative_path, write, true)
+    }
+
+    fn write_atomic_inner<F>(
+        &self,
+        relative_path: PathBuf,
+        write: F,
+        replace_existing: bool,
+    ) -> Result<CacheWrite, CacheError>
+    where
+        F: FnOnce(&mut File) -> std::io::Result<()>,
+    {
         let final_path = self.resolve_checked(&relative_path)?;
-        if is_regular_file(&final_path)? {
+        if !replace_existing && is_regular_file(&final_path)? {
             return Ok(CacheWrite {
                 relative_path,
                 size_bytes: final_path.metadata()?.len(),
@@ -77,9 +142,27 @@ impl CacheWriter {
         let size_bytes = partial.metadata()?.len();
         drop(partial);
 
-        match std::fs::hard_link(&partial_path, &final_path) {
+        let publish = if replace_existing {
+            match std::fs::rename(&partial_path, &final_path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Windows does not replace an existing destination with
+                    // rename. The destination was validated above and this
+                    // path is used only for an in-process immutable-key
+                    // repair, so remove and retry the atomic rename.
+                    std::fs::remove_file(&final_path)?;
+                    std::fs::rename(&partial_path, &final_path)
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            std::fs::hard_link(&partial_path, &final_path)
+        };
+        match publish {
             Ok(()) => {
-                std::fs::remove_file(&partial_path)?;
+                if !replace_existing {
+                    std::fs::remove_file(&partial_path)?;
+                }
                 Ok(CacheWrite {
                     relative_path,
                     size_bytes,
@@ -87,6 +170,10 @@ impl CacheWriter {
                 })
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if replace_existing {
+                    let _ = std::fs::remove_file(&partial_path);
+                    return Err(CacheError::Write(error));
+                }
                 std::fs::remove_file(&partial_path)?;
                 self.resolve_checked(&relative_path)?;
                 if !is_regular_file(&final_path)? {
@@ -285,6 +372,8 @@ impl CacheWriter {
             unsafe { libc::close(directory_fd) };
             directory_fd = next_fd;
         }
+        #[cfg(any(test, debug_assertions))]
+        self.run_path_race_test_hook();
         let file_fd = unsafe {
             libc::openat(
                 directory_fd,
@@ -348,6 +437,30 @@ impl CacheWriter {
             }
             unsafe { libc::close(directory_fd) };
             directory_fd = next_fd;
+        }
+        #[cfg(any(test, debug_assertions))]
+        self.run_path_race_test_hook();
+        let mut file_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let stat_result = unsafe {
+            libc::fstatat(
+                directory_fd,
+                file_name.as_ptr(),
+                file_stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if stat_result < 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::close(directory_fd) };
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        let file_stat = unsafe { file_stat.assume_init() };
+        if (file_stat.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            unsafe { libc::close(directory_fd) };
+            return Err(CacheError::PathEscape);
         }
         let result = unsafe { libc::unlinkat(directory_fd, file_name.as_ptr(), 0) };
         let error = if result < 0 {

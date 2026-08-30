@@ -171,6 +171,27 @@ async fn family_owned_dequeue_preserves_priority_across_selection_drivers() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn family_priority_ignores_unrelated_index_jobs() {
+    let scheduler = IndexScheduler::new(SchedulerConfig::default());
+    scheduler
+        .enqueue(job(
+            "photo-derivative-coordinator:selection-a:background",
+            JobPriority::IdleLibrary,
+        ))
+        .await;
+    scheduler
+        .enqueue(job("index:visible", JobPriority::Visible))
+        .await;
+
+    assert_eq!(
+        scheduler
+            .highest_priority_in_family("photo-derivative-coordinator:")
+            .await,
+        Some(JobPriority::IdleLibrary)
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn owned_dequeue_discards_stale_foreign_entries_before_owner_barrier() {
     let scheduler = IndexScheduler::new(SchedulerConfig::default());
     scheduler
