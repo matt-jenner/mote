@@ -64,7 +64,7 @@ git status --short
 
 Source-media mutation audit found no source-root `write`, `remove`, `rename`, or `copy` operation in the hosted derivative path. Cache writes and partial-file cleanup are confined to the canonical cache root. DTO and HTTP error paths expose opaque IDs/relative selection breadcrumbs or generic messages; no native source path is serialized. Relevant path-free tests passed, including `wall_dtos_never_serialize_native_paths`, `bootstrap_does_not_expose_a_native_source_path`, and the task-7 source snapshot harness.
 
-## Concern
+## Concern (resolved in fix round 1)
 
 `crates/server/src/api/derivative.rs` calls `Read::read_to_end` and constructs `Body::from(bytes)`, so delivery is safely cache-scoped but currently buffers the complete derivative rather than streaming the managed file. If “managed streaming” is a hard requirement for large derivatives, this should be addressed in a follow-up.
 
@@ -117,4 +117,48 @@ git diff --check
   PASS: no whitespace errors
 ```
 
-All Cargo commands were run one at a time, offline, with `CARGO_BUILD_JOBS=2` and `--jobs 2`; no background build was launched and existing target artifacts were reused. The source-media audit found no hosted derivative write/delete/rename/copy operations under source roots. Cache mutation remains managed-cache-only. The open-check implementation uses descriptor-relative containment verification on Unix/macOS/Windows code paths; no deterministic swap-race harness was added because no safe cross-platform deterministic scheduling hook exists in the current cache test fixtures.
+All Cargo commands were run one at a time, offline, with `CARGO_BUILD_JOBS=2` and `--jobs 2`; no background build was launched and existing target artifacts were reused. The source-media audit found no hosted derivative write/delete/rename/copy operations under source roots. Cache mutation remains managed-cache-only. The open-check implementation uses descriptor-relative opening/containment on Unix/macOS and a Windows no-follow final-handle plus descriptor-containment check; no deterministic swap-race harness was added because no safe cross-platform deterministic scheduling hook exists in the current cache test fixtures.
+
+## Task 5 fix round 2
+
+Implementation/fix commit: `2b4c11e` (`fix: close hosted derivative coordination races`), based on `3aa171a`.
+
+Root-cause RED evidence:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections corrupt_hosted_thumbnail_is_repaired_before_it_is_reused --jobs 2
+  RED: with a live subscription retained, repair returned Err(NotFound); the coordinator replayed its remembered completion after the stale cache row was removed and no worker ran.
+```
+
+The fix invalidates remembered completions when a catalogued cache record is stale, carries requested scope in hosted work keys, rechecks many-to-many selection membership before and after encoding, encodes wall thumbnails before the current-key fence and commits afterward, bounds hosted attempts with shared admission, runs one supervised driver per selection runtime (without engine-wide unfair draining), and restarts queued work after a driver panic. Unix/macOS cache reads and deletes now walk opened no-follow directory descriptors; FIFOs are opened nonblocking and rejected before media use. Windows uses a no-follow final handle and validates its final descriptor before use/deletion. Typed derivative failures now map to explicit HTTP error codes. Added hosted scope/foreign, retained-runtime repair, offline route, route-size guard, FIFO, and safe-delete regressions.
+
+Fix-round GREEN evidence:
+
+- `photo-cache` cache policy: 17 passed, including FIFO rejection and symlinked-ancestor deletion safety.
+- `photo-app-service` library/coordinator tests: 92 passed; hosted selections: 9 passed, including current-folder/foreign membership and live-runtime repair; hosted runtime: 15 passed.
+- `photo-server` derivative API: 2 passed, including offline cache delivery and decoded-ID/query-size guards.
+- Required full workspace command: all unit/integration tests and doc-tests passed, including progressive wall (57), source safety (1), catalog, indexer, metadata, and server suites.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+
+Exact round-2 commands/results:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections corrupt_hosted_thumbnail_is_repaired_before_it_is_reused --jobs 2
+  RED: stale retained completion caused NotFound after repair
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test cache_policy --jobs 2
+  PASS: 17 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections --jobs 2
+  PASS: 9 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --test derivative_api --jobs 2
+  PASS: 2 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --lib --jobs 2
+  PASS: 92 passed, 0 failed
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test --offline --workspace --jobs 2
+  PASS: all workspace tests and doc-tests; 0 failures
+CARGO_BUILD_JOBS=2 cargo fmt --all -- --check
+  PASS: no formatting differences
+git diff --check
+  PASS: no whitespace errors
+```
+
+Round-2 concern: Unix/macOS uses descriptor-relative no-follow component walks for opening and unlinking. Windows avoids following the final reparse point and checks the opened handle’s final path before reading/deleting, but Windows ancestor traversal remains a platform boundary because the standard library has no handle-relative `CreateFile` equivalent; this is explicitly not claimed as descriptor-relative Windows ancestor opening. No Cargo process was launched in the background; the final full gate exited successfully before report generation.
