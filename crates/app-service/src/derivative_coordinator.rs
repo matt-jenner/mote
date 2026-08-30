@@ -34,7 +34,7 @@ impl WorkLane {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct WorkKey {
     pub(crate) selection: SelectionToken,
     pub(crate) asset_id: AssetId,
@@ -43,6 +43,18 @@ pub(crate) struct WorkKey {
     pub(crate) availability: Availability,
     pub(crate) scope: GalleryScope,
 }
+
+impl PartialEq for WorkKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.selection == other.selection
+            && self.asset_id == other.asset_id
+            && self.class == other.class
+            && self.cache_key == other.cache_key
+            && self.availability == other.availability
+    }
+}
+
+impl Eq for WorkKey {}
 
 impl Hash for WorkKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -57,11 +69,6 @@ impl Hash for WorkKey {
             Availability::Unreadable => 3,
         };
         availability.hash(state);
-        match self.scope {
-            GalleryScope::CurrentFolder => 0_u8,
-            GalleryScope::IncludeSubfolders => 1_u8,
-        }
-        .hash(state);
     }
 }
 
@@ -485,7 +492,10 @@ impl DerivativeCoordinator {
 
     pub(crate) async fn next_work(&self) -> Option<WorkTicket> {
         loop {
-            let job = self.scheduler.next_owned(&self.owner_prefix).await?;
+            let job = self
+                .scheduler
+                .next_owned_in_family(&self.owner_prefix, SCHEDULER_OWNER_PREFIX)
+                .await?;
             let result = {
                 let mut state = self.state.lock().await;
                 match state.job_names.get(job.name()).cloned() {

@@ -2,6 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Semaphore;
@@ -182,6 +184,8 @@ pub struct GalleryEngine {
     pub(crate) catalog_path: PathBuf,
     derivative_admission: Arc<Semaphore>,
     protected_groups: photo_cache::ProtectedGroups,
+    #[cfg(debug_assertions)]
+    hosted_attempts: Arc<AtomicUsize>,
     #[cfg(test)]
     fail_next_start: Arc<AtomicBool>,
     #[cfg(test)]
@@ -265,6 +269,8 @@ impl GalleryEngine {
             catalog_path,
             derivative_admission: Arc::new(Semaphore::new(4)),
             protected_groups: photo_cache::ProtectedGroups::default(),
+            #[cfg(debug_assertions)]
+            hosted_attempts: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             fail_next_start: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -295,6 +301,8 @@ impl GalleryEngine {
             catalog_path,
             derivative_admission: Arc::new(Semaphore::new(4)),
             protected_groups: photo_cache::ProtectedGroups::default(),
+            #[cfg(debug_assertions)]
+            hosted_attempts: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             fail_next_start: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -784,6 +792,12 @@ impl GalleryEngine {
         Ok(())
     }
 
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn hosted_derivative_attempts_for_test(&self) -> usize {
+        self.hosted_attempts.load(Ordering::Acquire)
+    }
+
     /// Validates derivative identifiers and selection scope without starting
     /// a scan or touching source media. HTTP callers use this boundary before
     /// admitting work for a selection.
@@ -843,7 +857,39 @@ impl GalleryEngine {
             let driver_runtime = runtime.clone();
             let driver_engine = engine.clone();
             let driver = tokio::spawn(async move {
-                while let Some(ticket) = driver_runtime.coordinator.next_work().await {
+                loop {
+                    let Some(ticket) = driver_runtime.coordinator.next_work().await else {
+                        tokio::task::yield_now().await;
+                        if driver_runtime.coordinator.pending_job_count().await == 0 {
+                            driver_runtime
+                                .derivative_driver_started
+                                .store(false, Ordering::Release);
+                            if driver_runtime.coordinator.pending_job_count().await == 0 {
+                                break;
+                            }
+                            if driver_runtime
+                                .derivative_driver_started
+                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        continue;
+                    };
+                    let lane = driver_runtime.coordinator.lane(ticket).await;
+                    if driver_engine
+                        .scheduler
+                        .highest_priority()
+                        .await
+                        .is_some_and(|priority| {
+                            priority > crate::derivative_coordinator::scheduler_priority(lane)
+                        })
+                    {
+                        driver_runtime.coordinator.requeue(ticket).await;
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
                     let Some(key) = driver_runtime.coordinator.work_key(ticket).await else {
                         continue;
                     };
@@ -880,6 +926,8 @@ impl GalleryEngine {
             runtime.coordinator.discard(ticket).await;
             return;
         };
+        #[cfg(debug_assertions)]
+        self.hosted_attempts.fetch_add(1, Ordering::AcqRel);
         let prerequisite = (key.class == DerivativeClass::ScreenPreview).then(|| {
             DerivativeKey::compute(&derivative_spec_for_gallery(
                 &asset,
@@ -987,6 +1035,34 @@ impl GalleryEngine {
             Ok(Ok(generated)) => Some(generated),
             Ok(Err(_)) | Err(_) => None,
         };
+        if let Some(generated) = result.as_ref()
+            && self.pending_hosted_derivative(&key).is_none()
+        {
+            let relative_path = generated.relative_path.clone();
+            let cache_root = self.cache_root.clone();
+            let catalog_path = self.catalog_path.clone();
+            let cache_key = key.cache_key.clone();
+            let asset_id = key.asset_id;
+            let class = key.class;
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(writer) = CacheWriter::new(&cache_root) {
+                    let _ = writer.remove_checked(&relative_path);
+                }
+                if let Ok(catalog) = Catalog::open(&catalog_path)
+                    && let Ok(Some(record)) = catalog.find_derivative(
+                        asset_id,
+                        derivative_kind_name_for_gallery(class),
+                        &cache_key,
+                    )
+                {
+                    let mut catalog = catalog;
+                    let _ = catalog.delete_derivatives(&[record.id]);
+                }
+            })
+            .await;
+            runtime.coordinator.fail_commit(permit).await;
+            return;
+        }
         if let Some(generated) = result {
             let reference = DerivativeReference {
                 asset_id: asset_id.as_uuid().hyphenated().to_string(),

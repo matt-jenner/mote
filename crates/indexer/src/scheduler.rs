@@ -214,6 +214,69 @@ impl IndexScheduler {
         state.queued.remove(&entry.name).map(|queued| queued.job)
     }
 
+    /// Dequeue an owner job only when it is the highest-priority job in the
+    /// supplied family.  This is used by hosted derivative consumers: each
+    /// selection has its own driver, but the family must still have one
+    /// priority order across all selections.  The check and removal happen
+    /// under the scheduler lock, so two drivers cannot reserve work out of
+    /// order.
+    pub async fn next_owned_in_family(
+        &self,
+        owner_prefix: &str,
+        family_prefix: &str,
+    ) -> Option<IndexJob> {
+        let mut state = self.state.lock().await;
+        let mut heap = std::mem::take(&mut state.heap).into_vec();
+        let mut selected = None;
+        let mut index = 0;
+        while index < heap.len() {
+            let entry = &heap[index];
+            let valid = state.queued.get(&entry.name).is_some_and(|current| {
+                current.sequence == entry.sequence && current.job.priority == entry.priority
+            });
+            if !valid {
+                heap.swap_remove(index);
+                continue;
+            }
+            if entry.name.starts_with(family_prefix)
+                && selected
+                    .as_ref()
+                    .is_none_or(|best: &QueueEntry| entry > best)
+            {
+                selected = Some(entry.clone());
+            }
+            index += 1;
+        }
+        let Some(entry) = selected else {
+            state.heap = BinaryHeap::from(heap);
+            return None;
+        };
+        if !entry.name.starts_with(owner_prefix) {
+            state.heap = BinaryHeap::from(heap);
+            return None;
+        }
+        heap.retain(|queued| queued != &entry);
+        state.heap = BinaryHeap::from(heap);
+        state.queued.remove(&entry.name).map(|queued| queued.job)
+    }
+
+    /// Returns the highest-priority valid queued job without removing it.
+    /// Consumers with per-owner queues use this as a global admission hint so
+    /// a lower-priority owner cannot reserve capacity ahead of visible work.
+    pub async fn highest_priority(&self) -> Option<JobPriority> {
+        let state = self.state.lock().await;
+        state
+            .heap
+            .iter()
+            .filter_map(|entry| {
+                state.queued.get(&entry.name).and_then(|queued| {
+                    (queued.sequence == entry.sequence && queued.job.priority == entry.priority)
+                        .then_some(entry.priority)
+                })
+            })
+            .max()
+    }
+
     pub async fn set_interaction_mode(&self, mode: InteractionMode) {
         let permits = match mode {
             InteractionMode::Idle => self.config.idle_workers,

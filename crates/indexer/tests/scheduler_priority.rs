@@ -122,6 +122,55 @@ async fn owned_dequeue_finds_its_best_job_behind_a_foreign_head() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn family_owned_dequeue_preserves_priority_across_selection_drivers() {
+    let scheduler = IndexScheduler::new(SchedulerConfig::default());
+    scheduler
+        .enqueue(job(
+            "photo-derivative-coordinator:selection-a:background",
+            JobPriority::IdleLibrary,
+        ))
+        .await;
+    scheduler
+        .enqueue(job(
+            "photo-derivative-coordinator:selection-b:visible",
+            JobPriority::Visible,
+        ))
+        .await;
+
+    assert!(
+        scheduler
+            .next_owned_in_family(
+                "photo-derivative-coordinator:selection-a:",
+                "photo-derivative-coordinator:"
+            )
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        scheduler
+            .next_owned_in_family(
+                "photo-derivative-coordinator:selection-b:",
+                "photo-derivative-coordinator:"
+            )
+            .await
+            .unwrap()
+            .name(),
+        "photo-derivative-coordinator:selection-b:visible"
+    );
+    assert_eq!(
+        scheduler
+            .next_owned_in_family(
+                "photo-derivative-coordinator:selection-a:",
+                "photo-derivative-coordinator:"
+            )
+            .await
+            .unwrap()
+            .name(),
+        "photo-derivative-coordinator:selection-a:background"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn owned_dequeue_discards_stale_foreign_entries_before_owner_barrier() {
     let scheduler = IndexScheduler::new(SchedulerConfig::default());
     scheduler

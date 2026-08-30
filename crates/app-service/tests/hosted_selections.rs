@@ -423,6 +423,7 @@ async fn corrupt_hosted_thumbnail_is_repaired_before_it_is_reused() {
         .unwrap();
     let repaired = std::fs::read(cache_path).unwrap();
     assert_eq!(&repaired[..3], &[0xff, 0xd8, 0xff]);
+    let attempts_before = engine.hosted_derivative_attempts_for_test();
 
     let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
     let record = catalog.find_derivative_by_cache_key(&key).unwrap().unwrap();
@@ -440,7 +441,7 @@ async fn corrupt_hosted_thumbnail_is_repaired_before_it_is_reused() {
         ),
         second.request_derivatives(
             &second_selection,
-            photo_app_service::GalleryScope::CurrentFolder,
+            photo_app_service::GalleryScope::IncludeSubfolders,
             photo_app_service::DerivativeRequest::visible(vec![asset_id]),
         )
     );
@@ -449,4 +450,8 @@ async fn corrupt_hosted_thumbnail_is_repaired_before_it_is_reused() {
     let repaired = std::fs::read(cache_path).unwrap();
     assert!(repaired.len() > 3);
     assert_eq!(&repaired[..3], &[0xff, 0xd8, 0xff]);
+    assert_eq!(
+        engine.hosted_derivative_attempts_for_test(),
+        attempts_before + 1
+    );
 }
