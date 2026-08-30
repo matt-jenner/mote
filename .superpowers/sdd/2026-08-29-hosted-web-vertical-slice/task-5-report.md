@@ -590,3 +590,62 @@ All Cargo commands ran serially in the foreground and offline with `CARGO_BUILD_
 ## Round-9 evidence limits
 
 The two new regressions are macOS-executed in-process hosted cancellation tests. Round 9 did not change Windows-specific code and does not claim Windows compile or runtime evidence. It also does not claim a cross-process cache/catalog transaction. The lease closes the in-process supervisor/attempt ownership transitions under review while preserving the existing managed-cache, source-read-only, and desktop contracts.
+
+## Task 5 exceptional fix round 10
+
+Implementation/test commit: `a96ba93` (`fix: recover dropped hosted publications`), based on `63e22de`.
+
+Authorization now places the captured `CommitDelivery` in a single-take slot owned by the coordinator ticket. The returned `HostedPublication` references that slot instead of owning the senders by itself. Normal finish and failure recovery compete for the same `Option`, so exactly one terminal path can take it. The winning path transfers the delivery to one bounded owned task before awaiting, preserving the existing cancellation-safe delivery behavior.
+
+If a hosted child panics after authorization, driver recovery takes the remaining delivery as `Failed`. If the child returns after dropping its publication token, normal driver completion performs the same recovery. If the driver was already dropped while publication owned the round-9 attempt lease, owner cleanup waits for the lease to finish and then recovers any delivery still in the ticket before releasing driver generation. A successful finish has already taken the slot and removed the ticket, so later recovery is a no-op. No recovery path emits a ready event.
+
+The two deterministic regressions pause immediately after publication authorization. One injects a Rust panic and the other drops the token and returns normally. Both assert exact `DerivativeFailed`, zero pending coordinator jobs, no derivative row or ready event for the faulted asset, queued sibling completion, one sibling row/event, and an unchanged source sentinel.
+
+Round-10 behavioral RED evidence:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test -p photo-app-service --test hosted_selections hosted_post_authorization_ --offline --jobs 2 -- --nocapture
+  RED: 0 passed, 2 failed
+  FAIL: hosted_post_authorization_panic_delivers_typed_failure_and_clears_job
+  FAIL: hosted_post_authorization_drop_delivers_typed_failure_and_clears_job
+  Both returned Err(DerivativeUnavailable) and retained exactly 1 coordinator job.
+```
+
+Round-10 focused GREEN and final evidence:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test -p photo-app-service --test hosted_selections hosted_post_authorization_ --offline --jobs 2 -- --nocapture
+  PASS: 2 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test -p photo-app-service --test hosted_selections hosted_cancellation_transition_yields_to_publication_authorized_after_drop_starts --offline --jobs 2 -- --nocapture
+  PASS: 1 passed, 0 failed; successful finish won before later owner cleanup
+CARGO_BUILD_JOBS=2 cargo test -p photo-app-service --test hosted_selections hosted_driver_drop_aborts_active_attempt_without_stale_publication --offline --jobs 2
+  PASS: 1 passed, 0 failed; pre-publication cancellation remained Unavailable
+CARGO_BUILD_JOBS=2 cargo test -p photo-app-service --test hosted_selections --offline --jobs 2
+  PASS: 26 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test -p photo-app-service --lib --offline --jobs 2
+  PASS: 102 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test -p photo-app-service --test progressive_wall cancelled_ --offline --jobs 2
+  PASS: 3 passed, 0 failed, including both desktop started-blocking-work cancellation tests
+CARGO_BUILD_JOBS=2 cargo test -p photo-app-service --test hosted_runtime --offline --jobs 2
+  PASS: 16 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test -p photo-server --test derivative_api --offline --jobs 2
+  PASS: 3 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo fmt --all
+  PASS: formatting completed
+CARGO_BUILD_JOBS=2 cargo fmt --all -- --check
+  PASS: no formatting differences
+git diff --check
+  PASS: no whitespace errors
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test --offline --workspace --jobs 2
+  PASS: all workspace unit/integration tests and doc-tests; 0 failures
+  PASS: app-service lib 102, hosted selections 26, hosted runtime 16,
+        progressive wall 57, task-7 source safety 1, cache policy 25,
+        cache image derivatives 15, catalog round trip 13,
+        derivative HTTP 3, and all remaining workspace suites
+```
+
+All Cargo commands ran serially in the foreground and offline with `CARGO_BUILD_JOBS=2`; test commands used `--jobs 2`. No background command or `cargo clean` was used. The full workspace gate ran exactly once and was the final Cargo command, after all source/test edits, formatting, and the implementation/test commit. No source or test file changed afterward, and every foreground Cargo command exited. Process enumeration remains restricted on this host; cleanup confirmation is based on those exited foreground sessions and the fact that no background build was launched.
+
+## Round-10 evidence limits
+
+The new fault tests are macOS-executed in-process hosted publication tests. Round 10 did not change Windows-specific code and does not claim Windows compile or runtime evidence. It also does not claim a cross-process cache/catalog transaction. The ticket-owned slot protects in-process terminal delivery; the existing cache, catalog, source-read-only, managed GET, and desktop contracts remain unchanged.
