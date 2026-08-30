@@ -267,6 +267,255 @@
 	border: 0;
 }
 
+.hostedFolderBackdrop {
+	position: fixed;
+	inset: var(--safe-area-top) var(--safe-area-right) var(--safe-area-bottom)
+		var(--safe-area-left);
+	z-index: 40;
+	display: grid;
+	place-items: center;
+	padding: var(--space-6);
+	background: var(--overlay-scrim);
+}
+
+.hostedFolderSurface {
+	display: flex;
+	flex-direction: column;
+	width: min(640px, 100%);
+	height: min(70vh, 680px);
+	min-height: 360px;
+	overflow: hidden;
+	background: var(--canvas-elevated);
+	border: 1px solid var(--separator);
+	border-radius: var(--radius-medium);
+	box-shadow: var(--overlay-shadow);
+	transition:
+		opacity var(--sheet-duration) ease,
+		transform var(--sheet-duration) ease;
+}
+
+.hostedFolderReducedMotion {
+	transition: none;
+}
+
+.hostedFolderHeader {
+	display: flex;
+	flex: 0 0 auto;
+	align-items: center;
+	justify-content: space-between;
+	min-height: 72px;
+	padding: var(--space-3) var(--space-4) var(--space-3) var(--space-6);
+	border-bottom: 1px solid var(--separator);
+}
+
+.hostedFolderEyebrow {
+	display: block;
+	margin-bottom: 2px;
+	color: var(--text-secondary);
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+}
+
+.hostedFolderTitle {
+	margin: 0;
+	font-size: 18px;
+	font-weight: 590;
+	letter-spacing: -0.02em;
+}
+
+.hostedFolderNavigationRow {
+	display: flex;
+	flex: 0 0 auto;
+	align-items: center;
+	gap: var(--space-2);
+	min-height: 52px;
+	padding: 0 var(--space-4);
+	border-bottom: 1px solid var(--separator);
+}
+
+.hostedFolderBack,
+.hostedBreadcrumbs button,
+.hostedFolderError button {
+	border: 0;
+	border-radius: var(--radius-small);
+	cursor: pointer;
+}
+
+.hostedFolderBack {
+	display: inline-flex;
+	flex: 0 0 auto;
+	align-items: center;
+	gap: 6px;
+	min-height: 36px;
+	padding: 0 var(--space-2);
+	background: transparent;
+}
+
+.hostedFolderBack:disabled,
+.hostedBreadcrumbs button:disabled {
+	color: var(--unavailable);
+	cursor: default;
+}
+
+.hostedBreadcrumbs {
+	min-width: 0;
+	overflow-x: auto;
+	color: var(--text-secondary);
+	font-size: 13px;
+	scrollbar-width: thin;
+}
+
+.hostedBreadcrumbs ol,
+.hostedBreadcrumbs li {
+	display: flex;
+	align-items: center;
+}
+
+.hostedBreadcrumbs ol {
+	min-width: max-content;
+	padding: 0;
+	margin: 0;
+	list-style: none;
+}
+
+.hostedBreadcrumbs li {
+	gap: 2px;
+}
+
+.hostedBreadcrumbs button,
+.hostedBreadcrumbs span {
+	display: inline-flex;
+	align-items: center;
+	min-height: 36px;
+	padding: 0 6px;
+	background: transparent;
+}
+
+.hostedBreadcrumbs span[aria-current="page"] {
+	color: var(--text-primary);
+	font-weight: 560;
+}
+
+.hostedFolderBody {
+	flex: 1 1 auto;
+	min-height: 0;
+	padding: var(--space-3) var(--space-4);
+	overflow-y: auto;
+	background: color-mix(in srgb, var(--canvas) 72%, var(--canvas-elevated));
+}
+
+.hostedFolderError {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: var(--space-3);
+	min-height: 44px;
+	padding: var(--space-2) var(--space-3);
+	margin-bottom: var(--space-3);
+	font-size: 13px;
+	line-height: 1.4;
+	background: var(--selection);
+	border: 1px solid var(--separator);
+	border-radius: var(--radius-small);
+}
+
+.hostedFolderError button {
+	min-height: 36px;
+	padding: 0 var(--space-3);
+	font-weight: 580;
+	background: var(--control);
+}
+
+.hostedFolderList {
+	display: grid;
+	gap: 2px;
+	padding: 0;
+	margin: 0;
+	list-style: none;
+}
+
+.hostedFolderList button {
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr) auto;
+	align-items: center;
+	gap: var(--space-3);
+	width: 100%;
+	min-height: 48px;
+	padding: 0 var(--space-3);
+	text-align: left;
+	background: transparent;
+	border: 0;
+	border-radius: var(--radius-small);
+	cursor: pointer;
+}
+
+.hostedFolderList button:disabled {
+	color: var(--unavailable);
+	cursor: default;
+}
+
+.hostedFolderList button span {
+	overflow: hidden;
+	font-size: 14px;
+	font-weight: 520;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.hostedFolderStatus {
+	padding: var(--space-6);
+	margin: 0;
+	color: var(--text-secondary);
+	font-size: 13px;
+	text-align: center;
+}
+
+.hostedFolderFooter {
+	display: flex;
+	flex: 0 0 auto;
+	align-items: center;
+	justify-content: flex-end;
+	gap: var(--space-3);
+	min-height: 64px;
+	padding: var(--space-2) var(--space-4);
+	border-top: 1px solid var(--separator);
+}
+
+.hostedFolderBusyText {
+	margin-right: auto;
+	color: var(--text-secondary);
+	font-size: 12px;
+}
+
+.hostedFolderSheet {
+	width: 100%;
+	height: 100%;
+	max-width: none;
+	max-height: none;
+	border-radius: 0;
+}
+
+.hostedFolderBackdropSheet {
+	padding: 0;
+}
+
+@media (hover: hover) {
+	.hostedFolderBack:not(:disabled):hover,
+	.hostedBreadcrumbs button:not(:disabled):hover,
+	.hostedFolderList button:not(:disabled):hover,
+	.hostedFolderError button:not(:disabled):hover {
+		background: var(--control-hover);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.hostedFolderSurface {
+		transition: none;
+	}
+}
+
 @media (min-width: 640px) and (max-width: 899px) {
 	.appShell {
 		grid-template-columns: 56px minmax(0, 1fr);
@@ -375,5 +624,34 @@
 
 	.radioOption {
 		min-height: 48px;
+	}
+
+	.hostedFolderBackdrop {
+		padding: 0;
+	}
+
+	.hostedFolderSurface {
+		width: 100%;
+		height: 100%;
+		min-height: 0;
+		border-radius: 0;
+	}
+
+	.hostedFolderHeader {
+		min-height: 64px;
+		padding-left: var(--space-4);
+	}
+
+	.hostedFolderNavigationRow {
+		padding-inline: var(--space-2);
+	}
+
+	.hostedFolderBody {
+		padding-inline: var(--space-3);
+	}
+
+	.hostedFolderFooter {
+		min-height: 68px;
+		padding-inline: var(--space-3);
 	}
 }

@@ -4,7 +4,16 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { PhotoServiceProvider } from "../app/PhotoServiceContext";
-import { createInMemoryPhotoService } from "../services/inMemoryPhotoService";
+import {
+	createInMemoryPhotoService,
+	type InMemoryPhotoService,
+} from "../services/inMemoryPhotoService";
+import type {
+	BootstrapState,
+	FolderBreadcrumb,
+	FolderListing,
+	PhotoService,
+} from "../services/photoService";
 import "../styles/tokens.css";
 import "../styles/global.css";
 import { AppShell } from "./AppShell";
@@ -44,7 +53,9 @@ function contrastRatio(foreground: string, background: string): number {
 }
 
 function renderApp(
-	service = createInMemoryPhotoService({ selectedFolderName: "Iceland 2025" }),
+	service: PhotoService = createInMemoryPhotoService({
+		selectedFolderName: "Iceland 2025",
+	}),
 ) {
 	const queryClient = new QueryClient({
 		defaultOptions: {
@@ -59,6 +70,129 @@ function renderApp(
 			</PhotoServiceProvider>
 		</QueryClientProvider>,
 	);
+}
+
+function hostedFolderService(): PhotoService {
+	const memory = createInMemoryPhotoService({ cancelFolderPicker: true });
+	return {
+		...memory,
+		capabilities: {
+			chooseFolder: true,
+			folderSelection: "hosted",
+			locateFolder: false,
+		},
+		chooseFolder: async () => {
+			throw new Error("Hosted mode must not open the native picker");
+		},
+		listFolders: async () => ({
+			path: "",
+			breadcrumbs: [],
+			children: [{ name: "Trips", path: "Trips" }],
+		}),
+	};
+}
+
+function hostedGalleryService(): {
+	service: PhotoService;
+	memory: InMemoryPhotoService;
+} {
+	const memory = createInMemoryPhotoService({
+		cancelFolderPicker: true,
+		wallAssets: [
+			{
+				id: "aurora",
+				displayName: "Aurora",
+				mediaKind: "jpeg",
+				provisionalOrder: 1,
+				capturedAtUtc: "2025-01-01T12:00:00Z",
+				dateState: "settled",
+				width: 1200,
+				height: 800,
+				representativeRgb: 0x3d536b,
+				shapeState: "ready",
+				availability: "available",
+				warning: null,
+				wallThumbnail: {
+					assetId: "aurora",
+					kind: "wallThumbnail",
+					key: "aurora-wall",
+				},
+				screenPreview: null,
+				rating: null,
+				wallThumbnailUrl: "/demo-photos/coast.jpg",
+			},
+		],
+	});
+	let breadcrumbs: FolderBreadcrumb[] = [];
+	let state: BootstrapState = {
+		settings: { appearance: "system", galleryScope: "includeSubfolders" },
+		activeSource: null,
+	};
+	const listings: Record<string, FolderListing> = {
+		"": {
+			path: "",
+			breadcrumbs: [],
+			children: [{ name: "Trips", path: "Trips" }],
+		},
+		Trips: {
+			path: "Trips",
+			breadcrumbs: [{ name: "Trips", path: "Trips" }],
+			children: [{ name: "Iceland", path: "Trips/Iceland" }],
+		},
+		"Trips/Iceland": {
+			path: "Trips/Iceland",
+			breadcrumbs: [
+				{ name: "Trips", path: "Trips" },
+				{ name: "Iceland", path: "Trips/Iceland" },
+			],
+			children: [{ name: "Processed", path: "Trips/Iceland/Processed" }],
+		},
+	};
+	const service: PhotoService = {
+		...memory,
+		capabilities: {
+			chooseFolder: true,
+			folderSelection: "hosted",
+			locateFolder: false,
+		},
+		getBootstrapState: async () => structuredClone(state),
+		chooseFolder: async () => {
+			throw new Error("Hosted mode must not open the native picker");
+		},
+		updateAppearance: async (appearance) => {
+			state = { ...state, settings: { ...state.settings, appearance } };
+			return structuredClone(state);
+		},
+		updateGalleryScope: async (galleryScope) => {
+			state = { ...state, settings: { ...state.settings, galleryScope } };
+			return structuredClone(state);
+		},
+		listFolders: async (path) => {
+			const listing = listings[path];
+			if (!listing) throw new Error("That folder is unavailable.");
+			return structuredClone(listing);
+		},
+		selectFolder: async (path) => {
+			const listing = listings[path];
+			if (!listing) throw new Error("That folder is unavailable.");
+			breadcrumbs = structuredClone([...listing.breadcrumbs]);
+			state = {
+				...state,
+				activeSource: {
+					id: "memory-source",
+					selectionId: "memory-selection-1",
+					displayName: listing.breadcrumbs.at(-1)?.name ?? "Photos",
+					availability: "available",
+				},
+			};
+			return { kind: "selected", state: structuredClone(state) };
+		},
+		folderBrowserState: () => ({
+			breadcrumbs: structuredClone(breadcrumbs),
+			initialPath: breadcrumbs.at(-1)?.path ?? "",
+		}),
+	};
+	return { service, memory };
 }
 
 describe("open and return shell", () => {
@@ -79,6 +213,83 @@ describe("open and return shell", () => {
 		await screen.getByRole("button", { name: "Choose Folder" }).click();
 		await expect.element(screen.getByText("Iceland 2025")).toBeVisible();
 		await expect.element(screen.getByText("Folder ready")).toBeVisible();
+	});
+
+	it("opens the contained folder browser instead of the native picker in hosted mode", async () => {
+		const screen = await renderApp(hostedFolderService());
+		await screen.getByRole("button", { name: "Folders", exact: true }).click();
+
+		await expect
+			.element(screen.getByRole("dialog", { name: "Choose a folder" }))
+			.toBeVisible();
+		await expect
+			.element(screen.getByRole("button", { name: "Trips" }))
+			.toBeVisible();
+	});
+
+	it("selects a hosted folder, restores its breadcrumbs, and opens the existing viewer", async () => {
+		const { service, memory } = hostedGalleryService();
+		const screen = await renderApp(service);
+		await screen.getByRole("button", { name: "Folders", exact: true }).click();
+		await screen.getByRole("button", { name: "Trips" }).click();
+		await screen.getByRole("button", { name: "Iceland" }).click();
+		await screen.getByRole("button", { name: "Open this folder" }).click();
+
+		expect(
+			screen.getByRole("dialog", { name: "Choose a folder" }).query(),
+		).toBeNull();
+		await expect
+			.element(
+				screen
+					.getByRole("region", { name: "Photo workspace" })
+					.getByText("Iceland", { exact: true }),
+			)
+			.toBeVisible();
+
+		await memory.finishFixtureScan();
+		const photo = screen.getByRole("button", {
+			name: "Open Aurora",
+			exact: true,
+		});
+		await expect.element(photo).toBeVisible();
+		await photo.click();
+		await expect
+			.element(screen.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		await screen.getByRole("button", { name: "Back to photos" }).click();
+
+		await screen.getByRole("button", { name: "Folders", exact: true }).click();
+		await expect
+			.element(
+				screen
+					.getByRole("navigation", { name: "Folder path" })
+					.getByText("Iceland", { exact: true }),
+			)
+			.toBeVisible();
+		await expect
+			.element(screen.getByRole("button", { name: "Processed" }))
+			.toBeVisible();
+		expect(screen.getByText("Locate Folder").query()).toBeNull();
+	});
+
+	it("opens the hosted sheet from the phone sources drawer and restores its trigger", async () => {
+		await page.viewport(390, 844);
+		const screen = await renderApp(hostedFolderService());
+		const sources = screen.getByRole("button", { name: "Open sources" });
+		await sources.click();
+		await screen.getByRole("button", { name: "Folders", exact: true }).click();
+
+		const dialog = screen.getByRole("dialog", { name: "Choose a folder" });
+		await expect.element(dialog).toBeVisible();
+		expect(
+			screen.getByRole("dialog", { name: "Sources drawer" }).query(),
+		).toBeNull();
+		const bounds = dialog.element().getBoundingClientRect();
+		expect(bounds.width).toBeCloseTo(390, 0);
+		expect(bounds.height).toBeCloseTo(844, 0);
+
+		await userEvent.keyboard("{Escape}");
+		await expect.poll(() => document.activeElement).toBe(sources.element());
 	});
 
 	it("applies an explicit dark override", async () => {

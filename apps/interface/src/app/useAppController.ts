@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import type {
 	Appearance,
 	BootstrapState,
+	ChooseFolderResult,
 	GalleryScope,
 } from "../services/photoService";
 import { applyAppearance } from "../theme/applyAppearance";
@@ -13,6 +14,11 @@ const bootstrapKey = ["bootstrap"] as const;
 export function useAppController() {
 	const service = usePhotoService();
 	const queryClient = useQueryClient();
+	const acceptFolderSelection = (result: ChooseFolderResult) => {
+		if (result.kind === "selected") {
+			queryClient.setQueryData<BootstrapState>(bootstrapKey, result.state);
+		}
+	};
 	const bootstrap = useQuery({
 		queryKey: bootstrapKey,
 		queryFn: () => service.getBootstrapState(),
@@ -24,11 +30,7 @@ export function useAppController() {
 
 	const folder = useMutation({
 		mutationFn: () => service.chooseFolder(),
-		onSuccess(result) {
-			if (result.kind === "selected") {
-				queryClient.setQueryData<BootstrapState>(bootstrapKey, result.state);
-			}
-		},
+		onSuccess: acceptFolderSelection,
 	});
 	const appearance = useMutation({
 		mutationFn: (value: Appearance) => service.updateAppearance(value),
@@ -51,6 +53,7 @@ export function useAppController() {
 			bootstrap.error ?? folder.error ?? appearance.error ?? galleryScope.error,
 		capabilities: service.capabilities,
 		chooseFolder: folder.mutate,
+		acceptFolderSelection,
 		updateAppearance: appearance.mutate,
 		updateGalleryScope: galleryScope.mutate,
 	};

@@ -11,9 +11,11 @@ import {
 import { usePhotoService } from "../app/PhotoServiceContext";
 import { useAppController } from "../app/useAppController";
 import { usePhotoWall } from "../app/usePhotoWall";
+import type { PhotoService } from "../services/photoService";
 import styles from "../styles/appShell.module.css";
 import { initialViewerState, viewerReducer } from "../viewer/viewerReducer";
 import { AppearanceMenu } from "./AppearanceMenu";
+import { HostedFolderBrowser } from "./HostedFolderBrowser";
 import { NavigationRail } from "./NavigationRail";
 import { PhotoViewerOverlay } from "./PhotoViewerOverlay";
 import { SourceCanvas } from "./SourceCanvas";
@@ -23,6 +25,9 @@ export function AppShell() {
 	const controller = useAppController();
 	const service = usePhotoService();
 	const [drawerOpen, setDrawerOpen] = useState(false);
+	const [folderBrowserBreadcrumbs, setFolderBrowserBreadcrumbs] = useState<
+		ReturnType<PhotoService["folderBrowserState"]>["breadcrumbs"] | null
+	>(null);
 	const [viewer, dispatchViewer] = useReducer(
 		viewerReducer,
 		initialViewerState,
@@ -36,13 +41,34 @@ export function AppShell() {
 	const drawerRef = useRef<HTMLElement>(null);
 	const drawerTriggerRef = useRef<HTMLButtonElement>(null);
 	const drawerCloseRef = useRef<HTMLButtonElement>(null);
+	const permanentFolderTriggerRef = useRef<HTMLButtonElement>(null);
+	const folderRestoreFocusRef = useRef<HTMLElement | null>(null);
 	const drawerWasOpen = useRef(false);
+	const restoreFolderFocusPendingRef = useRef(false);
+	const folderBrowserOpen = folderBrowserBreadcrumbs !== null;
 	const source = controller.state?.activeSource ?? null;
 	const galleryScope =
 		controller.state?.settings.galleryScope ?? "includeSubfolders";
 	const wall = usePhotoWall(source?.selectionId ?? null, galleryScope);
 	const appearance = controller.state?.settings.appearance ?? "system";
-	const chooseFolder = () => controller.chooseFolder();
+	const chooseFolder = () => {
+		if (controller.capabilities.folderSelection === "native") {
+			controller.chooseFolder();
+			return;
+		}
+		const activeElement = document.activeElement;
+		folderRestoreFocusRef.current =
+			activeElement instanceof HTMLElement && activeElement !== document.body
+				? activeElement
+				: drawerOpen
+					? drawerTriggerRef.current
+					: permanentFolderTriggerRef.current;
+		setFolderBrowserBreadcrumbs(service.folderBrowserState().breadcrumbs);
+	};
+	const closeFolderBrowser = () => {
+		restoreFolderFocusPendingRef.current = true;
+		setFolderBrowserBreadcrumbs(null);
+	};
 	const handleOpenViewer = useCallback(
 		(assetId: string) => {
 			const asset = wall.state.items.find((item) => item.id === assetId);
@@ -146,9 +172,19 @@ export function AppShell() {
 		}
 		if (drawerWasOpen.current) {
 			drawerWasOpen.current = false;
-			drawerTriggerRef.current?.focus();
+			if (!folderBrowserOpen) drawerTriggerRef.current?.focus();
 		}
-	}, [drawerOpen]);
+	}, [drawerOpen, folderBrowserOpen]);
+
+	useLayoutEffect(() => {
+		if (folderBrowserOpen || !restoreFolderFocusPendingRef.current) return;
+		restoreFolderFocusPendingRef.current = false;
+		const restoreFocus = folderRestoreFocusRef.current;
+		if (restoreFocus?.isConnected) restoreFocus.focus();
+		else if (drawerTriggerRef.current?.isConnected)
+			drawerTriggerRef.current.focus();
+		else permanentFolderTriggerRef.current?.focus();
+	}, [folderBrowserOpen]);
 
 	useEffect(() => {
 		const phoneViewport = window.matchMedia("(max-width: 639px)");
@@ -192,13 +228,16 @@ export function AppShell() {
 			<NavigationRail
 				chooseFolderAvailable={controller.capabilities.chooseFolder}
 				className={styles.permanentRail}
-				inert={drawerOpen || viewer.open}
+				folderBrowserOpen={folderBrowserOpen}
+				folderButtonRef={permanentFolderTriggerRef}
+				folderSelection={controller.capabilities.folderSelection}
+				inert={drawerOpen || viewer.open || folderBrowserOpen}
 				onChooseFolder={chooseFolder}
 			/>
 			<section
 				aria-label="Photo workspace"
 				className={styles.workspace}
-				inert={drawerOpen || viewer.open}
+				inert={drawerOpen || viewer.open || folderBrowserOpen}
 			>
 				<header className={styles.toolbar}>
 					<button
@@ -276,6 +315,17 @@ export function AppShell() {
 					nextCursor={wall.state.cursor}
 				/>
 			) : null}
+			{folderBrowserBreadcrumbs ? (
+				<HostedFolderBrowser
+					initialBreadcrumbs={folderBrowserBreadcrumbs}
+					onClose={closeFolderBrowser}
+					onSelected={(result) => {
+						controller.acceptFolderSelection(result);
+						closeFolderBrowser();
+					}}
+					service={service}
+				/>
+			) : null}
 			{drawerOpen ? (
 				<div className={styles.drawerBackdrop}>
 					<section
@@ -301,6 +351,8 @@ export function AppShell() {
 						<NavigationRail
 							chooseFolderAvailable={controller.capabilities.chooseFolder}
 							className={styles.drawerNavigation}
+							folderBrowserOpen={folderBrowserOpen}
+							folderSelection={controller.capabilities.folderSelection}
 							onChooseFolder={() => {
 								chooseFolder();
 								setDrawerOpen(false);
