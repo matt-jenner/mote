@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { hostedPreferencesStorageKey } from "./browserPreferences";
+import {
+	hostedClientStorageKey,
+	hostedPreferencesStorageKey,
+} from "./browserPreferences";
 import {
 	createHttpPhotoService,
 	type EventSourceLike,
@@ -69,8 +72,12 @@ class FakeEventSource implements EventSourceLike {
 	}
 
 	emit(update: unknown, lastEventId: string): void {
+		this.emitRaw(JSON.stringify(update), lastEventId);
+	}
+
+	emitRaw(data: string, lastEventId: string): void {
 		const event = {
-			data: JSON.stringify(update),
+			data,
 			lastEventId,
 		} as MessageEvent<string>;
 		for (const listener of this.listeners.get("wallUpdate") ?? []) {
@@ -98,6 +105,43 @@ const selectionSummary = {
 		{ name: "Iceland", path: "Trips/Iceland" },
 	],
 	availability: "available",
+};
+
+const secondSelectionSummary = {
+	id: "selection-b",
+	sourceId: "source-b",
+	displayName: "Alps",
+	breadcrumbs: [
+		{ name: "Trips", path: "Trips" },
+		{ name: "Alps", path: "Trips/Alps" },
+	],
+	availability: "rootOffline",
+};
+
+const representativeAsset = {
+	id: "asset-a",
+	displayName: "Aurora.jpg",
+	mediaKind: "jpeg",
+	provisionalOrder: 7,
+	capturedAtUtc: "2025-01-02T03:04:05Z",
+	dateState: "settled",
+	width: 1600,
+	height: 900,
+	representativeRgb: 0x123456,
+	shapeState: "ready",
+	availability: "available",
+	warning: { code: "screenPreviewUnavailable", retryable: true },
+	wallThumbnail: {
+		assetId: "asset-a",
+		kind: "wallThumbnail",
+		key: "wall/cache-a",
+	},
+	screenPreview: {
+		assetId: "asset-a",
+		kind: "screenPreview",
+		key: "screen/cache-a",
+	},
+	rating: 4,
 };
 
 const emptyWallPage = {
@@ -148,11 +192,92 @@ function requestBody(request: RecordedRequest): unknown {
 	return JSON.parse(request.init.body);
 }
 
+function recordedState(request: RecordedRequest): unknown {
+	const body = requestBody(request);
+	return typeof body === "object" && body !== null && "state" in body
+		? body.state
+		: null;
+}
+
 afterEach(() => {
 	vi.useRealTimers();
 });
 
 describe("HTTP PhotoService", () => {
+	it("restores independent browser and tab state against one server", async () => {
+		const firstLocal = savedPreferences({
+			selectionId: "selection-a",
+			breadcrumbs: selectionSummary.breadcrumbs,
+			appearance: "dark",
+			galleryScope: "currentFolder",
+			sortDirection: "newestFirst",
+		});
+		const secondLocal = savedPreferences({
+			selectionId: "selection-b",
+			breadcrumbs: secondSelectionSummary.breadcrumbs,
+			appearance: "light",
+			galleryScope: "includeSubfolders",
+			sortDirection: "oldestFirst",
+		});
+		const firstSession = new MemoryStorage();
+		const secondSession = new MemoryStorage();
+		const streams: FakeEventSource[] = [];
+		const fetch = vi.fn(async (input: RequestInfo | URL) => {
+			switch (String(input)) {
+				case "/api/v1/bootstrap":
+					return json(bootstrapResponse);
+				case "/api/v1/selections/selection-a":
+					return json(selectionSummary);
+				case "/api/v1/selections/selection-b":
+					return json(secondSelectionSummary);
+				default:
+					throw new Error(`unexpected request ${String(input)}`);
+			}
+		});
+		const create = (
+			localStorage: MemoryStorage,
+			sessionStorage: MemoryStorage,
+			clientId: string,
+		) =>
+			createHttpPhotoService({
+				localStorage,
+				sessionStorage,
+				fetch,
+				eventSourceFactory: (url) => {
+					const stream = new FakeEventSource(url);
+					streams.push(stream);
+					return stream;
+				},
+				randomUuid: () => clientId,
+			});
+		const first = create(firstLocal, firstSession, "client-a");
+		const second = create(secondLocal, secondSession, "client-b");
+
+		await expect(first.getBootstrapState()).resolves.toMatchObject({
+			settings: { appearance: "dark", galleryScope: "currentFolder" },
+			activeSource: { id: "source-a", selectionId: "selection-a" },
+		});
+		await expect(second.getBootstrapState()).resolves.toMatchObject({
+			settings: {
+				appearance: "light",
+				galleryScope: "includeSubfolders",
+			},
+			activeSource: { id: "source-b", selectionId: "selection-b" },
+		});
+		expect(first.initialSortDirection()).toBe("newestFirst");
+		expect(second.initialSortDirection()).toBe("oldestFirst");
+		const stopFirst = first.watchWallUpdates(() => undefined);
+		const stopSecond = second.watchWallUpdates(() => undefined);
+		expect(streams.map((stream) => stream.url)).toEqual([
+			"/api/v1/selections/selection-a/events?clientId=client-a&scope=currentFolder",
+			"/api/v1/selections/selection-b/events?clientId=client-b&scope=includeSubfolders",
+		]);
+		expect(firstSession.getItem(hostedClientStorageKey)).toBe("client-a");
+		expect(secondSession.getItem(hostedClientStorageKey)).toBe("client-b");
+		stopFirst();
+		stopSecond();
+	});
+
 	it("restores browser-owned state and maps origin-relative gallery calls", async () => {
 		const calls: RecordedRequest[] = [];
 		const localStorage = savedPreferences({
@@ -361,6 +486,315 @@ describe("HTTP PhotoService", () => {
 		expect((error as Error).message).not.toContain("/private");
 	});
 
+	it.each([
+		{
+			name: "malformed bootstrap",
+			localStorage: savedPreferences(),
+			fetch: async () =>
+				json({
+					capabilities: { folderBrowser: "yes", video: false },
+					sourceAvailable: true,
+				}),
+			act: (service: ReturnType<typeof createHttpPhotoService>) =>
+				service.getBootstrapState(),
+		},
+		{
+			name: "extra folder field",
+			localStorage: savedPreferences(),
+			fetch: async () =>
+				json({
+					path: "",
+					breadcrumbs: [],
+					children: [],
+					nativePath: "/photos",
+				}),
+			act: (service: ReturnType<typeof createHttpPhotoService>) =>
+				service.listFolders(""),
+		},
+		{
+			name: "unknown wall enum",
+			localStorage: savedPreferences({ selectionId: "selection-a" }),
+			fetch: async () =>
+				json({
+					items: [{ ...representativeAsset, mediaKind: "mov" }],
+					nextCursor: null,
+					orderState: "settled",
+					sourceWarnings: [],
+				}),
+			act: (service: ReturnType<typeof createHttpPhotoService>) =>
+				service.queryWall({
+					cursor: null,
+					limit: 1,
+					direction: "oldestFirst",
+				}),
+		},
+	])(
+		"strictly rejects $name success DTOs",
+		async ({ localStorage, fetch, act }) => {
+			const service = createHttpPhotoService({
+				localStorage,
+				sessionStorage: new MemoryStorage(),
+				fetch: vi.fn(fetch),
+				eventSourceFactory: () => new FakeEventSource("unused"),
+				randomUuid: () => "client-a",
+			});
+
+			await expect(act(service)).rejects.toEqual(
+				expect.objectContaining({
+					code: "internal",
+					message: "Photo Viewer could not complete that request.",
+				}),
+			);
+		},
+	);
+
+	it("turns malformed and extra SSE payloads into one authoritative resync", () => {
+		const streams: FakeEventSource[] = [];
+		const service = createHttpPhotoService({
+			localStorage: savedPreferences({ selectionId: "selection-a" }),
+			sessionStorage: new MemoryStorage(),
+			fetch: vi.fn(async () => noContent()),
+			eventSourceFactory: (url) => {
+				const stream = new FakeEventSource(url);
+				streams.push(stream);
+				return stream;
+			},
+			randomUuid: () => "client-a",
+		});
+		const received: WallUpdate[] = [];
+		const stop = service.watchWallUpdates((update) => received.push(update));
+
+		streams[0]?.emitRaw("{not-json", "1");
+		streams[0]?.emit(
+			{
+				kind: "progress",
+				selectionId: "selection-a",
+				generation: 1,
+				progress: { discovered: 1, shaped: 1, enriched: 0, total: 1 },
+				nativePath: "/photos/private",
+			},
+			"2",
+		);
+		streams[0]?.emit({ kind: "futureUpdate", selectionId: "selection-a" }, "3");
+
+		expect(received).toEqual([
+			{ kind: "resyncRequired", selectionId: "selection-a" },
+		]);
+		stop();
+	});
+
+	it("preserves one monotonic u64 replay cursor and resets it across contexts", async () => {
+		vi.useFakeTimers();
+		const streams: FakeEventSource[] = [];
+		const service = createHttpPhotoService({
+			localStorage: savedPreferences({ selectionId: "selection-a" }),
+			sessionStorage: new MemoryStorage(),
+			fetch: vi.fn(async () => noContent()),
+			eventSourceFactory: (url) => {
+				const stream = new FakeEventSource(url);
+				streams.push(stream);
+				return stream;
+			},
+			randomUuid: () => "client-a",
+		});
+		const stop = service.watchWallUpdates(() => undefined);
+		const progress = {
+			kind: "progress",
+			selectionId: "selection-a",
+			generation: 1,
+			progress: { discovered: 1, shaped: 1, enriched: 0, total: 1 },
+		};
+		const reconnect = async (expected: string) => {
+			streams.at(-1)?.fail();
+			await vi.advanceTimersByTimeAsync(250);
+			expect(streams.at(-1)?.url).toBe(expected);
+			streams.at(-1)?.open();
+		};
+
+		streams[0]?.emit(progress, "10");
+		streams[0]?.emit(progress, "010");
+		streams[0]?.emit(progress, "9");
+		await reconnect(
+			"/api/v1/selections/selection-a/events?clientId=client-a&scope=includeSubfolders&afterEventId=10",
+		);
+		streams.at(-1)?.emit(progress, "18446744073709551616");
+		await reconnect(
+			"/api/v1/selections/selection-a/events?clientId=client-a&scope=includeSubfolders&afterEventId=10",
+		);
+		streams.at(-1)?.emit(progress, "");
+		streams.at(-1)?.emit(progress, "12x");
+		await reconnect(
+			"/api/v1/selections/selection-a/events?clientId=client-a&scope=includeSubfolders&afterEventId=10",
+		);
+		streams.at(-1)?.emit(progress, "18446744073709551615");
+		await reconnect(
+			"/api/v1/selections/selection-a/events?clientId=client-a&scope=includeSubfolders&afterEventId=18446744073709551615",
+		);
+
+		await service.updateGalleryScope("currentFolder");
+		expect(streams.at(-1)?.url).toBe(
+			"/api/v1/selections/selection-a/events?clientId=client-a&scope=currentFolder",
+		);
+		streams.at(-1)?.emit({ ...progress, generation: 2 }, "3");
+		await reconnect(
+			"/api/v1/selections/selection-a/events?clientId=client-a&scope=currentFolder&afterEventId=3",
+		);
+		await service.updateGalleryScope("includeSubfolders");
+		expect(streams.at(-1)?.url).toBe(
+			"/api/v1/selections/selection-a/events?clientId=client-a&scope=includeSubfolders",
+		);
+		stop();
+	});
+
+	it("does not replace a valid replay cursor with a decimal above u64 max", async () => {
+		vi.useFakeTimers();
+		const streams: FakeEventSource[] = [];
+		const service = createHttpPhotoService({
+			localStorage: savedPreferences({ selectionId: "selection-a" }),
+			sessionStorage: new MemoryStorage(),
+			fetch: vi.fn(async () => noContent()),
+			eventSourceFactory: (url) => {
+				const stream = new FakeEventSource(url);
+				streams.push(stream);
+				return stream;
+			},
+			randomUuid: () => "client-a",
+		});
+		const stop = service.watchWallUpdates(() => undefined);
+		const progress = {
+			kind: "progress",
+			selectionId: "selection-a",
+			generation: 1,
+			progress: { discovered: 1, shaped: 1, enriched: 0, total: 1 },
+		};
+
+		streams[0]?.emit(progress, "10");
+		streams[0]?.emit(progress, "18446744073709551616");
+		streams[0]?.fail();
+		await vi.advanceTimersByTimeAsync(250);
+
+		expect(streams[1]?.url).toBe(
+			"/api/v1/selections/selection-a/events?clientId=client-a&scope=includeSubfolders&afterEventId=10",
+		);
+		stop();
+	});
+
+	it("caps reconnect backoff at five seconds and stops queued retries", async () => {
+		vi.useFakeTimers();
+		const streams: FakeEventSource[] = [];
+		const create = () =>
+			createHttpPhotoService({
+				localStorage: savedPreferences({ selectionId: "selection-a" }),
+				sessionStorage: new MemoryStorage(),
+				fetch: vi.fn(async () => noContent()),
+				eventSourceFactory: (url) => {
+					const stream = new FakeEventSource(url);
+					streams.push(stream);
+					return stream;
+				},
+				randomUuid: () => `client-${streams.length}`,
+			});
+		const service = create();
+		const stop = service.watchWallUpdates(() => undefined);
+		for (const delay of [250, 500, 1_000, 2_000, 4_000, 5_000, 5_000]) {
+			const count = streams.length;
+			streams.at(-1)?.fail();
+			await vi.advanceTimersByTimeAsync(delay - 1);
+			expect(streams).toHaveLength(count);
+			await vi.advanceTimersByTimeAsync(1);
+			expect(streams).toHaveLength(count + 1);
+		}
+		streams.at(-1)?.fail();
+		stop();
+		await vi.advanceTimersByTimeAsync(10_000);
+		expect(streams).toHaveLength(8);
+
+		const disposable = create();
+		disposable.watchWallUpdates(() => undefined);
+		streams.at(-1)?.fail();
+		disposable.dispose();
+		const afterDispose = streams.length;
+		await vi.advanceTimersByTimeAsync(10_000);
+		expect(streams).toHaveLength(afterDispose);
+	});
+
+	it("keeps selection identity consistent across nonempty wall and event DTOs", async () => {
+		const streams: FakeEventSource[] = [];
+		const calls: string[] = [];
+		const fetch = vi.fn(async (input: RequestInfo | URL) => {
+			const url = String(input);
+			calls.push(url);
+			if (url === "/api/v1/bootstrap") return json(bootstrapResponse);
+			if (url === "/api/v1/selections/selection-a")
+				return json(selectionSummary);
+			if (url.includes("/wall?"))
+				return json({
+					items: [representativeAsset],
+					nextCursor: "cursor-a",
+					orderState: "settled",
+					sourceWarnings: [{ code: "sourceOffline", retryable: true }],
+				});
+			throw new Error(`unexpected request ${url}`);
+		});
+		const service = createHttpPhotoService({
+			localStorage: savedPreferences({ selectionId: "selection-a" }),
+			sessionStorage: new MemoryStorage(),
+			fetch,
+			eventSourceFactory: (url) => {
+				const stream = new FakeEventSource(url);
+				streams.push(stream);
+				return stream;
+			},
+			randomUuid: () => "client-a",
+		});
+
+		const state = await service.getBootstrapState();
+		const page = await service.queryWall({
+			cursor: null,
+			limit: 1,
+			direction: "oldestFirst",
+		});
+		const received: WallUpdate[] = [];
+		const stop = service.watchWallUpdates((update) => received.push(update));
+		streams[0]?.emit(
+			{
+				kind: "catalogBatch",
+				selectionId: "selection-a",
+				assets: [representativeAsset],
+				orderState: "settled",
+				generation: 2,
+				progress: { discovered: 1, shaped: 1, enriched: 1, total: 1 },
+			},
+			"2",
+		);
+
+		expect(state.activeSource).toEqual({
+			id: "source-a",
+			selectionId: "selection-a",
+			displayName: "Iceland",
+			availability: "available",
+		});
+		expect(page).toEqual({
+			items: [representativeAsset],
+			nextCursor: "cursor-a",
+			orderState: "settled",
+			sourceWarnings: [{ code: "sourceOffline", retryable: true }],
+		});
+		expect(received).toEqual([
+			{
+				kind: "catalogBatch",
+				selectionId: "selection-a",
+				assets: [representativeAsset],
+				orderState: "settled",
+				generation: 2,
+				progress: { discovered: 1, shaped: 1, enriched: 1, total: 1 },
+			},
+		]);
+		expect(calls[2]).toContain("/api/v1/selections/selection-a/wall?");
+		expect(streams[0]?.url).toContain("/api/v1/selections/selection-a/events?");
+		stop();
+	});
+
 	it("reconnects SSE with pair-scoped replay and emits one resync per gap", async () => {
 		vi.useFakeTimers();
 		const streams: FakeEventSource[] = [];
@@ -478,5 +912,57 @@ describe("HTTP PhotoService", () => {
 			state: "idle",
 		});
 		service.dispose();
+	});
+
+	it("cancels interaction refresh on idle, selection replacement, and disposal", async () => {
+		vi.useFakeTimers();
+		const calls: RecordedRequest[] = [];
+		let selectionCalls = 0;
+		const fetch = vi.fn(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = String(input);
+				calls.push({ url, init });
+				if (url === "/api/v1/selections") {
+					selectionCalls += 1;
+					return json(
+						selectionCalls === 1 ? selectionSummary : secondSelectionSummary,
+						201,
+					);
+				}
+				return noContent();
+			},
+		);
+		const service = createHttpPhotoService({
+			localStorage: savedPreferences(),
+			sessionStorage: new MemoryStorage(),
+			fetch,
+			eventSourceFactory: (url) => new FakeEventSource(url),
+			randomUuid: () => "client-a",
+		});
+		const activeCalls = () =>
+			calls.filter(
+				(call) =>
+					call.url.endsWith("/interaction") && recordedState(call) === "active",
+			).length;
+		await service.selectFolder("Trips/Iceland");
+		await service.setWallInteraction(true);
+		await vi.advanceTimersByTimeAsync(10_000);
+		expect(activeCalls()).toBe(2);
+		await service.setWallInteraction(false);
+		const afterIdle = activeCalls();
+		await vi.advanceTimersByTimeAsync(20_000);
+		expect(activeCalls()).toBe(afterIdle);
+
+		await service.setWallInteraction(true);
+		await service.selectFolder("Trips/Alps");
+		const afterSelection = activeCalls();
+		await vi.advanceTimersByTimeAsync(20_000);
+		expect(activeCalls()).toBe(afterSelection);
+
+		await service.setWallInteraction(true);
+		service.dispose();
+		const afterDispose = activeCalls();
+		await vi.advanceTimersByTimeAsync(20_000);
+		expect(activeCalls()).toBe(afterDispose);
 	});
 });

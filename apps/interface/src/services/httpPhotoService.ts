@@ -71,6 +71,7 @@ const internalErrorMessage = "Photo Viewer could not complete that request.";
 const retryStartMs = 250;
 const retryMaximumMs = 5_000;
 const interactionRefreshMs = 10_000;
+const maximumU64 = 18_446_744_073_709_551_615n;
 
 const publicErrorMessages: Readonly<Record<string, string>> = {
 	invalidRequest: "That request is not valid.",
@@ -448,6 +449,7 @@ export function createHttpPhotoService(
 	let interactionTimer: ReturnType<typeof setInterval> | null = null;
 	let replayContext: string | null = null;
 	let replayId: string | null = null;
+	let replayValue: bigint | null = null;
 	const watches = new Set<ActiveWatch>();
 
 	const bootstrapState = (): BootstrapState => ({
@@ -533,6 +535,20 @@ export function createHttpPhotoService(
 		if (replayContext === context) return;
 		replayContext = context;
 		replayId = null;
+		replayValue = null;
+	};
+
+	const rememberReplayId = (value: string): void => {
+		if (!/^\d{1,20}$/.test(value)) return;
+		const parsed = BigInt(value);
+		if (
+			parsed > maximumU64 ||
+			(replayValue !== null && parsed <= replayValue)
+		) {
+			return;
+		}
+		replayValue = parsed;
+		replayId = parsed.toString();
 	};
 
 	const closeStream = (watch: ActiveWatch): void => {
@@ -574,7 +590,7 @@ export function createHttpPhotoService(
 		watch.stream = stream;
 		const onUpdate = (event: MessageEvent<string>): void => {
 			if (!watch.active || watch.stream !== stream) return;
-			if (/^\d{1,20}$/.test(event.lastEventId)) replayId = event.lastEventId;
+			rememberReplayId(event.lastEventId);
 			let update: WallUpdate;
 			try {
 				update = decodeWallUpdate(JSON.parse(event.data));
@@ -636,6 +652,7 @@ export function createHttpPhotoService(
 		watches.clear();
 		replayContext = null;
 		replayId = null;
+		replayValue = null;
 	};
 
 	const service: HttpPhotoService = {
