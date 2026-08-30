@@ -262,16 +262,29 @@ impl SelectionRuntime {
         } else {
             requested_state
         };
+        let publication = if state == ScanLifecycle::Failed {
+            Some(
+                self.publication
+                    .lock()
+                    .expect("runtime publication poisoned"),
+            )
+        } else {
+            None
+        };
+        let failure_event_id = publication
+            .as_ref()
+            .map(|_| self.publish_terminal_warning_locked().id);
         control.state = state;
         control.cancel_requested = state == ScanLifecycle::Cancelled;
         control.sender = None;
         self.terminal_event_id.store(
-            self.next_event_id.load(Ordering::Acquire),
+            failure_event_id.unwrap_or_else(|| self.next_event_id.load(Ordering::Acquire)),
             Ordering::Release,
         );
         #[cfg(test)]
         self.wait_lifecycle_publish_test_gate(state);
         self.scan_lifecycle.send_replace(state);
+        drop(publication);
         state
     }
 
@@ -287,11 +300,7 @@ impl SelectionRuntime {
             .generation
     }
 
-    pub(crate) async fn publish(&self, update: WallUpdate) -> SequencedWallUpdate {
-        let _publication = self
-            .publication
-            .lock()
-            .expect("runtime publication poisoned");
+    fn publish_locked(&self, update: WallUpdate) -> SequencedWallUpdate {
         let event = SequencedWallUpdate {
             id: self.next_event_id.fetch_add(1, Ordering::AcqRel) + 1,
             update,
@@ -304,6 +313,30 @@ impl SelectionRuntime {
         let _ = self.updates.send(event.clone());
         drop(history);
         event
+    }
+
+    fn publish_now(&self, update: WallUpdate) -> SequencedWallUpdate {
+        let _publication = self
+            .publication
+            .lock()
+            .expect("runtime publication poisoned");
+        self.publish_locked(update)
+    }
+
+    pub(crate) async fn publish(&self, update: WallUpdate) -> SequencedWallUpdate {
+        self.publish_now(update)
+    }
+
+    fn publish_terminal_warning_locked(&self) -> SequencedWallUpdate {
+        self.publish_locked(WallUpdate::Warning {
+            selection_id: self.selection.id().to_owned(),
+            source_id: self.selection.library_id.as_uuid().hyphenated().to_string(),
+            asset_id: None,
+            warning: crate::WallWarningState {
+                code: "catalogUnavailable".to_owned(),
+                retryable: true,
+            },
+        })
     }
 
     pub(crate) fn register(

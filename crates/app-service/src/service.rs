@@ -1183,7 +1183,7 @@ mod tests {
     #[cfg(debug_assertions)]
     use super::DerivativeTaskTracker;
     use super::{AppConfig, AppService, AppServiceError, RecentSourceValidator};
-    use crate::WallUpdate;
+    use crate::{WallUpdate, WallWarningState};
 
     #[cfg(debug_assertions)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1638,51 +1638,19 @@ mod tests {
         let mut updates = service.subscribe_wall_updates();
 
         assert!(service.start_selected_scan(token).await.is_err());
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while service.runtime_count_for_test() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("failed startup bridge did not release its runtime");
-        assert_eq!(service.desktop_bridge_count_for_test(), 0);
-        assert!(service.state().unwrap().active_scan.is_none());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), updates.recv())
-                .await
-                .is_err(),
-            "failed startup must not forward a later event"
+        assert_eq!(
+            recv_terminal_warning(&mut updates, token).await,
+            terminal_warning(token)
         );
+        wait_for_desktop_cleanup(&service).await;
+        assert_eq!(count_pending_warnings(&mut updates), 0);
 
         service.start_selected_scan(token).await.unwrap();
-        let settled = tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                if matches!(
-                    updates.recv().await.unwrap(),
-                    WallUpdate::MetadataSettled { .. }
-                ) {
-                    break;
-                }
-            }
-        })
-        .await;
-        assert!(settled.is_ok(), "retry did not settle");
-        let mut settled_count = 1;
-        while let Ok(Ok(update)) =
-            tokio::time::timeout(Duration::from_millis(150), updates.recv()).await
-        {
-            if matches!(update, WallUpdate::MetadataSettled { .. }) {
-                settled_count += 1;
-            }
-        }
+        let (warning_count, settled_count) =
+            wait_for_retry_without_warnings(&service, &mut updates).await;
+        assert_eq!(warning_count, 0, "retry replayed the old terminal warning");
         assert_eq!(settled_count, 1, "retry left a duplicate desktop bridge");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while service.desktop_bridge_count_for_test() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("successful retry bridge did not clean up");
+        wait_for_desktop_cleanup(&service).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1703,36 +1671,19 @@ mod tests {
         let mut updates = service.subscribe_wall_updates();
 
         assert!(service.start_selected_scan(token).await.is_err());
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while service.desktop_bridge_count_for_test() != 0
-                || service.runtime_count_for_test() != 0
-                || service.state().unwrap().active_scan.is_some()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("source-check failure did not release desktop state");
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), updates.recv())
-                .await
-                .is_err(),
-            "source-check failure must not forward a later event"
+        assert_eq!(
+            recv_terminal_warning(&mut updates, token).await,
+            terminal_warning(token)
         );
+        wait_for_desktop_cleanup(&service).await;
+        assert_eq!(count_pending_warnings(&mut updates), 0);
 
         service.start_selected_scan(token).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                if matches!(
-                    updates.recv().await.unwrap(),
-                    WallUpdate::MetadataSettled { .. }
-                ) {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("retry after source-check failure did not settle");
+        let (warning_count, settled_count) =
+            wait_for_retry_without_warnings(&service, &mut updates).await;
+        assert_eq!(warning_count, 0, "retry replayed the old terminal warning");
+        assert_eq!(settled_count, 1, "retry left a duplicate desktop bridge");
+        wait_for_desktop_cleanup(&service).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1753,71 +1704,137 @@ mod tests {
         let mut updates = service.subscribe_wall_updates();
 
         service.start_selected_scan(token).await.unwrap();
-        let warning = tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                if let WallUpdate::Warning {
-                    asset_id: None,
-                    warning,
-                    ..
-                } = updates.recv().await.unwrap()
-                {
-                    break warning;
-                }
-            }
-        })
-        .await
-        .expect("failed persistence did not forward terminal warning");
-        assert_eq!(warning.code, "catalogUnavailable");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while service.state().unwrap().active_scan.is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("failed persistence cleanup did not clear the active scan");
+        assert_eq!(
+            recv_terminal_warning(&mut updates, token).await,
+            terminal_warning(token)
+        );
+        wait_for_desktop_cleanup(&service).await;
+        assert_eq!(count_pending_warnings(&mut updates), 0);
 
         service.start_selected_scan(token).await.unwrap();
-        let mut warning_count = 1;
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let update = updates.recv().await.unwrap();
-                if matches!(update, WallUpdate::Warning { .. }) {
-                    warning_count += 1;
-                }
-                if matches!(update, WallUpdate::MetadataSettled { .. }) {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("persistence retry did not settle");
+        let (warning_count, settled_count) =
+            wait_for_retry_without_warnings(&service, &mut updates).await;
         assert_eq!(
-            warning_count, 1,
+            warning_count, 0,
             "terminal persistence warning was duplicated"
         );
-        let mut settled_count = 1;
-        while let Ok(Ok(update)) =
-            tokio::time::timeout(Duration::from_millis(150), updates.recv()).await
-        {
-            if matches!(update, WallUpdate::MetadataSettled { .. }) {
-                settled_count += 1;
+        assert_eq!(settled_count, 1, "retry left a duplicate desktop bridge");
+        wait_for_desktop_cleanup(&service).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_join_bridge_forwards_one_terminal_warning_and_retry_is_clean() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(&source).unwrap();
+        ImageBuffer::from_pixel(2, 2, Rgb([10_u8, 20, 30]))
+            .save(source.join("photo.jpg"))
+            .unwrap();
+        let service = AppService::open(AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let token = service.select_recent(&source).unwrap().1;
+        service.gallery.fail_next_join_for_test();
+        let mut updates = service.subscribe_wall_updates();
+
+        service.start_selected_scan(token).await.unwrap();
+        assert_eq!(
+            recv_terminal_warning(&mut updates, token).await,
+            terminal_warning(token)
+        );
+        wait_for_desktop_cleanup(&service).await;
+        assert_eq!(count_pending_warnings(&mut updates), 0);
+
+        service.start_selected_scan(token).await.unwrap();
+        let (warning_count, settled_count) =
+            wait_for_retry_without_warnings(&service, &mut updates).await;
+        assert_eq!(warning_count, 0, "retry replayed the failed join warning");
+        assert_eq!(settled_count, 1, "retry left a duplicate desktop bridge");
+        wait_for_desktop_cleanup(&service).await;
+    }
+
+    fn terminal_warning(selection: super::SelectionToken) -> WallUpdate {
+        WallUpdate::Warning {
+            selection_id: selection.selection_id(),
+            source_id: selection.library_id.as_uuid().hyphenated().to_string(),
+            asset_id: None,
+            warning: WallWarningState {
+                code: "catalogUnavailable".to_owned(),
+                retryable: true,
+            },
+        }
+    }
+
+    async fn recv_terminal_warning(
+        updates: &mut tokio::sync::broadcast::Receiver<WallUpdate>,
+        selection: super::SelectionToken,
+    ) -> WallUpdate {
+        let update = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let update = updates.recv().await.expect("desktop bridge closed early");
+                if matches!(update, WallUpdate::Warning { asset_id: None, .. }) {
+                    return update;
+                }
+            }
+        })
+        .await
+        .expect("failed scan did not forward its terminal warning");
+        assert_eq!(update, terminal_warning(selection));
+        update
+    }
+
+    fn count_pending_warnings(updates: &mut tokio::sync::broadcast::Receiver<WallUpdate>) -> usize {
+        let mut count = 0;
+        while let Ok(update) = updates.try_recv() {
+            if matches!(update, WallUpdate::Warning { .. }) {
+                count += 1;
             }
         }
-        assert_eq!(settled_count, 1, "retry left a duplicate desktop bridge");
+        count
+    }
+
+    async fn wait_for_desktop_cleanup(service: &AppService) {
         tokio::time::timeout(Duration::from_secs(1), async {
-            while service.desktop_bridge_count_for_test() != 0 {
+            loop {
+                if service.desktop_bridge_count_for_test() == 0
+                    && service.runtime_count_for_test() == 0
+                    && service.state().unwrap().active_scan.is_none()
+                {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("successful retry bridge did not clean up");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while service.runtime_count_for_test() != 0 {
+        .expect("desktop failure state did not clean up");
+    }
+
+    async fn wait_for_retry_without_warnings(
+        service: &AppService,
+        updates: &mut tokio::sync::broadcast::Receiver<WallUpdate>,
+    ) -> (usize, usize) {
+        let mut warning_count = 0;
+        let mut settled_count = 0;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                while let Ok(update) = updates.try_recv() {
+                    match update {
+                        WallUpdate::Warning { .. } => warning_count += 1,
+                        WallUpdate::MetadataSettled { .. } => settled_count += 1,
+                        _ => {}
+                    }
+                }
+                if service.desktop_bridge_count_for_test() == 0 && settled_count > 0 {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("failed persistence bridge did not release its runtime");
+        .expect("retry did not settle and release its bridge");
+        (warning_count, settled_count)
     }
 
     fn seed_wall_asset(service: &AppService, selection: super::SelectionToken, name: &str) {

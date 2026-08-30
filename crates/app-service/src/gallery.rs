@@ -100,6 +100,8 @@ pub struct GalleryEngine {
     fail_next_source_check: Arc<AtomicBool>,
     #[cfg(test)]
     fail_next_batch: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_next_join: Arc<AtomicBool>,
 }
 
 impl GalleryEngine {
@@ -175,6 +177,8 @@ impl GalleryEngine {
             fail_next_source_check: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_batch: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_join: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -197,6 +201,8 @@ impl GalleryEngine {
             fail_next_source_check: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             fail_next_batch: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_next_join: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -928,6 +934,11 @@ impl GalleryEngine {
         self.fail_next_batch.store(true, Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_join_for_test(&self) {
+        self.fail_next_join.store(true, Ordering::Release);
+    }
+
     async fn drain_runtime_scan(
         &self,
         runtime: Arc<SelectionRuntime>,
@@ -973,6 +984,12 @@ impl GalleryEngine {
             .await
             .map(|summary| !summary.cancelled)
             .unwrap_or(false);
+        #[cfg(test)]
+        let successful = if self.fail_next_join.swap(false, Ordering::AcqRel) {
+            false
+        } else {
+            successful
+        };
         let mut completed = false;
         if successful && !persistence_failed && !runtime.cancellation_requested() {
             completed = if let Ok(mut state) = self.state.lock() {
@@ -1007,24 +1024,6 @@ impl GalleryEngine {
             } else {
                 persistence_failed = true;
             }
-        }
-        if persistence_failed && !runtime.cancellation_requested() {
-            let _ = runtime
-                .publish(WallUpdate::Warning {
-                    selection_id: runtime.selection.id().to_owned(),
-                    source_id: runtime
-                        .selection
-                        .library_id
-                        .as_uuid()
-                        .hyphenated()
-                        .to_string(),
-                    asset_id: None,
-                    warning: crate::WallWarningState {
-                        code: "catalogUnavailable".to_owned(),
-                        retryable: true,
-                    },
-                })
-                .await;
         }
         let terminal = if runtime.cancellation_requested() {
             crate::hosted_runtime::ScanLifecycle::Cancelled
