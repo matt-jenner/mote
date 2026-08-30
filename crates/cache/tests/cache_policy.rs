@@ -112,6 +112,39 @@ fn open_checked_opens_only_a_managed_regular_file() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn open_checked_rejects_a_fifo_without_blocking_or_opening_it_as_media() {
+    let temp = tempfile::tempdir().unwrap();
+    let writer = CacheWriter::new(temp.path()).unwrap();
+    let fifo = temp.path().join("fifo");
+    use std::os::unix::ffi::OsStrExt;
+    let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+
+    assert!(matches!(
+        writer.open_checked(std::path::Path::new("fifo")),
+        Err(CacheError::PathEscape)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_checked_rejects_a_symlinked_ancestor_without_touching_outside() {
+    let temp = tempfile::tempdir().unwrap();
+    let writer = CacheWriter::new(&temp.path().join("cache")).unwrap();
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("item.bin"), b"outside").unwrap();
+    std::os::unix::fs::symlink(&outside, temp.path().join("cache/escape")).unwrap();
+
+    assert!(matches!(
+        writer.remove_checked(std::path::Path::new("escape/item.bin")),
+        Err(CacheError::PathEscape) | Err(CacheError::Io(_))
+    ));
+    assert_eq!(std::fs::read(outside.join("item.bin")).unwrap(), b"outside");
+}
+
 #[test]
 fn concurrent_writers_publish_exactly_one_immutable_output() {
     let temp = tempfile::tempdir().unwrap();

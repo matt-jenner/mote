@@ -196,6 +196,63 @@ impl ImageDerivativeGenerator {
         })
     }
 
+    /// Encodes a wall thumbnail without writing it to the cache. Callers that
+    /// need to fence source identity before publication use this paired with
+    /// `commit_wall_thumbnail`.
+    pub fn encode_wall_thumbnail(
+        &self,
+        source: &Path,
+        spec: &DerivativeSpec,
+    ) -> Result<EncodedScreenPreview, ImageDerivativeError> {
+        validate_spec(spec)?;
+        if spec.kind != DerivativeKind::WallThumbnail {
+            return Err(ImageDerivativeError::UnsupportedTarget);
+        }
+        let image = ImageReader::open(source)?.with_guessed_format()?.decode()?;
+        let image = apply_orientation(image, spec.orientation);
+        let representative_rgb = average_rgb(&image.thumbnail(32, 32).to_rgb8());
+        let resized = resize_without_upscale(image, 1024).to_rgb8();
+        let mut bytes = Vec::new();
+        JpegEncoder::new_with_quality(&mut bytes, 82).encode(
+            &resized,
+            resized.width(),
+            resized.height(),
+            image::ExtendedColorType::Rgb8,
+        )?;
+        Ok(EncodedScreenPreview {
+            bytes,
+            representative_rgb,
+        })
+    }
+
+    /// Writes a previously encoded wall thumbnail under its immutable key.
+    /// The caller is responsible for checking source identity immediately
+    /// before this operation and for catalog publication afterward.
+    pub fn commit_wall_thumbnail(
+        &self,
+        encoded: EncodedScreenPreview,
+        spec: &DerivativeSpec,
+    ) -> Result<GeneratedDerivative, ImageDerivativeError> {
+        validate_spec(spec)?;
+        if spec.kind != DerivativeKind::WallThumbnail {
+            return Err(ImageDerivativeError::UnsupportedTarget);
+        }
+        let key = DerivativeKey::compute(spec);
+        let relative_path = key.sharded_path("jpg");
+        let write = self.writer.write_atomic(relative_path.clone(), |file| {
+            std::io::Write::write_all(file, &encoded.bytes)
+        })?;
+        Ok(GeneratedDerivative {
+            key,
+            relative_path,
+            size_bytes: write.size_bytes,
+            durable: true,
+            reused: write.reused,
+            representative_rgb: encoded.representative_rgb,
+            content_type: "image/jpeg",
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn commit_screen_preview(
         &self,

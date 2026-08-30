@@ -580,6 +580,7 @@ impl AppService {
                 class: pending.class,
                 cache_key: DerivativeKey::compute(&pending.spec).as_str().to_owned(),
                 availability: pending.availability,
+                scope: GalleryScope::IncludeSubfolders,
             };
             // Availability is part of the persisted terminal identity even
             // though it is not part of the derivative key.  A pending item

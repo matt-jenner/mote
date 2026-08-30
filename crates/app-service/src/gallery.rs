@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, Weak};
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::Semaphore;
 
 use photo_cache::{
     CacheBudget, CacheWriter, DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget,
@@ -94,7 +94,7 @@ struct ProtectedGroupGuard {
 }
 
 enum HostedDerivativePrepared {
-    Wall(photo_cache::GeneratedDerivative),
+    Wall(photo_cache::EncodedScreenPreview),
     Screen(photo_cache::EncodedScreenPreview),
 }
 
@@ -180,7 +180,7 @@ pub struct GalleryEngine {
         Option<Arc<crate::derivative_coordinator::DerivativeCoordinator>>,
     pub(crate) cache_root: PathBuf,
     pub(crate) catalog_path: PathBuf,
-    derivative_driver: Arc<TokioMutex<()>>,
+    derivative_admission: Arc<Semaphore>,
     protected_groups: photo_cache::ProtectedGroups,
     #[cfg(test)]
     fail_next_start: Arc<AtomicBool>,
@@ -263,7 +263,7 @@ impl GalleryEngine {
             shared_coordinator: None,
             cache_root,
             catalog_path,
-            derivative_driver: Arc::new(TokioMutex::new(())),
+            derivative_admission: Arc::new(Semaphore::new(4)),
             protected_groups: photo_cache::ProtectedGroups::default(),
             #[cfg(test)]
             fail_next_start: Arc::new(AtomicBool::new(false)),
@@ -293,7 +293,7 @@ impl GalleryEngine {
             shared_coordinator: Some(shared_coordinator),
             cache_root,
             catalog_path,
-            derivative_driver: Arc::new(TokioMutex::new(())),
+            derivative_admission: Arc::new(Semaphore::new(4)),
             protected_groups: photo_cache::ProtectedGroups::default(),
             #[cfg(test)]
             fail_next_start: Arc::new(AtomicBool::new(false)),
@@ -757,20 +757,18 @@ impl GalleryEngine {
                     .as_str()
                     .to_owned()
                 });
+                let work_key = WorkKey {
+                    selection: selection.token(),
+                    asset_id: asset.id,
+                    class,
+                    cache_key: key.as_str().to_owned(),
+                    availability: asset.availability,
+                    scope,
+                };
+                runtime.coordinator.invalidate_completed(&work_key).await;
                 let receiver = runtime
                     .coordinator
-                    .enqueue_with_prerequisite_observed(
-                        WorkKey {
-                            selection: selection.token(),
-                            asset_id: asset.id,
-                            class,
-                            cache_key: key.as_str().to_owned(),
-                            availability: asset.availability,
-                        },
-                        lane,
-                        prerequisite,
-                        None,
-                    )
+                    .enqueue_with_prerequisite_observed(work_key, lane, prerequisite, None)
                     .await;
                 receivers.push(receiver);
             }
@@ -834,17 +832,37 @@ impl GalleryEngine {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
+        if runtime
+            .derivative_driver_started
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
         let engine = self.clone();
         tokio::spawn(async move {
-            let _driver = engine.derivative_driver.lock().await;
-            while let Some(ticket) = runtime.coordinator.next_work().await {
-                let Some(key) = runtime.coordinator.work_key(ticket).await else {
-                    continue;
-                };
-                engine
-                    .process_hosted_derivative(runtime.clone(), ticket, key)
-                    .await;
+            let driver_runtime = runtime.clone();
+            let driver_engine = engine.clone();
+            let driver = tokio::spawn(async move {
+                while let Some(ticket) = driver_runtime.coordinator.next_work().await {
+                    let Some(key) = driver_runtime.coordinator.work_key(ticket).await else {
+                        continue;
+                    };
+                    driver_engine
+                        .process_hosted_derivative(driver_runtime.clone(), ticket, key)
+                        .await;
+                }
+            });
+            if driver.await.is_err() {
+                runtime.coordinator.abort_all_attempts().await;
+                runtime
+                    .derivative_driver_started
+                    .store(false, Ordering::Release);
+                engine.start_hosted_derivative_driver(runtime.clone());
+                return;
             }
+            runtime
+                .derivative_driver_started
+                .store(false, Ordering::Release);
         });
     }
 
@@ -854,6 +872,10 @@ impl GalleryEngine {
         ticket: WorkTicket,
         key: WorkKey,
     ) {
+        let Ok(_admission) = self.derivative_admission.clone().acquire_owned().await else {
+            runtime.coordinator.discard(ticket).await;
+            return;
+        };
         let Some((asset, source, spec)) = self.pending_hosted_derivative(&key) else {
             runtime.coordinator.discard(ticket).await;
             return;
@@ -908,10 +930,10 @@ impl GalleryEngine {
                     .map(HostedDerivativePrepared::Screen)
                     .map_err(|_| AppServiceError::DerivativeFailed)
             } else {
-                let generated = generator
-                    .generate(&source, &generation_spec)
+                let encoded = generator
+                    .encode_wall_thumbnail(&source, &generation_spec)
                     .map_err(|_| AppServiceError::DerivativeFailed)?;
-                Ok(HostedDerivativePrepared::Wall(generated))
+                Ok(HostedDerivativePrepared::Wall(encoded))
             }
         })
         .await;
@@ -941,7 +963,10 @@ impl GalleryEngine {
                         &protected,
                     )
                     .map_err(|_| AppServiceError::DerivativeFailed),
-                HostedDerivativePrepared::Wall(generated) => {
+                HostedDerivativePrepared::Wall(encoded) => {
+                    let generated = generator
+                        .commit_wall_thumbnail(encoded, &spec)
+                        .map_err(|_| AppServiceError::DerivativeFailed)?;
                     catalog.upsert_derivative(&NewDerivative {
                         id: photo_domain::DerivativeId::new(),
                         asset_id,
@@ -990,9 +1015,14 @@ impl GalleryEngine {
     )> {
         let state = self.state.lock().ok()?;
         let asset = state.libraries.catalog().find_asset(key.asset_id).ok()??;
-        if asset.folder_group_id != Some(key.selection.group_id)
-            || asset.media_kind == photo_domain::MediaKind::Video
+        if asset.media_kind == photo_domain::MediaKind::Video
             || asset.availability != key.availability
+            || state
+                .libraries
+                .catalog()
+                .wall_records_for_assets_scoped(key.selection.group_id, key.scope, &[key.asset_id])
+                .ok()?
+                .is_empty()
         {
             return None;
         }

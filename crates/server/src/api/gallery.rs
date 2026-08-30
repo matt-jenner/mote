@@ -202,6 +202,16 @@ pub(crate) fn map_service_error(error: AppServiceError) -> super::ApiError {
             "invalidLimit",
             "That wall page limit is not valid.",
         ),
+        AppServiceError::DerivativeUnavailable => super::ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "derivativeUnavailable",
+            "The requested derivative is not currently available.",
+        ),
+        AppServiceError::DerivativeFailed => super::ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "derivativeFailed",
+            "The requested derivative could not be generated.",
+        ),
         _ => invalid_request(),
     }
 }

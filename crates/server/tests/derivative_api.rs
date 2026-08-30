@@ -32,7 +32,7 @@ async fn body(response: axum::response::Response) -> serde_json::Value {
 
 #[tokio::test]
 async fn derivative_route_delivers_managed_jpeg_with_immutable_headers() {
-    let (_temp, app) = app();
+    let (temp, app) = app();
     let selected = app
         .clone()
         .oneshot(
@@ -114,6 +114,7 @@ async fn derivative_route_delivers_managed_jpeg_with_immutable_headers() {
             .unwrap()
             .to_owned()
     };
+    std::fs::remove_file(temp.path().join("photos/photo.jpg")).unwrap();
     let response = app
         .clone()
         .oneshot(
@@ -162,4 +163,34 @@ async fn derivative_route_delivers_managed_jpeg_with_immutable_headers() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn derivative_route_rejects_oversized_decoded_id_and_query_before_lookup() {
+    let (_temp, app) = app();
+    let oversized_id = "a".repeat(513);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/derivatives/{oversized_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body(response).await["code"], "invalidRequest");
+
+    let oversized_query = "x=".to_owned() + &"a".repeat(8_200);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/v1/derivatives/missing?{oversized_query}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body(response).await["code"], "invalidRequest");
 }

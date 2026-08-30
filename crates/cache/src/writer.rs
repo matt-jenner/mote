@@ -160,31 +160,56 @@ impl CacheWriter {
     /// Opens a regular file beneath the managed cache root after checking every
     /// path component for traversal or symlink escapes.
     pub fn open_checked(&self, relative_path: &Path) -> Result<File, CacheError> {
-        let path = self.resolve_checked(relative_path)?;
-        if !is_regular_file(&path)? {
-            return Err(CacheError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "cache file does not exist",
-            )));
+        validate_relative(relative_path)?;
+        #[cfg(unix)]
+        {
+            return self.open_checked_unix(relative_path);
         }
-        let file = OpenOptions::new().read(true).open(path)?;
-        // The lexical/symlink checks above can race a rename. Validate the
-        // descriptor after opening as well, so a swap cannot redirect the
-        // returned handle outside the managed root.
-        if !file.metadata()?.is_file() || !descriptor_is_contained(&file, &self.root) {
-            return Err(CacheError::PathEscape);
+        #[cfg(not(unix))]
+        {
+            let path = self.resolve_checked(relative_path)?;
+            if !is_regular_file(&path)? {
+                return Err(CacheError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "cache file does not exist",
+                )));
+            }
+            #[cfg(windows)]
+            use std::os::windows::fs::OpenOptionsExt;
+            #[cfg(windows)]
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            let mut options = OpenOptions::new();
+            options.read(true);
+            #[cfg(windows)]
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            let file = options.open(path)?;
+            if !file.metadata()?.is_file() || !descriptor_is_contained(&file, &self.root) {
+                return Err(CacheError::PathEscape);
+            }
+            return Ok(file);
         }
-        Ok(file)
     }
 
     /// Removes a managed cache file after applying the same containment checks
     /// used for reads. Missing files are treated as already removed.
     pub fn remove_checked(&self, relative_path: &Path) -> Result<(), CacheError> {
-        let path = self.resolve_checked(relative_path)?;
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+        validate_relative(relative_path)?;
+        #[cfg(unix)]
+        {
+            return self.remove_checked_unix(relative_path);
+        }
+        #[cfg(not(unix))]
+        {
+            #[cfg(windows)]
+            {
+                return self.remove_checked_windows(relative_path);
+            }
+            let path = self.resolve_checked(relative_path)?;
+            return match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            };
         }
     }
 
@@ -213,11 +238,128 @@ impl CacheWriter {
     }
 
     pub(crate) fn remove_relative_file(&self, relative_path: &Path) -> Result<(), CacheError> {
-        let path = self.resolve_checked(relative_path)?;
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+        self.remove_checked(relative_path)
+    }
+
+    #[cfg(unix)]
+    fn open_checked_unix(&self, relative_path: &Path) -> Result<File, CacheError> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::FromRawFd;
+
+        let mut components = relative_path.components();
+        let file_name = components.next_back().ok_or(CacheError::PathEscape)?;
+        let file_name =
+            CString::new(file_name.as_os_str().as_bytes()).map_err(|_| CacheError::PathEscape)?;
+        let root =
+            CString::new(self.root.as_os_str().as_bytes()).map_err(|_| CacheError::PathEscape)?;
+        let mut directory_fd = unsafe {
+            libc::open(
+                root.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if directory_fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        for component in components {
+            let component = match CString::new(component.as_os_str().as_bytes()) {
+                Ok(component) => component,
+                Err(_) => {
+                    unsafe { libc::close(directory_fd) };
+                    return Err(CacheError::PathEscape);
+                }
+            };
+            let next_fd = unsafe {
+                libc::openat(
+                    directory_fd,
+                    component.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if next_fd < 0 {
+                let error = std::io::Error::last_os_error();
+                unsafe { libc::close(directory_fd) };
+                return Err(error.into());
+            }
+            unsafe { libc::close(directory_fd) };
+            directory_fd = next_fd;
+        }
+        let file_fd = unsafe {
+            libc::openat(
+                directory_fd,
+                file_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        unsafe { libc::close(directory_fd) };
+        if file_fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let file = unsafe { File::from_raw_fd(file_fd) };
+        if !file.metadata()?.is_file() || !descriptor_is_contained(&file, &self.root) {
+            return Err(CacheError::PathEscape);
+        }
+        Ok(file)
+    }
+
+    #[cfg(unix)]
+    fn remove_checked_unix(&self, relative_path: &Path) -> Result<(), CacheError> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut components = relative_path.components();
+        let file_name = components.next_back().ok_or(CacheError::PathEscape)?;
+        let file_name =
+            CString::new(file_name.as_os_str().as_bytes()).map_err(|_| CacheError::PathEscape)?;
+        let root =
+            CString::new(self.root.as_os_str().as_bytes()).map_err(|_| CacheError::PathEscape)?;
+        let mut directory_fd = unsafe {
+            libc::open(
+                root.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if directory_fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        for component in components {
+            let component = match CString::new(component.as_os_str().as_bytes()) {
+                Ok(component) => component,
+                Err(_) => {
+                    unsafe { libc::close(directory_fd) };
+                    return Err(CacheError::PathEscape);
+                }
+            };
+            let next_fd = unsafe {
+                libc::openat(
+                    directory_fd,
+                    component.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if next_fd < 0 {
+                let error = std::io::Error::last_os_error();
+                unsafe { libc::close(directory_fd) };
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    return Ok(());
+                }
+                return Err(error.into());
+            }
+            unsafe { libc::close(directory_fd) };
+            directory_fd = next_fd;
+        }
+        let result = unsafe { libc::unlinkat(directory_fd, file_name.as_ptr(), 0) };
+        let error = if result < 0 {
+            Some(std::io::Error::last_os_error())
+        } else {
+            None
+        };
+        unsafe { libc::close(directory_fd) };
+        match error {
+            None => Ok(()),
+            Some(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Some(error) => Err(error.into()),
         }
     }
 
@@ -247,6 +389,84 @@ impl CacheWriter {
                 }
                 Err(error) => return Err(error.into()),
             }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn remove_checked_windows(&self, relative_path: &Path) -> Result<(), CacheError> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+
+        #[repr(C)]
+        struct FileDispositionInfo {
+            delete_file: i32,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateFileW(
+                name: *const u16,
+                access: u32,
+                share_mode: u32,
+                security_attributes: *const std::ffi::c_void,
+                creation_disposition: u32,
+                flags_and_attributes: u32,
+                template_file: RawHandle,
+            ) -> RawHandle;
+            fn SetFileInformationByHandle(
+                file: RawHandle,
+                info_class: u32,
+                info: *const std::ffi::c_void,
+                info_size: u32,
+            ) -> i32;
+            fn GetLastError() -> u32;
+        }
+        const INVALID_HANDLE_VALUE: RawHandle = -1_isize as RawHandle;
+        const DELETE: u32 = 0x0001_0000;
+        const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const FILE_SHARE_DELETE: u32 = 0x4;
+        const OPEN_EXISTING: u32 = 3;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_INFO_DISPOSITION: u32 = 4;
+        let path = self.root.join(relative_path);
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        wide.push(0);
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                DELETE | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            let error = std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32);
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        let file = unsafe { std::fs::File::from_raw_handle(handle) };
+        if !file.metadata()?.is_file() || !descriptor_is_contained(&file, &self.root) {
+            return Err(CacheError::PathEscape);
+        }
+        let disposition = FileDispositionInfo { delete_file: 1 };
+        let deleted = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FILE_INFO_DISPOSITION,
+                (&disposition as *const FileDispositionInfo).cast(),
+                u32::try_from(std::mem::size_of::<FileDispositionInfo>())
+                    .map_err(|_| CacheError::SizeOutOfRange)?,
+            )
+        };
+        if deleted == 0 {
+            return Err(std::io::Error::from_raw_os_error(unsafe { GetLastError() } as i32).into());
         }
         Ok(())
     }

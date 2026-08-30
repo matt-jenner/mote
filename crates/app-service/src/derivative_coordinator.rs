@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering};
 use crate::dto::{DerivativeClass, DerivativeReference};
 use crate::service::SelectionToken;
 use photo_catalog::WallCursorKey;
-use photo_domain::{AssetId, Availability};
+use photo_domain::{AssetId, Availability, GalleryScope};
 use photo_indexer::{IndexJob, IndexScheduler, JobPriority};
 use tokio::sync::{Mutex, Notify, oneshot};
 
@@ -41,6 +41,7 @@ pub(crate) struct WorkKey {
     pub(crate) class: DerivativeClass,
     pub(crate) cache_key: String,
     pub(crate) availability: Availability,
+    pub(crate) scope: GalleryScope,
 }
 
 impl Hash for WorkKey {
@@ -56,6 +57,11 @@ impl Hash for WorkKey {
             Availability::Unreadable => 3,
         };
         availability.hash(state);
+        match self.scope {
+            GalleryScope::CurrentFolder => 0_u8,
+            GalleryScope::IncludeSubfolders => 1_u8,
+        }
+        .hash(state);
     }
 }
 
@@ -1339,6 +1345,17 @@ impl DerivativeCoordinator {
         self.state.lock().await.terminal.remove(key);
     }
 
+    /// Drops a remembered successful outcome when its immutable cache record
+    /// has been found stale. The next enqueue must perform real work rather
+    /// than replaying bytes that no longer exist or no longer match metadata.
+    pub(crate) async fn invalidate_completed(&self, key: &WorkKey) {
+        let mut state = self.state.lock().await;
+        state.completed.remove(key);
+        state
+            .completed_order
+            .retain(|(completed_key, _)| completed_key != key);
+    }
+
     pub(crate) async fn pending_job_count(&self) -> usize {
         self.state.lock().await.jobs.len()
     }
@@ -1562,7 +1579,7 @@ mod tests {
     use std::time::Duration;
 
     use photo_catalog::WallCursorKey;
-    use photo_domain::{AssetId, Availability, FolderGroupId, LibraryId};
+    use photo_domain::{AssetId, Availability, FolderGroupId, GalleryScope, LibraryId};
     use photo_indexer::{IndexScheduler, SchedulerConfig};
     use tokio::sync::Notify;
 
@@ -1617,6 +1634,7 @@ mod tests {
             class: DerivativeClass::ScreenPreview,
             cache_key: cache_key.to_owned(),
             availability: Availability::Available,
+            scope: GalleryScope::IncludeSubfolders,
         }
     }
 
@@ -1940,6 +1958,7 @@ mod tests {
             class: DerivativeClass::WallThumbnail,
             cache_key: "wall-v2".to_owned(),
             availability: Availability::Available,
+            scope: GalleryScope::IncludeSubfolders,
         };
         let waiter = fixture.enqueue(fresh, WorkLane::VisibleWall).await;
         assert!(fixture.coordinator.next_work().await.is_some());
@@ -2031,6 +2050,7 @@ mod tests {
             class: DerivativeClass::WallThumbnail,
             cache_key: "left".into(),
             availability: Availability::Available,
+            scope: GalleryScope::IncludeSubfolders,
         };
         let right_key = WorkKey {
             selection: right_selection,
@@ -2038,6 +2058,7 @@ mod tests {
             class: DerivativeClass::WallThumbnail,
             cache_key: "right".into(),
             availability: Availability::Available,
+            scope: GalleryScope::IncludeSubfolders,
         };
         let _left_waiter = left.enqueue(left_key, WorkLane::VisibleWall).await;
         let _right_waiter = right.enqueue(right_key, WorkLane::VisibleWall).await;

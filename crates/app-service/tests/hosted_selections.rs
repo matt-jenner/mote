@@ -227,6 +227,65 @@ async fn completed_selection_reopens_for_cached_browsing_when_source_is_offline(
 }
 
 #[tokio::test]
+async fn hosted_derivative_requests_enforce_current_folder_and_foreign_membership() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir_all(source.join("Parent/Child")).unwrap();
+    ImageBuffer::from_pixel(3, 2, image::Rgb([220_u8, 180_u8, 80_u8]))
+        .save(source.join("Parent/root.jpg"))
+        .unwrap();
+    ImageBuffer::from_pixel(3, 2, image::Rgb([80_u8, 180_u8, 220_u8]))
+        .save(source.join("Parent/Child/child.jpg"))
+        .unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config, source).unwrap();
+    let summary = engine.select_relative(Path::new("Parent")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    engine.ensure_running(&selection).await.unwrap();
+    let page = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let page = engine
+                .query_wall(
+                    &selection,
+                    photo_app_service::GalleryScope::IncludeSubfolders,
+                    photo_app_service::WallQueryRequest::oldest_first(),
+                )
+                .await
+                .unwrap();
+            if page.items.len() == 2 {
+                break page;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let child_id = page
+        .items
+        .iter()
+        .find(|item| item.display_name.contains("child"))
+        .unwrap()
+        .id
+        .clone();
+    assert!(matches!(
+        engine.validate_derivative_request(
+            &selection,
+            photo_app_service::GalleryScope::CurrentFolder,
+            &photo_app_service::DerivativeRequest::visible(vec![child_id.clone()]),
+        ),
+        Err(photo_app_service::AppServiceError::ForeignAsset)
+    ));
+    engine
+        .request_derivatives(
+            &selection,
+            photo_app_service::GalleryScope::IncludeSubfolders,
+            photo_app_service::DerivativeRequest::visible(vec![child_id]),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn hosted_selection_can_request_and_open_a_managed_thumbnail() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");
@@ -321,6 +380,12 @@ async fn corrupt_hosted_thumbnail_is_repaired_before_it_is_reused() {
     })
     .await
     .unwrap();
+    let _events = engine.subscribe(
+        &selection,
+        "repair-retained-runtime".to_owned(),
+        photo_app_service::GalleryScope::CurrentFolder,
+        None,
+    );
     let asset_id = page.items[0].id.clone();
     engine
         .request_derivatives(
