@@ -380,3 +380,70 @@ All Cargo commands were foreground, serial, offline, and used `CARGO_BUILD_JOBS=
 ## Round-6 evidence limits
 
 Descriptor-relative containment and the publication fence establish the exercised in-process guarantees. Windows parent handles prevent the tested ancestor pathname swap while held and replacement is non-destructive, but Windows and catalog consistency are not claimed as a universal cross-process transaction. The direct hosted commit path intentionally keeps the short cache/catalog publication operation in the owned async attempt under the fence; this avoids a detached blocking publisher, while unusually slow filesystem/catalog operations could still occupy an async worker briefly. GET and cache validation remain bounded and streamed. The Windows-specific tests were not runnable on this macOS-only target.
+
+## Task 5 exceptional fix round 7
+
+Implementation/test commit: `aa66bb7` (`fix: close hosted derivative exceptional races`), based on `06342ab`.
+
+This round closes the remaining exceptional findings. Hosted admission now travels into the blocking encoder and remains held until that work exits, even when the hosted supervisor is aborted; hosted cancellation settles the waiter as `DerivativeUnavailable`, while desktop cancellation behavior is unchanged. Publication rechecks the current many-to-many membership for every waiter under the shared fence, suppressing cache/catalog/event publication when no authorized waiter remains while retaining authorized late waiters and shared-group reuse.
+
+Repair cleanup now removes a final physical file before its final catalog link and restores the recorded bytes when link removal fails; if restoration is impossible, it falls back to deleting the row. Repair paths use `replace_atomic`, and ordinary image generation validates an existing immutable JPEG before allowing generic writer reuse. JPEG validation is bounded to the 64 MiB ceiling and performs full decoding only from controlled blocking work. Derivative GET opens and validates on `spawn_blocking` before handing its descriptor to the existing asynchronous chunk stream.
+
+Windows replacement validation now runs at the replacement boundary with reparse-safe parent handling and no destructive `MoveFileExW` fallback; the cfg-gated seam forces a final reparse swap and checks the outside sentinel and preserved old bytes. Windows execution was not possible because this host has only the `aarch64-apple-darwin` target.
+
+Round-7 RED evidence:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test image_derivative generate_replaces_an_orphaned_corrupt_regular_file --jobs 2
+  RED: failed; generic reuse reported `reused = true` for an orphaned corrupt regular file
+
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections hosted_repair_rejects_same_size_jpeg_with_corrupt_entropy --jobs 2
+  RED: failed; marker-only validation accepted the same-size malformed JPEG and the final decode assertion failed
+
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections hosted_membership_removal_at_publication_leaves_no_catalog_link_or_event --jobs 2
+  RED: first compile probe failed because `remove_asset_membership` was absent
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections hosted_membership_removal_at_publication_leaves_no_catalog_link_or_event --jobs 2
+  RED: after adding the mutation fixture, the behavioral probe failed because the catalog row remained after membership removal
+
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test image_derivative cached_preview_repair_replaces_an_orphaned_corrupt_regular_file --jobs 2
+  RED: failed; cached-preview repair reused the corrupt regular target instead of replacing it
+```
+
+Round-7 GREEN evidence:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections --jobs 2
+  PASS: 21 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test image_derivative --jobs 2
+  PASS: 14 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-cache --test cache_policy --jobs 2
+  PASS: 25 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --lib --jobs 2
+  PASS: 102 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_runtime --jobs 2
+  PASS: 16 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test progressive_wall --jobs 2
+  PASS: 57 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test task7_source_safety --jobs 2
+  PASS: 1 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-indexer --test scheduler_priority --jobs 2
+  PASS: 13 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --test derivative_api --jobs 2
+  PASS: 3 passed, 0 failed
+CARGO_BUILD_JOBS=2 cargo fmt --all -- --check
+  PASS: no formatting differences
+git diff --check
+  PASS: no whitespace errors
+CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test --offline --workspace --jobs 2
+  PASS: all workspace unit/integration tests and doc-tests; 0 failures
+  PASS: app-service lib 102, hosted runtime 16, hosted selections 21,
+        progressive wall 57, task-7 source safety 1, cache policy 25,
+        cache image derivatives 14, scheduler priority 13, derivative HTTP 3,
+        and all remaining workspace suites
+```
+
+All Cargo commands were run in the foreground, serially, offline, with `CARGO_BUILD_JOBS=2` and `--jobs 2`; no background command or `cargo clean` was used. The full workspace gate ran exactly once, last, after the final source/test edits and formatting. No source or test file changed afterward. Windows API/test code was added under `cfg(windows)` but not executed on macOS; no Windows runtime claim is made. Process-table enumeration is restricted on this host, so cleanup confirmation is based on every foreground command returning and no background launch.
+
+## Round-7 evidence limits
+
+The publication and repair guarantees are in-process fences; they do not claim a cross-process catalog transaction or crash-consistency guarantee. macOS tests exercise the hosted cancellation, membership, cleanup, full JPEG decode, managed streaming, and cache containment behavior. The Windows replacement seam is source-level/cfg-gated only on this host; a Windows build and runtime test remain required on a Windows target.
