@@ -3,7 +3,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum JobPriority {
@@ -91,6 +91,8 @@ pub struct IndexScheduler {
     config: SchedulerConfig,
     available_background_permits: AtomicUsize,
     active_enrichment: AtomicUsize,
+    change_generation: AtomicUsize,
+    wake: Notify,
 }
 
 #[derive(Default)]
@@ -133,6 +135,8 @@ impl IndexScheduler {
             state: Mutex::new(SchedulerState::default()),
             available_background_permits: AtomicUsize::new(config.idle_workers),
             active_enrichment: AtomicUsize::new(0),
+            change_generation: AtomicUsize::new(0),
+            wake: Notify::new(),
             config,
         }
     }
@@ -148,6 +152,7 @@ impl IndexScheduler {
                     sequence: existing.sequence,
                 };
                 state.heap.push(entry);
+                self.notify_change();
             }
             return;
         }
@@ -163,6 +168,7 @@ impl IndexScheduler {
             .queued
             .insert(job.name.clone(), QueuedJob { sequence, job });
         state.heap.push(entry);
+        self.notify_change();
     }
 
     pub async fn next(&self) -> Option<IndexJob> {
@@ -174,7 +180,11 @@ impl IndexScheduler {
             if current.sequence != entry.sequence || current.job.priority != entry.priority {
                 continue;
             }
-            return state.queued.remove(&entry.name).map(|queued| queued.job);
+            let result = state.queued.remove(&entry.name).map(|queued| queued.job);
+            if result.is_some() {
+                self.notify_change();
+            }
+            return result;
         }
         None
     }
@@ -211,7 +221,11 @@ impl IndexScheduler {
         }
         state.heap = BinaryHeap::from(heap);
         let entry = selected?;
-        state.queued.remove(&entry.name).map(|queued| queued.job)
+        let result = state.queued.remove(&entry.name).map(|queued| queued.job);
+        if result.is_some() {
+            self.notify_change();
+        }
+        result
     }
 
     /// Dequeue an owner job only when it is the highest-priority job in the
@@ -257,7 +271,11 @@ impl IndexScheduler {
         }
         heap.retain(|queued| queued != &entry);
         state.heap = BinaryHeap::from(heap);
-        state.queued.remove(&entry.name).map(|queued| queued.job)
+        let result = state.queued.remove(&entry.name).map(|queued| queued.job);
+        if result.is_some() {
+            self.notify_change();
+        }
+        result
     }
 
     /// Returns the highest-priority valid queued job without removing it.
@@ -284,6 +302,32 @@ impl IndexScheduler {
         };
         self.available_background_permits
             .store(permits, AtomicOrdering::Release);
+        self.notify_change();
+    }
+
+    pub fn change_generation(&self) -> u64 {
+        self.change_generation.load(AtomicOrdering::Acquire) as u64
+    }
+
+    pub async fn wait_for_change_since(&self, observed: u64) {
+        loop {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.change_generation() != observed {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn wait_for_change(&self) {
+        self.wait_for_change_since(self.change_generation()).await;
+    }
+
+    fn notify_change(&self) {
+        self.change_generation.fetch_add(1, AtomicOrdering::AcqRel);
+        self.wake.notify_waiters();
     }
 
     pub fn available_background_permits(&self) -> usize {
@@ -326,9 +370,13 @@ impl IndexScheduler {
             .filter(|(_, queued)| queued.job.priority < minimum)
             .map(|(name, queued)| (name.clone(), queued.job.cancellation.clone()))
             .collect::<Vec<_>>();
+        let changed = !cancelled.is_empty();
         for (name, token) in cancelled {
             token.cancel();
             state.queued.remove(&name);
+        }
+        if changed {
+            self.notify_change();
         }
     }
 }

@@ -58,6 +58,9 @@ pub(crate) async fn derivative(
         return Err(invalid_request());
     }
     validate_decoded_identifier(&id, 512)?;
+    if !id.is_ascii() {
+        return Err(invalid_request());
+    }
     let engine = gallery(&state)?;
     let managed = engine.open_derivative(&id).map_err(|error| match error {
         AppServiceError::UnknownAsset

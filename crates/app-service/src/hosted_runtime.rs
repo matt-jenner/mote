@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use photo_domain::GalleryScope;
@@ -57,7 +57,6 @@ pub(crate) struct SelectionRuntime {
     scan_cancel: Mutex<ScanControl>,
     pub(crate) scan_lifecycle: watch::Sender<ScanLifecycle>,
     pub(crate) coordinator: Arc<crate::derivative_coordinator::DerivativeCoordinator>,
-    pub(crate) derivative_driver_started: AtomicBool,
     pub(crate) updates: broadcast::Sender<SequencedWallUpdate>,
     pub(crate) publication: Mutex<()>,
     pub(crate) history: Mutex<VecDeque<SequencedWallUpdate>>,
@@ -132,7 +131,6 @@ impl SelectionRuntime {
             scan_cancel: Mutex::new(ScanControl::new(initial_lifecycle)),
             scan_lifecycle,
             coordinator,
-            derivative_driver_started: AtomicBool::new(false),
             updates,
             publication: Mutex::new(()),
             history: Mutex::new(VecDeque::with_capacity(256)),
