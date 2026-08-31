@@ -122,9 +122,9 @@ pub(crate) async fn folders(
     let listing = root.list(&path);
     if path.is_empty() {
         match &listing {
-            Ok(_) => state.record_source_root_listing(true),
+            Ok(_) => state.record_source_root_listing(true).await,
             Err(FolderError::Unavailable | FolderError::NotDirectory | FolderError::Unreadable) => {
-                state.record_source_root_listing(false);
+                state.record_source_root_listing(false).await;
             }
             Err(FolderError::InvalidPath | FolderError::OutsideRoot) => {}
         }

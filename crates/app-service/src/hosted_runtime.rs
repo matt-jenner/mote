@@ -31,7 +31,7 @@ struct ScanControl {
     state: ScanLifecycle,
     generation: u64,
     cancel_requested: bool,
-    scan_quiesced: bool,
+    worker_owner: Option<u64>,
     sender: Option<watch::Sender<bool>>,
     reconciled_recovery_token: u64,
     pending_recovery_token: Option<u64>,
@@ -41,6 +41,11 @@ struct ScanControl {
 pub(crate) struct ScanAdmission {
     pub(crate) generation: u64,
     pub(crate) recovery_token: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ScanWorkerOwner {
+    generation: u64,
 }
 
 #[cfg(test)]
@@ -56,7 +61,7 @@ impl ScanControl {
             state,
             generation: 0,
             cancel_requested: false,
-            scan_quiesced: true,
+            worker_owner: None,
             sender: None,
             reconciled_recovery_token,
             pending_recovery_token: None,
@@ -243,15 +248,20 @@ impl SelectionRuntime {
             if recovery_token <= control.reconciled_recovery_token {
                 return None;
             }
-            matches!(
-                control.state,
-                ScanLifecycle::Completed | ScanLifecycle::SourceUnavailable | ScanLifecycle::Failed
-            ) || (control.state == ScanLifecycle::Cancelled && control.scan_quiesced)
+            control.worker_owner.is_none()
+                && matches!(
+                    control.state,
+                    ScanLifecycle::Completed
+                        | ScanLifecycle::Cancelled
+                        | ScanLifecycle::SourceUnavailable
+                        | ScanLifecycle::Failed
+                )
         } else {
-            matches!(
-                control.state,
-                ScanLifecycle::Idle | ScanLifecycle::SourceUnavailable | ScanLifecycle::Failed
-            )
+            control.worker_owner.is_none()
+                && matches!(
+                    control.state,
+                    ScanLifecycle::Idle | ScanLifecycle::SourceUnavailable | ScanLifecycle::Failed
+                )
         };
         if !admissible {
             return None;
@@ -259,7 +269,7 @@ impl SelectionRuntime {
         control.generation = control.generation.wrapping_add(1).max(1);
         control.state = ScanLifecycle::Starting;
         control.cancel_requested = false;
-        control.scan_quiesced = false;
+        control.worker_owner = None;
         control.sender = None;
         control.pending_recovery_token = Some(recovery_token);
         self.terminal_event_id.store(0, Ordering::Release);
@@ -279,13 +289,36 @@ impl SelectionRuntime {
             || control.reconciled_recovery_token < recovery_token
     }
 
-    /// Installs the indexer's cancellation sender after scan admission. A
-    /// cancellation can race this handoff, so the sender is cancelled before
-    /// it is published when the control state has already been terminated.
-    pub(crate) fn install_scan_sender(&self, generation: u64, sender: watch::Sender<bool>) -> bool {
+    /// Claims exclusive responsibility for an admitted worker before the
+    /// indexer can start. Only the returned owner may later certify that the
+    /// worker and its detached blocking work have drained.
+    pub(crate) fn claim_scan_worker(&self, admission: ScanAdmission) -> Option<ScanWorkerOwner> {
+        let mut control = self.scan_cancel.lock().expect("scan control poisoned");
+        if control.generation != admission.generation
+            || control.state != ScanLifecycle::Starting
+            || control.cancel_requested
+            || control.worker_owner.is_some()
+        {
+            return None;
+        }
+        control.worker_owner = Some(admission.generation);
+        Some(ScanWorkerOwner {
+            generation: admission.generation,
+        })
+    }
+
+    /// Installs the indexer's cancellation sender for the exact worker owner.
+    /// A cancellation can race this handoff, so an unauthorized sender is
+    /// cancelled before returning.
+    pub(crate) fn install_scan_sender(
+        &self,
+        owner: &ScanWorkerOwner,
+        sender: watch::Sender<bool>,
+    ) -> bool {
         let cancel_now = {
             let mut control = self.scan_cancel.lock().expect("scan control poisoned");
-            if control.generation == generation
+            if control.generation == owner.generation
+                && control.worker_owner == Some(owner.generation)
                 && control.state == ScanLifecycle::Starting
                 && !control.cancel_requested
             {
@@ -339,24 +372,64 @@ impl SelectionRuntime {
         }
     }
 
-    pub(crate) fn finish_scan(
+    /// Records source loss without claiming that an admitted worker has
+    /// drained. The owner remains installed until its join path completes.
+    pub(crate) fn request_source_unavailable(&self) {
+        let sender = {
+            let mut control = self.scan_cancel.lock().expect("scan control poisoned");
+            control.cancel_requested = true;
+            control.state = ScanLifecycle::SourceUnavailable;
+            self.terminal_event_id.store(
+                self.next_event_id.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+            #[cfg(test)]
+            self.wait_lifecycle_publish_test_gate(ScanLifecycle::SourceUnavailable);
+            self.scan_lifecycle
+                .send_replace(ScanLifecycle::SourceUnavailable);
+            control.sender.take()
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(true);
+        }
+    }
+
+    pub(crate) fn finish_unowned_scan(
         &self,
-        generation: u64,
+        admission: ScanAdmission,
         requested_state: ScanLifecycle,
     ) -> ScanLifecycle {
         let mut control = self.scan_cancel.lock().expect("scan control poisoned");
-        if control.generation != generation {
+        if control.generation != admission.generation || control.worker_owner.is_some() {
             return control.state;
         }
-        if control.state == ScanLifecycle::Cancelled {
-            control.sender = None;
-            control.scan_quiesced = true;
-            return ScanLifecycle::Cancelled;
+        Self::finish_control(self, &mut control, requested_state)
+    }
+
+    pub(crate) fn finish_owned_scan(
+        &self,
+        owner: ScanWorkerOwner,
+        requested_state: ScanLifecycle,
+    ) -> ScanLifecycle {
+        let mut control = self.scan_cancel.lock().expect("scan control poisoned");
+        if control.generation != owner.generation || control.worker_owner != Some(owner.generation)
+        {
+            return control.state;
         }
+        control.worker_owner = None;
+        control.sender = None;
+        Self::finish_control(self, &mut control, requested_state)
+    }
+
+    fn finish_control(
+        &self,
+        control: &mut ScanControl,
+        requested_state: ScanLifecycle,
+    ) -> ScanLifecycle {
         if control.state.is_terminal() {
             return control.state;
         }
-        let state = if control.cancel_requested || control.state == ScanLifecycle::Cancelled {
+        let state = if control.cancel_requested {
             ScanLifecycle::Cancelled
         } else {
             requested_state
@@ -375,7 +448,6 @@ impl SelectionRuntime {
             .map(|_| self.publish_terminal_warning_locked().id);
         control.state = state;
         control.cancel_requested = state == ScanLifecycle::Cancelled;
-        control.scan_quiesced = true;
         control.sender = None;
         if state == ScanLifecycle::Completed
             && let Some(recovery_token) = control.pending_recovery_token.take()
@@ -394,16 +466,20 @@ impl SelectionRuntime {
         state
     }
 
+    pub(crate) fn worker_may_publish(&self, owner: &ScanWorkerOwner) -> bool {
+        let control = self.scan_cancel.lock().expect("scan control poisoned");
+        control.generation == owner.generation
+            && control.worker_owner == Some(owner.generation)
+            && !control.cancel_requested
+            && !matches!(
+                control.state,
+                ScanLifecycle::Cancelled | ScanLifecycle::SourceUnavailable
+            )
+    }
+
     pub(crate) fn cancellation_requested(&self) -> bool {
         let control = self.scan_cancel.lock().expect("scan control poisoned");
         control.cancel_requested || control.state == ScanLifecycle::Cancelled
-    }
-
-    pub(crate) fn current_generation(&self) -> u64 {
-        self.scan_cancel
-            .lock()
-            .expect("scan control poisoned")
-            .generation
     }
 
     fn publish_locked(&self, update: WallUpdate) -> SequencedWallUpdate {
@@ -605,7 +681,7 @@ impl SelectionRuntime {
         let source_available = match engine.ensure_runtime_source(self).await {
             Ok(source_available) => source_available,
             Err(error) => {
-                self.finish_scan(admission.generation, ScanLifecycle::Failed);
+                self.finish_unowned_scan(admission, ScanLifecycle::Failed);
                 return Err(error);
             }
         };
@@ -621,7 +697,7 @@ impl SelectionRuntime {
         match engine.start_runtime_scan(self.clone(), admission).await {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.finish_scan(admission.generation, ScanLifecycle::Failed);
+                self.finish_unowned_scan(admission, ScanLifecycle::Failed);
                 Err(error)
             }
         }
@@ -980,7 +1056,7 @@ mod tests {
         let initial_generation = initial
             .admit_scan_at_recovery_token(6, 0)
             .expect("initial scan should capture the current recovery token");
-        initial.finish_scan(initial_generation.generation, ScanLifecycle::Completed);
+        initial.finish_unowned_scan(initial_generation, ScanLifecycle::Completed);
         assert!(!initial.recovery_required(6));
 
         let runtime = SelectionRuntime::new(
@@ -994,7 +1070,7 @@ mod tests {
             .expect("recovery scan should be admitted");
         assert!(runtime.admit_recovery_scan(7, 0).is_none());
         assert_eq!(
-            runtime.finish_scan(failed.generation, ScanLifecycle::Failed),
+            runtime.finish_unowned_scan(failed, ScanLifecycle::Failed),
             ScanLifecycle::Failed
         );
         assert!(runtime.recovery_required(7));
@@ -1003,7 +1079,7 @@ mod tests {
             .admit_recovery_scan(7, 0)
             .expect("failed recovery should remain retryable");
         assert_eq!(
-            runtime.finish_scan(retry.generation, ScanLifecycle::Completed),
+            runtime.finish_unowned_scan(retry, ScanLifecycle::Completed),
             ScanLifecycle::Completed
         );
         assert!(!runtime.recovery_required(7));
@@ -1017,17 +1093,20 @@ mod tests {
         let cancelled_generation = cancelled
             .admit_recovery_scan(9, 0)
             .expect("cancelled recovery should first be admitted");
+        let cancelled_owner = cancelled
+            .claim_scan_worker(cancelled_generation)
+            .expect("the cancelled generation should own its worker");
         cancelled.request_cancel();
         assert!(cancelled.recovery_required(9));
         assert!(
             cancelled.admit_recovery_scan(9, 0).is_none(),
             "retry cannot overlap the cancelled generation while it drains"
         );
-        cancelled.finish_scan(cancelled_generation.generation, ScanLifecycle::Cancelled);
+        cancelled.finish_owned_scan(cancelled_owner, ScanLifecycle::Cancelled);
         let retry_after_cancel = cancelled
             .admit_recovery_scan(9, 0)
             .expect("cancelled recovery should remain retryable for the pending token");
-        cancelled.finish_scan(retry_after_cancel.generation, ScanLifecycle::Completed);
+        cancelled.finish_unowned_scan(retry_after_cancel, ScanLifecycle::Completed);
         assert!(!cancelled.recovery_required(9));
 
         assert!(
@@ -1037,22 +1116,65 @@ mod tests {
     }
 
     #[test]
+    fn non_owner_terminal_transition_cannot_clear_worker_ownership() {
+        let runtime = SelectionRuntime::new(
+            selection(),
+            Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
+            true,
+        );
+        let admission = runtime
+            .admit_recovery_scan(4, 0)
+            .expect("recovery should be admitted");
+        let owner = runtime
+            .claim_scan_worker(admission)
+            .expect("the admitted recovery should own its worker");
+
+        runtime.request_source_unavailable();
+        assert_eq!(
+            runtime.finish_unowned_scan(admission, ScanLifecycle::Completed),
+            ScanLifecycle::SourceUnavailable
+        );
+        assert!(
+            runtime.admit_recovery_scan(4, 0).is_none(),
+            "a non-owner terminal writer must not release recovery admission"
+        );
+        assert!(runtime.recovery_required(4));
+
+        assert_eq!(
+            runtime.finish_owned_scan(owner, ScanLifecycle::Completed),
+            ScanLifecycle::SourceUnavailable,
+            "owner drain preserves the authoritative source terminal state"
+        );
+        let retry = runtime
+            .admit_recovery_scan(4, 0)
+            .expect("owner-certified drain should release exactly one retry");
+        assert!(runtime.admit_recovery_scan(4, 0).is_none());
+        runtime.finish_unowned_scan(retry, ScanLifecycle::Completed);
+        assert!(!runtime.recovery_required(4));
+    }
+
+    #[test]
     fn stale_transition_writers_cannot_regress_a_newer_terminal_state() {
         let runtime = SelectionRuntime::new(
             selection(),
             Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
             false,
         );
-        let generation = runtime.admit_scan().expect("scan should be admitted");
+        let admission = runtime
+            .admit_scan_at_recovery_token(0, 0)
+            .expect("scan should be admitted");
+        let owner = runtime
+            .claim_scan_worker(admission)
+            .expect("the admitted scan should own its worker");
         let (sender, _receiver) = watch::channel(false);
-        assert!(!runtime.install_scan_sender(generation, sender));
+        assert!(!runtime.install_scan_sender(&owner, sender));
 
         runtime.request_cancel();
 
         let (stale_sender, _stale_receiver) = watch::channel(false);
-        assert!(runtime.install_scan_sender(generation, stale_sender));
+        assert!(runtime.install_scan_sender(&owner, stale_sender));
         assert_eq!(
-            runtime.finish_scan(generation, ScanLifecycle::Completed),
+            runtime.finish_owned_scan(owner, ScanLifecycle::Completed),
             ScanLifecycle::Cancelled
         );
         assert_eq!(
@@ -1068,23 +1190,33 @@ mod tests {
             Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
             false,
         );
-        let older_generation = runtime.admit_scan().expect("first scan should be admitted");
+        let older_generation = runtime
+            .admit_scan_at_recovery_token(0, 0)
+            .expect("first scan should be admitted");
         assert_eq!(
-            runtime.finish_scan(older_generation, ScanLifecycle::Failed),
+            runtime.finish_unowned_scan(older_generation, ScanLifecycle::Failed),
             ScanLifecycle::Failed
         );
-        let newer_generation = runtime.admit_scan().expect("retry should be admitted");
+        let newer_generation = runtime
+            .admit_scan_at_recovery_token(0, 0)
+            .expect("retry should be admitted");
+        let newer_owner = runtime
+            .claim_scan_worker(newer_generation)
+            .expect("the retry should own its worker");
         let (sender, _receiver) = watch::channel(false);
-        assert!(!runtime.install_scan_sender(newer_generation, sender));
+        assert!(!runtime.install_scan_sender(&newer_owner, sender));
         assert_eq!(
-            runtime.finish_scan(newer_generation, ScanLifecycle::Completed),
+            runtime.finish_owned_scan(newer_owner, ScanLifecycle::Completed),
             ScanLifecycle::Completed
         );
 
         let (stale_sender, _stale_receiver) = watch::channel(false);
-        assert!(runtime.install_scan_sender(older_generation, stale_sender));
+        let stale_owner = ScanWorkerOwner {
+            generation: older_generation.generation,
+        };
+        assert!(runtime.install_scan_sender(&stale_owner, stale_sender));
         assert_eq!(
-            runtime.finish_scan(older_generation, ScanLifecycle::Failed),
+            runtime.finish_owned_scan(stale_owner, ScanLifecycle::Failed),
             ScanLifecycle::Completed
         );
         assert_eq!(
@@ -1188,8 +1320,10 @@ mod tests {
         );
         let mut first = runtime.lifecycle_receiver();
         let mut second = runtime.lifecycle_receiver();
-        let generation = runtime.admit_scan().expect("scan should be admitted");
-        runtime.finish_scan(generation, ScanLifecycle::Completed);
+        let admission = runtime
+            .admit_scan_at_recovery_token(0, 0)
+            .expect("scan should be admitted");
+        runtime.finish_unowned_scan(admission, ScanLifecycle::Completed);
 
         tokio::time::timeout(Duration::from_secs(1), first.changed())
             .await

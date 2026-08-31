@@ -26,7 +26,8 @@ use crate::derivative_coordinator::{
     HostedAttemptLease, HostedCancellationDecision, WorkKey, WorkLane, WorkTicket,
 };
 use crate::hosted_runtime::{
-    ScanAdmission, SelectionEventSubscription, SelectionRuntime, SubscriptionOrigin,
+    ScanAdmission, ScanWorkerOwner, SelectionEventSubscription, SelectionRuntime,
+    SubscriptionOrigin,
 };
 use crate::service::{ReaderAdapter, ServiceState};
 use crate::{
@@ -2554,17 +2555,8 @@ impl GalleryEngine {
         runtime: Arc<SelectionRuntime>,
         admission: ScanAdmission,
     ) -> Result<(), AppServiceError> {
-        #[cfg(test)]
-        if self.fail_next_start.swap(false, Ordering::AcqRel) {
-            return Err(AppServiceError::Catalog(CatalogError::InvalidData(
-                "test startup failure".to_owned(),
-            )));
-        }
         if runtime.cancellation_requested() {
-            runtime.finish_scan(
-                admission.generation,
-                crate::hosted_runtime::ScanLifecycle::Cancelled,
-            );
+            runtime.finish_unowned_scan(admission, crate::hosted_runtime::ScanLifecycle::Cancelled);
             return Ok(());
         }
         if !self.ensure_runtime_source(&runtime).await? {
@@ -2599,10 +2591,7 @@ impl GalleryEngine {
             return Ok(());
         }
         if runtime.cancellation_requested() {
-            runtime.finish_scan(
-                admission.generation,
-                crate::hosted_runtime::ScanLifecycle::Cancelled,
-            );
+            runtime.finish_unowned_scan(admission, crate::hosted_runtime::ScanLifecycle::Cancelled);
             return Ok(());
         }
         let generation = {
@@ -2642,25 +2631,43 @@ impl GalleryEngine {
         );
         let selection_root = root.join(&selected);
         if runtime.cancellation_requested() {
-            runtime.finish_scan(
-                admission.generation,
-                crate::hosted_runtime::ScanLifecycle::Cancelled,
-            );
+            runtime.finish_unowned_scan(admission, crate::hosted_runtime::ScanLifecycle::Cancelled);
             return Ok(());
         }
-        let handle = indexer
-            .start(
-                ScanRequest::new(selection_root.clone())
-                    .for_library(runtime.selection.library_id)
-                    .roots(root, selection_root)
-                    .for_folder_group(runtime.selection.group_id),
-            )
-            .map_err(|e| AppServiceError::LibrarySetup(std::io::Error::other(e.to_string())))?;
-        runtime.install_scan_sender(admission.generation, handle.cancellation_sender());
+        let Some(owner) = runtime.claim_scan_worker(admission) else {
+            runtime.finish_unowned_scan(admission, crate::hosted_runtime::ScanLifecycle::Cancelled);
+            return Ok(());
+        };
+        if runtime.cancellation_requested() {
+            runtime.finish_owned_scan(owner, crate::hosted_runtime::ScanLifecycle::Cancelled);
+            return Ok(());
+        }
+        #[cfg(test)]
+        if self.fail_next_start.swap(false, Ordering::AcqRel) {
+            runtime.finish_owned_scan(owner, crate::hosted_runtime::ScanLifecycle::Failed);
+            return Err(AppServiceError::Catalog(CatalogError::InvalidData(
+                "test startup failure".to_owned(),
+            )));
+        }
+        let handle = match indexer.start(
+            ScanRequest::new(selection_root.clone())
+                .for_library(runtime.selection.library_id)
+                .roots(root, selection_root)
+                .for_folder_group(runtime.selection.group_id),
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                runtime.finish_owned_scan(owner, crate::hosted_runtime::ScanLifecycle::Failed);
+                return Err(AppServiceError::LibrarySetup(std::io::Error::other(
+                    error.to_string(),
+                )));
+            }
+        };
+        runtime.install_scan_sender(&owner, handle.cancellation_sender());
         let engine = self.clone();
         tokio::spawn(async move {
             engine
-                .drain_runtime_scan(runtime, handle, generation, admission)
+                .drain_runtime_scan(runtime, handle, generation, admission, owner)
                 .await;
         });
         Ok(())
@@ -2714,28 +2721,34 @@ impl GalleryEngine {
         &self,
         runtime: &Arc<SelectionRuntime>,
     ) -> Result<(), AppServiceError> {
-        if runtime.cancellation_requested() {
-            runtime.finish_scan(
-                runtime.current_generation(),
-                crate::hosted_runtime::ScanLifecycle::Cancelled,
-            );
+        let root = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| AppServiceError::StatePoisoned)?;
+            state
+                .libraries
+                .catalog()
+                .find_library(runtime.selection.library_id)?
+                .ok_or(AppServiceError::UnknownAsset)?
+                .canonical_root_key
+                .to_path_buf()
+                .map_err(|e| CatalogError::InvalidData(e.to_string()))?
+        };
+        if !root.is_dir()
+            && self
+                .mark_hosted_library_root_unavailable(runtime.selection.library_id)
+                .await?
+        {
             return Ok(());
         }
+        runtime.request_source_unavailable();
         let should_publish = {
             let _publication = self.hosted_publication_fence.lock().await;
             let mut state = self
                 .state
                 .lock()
                 .map_err(|_| AppServiceError::StatePoisoned)?;
-            let library = state
-                .libraries
-                .catalog()
-                .find_library(runtime.selection.library_id)?
-                .ok_or(AppServiceError::UnknownAsset)?;
-            let root = library
-                .canonical_root_key
-                .to_path_buf()
-                .map_err(|e| CatalogError::InvalidData(e.to_string()))?;
             if root.is_dir() {
                 state
                     .libraries
@@ -2764,12 +2777,58 @@ impl GalleryEngine {
                 })
                 .await;
         }
-        runtime.finish_scan(
-            runtime.current_generation(),
-            crate::hosted_runtime::ScanLifecycle::SourceUnavailable,
-        );
         self.remove_runtime_if_dead(runtime.selection.group_id, runtime);
         Ok(())
+    }
+
+    /// Persists an authoritative hosted root outage behind the same fence as
+    /// scan batches. Every active selection for the library is cancelled
+    /// before the durable transition, so no scope can publish an old batch
+    /// after the root is recorded offline.
+    pub async fn mark_hosted_library_root_unavailable(
+        &self,
+        library_id: LibraryId,
+    ) -> Result<bool, AppServiceError> {
+        if self.hosted_library_id != Some(library_id) {
+            return Ok(false);
+        }
+        let runtimes = self
+            .runtimes
+            .lock()
+            .map_err(|_| AppServiceError::StatePoisoned)?
+            .values()
+            .filter_map(Weak::upgrade)
+            .filter(|runtime| runtime.selection.library_id == library_id)
+            .collect::<Vec<_>>();
+        for runtime in &runtimes {
+            runtime.request_source_unavailable();
+        }
+        {
+            let _publication = self.hosted_publication_fence.lock().await;
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| AppServiceError::StatePoisoned)?;
+            state
+                .libraries
+                .catalog_mut()
+                .mark_root_offline(library_id)?;
+        }
+        for runtime in runtimes {
+            if !runtime
+                .source_unavailable_reported
+                .swap(true, Ordering::AcqRel)
+            {
+                runtime
+                    .publish(WallUpdate::SourceUnavailable {
+                        selection_id: runtime.selection.id().to_owned(),
+                        source_id: library_id.as_uuid().hyphenated().to_string(),
+                    })
+                    .await;
+            }
+            self.remove_runtime_if_dead(runtime.selection.group_id, &runtime);
+        }
+        Ok(true)
     }
 
     #[doc(hidden)]
@@ -2864,6 +2923,7 @@ impl GalleryEngine {
         mut handle: photo_indexer::ScanHandle,
         generation: u64,
         admission: ScanAdmission,
+        owner: ScanWorkerOwner,
     ) {
         let mut batch = Vec::new();
         let mut persistence_failed = false;
@@ -2888,7 +2948,7 @@ impl GalleryEngine {
                 break;
             }
             if self
-                .apply_runtime_batch(&runtime, generation, &batch)
+                .apply_runtime_batch(&runtime, &owner, generation, &batch)
                 .await
                 .is_err()
             {
@@ -2912,7 +2972,9 @@ impl GalleryEngine {
         let mut completed = false;
         if successful && !persistence_failed && !runtime.cancellation_requested() {
             let _publication = self.hosted_publication_fence.lock().await;
-            completed = if let Ok(mut state) = self.state.lock() {
+            completed = if runtime.worker_may_publish(&owner)
+                && let Ok(mut state) = self.state.lock()
+            {
                 state
                     .libraries
                     .catalog_mut()
@@ -2926,7 +2988,7 @@ impl GalleryEngine {
             } else {
                 false
             };
-            if completed {
+            if completed && runtime.worker_may_publish(&owner) {
                 runtime
                     .settled
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -2955,13 +3017,14 @@ impl GalleryEngine {
         } else {
             crate::hosted_runtime::ScanLifecycle::Failed
         };
-        runtime.finish_scan(admission.generation, terminal);
+        runtime.finish_owned_scan(owner, terminal);
         self.remove_runtime_if_dead(runtime.selection.group_id, &runtime);
     }
 
     async fn apply_runtime_batch(
         &self,
         runtime: &Arc<SelectionRuntime>,
+        owner: &ScanWorkerOwner,
         generation: u64,
         events: &[IndexEvent],
     ) -> Result<(), AppServiceError> {
@@ -2992,8 +3055,11 @@ impl GalleryEngine {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let _publication = self.hosted_publication_fence.lock().await;
+        if !runtime.worker_may_publish(owner) {
+            return Ok(());
+        }
         let updates = {
-            let _publication = self.hosted_publication_fence.lock().await;
             let mut updates = Vec::new();
             let mut state = self
                 .state
@@ -3038,7 +3104,7 @@ impl GalleryEngine {
             updates
         };
         for update in updates {
-            if runtime.cancellation_requested() {
+            if !runtime.worker_may_publish(owner) {
                 break;
             }
             let _ = runtime.publish(update).await;

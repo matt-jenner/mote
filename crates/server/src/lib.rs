@@ -61,23 +61,42 @@ pub enum StartupError {
 }
 
 impl AppState {
-    pub(crate) fn record_source_root_listing(&self, available: bool) {
+    pub(crate) async fn record_source_root_listing(&self, available: bool) {
         let Some(folder_root) = self.folder_root.as_ref() else {
             return;
         };
         let canonical_root = photo_domain::NativePathKey::from_path(folder_root.canonical_root());
+        let library = {
+            let Ok(catalog) = self.catalog.lock() else {
+                tracing::warn!("source availability could not acquire the catalog");
+                return;
+            };
+            let Ok(libraries) = catalog.list_libraries() else {
+                tracing::warn!("source availability could not read the catalog");
+                return;
+            };
+            libraries
+                .into_iter()
+                .find(|library| library.canonical_root_key == canonical_root)
+        };
+        let Some(library) = library else {
+            return;
+        };
+        if !available && let Some(gallery) = &self.gallery {
+            match gallery
+                .mark_hosted_library_root_unavailable(library.id)
+                .await
+            {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "source availability could not be persisted");
+                    return;
+                }
+            }
+        }
         let Ok(mut catalog) = self.catalog.lock() else {
             tracing::warn!("source availability could not acquire the catalog");
-            return;
-        };
-        let Ok(libraries) = catalog.list_libraries() else {
-            tracing::warn!("source availability could not read the catalog");
-            return;
-        };
-        let Some(library) = libraries
-            .into_iter()
-            .find(|library| library.canonical_root_key == canonical_root)
-        else {
             return;
         };
         let result = if available {

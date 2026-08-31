@@ -4,10 +4,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use photo_app_service::{
-    AppConfig, DerivativeClass, DerivativeReference, GalleryEngine, GalleryScope, InteractionState,
-    MetadataReader, OrderState, WallUpdate, WallWarningState,
+    AppConfig, DerivativeClass, DerivativeReference, GalleryEngine, GalleryScope, GallerySelection,
+    InteractionState, MetadataReader, OrderState, WallUpdate, WallWarningState,
 };
-use photo_metadata::{MetadataBundle, MetadataReadWarning};
+use photo_metadata::{MetadataBundle, MetadataCandidate, MetadataReadWarning, MetadataSource};
 
 #[tokio::test]
 async fn separate_selection_runtimes_publish_only_their_selection() {
@@ -237,6 +237,7 @@ struct GatedConcurrencyReader {
     starts: Arc<AtomicUsize>,
     active: Arc<AtomicUsize>,
     max_active: Arc<AtomicUsize>,
+    rating: Option<u8>,
 }
 
 impl GatedConcurrencyReader {
@@ -247,6 +248,14 @@ impl GatedConcurrencyReader {
             starts: Arc::new(AtomicUsize::new(0)),
             active: Arc::new(AtomicUsize::new(0)),
             max_active: Arc::new(AtomicUsize::new(0)),
+            rating: None,
+        }
+    }
+
+    fn with_rating(rating: u8) -> Self {
+        Self {
+            rating: Some(rating),
+            ..Self::new()
         }
     }
 
@@ -273,9 +282,395 @@ impl MetadataReader for GatedConcurrencyReader {
             released = changed.wait(released).unwrap();
         }
         drop(released);
-        let result = photo_indexer::DefaultMetadataReader.read(media_path, sidecar_path);
+        let result = if let Some(rating) = self.rating {
+            Ok(MetadataBundle {
+                ratings: vec![MetadataCandidate {
+                    value: rating,
+                    source: MetadataSource::SidecarXmp,
+                    raw_value: rating.to_string(),
+                }],
+                ..MetadataBundle::default()
+            })
+        } else {
+            photo_indexer::DefaultMetadataReader.read(media_path, sidecar_path)
+        };
         self.active.fetch_sub(1, Ordering::SeqCst);
         result
+    }
+}
+
+struct GatedRecoveryFixture {
+    _temp: tempfile::TempDir,
+    source: std::path::PathBuf,
+    offline_source: std::path::PathBuf,
+    config: AppConfig,
+    engine: GalleryEngine,
+    selection: GallerySelection,
+    reader: GatedConcurrencyReader,
+}
+
+async fn prepare_gated_recovery(reader: GatedConcurrencyReader) -> GatedRecoveryFixture {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let offline_source = temp.path().join("photos-offline");
+    std::fs::create_dir(&source).unwrap();
+    write_jpeg(&source.join("photo.jpg"));
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+
+    let initial = GalleryEngine::open(config.clone(), source.clone()).unwrap();
+    let summary = initial.select_relative(Path::new("")).await.unwrap();
+    let selection = initial.resolve_selection(&summary.id).unwrap();
+    let mut events = initial.subscribe(
+        &selection,
+        "initial".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    initial.ensure_running(&selection).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().update,
+                WallUpdate::MetadataSettled { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("initial scan did not settle");
+    drop(events);
+    drop(initial);
+
+    let mut catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    catalog.mark_root_offline(selection.library_id()).unwrap();
+    catalog
+        .set_library_availability(
+            selection.library_id(),
+            photo_domain::Availability::Available,
+        )
+        .unwrap();
+    drop(catalog);
+
+    let engine =
+        GalleryEngine::open_with_reader(config.clone(), source.clone(), Arc::new(reader.clone()))
+            .unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    GatedRecoveryFixture {
+        _temp: temp,
+        source,
+        offline_source,
+        config,
+        engine,
+        selection,
+        reader,
+    }
+}
+
+async fn start_gated_recovery(fixture: &GatedRecoveryFixture) {
+    let entered = fixture.reader.entered.notified();
+    tokio::pin!(entered);
+    entered.as_mut().enable();
+    fixture
+        .engine
+        .ensure_running(&fixture.selection)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("recovery worker did not enter the metadata reader");
+}
+
+async fn wait_for_gated_reader_to_quiesce(reader: &GatedConcurrencyReader) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while reader.active.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("gated metadata worker did not quiesce");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+fn restore_source_and_mark_available(fixture: &GatedRecoveryFixture) {
+    std::fs::rename(&fixture.offline_source, &fixture.source).unwrap();
+    let mut catalog = photo_catalog::Catalog::open(&fixture.config.catalog_path()).unwrap();
+    catalog
+        .set_library_availability(
+            fixture.selection.library_id(),
+            photo_domain::Availability::Available,
+        )
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_loss_during_an_owned_worker_does_not_admit_an_overlapping_successor() {
+    let fixture = prepare_gated_recovery(GatedConcurrencyReader::new()).await;
+    start_gated_recovery(&fixture).await;
+
+    std::fs::rename(&fixture.source, &fixture.offline_source).unwrap();
+    fixture
+        .engine
+        .ensure_running(&fixture.selection)
+        .await
+        .unwrap();
+    restore_source_and_mark_available(&fixture);
+    for _ in 0..4 {
+        fixture
+            .engine
+            .ensure_running(&fixture.selection)
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let starts_before_owner_drain = fixture.reader.starts.load(Ordering::SeqCst);
+    let max_active_before_owner_drain = fixture.reader.max_active.load(Ordering::SeqCst);
+    fixture.reader.release();
+    wait_for_gated_reader_to_quiesce(&fixture.reader).await;
+
+    assert_eq!(
+        starts_before_owner_drain, 1,
+        "source loss must not let a successor overlap the active drain owner"
+    );
+    assert_eq!(max_active_before_owner_drain, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancellation_then_source_loss_cannot_certify_an_active_worker_as_quiescent() {
+    let fixture = prepare_gated_recovery(GatedConcurrencyReader::new()).await;
+    start_gated_recovery(&fixture).await;
+
+    fixture
+        .engine
+        .cancel_runtime_scan_for_test(&fixture.selection);
+    std::fs::rename(&fixture.source, &fixture.offline_source).unwrap();
+    fixture
+        .engine
+        .ensure_running(&fixture.selection)
+        .await
+        .unwrap();
+    restore_source_and_mark_available(&fixture);
+    for _ in 0..4 {
+        fixture
+            .engine
+            .ensure_running(&fixture.selection)
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let starts_before_owner_drain = fixture.reader.starts.load(Ordering::SeqCst);
+    let max_active_before_owner_drain = fixture.reader.max_active.load(Ordering::SeqCst);
+    fixture.reader.release();
+    wait_for_gated_reader_to_quiesce(&fixture.reader).await;
+
+    assert_eq!(
+        starts_before_owner_drain, 1,
+        "a non-owner source check must not release cancelled recovery admission"
+    );
+    assert_eq!(max_active_before_owner_drain, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_source_loss_fences_old_generation_catalog_and_event_publication() {
+    let fixture = prepare_gated_recovery(GatedConcurrencyReader::with_rating(4)).await;
+    start_gated_recovery(&fixture).await;
+
+    let catalog = photo_catalog::Catalog::open(&fixture.config.catalog_path()).unwrap();
+    let asset = catalog.assets(fixture.selection.library_id()).unwrap()[0].clone();
+    assert_eq!(asset.rating, None);
+    drop(catalog);
+
+    std::fs::rename(&fixture.source, &fixture.offline_source).unwrap();
+    fixture
+        .engine
+        .ensure_running(&fixture.selection)
+        .await
+        .unwrap();
+    let offline_event_id = fixture.engine.current_event_id_for_test(&fixture.selection);
+    let mut post_offline = fixture.engine.subscribe(
+        &fixture.selection,
+        "post-offline".to_owned(),
+        GalleryScope::CurrentFolder,
+        Some(offline_event_id),
+    );
+    std::fs::rename(&fixture.offline_source, &fixture.source).unwrap();
+
+    fixture.reader.release();
+    wait_for_gated_reader_to_quiesce(&fixture.reader).await;
+    let later_event = tokio::time::timeout(Duration::from_millis(250), post_offline.recv()).await;
+    let catalog = photo_catalog::Catalog::open(&fixture.config.catalog_path()).unwrap();
+    let asset_after_drain = catalog.find_asset(asset.id).unwrap().unwrap();
+
+    assert!(
+        later_event.is_err(),
+        "the old generation published an event after the durable offline transition: {later_event:?}"
+    );
+    assert_eq!(asset_after_drain.rating, None);
+    assert_eq!(
+        asset_after_drain.availability,
+        photo_domain::Availability::RootOffline
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_drain_allows_exactly_one_successor_for_the_exact_recovery_token() {
+    let fixture = prepare_gated_recovery(GatedConcurrencyReader::new()).await;
+    start_gated_recovery(&fixture).await;
+
+    std::fs::rename(&fixture.source, &fixture.offline_source).unwrap();
+    fixture
+        .engine
+        .ensure_running(&fixture.selection)
+        .await
+        .unwrap();
+    let mut catalog = photo_catalog::Catalog::open(&fixture.config.catalog_path()).unwrap();
+    let pending = catalog
+        .folder_group_recovery_state(fixture.selection.library_id(), fixture.selection.group_id())
+        .unwrap();
+    assert!(pending.requested > pending.reconciled);
+    drop(catalog);
+    restore_source_and_mark_available(&fixture);
+
+    for _ in 0..4 {
+        fixture
+            .engine
+            .ensure_running(&fixture.selection)
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let starts_before_owner_drain = fixture.reader.starts.load(Ordering::SeqCst);
+    fixture.reader.release();
+    wait_for_gated_reader_to_quiesce(&fixture.reader).await;
+    assert_eq!(
+        starts_before_owner_drain, 1,
+        "the successor must wait for owner-certified drain completion"
+    );
+
+    let mut events = fixture.engine.subscribe(
+        &fixture.selection,
+        "recovery-owner".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    let mut retries = Vec::new();
+    for _ in 0..8 {
+        let engine = fixture.engine.clone();
+        let selection = fixture.selection.clone();
+        retries.push(tokio::spawn(async move {
+            engine.ensure_running(&selection).await
+        }));
+    }
+    for retry in retries {
+        retry.await.unwrap().unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().update,
+                WallUpdate::MetadataSettled { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the exact recovery successor did not settle");
+
+    catalog = photo_catalog::Catalog::open(&fixture.config.catalog_path()).unwrap();
+    let reconciled = catalog
+        .folder_group_recovery_state(fixture.selection.library_id(), fixture.selection.group_id())
+        .unwrap();
+    assert_eq!(reconciled.requested, pending.requested);
+    assert_eq!(reconciled.reconciled, pending.requested);
+    assert_eq!(fixture.reader.starts.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.reader.max_active.load(Ordering::SeqCst), 1);
+
+    fixture
+        .engine
+        .ensure_running(&fixture.selection)
+        .await
+        .unwrap();
+    assert_eq!(fixture.reader.starts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authoritative_root_loss_cancels_every_active_scope_for_the_hosted_library() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir_all(source.join("left")).unwrap();
+    std::fs::create_dir_all(source.join("right")).unwrap();
+    write_jpeg(&source.join("left/photo.jpg"));
+    write_jpeg(&source.join("right/photo.jpg"));
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let reader = GatedConcurrencyReader::new();
+    let engine =
+        GalleryEngine::open_with_reader(config.clone(), source, Arc::new(reader.clone())).unwrap();
+    let left = engine.select_relative(Path::new("left")).await.unwrap();
+    let right = engine.select_relative(Path::new("right")).await.unwrap();
+    let left = engine.resolve_selection(&left.id).unwrap();
+    let right = engine.resolve_selection(&right.id).unwrap();
+
+    engine.ensure_running(&left).await.unwrap();
+    engine.ensure_running(&right).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while reader.starts.load(Ordering::SeqCst) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both hosted selection workers did not start");
+
+    assert!(
+        engine
+            .mark_hosted_library_root_unavailable(left.library_id())
+            .await
+            .unwrap()
+    );
+    let mut left_events = engine.subscribe(
+        &left,
+        "left-offline".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    let mut right_events = engine.subscribe(
+        &right,
+        "right-offline".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    for events in [&mut left_events, &mut right_events] {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    events.recv().await.unwrap().update,
+                    WallUpdate::SourceUnavailable { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("an active hosted scope did not publish sourceUnavailable");
+    }
+
+    reader.release();
+    wait_for_gated_reader_to_quiesce(&reader).await;
+    let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    assert!(
+        catalog
+            .assets(left.library_id())
+            .unwrap()
+            .iter()
+            .all(|asset| asset.availability == photo_domain::Availability::RootOffline)
+    );
+    for selection in [&left, &right] {
+        let recovery = catalog
+            .folder_group_recovery_state(selection.library_id(), selection.group_id())
+            .unwrap();
+        assert!(recovery.requested > recovery.reconciled);
     }
 }
 
