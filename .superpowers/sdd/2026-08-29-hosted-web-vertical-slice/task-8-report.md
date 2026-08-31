@@ -1,6 +1,6 @@
 # Task 8 implementation report
 
-Status: fix round 4 complete, awaiting task-scoped re-review.
+Status: fix round 5 complete, awaiting task-scoped re-review.
 
 Initial implementation commit: `e5c96b9` (`feat: serve the hosted photo viewer securely`), based on `bce40c4`.
 
@@ -11,6 +11,8 @@ Fix round 2 implementation commit: `9ee0916` (`fix: bind hosted static roots at 
 Fix round 3 implementation commit: `170071b` (`fix: pin hosted roots before validation`), based on `d480996`.
 
 Fix round 4 implementation commit: `6c0c47b` (`fix: enforce hosted mount boundaries`), based on `38a5f97`.
+
+Fix round 5 implementation commit: `caa708e` (`fix: prevalidate hosted source startup`), based on `a4e0d6e`.
 
 ## Delivered behavior
 
@@ -596,3 +598,116 @@ The process was interrupted in its foreground session, `lsof` found no listener 
 ### Round-4 limitations
 
 Only `aarch64-apple-darwin` was compiled and executed in this workspace. Linux mount-ID behavior is backed by the real rootless-container proof and platform-independent synthetic/parser tests, but this report does not claim a Linux Rust build or runtime test. If both Linux `statx` and bounded `/proc/self/fdinfo` access are unavailable, static startup fails closed. macOS does not expose a Linux-equivalent mount ID through this API; the `fstatfs` tuple detects distinct mount identities but cannot prove separation if the kernel presents an alias with an identical full tuple. Windows and other unsupported platforms continue to disable static hosting until they have an equivalent handle-relative, no-reparse and stable-mount implementation.
+
+## Fix round 5: one-shot prevalidated source startup
+
+The fifth Sol review found a remaining startup interval: the server validated the configured source descriptor, then both `ContainedFolderRoot` and `GalleryEngine` reopened the pathname before a later identity check. A transient symlink replacement could therefore be adopted by either constructor and restored before the post-check. The configuration also retained its original source descriptor indefinitely through every clone, which contradicted the intended offline/remount lifecycle.
+
+### Behavioral RED evidence
+
+Two deterministic stage hooks reproduced the old behavior on `a4e0d6e`:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline --jobs 2 -p photo-server --test health_api transient_source_swap_cannot_retarget_the_folder_root -- --exact --nocapture
+  RED: the folder API returned `source-sentinel-album` from the transient replacement instead of `safe-album` from the configured source.
+
+CARGO_BUILD_JOBS=2 cargo test --offline --jobs 2 -p photo-server --test health_api transient_source_swap_cannot_change_the_configured_library_key -- --exact --nocapture
+  RED: the post-check passed after restoration, but the catalog stored `/.../replacement` rather than `/.../photos`.
+```
+
+These are behavioral failures at the two exact pathname-reopen windows. They do not infer sentinel admission from a compile failure or from the earlier pre-validation swap test.
+
+### Prevalidated startup implementation
+
+- `ServerConfig` now owns the source validation inside one shared `Arc<Mutex<Option<...>>>`. All configuration clones share that slot. `AppState::open` atomically takes it; a second start receives the typed, path-free `SourceStartupUnavailable` error instead of reusing or duplicating the descriptor.
+- Taking the slot opens and fstats the current configured source path once and requires the same device/inode identity captured during configuration. The resulting move-only lease owns that operational directory descriptor.
+- `ContainedFolderRoot::from_prevalidated_operational_path` stores the configured operational path without canonicalizing, testing, listing, or reopening it during startup.
+- The server-only `server-internal-prevalidated-source` app-service feature exposes a doc-hidden capability requiring an owned `File`, not a path-only assertion. `GalleryEngine::open_prevalidated_hosted` consumes that capability, uses the normalized configured key verbatim for exact lookup or catalog admission, and performs no source-root canonicalize/is-dir/read operation.
+- Local-state and catalog overlap checks remain active. Their prevalidated path normalizes absolute and dot components without source I/O; on macOS it also normalizes only the exact built-in `/var`, `/tmp`, and `/etc` aliases to their `/private/...` forms. A negative `/various` case prevents prefix overmatching. An overlapping normalized catalog key returns typed `AddLibraryError::Overlaps` and does not admit another library.
+- The validated descriptor and its lifecycle marker are dropped on every success, error, or unwind path before `AppState::open` returns. A source moved offline immediately after the atomic validation remains untouched through both constructors; startup records only the configured key. Runtime folder resolution, scans, availability checks, and a later remount continue to use the configured pathname exactly as before.
+
+The ordinary public `GalleryEngine::open` and `ContainedFolderRoot::new` paths remain unchanged for desktop and non-hosted callers. Within this workspace only `photo-server` enables the internal feature. Rust cannot restrict a public cross-crate constructor to one named downstream crate, so the API is doc-hidden, explicitly server-internal, and requires ownership of the validated descriptor; it cannot be fabricated from paths alone.
+
+### Focused GREEN evidence
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline --jobs 2 -p photo-server --test health_api
+  PASS: 22 tests.
+  Both constructor-window swaps keep the configured folder/key; moving the source offline after operational validation succeeds without a source reopen; clones share one consumed slot; the descriptor marker releases on success, pre-Gallery error, in-Gallery overlap error, and unwind; second startup is typed and path-free.
+
+CARGO_BUILD_JOBS=2 cargo test --offline --jobs 2 -p photo-core --test local_state
+  PASS: 5 tests, including missing-source no-I/O overlap checks and exact macOS alias/near-miss normalization.
+
+CARGO_BUILD_JOBS=2 cargo test --offline --jobs 2 -p photo-app-service --test hosted_selections completed_selection_reopens_for_cached_browsing_when_source_is_offline -- --exact --nocapture
+  PASS: cached offline browsing and later path remount resolve the same selection.
+
+CARGO_BUILD_JOBS=2 cargo test --offline --jobs 2 -p photo-server
+  PASS: 82 tests across library, derivative, event, folder, gallery, health, and static-host targets.
+
+CARGO_BUILD_JOBS=2 cargo clippy --offline --jobs 2 -p photo-server --all-targets -- -D warnings
+  PASS.
+
+CARGO_BUILD_JOBS=2 cargo clippy --offline --jobs 2 -p photo-app-service --all-targets --no-default-features -- -D warnings
+  PASS: the ordinary non-hosted feature shape remains warning-free.
+
+CARGO_BUILD_JOBS=2 cargo check --offline --jobs 2 --release -p photo-server
+  PASS.
+```
+
+### Final round-5 gates
+
+All gates ran on the exact implementation source committed as `caa708e`:
+
+```text
+cargo fmt --all -- --check
+  PASS
+
+npm run check
+  PASS: Biome checked 75 files, no fixes required
+
+npm run typecheck
+  PASS
+
+npm test
+  PASS: 18 files, 154 tests
+
+npm run test:browser
+  PASS on approved loopback rerun: 4 files, 165 tests
+
+npm run web:build
+  PASS: Vite 8.2.2 transformed 1,891 modules; index script and stylesheet URLs are root-relative `/assets/...`
+
+CARGO_BUILD_JOBS=2 cargo test --offline --workspace --jobs 2
+  PASS: all workspace and doc tests, including the source-safety harness, 26 hosted-selection tests, 57 progressive-wall tests, and the 22-test source-startup/server-health suite
+
+CARGO_BUILD_JOBS=2 cargo clippy --offline --workspace --all-targets --all-features --jobs 2 -- -D warnings
+  PASS
+
+CARGO_BUILD_JOBS=2 cargo check --offline --manifest-path apps/desktop/src-tauri/Cargo.toml --jobs 2
+  PASS
+
+CARGO_BUILD_JOBS=2 cargo build --offline --release -p photo-server --jobs 2
+  PASS
+
+git diff --check
+  PASS
+```
+
+The first browser attempt was blocked before collection by the sandboxed IPv6 loopback bind (`EPERM`); the approved scoped rerun passed with only the branch's existing non-fatal `ViewerStage` `act(...)` warning. The desktop check added its known generated `image` and `libc` dependency-list lines; removing only those lines restored the exact pre-check nested-lock checksum `60ddf95256a7c20613c9f9f700db5793ab4bc04ce11cfa9375d9076612594a4c`.
+
+### Round-5 live release-process evidence
+
+One foreground optimized process used the hosted build, the existing six-photo demo source, and fresh explicit temporary data/cache directories:
+
+- `/gallery/live-demo` returned 200 HTML with `no-cache`, a quoted ETag, no redirect, the exact CSP, `nosniff`, and referrer headers. Host `hostile.example` and forwarded host `forwarded.example` were absent from the body; the generated script and stylesheet references remained root-relative.
+- `/healthz` returned healthy, path-free JSON with one available source. Encoded `/%61pi/v1/unknown` returned the fixed JSON 404 envelope.
+- Creating the root selection returned 201, and the wall exposed all six photos. A bounded future replay returned 200 `text/event-stream`, `no-cache`, `x-accel-buffering: no`, and one path-free `resyncRequired` event with authoritative `id: 0`.
+- A visible wall-thumbnail request returned 204. The resulting opaque derivative returned 200 `image/jpeg`, 190,681 bytes, `public, max-age=31536000, immutable`, `nosniff`, and an opaque quoted ETag.
+
+All six source hashes were identical before and after the live probe. The server was interrupted in its foreground session, `lsof` found no listener on port 18080, and the explicit temporary tree was removed. Generated `apps/interface/dist` remains ignored. No source photo changed, and no background build, `cargo clean`, merge, push, OCI work, Task 9 packaging, or deployment work occurred.
+
+### Round-5 limitations
+
+- Source identity is guaranteed across the hosted startup admission boundary, not pinned for the process lifetime. This is deliberate: after startup, path-based offline/remount semantics remain the product contract.
+- The installed and executed target remains `aarch64-apple-darwin`. Linux mount-ID behavior retains the round-4 synthetic/parser and rootless-container evidence; unsupported Unix and non-Unix static hosting remains fail closed.
+- The macOS no-I/O key normalizer handles only the three exact built-in aliases above. Arbitrary source symlink aliases are admitted initially only through the pinned configuration descriptor and stored under its canonical configured key; the prevalidated catalog path never follows arbitrary aliases.
