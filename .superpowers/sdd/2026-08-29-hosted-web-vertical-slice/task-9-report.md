@@ -6,7 +6,11 @@ Regression implementation commit: `e316105` (`fix: preserve hosted offline avail
 
 Deployment and acceptance commit: `517c679` (`feat: package hosted photo viewer for OCI`), based on `e316105`.
 
-Review-fix commit: `9a0cb05` (`fix: reconcile hosted source recovery`), based on report commit `b0616de`.
+Initial recovery review-fix commit: `9a0cb05` (`fix: reconcile hosted source recovery`), based on report commit `b0616de`.
+
+Persisted recovery review-fix commit: `d9fe53c` (`fix: persist hosted recovery reconciliation`), based on corrected report commit `8fa8af0`.
+
+Terminal replay review-fix commit: `1e3fd6f` (`fix: render terminal hosted cache after replay`), based on `d9fe53c`.
 
 ## Delivered deployment contract
 
@@ -43,19 +47,21 @@ The offline child UI then exposed two event-order races:
 - `wallError`/`sourceUnavailable` used to clear the active page request, causing a successful cached page to be rejected as unowned; only `pageRequestFailed` now clears that ownership;
 - a replayed historical `catalogBatch` could overwrite an authoritative page's `rootOffline` availability with stale `available`. Catalog replay may still merge metadata and derivative references, but it cannot upgrade an existing unavailable item. A later authoritative `pageLoaded` result can restore `available` normally. A conservative unavailable replay still downgrades available state.
 
-Task-scoped review then found a separate recovery defect: marking a root offline made every retained asset `rootOffline`, but a successful root listing restored only the library record. A settled stable selection skipped scan admission, so those assets stayed offline and a previously uncached derivative remained unavailable until process state changed. The review fix now:
+Task-scoped review then found a separate recovery defect: marking a root offline made every retained asset `rootOffline`, but a successful root listing restored only the library record. A settled stable selection skipped scan admission, so those assets stayed offline and a previously uncached derivative remained unavailable until process state changed. The first in-memory recovery fix was not durable for overlapping or empty groups. Migration v10 and the final review fix now:
 
-- advances a hosted-library recovery epoch only after a successful typed canonical `RootOffline -> Available` catalog transition;
-- serializes recovery admission in the existing per-selection scan control, so concurrent requests for one runtime and epoch start exactly one scan;
-- advances the reconciled epoch only after successful catalog completion; failed and cancelled attempts remain retryable without overlap;
-- captures the current epoch on ordinary unsettled scans, preventing a second scan for the same transition;
-- falls back to persisted `rootOffline` group membership after a process restart, including the no-asset/empty-group case through the live epoch;
-- restores wall assets to `available` and permits a previously uncached derivative after the same stable selection is reselected;
-- leaves desktop runtimes, nested-folder isolation, cached offline reads, and path-free health behavior unchanged.
+- persist checked signed-64 `recovery_requested` and `recovery_reconciled` counters per folder group, plus the exact recovery token on each scan generation;
+- selectively backfill only groups whose library is root-offline or whose membership contains root-offline assets, leaving clean large catalogs untouched;
+- increment every group once for a root outage and only the affected group for a local outage, without wraparound or duplicate increments while recovery is already pending;
+- serialize recovery admission in the existing per-selection scan control, reject stale tokens at or below the persisted reconciled value, and let concurrent callers for one token start exactly one scan;
+- advance only that generation's captured token in the same successful online catalog-completion transaction, so a newer outage during a scan remains pending and a failed or cancelled scan cannot reconcile it;
+- preserve pending recovery across overlapping groups, empty groups, unseen or deleted files, and process restart without inferring state from mutable asset availability;
+- keep cancellation terminal but non-quiescent until the same generation's detached worker drain calls completion; retry admission is rejected before that handshake and admitted exactly once afterward;
+- restore wall assets to `available` and permit a previously uncached derivative after the same stable selection is reselected;
+- leave desktop runtimes, nested-folder isolation, cached offline reads, and path-free health behavior unchanged.
 
 The smoke cleanup trap was also corrected to use EXIT for idempotent cleanup and explicit conventional HUP/INT/TERM exit codes. It still restores source permissions first and removes only exact smoke-owned names.
 
-The browser regression reproduces the exact order: restored current-folder page, scope broadening, source-unavailable event, authoritative broad page containing the uncached offline child, and a stale available catalog replay. It also proves later authoritative recovery.
+The browser regressions reproduce both relevant orders. The first covers a restored current-folder page, scope broadening, source-unavailable event, authoritative broad page containing the uncached offline child, and a stale available catalog replay. The closing regression adds synchronous scope reconnect/replay, a resync replacement request, a provisional authoritative page, and the same-selection React reset. Terminal scan knowledge now survives `sourceUnavailable`, resync, and same-selection scope reset while items, cursor, and page exhaustion still reset for the authoritative refetch. A different selection always clears that knowledge.
 
 ## RED evidence
 
@@ -94,7 +100,25 @@ photo-server real outage -> root listing -> same selection
   RED: stable selection did not reconcile after root recovery
 ```
 
-A scan-control RED additionally proved that a cancelled recovery retained its pending epoch but could not be readmitted. `Cancelled` is now an admissible settled-recovery terminal state; the focused test proves retry, successful completion, and epoch reconciliation.
+A scan-control RED additionally proved that a cancelled recovery retained its pending token but could be readmitted before the old detached worker drained. Cancellation now has an explicit quiescence handshake: retry is rejected while the cancelled generation is still active and becomes admissible only after that exact generation completes its drain.
+
+Closing review added deterministic REDs for the durable representation and final UI boundary:
+
+```text
+catalog migration/recovery state
+  RED: per-group requested/reconciled state and scan-generation token APIs were absent
+
+overlapping group restart
+  RED: reconciling one shared group could erase the other group's asset-derived fallback
+
+active cancellation barrier
+  RED: retry admission overlapped already-admitted blocking metadata work
+
+terminal offline browser replay
+  RED: replacement page state contained two assets, but the uncached child figure was absent
+```
+
+The browser RED traced the final failure past the HTTP and reducer boundaries: the replacement page was accepted (`Preparing previews · 1 of 2`), the child remained `rootOffline`, and the stale replay could not upgrade it. The figure was omitted because provisional layout withholds the final row until scan completion, while source-unavailable completion was lost across resync and the same-selection scope reset.
 
 ## Focused GREEN evidence
 
@@ -103,30 +127,33 @@ focused offline photo-server health and derivative API tests (two Cargo jobs)
   PASS: root health recovery and offline cached derivative cases
 
 npm test --workspace @photo-viewer/interface -- src/wall/wallReducer.test.ts
-  PASS: 40 tests
+  PASS: 43 tests
 
 npm run test:browser --workspace @photo-viewer/interface -- \
   src/components/PhotoWall.browser.test.tsx \
-  -t "shows an uncached offline child after broadening the restored scope"
-  PASS: 1 test, 52 skipped
+  -t "keeps an uncached offline child visible when scope replay ends during a provisional page"
+  PASS: 1 test, 53 skipped
 ```
 
-The final reducer assertions cover metadata/reference merging under the replay fence, conservative unavailable replay, absent-item insertion through existing behavior, and authoritative recovery.
+The final reducer assertions cover metadata/reference merging under the replay fence, conservative unavailable replay, absent-item insertion, authoritative recovery, source-unavailable terminal completion without invented exhaustion, resync preservation, and same-selection-only reset preservation.
 
 The recovery review fix passed the following focused evidence:
 
 ```text
+photo-catalog recovery_state
+  PASS: selective migration, empty/new offline group, idempotence, exact token, newer outage, and overflow rollback
+
 photo-app-service scan-control recovery unit
-  PASS: failure and cancellation retain retry; only completion reconciles the epoch
+  PASS: failure retains retry; cancellation requires quiescence; only completion reconciles the exact token
 
 photo-app-service hosted_runtime
-  PASS: 16 tests
+  PASS
 
-photo-app-service hosted_selections
-  PASS: 28 tests, including concurrent exact-one, restart fallback, and empty-group recovery
+photo-app-service hosted selections and runtime
+  PASS: concurrent exact-one, overlapping-group restart, empty-group recovery, retry, and active-worker barrier
 
 photo-server derivative/folder/health focused suites
-  PASS: 5 + 10 + 23 tests
+  PASS
 ```
 
 ## Pre-commit gates
@@ -153,10 +180,10 @@ npm run typecheck
   PASS
 
 npm test
-  PASS: 18 files, 157 tests
+  PASS: 18 files, 160 tests
 
 npm run test:browser
-  PASS: 4 files, 167 tests
+  PASS: 4 files, 168 tests
 
 podman build -t localhost/photo-viewer:dev -f Containerfile .
   PASS
@@ -165,7 +192,7 @@ git diff --check
   PASS
 ```
 
-The recovery review fix was followed by the same complete gate from the updated Rust source. The first sandboxed browser attempt could not bind its loopback test server; the identical approved local-listener run passed all 167 tests. The browser suite emitted only the branch's existing non-fatal `ViewerStage` `act(...)` warning.
+The persisted recovery review fix was followed by the complete Rust gate from the updated source. After the final frontend-only reducer change, Biome, typecheck, all 160 unit tests, and all 168 browser tests passed again. The first sandboxed browser attempt could not bind its loopback test server; the identical approved local-listener run passed. The browser suite emitted only the branch's existing non-fatal `ViewerStage` `act(...)` warning.
 
 ## Final lifecycle run
 
@@ -176,7 +203,7 @@ The accepted run was:
   PASS
 ```
 
-The explicit image build rebuilt the updated hosted web and Rust products once, with the Rust release build limited to two jobs. The smoke script's internal build was then a complete cache hit. The resulting accepted image was `b05633aba610b56124465e0b872f13f30aabc1f2d2d820fe90781024dae38b05`.
+The explicit image build rebuilt the updated Rust product once with two Cargo jobs. The final smoke build reused every Rust layer and rebuilt only the hosted web stage after the reducer fix. The resulting accepted image was `a52039cd7f66937eae5ab2fe341e6c6f10f3136ee1a693bd60716af840cbbd95`.
 
 Observed phase results:
 
@@ -198,10 +225,10 @@ The run reported unchanged source metadata and hashes after every required check
 
 ## Cleanup and limits
 
-- After the run, read-only Podman listings contained no `photo-viewer-smoke-*` container, network, or volume, and no matching temporary root remained. The smoke session exited 0; no background process was launched.
-- The only removed test artifacts were the exact RED screenshot and its hash-identical Vitest attachment, followed by their empty generated directories.
+- After the run, read-only Podman listings contained no `photo-viewer-smoke-*` container, network, or volume, and no matching temporary root remained. The foreground smoke session exited 0.
+- The only removed test artifacts were the exact RED screenshot and Vitest attachment, followed by their empty generated directories.
 - No source fixture was modified. No unrelated container, volume, or image was removed by the Task 9 implementation.
 - The nested desktop lockfile's generated dependency-list churn was removed before commit.
-- Host disk had 15 GiB free at the review-fix commit checkpoint.
+- Host disk had 13 GiB free at the closing review-fix commit checkpoint.
 - The image and lifecycle were exercised through Podman on macOS. This report does not claim a Windows container runtime or Windows source-loss execution.
 - No merge or push occurred.
