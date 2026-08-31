@@ -1,3 +1,5 @@
+#[cfg(feature = "server-internal-prevalidated-source")]
+use photo_core::PrevalidatedSourceKeys;
 #[cfg(target_os = "macos")]
 use photo_core::normalize_prevalidated_source_key;
 use photo_core::{LocalStateError, LocalStatePaths};
@@ -54,6 +56,7 @@ fn prepared_directories_are_private() {
     }
 }
 
+#[cfg(feature = "server-internal-prevalidated-source")]
 #[test]
 fn prevalidated_missing_source_keys_are_checked_without_resolving_the_source() {
     let temp = tempfile::tempdir().unwrap();
@@ -63,19 +66,43 @@ fn prevalidated_missing_source_keys_are_checked_without_resolving_the_source() {
         temp.path().join("cache-not-created"),
     );
 
+    // SAFETY: these absolute paths are the explicit identity keys under test;
+    // no filesystem identity is inferred from them by this fixture.
+    let missing_keys = unsafe {
+        PrevalidatedSourceKeys::from_validated_identity_keys(vec![missing_source.clone()])
+    }
+    .unwrap();
     assert!(matches!(
-        state.prepare_prevalidated_source_keys(std::slice::from_ref(&missing_source)),
+        state.prepare_prevalidated_source_keys(&missing_keys),
         Err(LocalStateError::InsideSourceRoot)
     ));
     assert!(!missing_source.exists());
 
     let disjoint_source = temp.path().join("other-missing-photos");
     let disjoint = LocalStatePaths::new(temp.path().join("data"), temp.path().join("cache"));
+    // SAFETY: same fixture-scoped identity-key invariant as above.
+    let disjoint_keys =
+        unsafe { PrevalidatedSourceKeys::from_validated_identity_keys(vec![disjoint_source]) }
+            .unwrap();
     assert!(
         disjoint
-            .validate_prevalidated_source_keys(&[disjoint_source])
+            .validate_prevalidated_source_keys(&disjoint_keys)
             .is_ok()
     );
+}
+
+#[cfg(feature = "server-internal-prevalidated-source")]
+#[test]
+fn prevalidated_source_key_capability_rejects_relative_inputs() {
+    // SAFETY: deliberately supplies an invalid key to exercise the runtime
+    // validation performed before a capability can be returned.
+    let result = unsafe {
+        PrevalidatedSourceKeys::from_validated_identity_keys(vec!["relative/photos".into()])
+    };
+
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(error.to_string(), "prevalidated source key is invalid");
 }
 
 #[cfg(target_os = "macos")]

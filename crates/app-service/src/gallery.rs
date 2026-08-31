@@ -17,7 +17,7 @@ use photo_cache::{
 use photo_catalog::NewLibrary;
 use photo_catalog::{Catalog, CatalogError, NewDerivative, NewFolderGroup, WallOrder};
 #[cfg(feature = "server-internal-prevalidated-source")]
-use photo_core::{AddLibraryError, normalize_prevalidated_source_key};
+use photo_core::{AddLibraryError, PrevalidatedSourceKeys, normalize_prevalidated_source_key};
 use photo_core::{LibraryService, RealSourceFs};
 use photo_domain::{FolderGroupId, GalleryScope, LibraryId, RelativePathKey};
 use photo_indexer::{DefaultMetadataReader, IndexEvent, Indexer, MetadataReader, ScanRequest};
@@ -468,19 +468,43 @@ pub struct PrevalidatedHostedSource {
 
 #[cfg(feature = "server-internal-prevalidated-source")]
 impl PrevalidatedHostedSource {
+    /// Constructs a hosted-source capability at the server's pinned startup
+    /// validation boundary.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `validated_directory`, `operational_path`, and
+    /// `canonical_key` describe the same directory and were validated together
+    /// without a pathname reopen window. Runtime checks below establish that
+    /// the descriptor is a directory and both keys are normalized absolute
+    /// paths, but cannot prove that three-way identity relationship.
     #[doc(hidden)]
-    pub fn from_server_validated_directory(
+    pub unsafe fn from_server_validated_directory(
         validated_directory: File,
         validation_lifetime: Arc<()>,
         operational_path: PathBuf,
         canonical_key: PathBuf,
-    ) -> Self {
-        Self {
+    ) -> std::io::Result<Self> {
+        if !validated_directory.metadata()?.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "prevalidated source descriptor is not a directory",
+            ));
+        }
+        for key in [&operational_path, &canonical_key] {
+            if !key.is_absolute() || normalize_prevalidated_source_key(key)? != *key {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "prevalidated source key is invalid",
+                ));
+            }
+        }
+        Ok(Self {
             validated_directory,
             validation_lifetime,
             operational_path,
             canonical_key,
-        }
+        })
     }
 }
 
@@ -552,12 +576,16 @@ impl GalleryEngine {
             operational_path,
             canonical_key,
         } = source;
-        let canonical_key = normalize_prevalidated_source_key(&canonical_key)
-            .map_err(AppServiceError::LibrarySetup)?;
         let mut cataloged_roots = Catalog::read_library_root_paths(&config.catalog_path())?;
         cataloged_roots.push(canonical_key.clone());
-        config.validate_prevalidated_source_keys(&cataloged_roots)?;
-        config.prepare_prevalidated_source_keys(&cataloged_roots)?;
+        // SAFETY: the configured key is tied to the owned server-validated
+        // descriptor. Remaining keys came from the catalog's typed canonical
+        // root field and are used only for no-I/O lexical overlap checks.
+        let source_keys =
+            unsafe { PrevalidatedSourceKeys::from_validated_identity_keys(cataloged_roots) }
+                .map_err(AppServiceError::LibrarySetup)?;
+        config.validate_prevalidated_source_keys(&source_keys)?;
+        config.prepare_prevalidated_source_keys(&source_keys)?;
         let mut catalog = Catalog::open(&config.catalog_path())?;
         CacheWriter::new(config.cache_dir())?.reconcile_catalog(&mut catalog)?;
         let mut libraries = LibraryService::new(
@@ -2988,5 +3016,66 @@ mod managed_derivative_validation_tests {
             .unwrap();
         file.as_file_mut().flush().unwrap();
         assert!(!validate_managed_jpeg(file.as_file_mut(), 7).unwrap());
+    }
+}
+
+#[cfg(all(test, feature = "server-internal-prevalidated-source"))]
+mod prevalidated_hosted_source_tests {
+    use std::sync::Arc;
+
+    use super::PrevalidatedHostedSource;
+
+    #[test]
+    fn arbitrary_regular_file_cannot_fabricate_a_prevalidated_hosted_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let regular_file_path = temp.path().join("not-a-directory");
+        std::fs::write(&regular_file_path, b"source sentinel").unwrap();
+        let regular_file = std::fs::File::open(&regular_file_path).unwrap();
+        // SAFETY: deliberately violates the constructor contract to prove the
+        // runtime descriptor-type check still rejects the misuse.
+        let result = unsafe {
+            PrevalidatedHostedSource::from_server_validated_directory(
+                regular_file,
+                Arc::new(()),
+                regular_file_path.clone(),
+                regular_file_path,
+            )
+        };
+
+        let error = match result {
+            Ok(_) => panic!("regular-file descriptor was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            !error
+                .to_string()
+                .contains(temp.path().to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn prevalidated_hosted_source_requires_normalized_absolute_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = std::fs::File::open(temp.path()).unwrap();
+        let non_normalized = temp.path().join("unused").join("..");
+
+        // SAFETY: deliberately violates the constructor contract to exercise
+        // its runtime key validation.
+        let result = unsafe {
+            PrevalidatedHostedSource::from_server_validated_directory(
+                directory,
+                Arc::new(()),
+                non_normalized,
+                temp.path().to_owned(),
+            )
+        };
+
+        let error = match result {
+            Ok(_) => panic!("non-normalized operational key was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "prevalidated source key is invalid");
     }
 }

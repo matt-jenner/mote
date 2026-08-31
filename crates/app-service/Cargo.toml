@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
-server-internal-prevalidated-source = []
+server-internal-prevalidated-source = ["photo-core/server-internal-prevalidated-source"]
 
 [dependencies]
 photo-cache = { path = "../cache" }

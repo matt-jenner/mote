@@ -1,12 +1,14 @@
 use std::env;
 use std::net::{AddrParseError, SocketAddr};
 use std::path::{Path, PathBuf};
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, unix))]
 use std::sync::Weak;
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
 use photo_app_service::PrevalidatedHostedSource;
-use photo_core::{LocalStateError, LocalStatePaths};
+use photo_core::{LocalStateError, LocalStatePaths, PrevalidatedSourceKeys};
 
 #[cfg(unix)]
 use crate::static_host::PinnedDirectory;
@@ -17,25 +19,22 @@ pub struct ServerConfig {
     local: LocalStatePaths,
     bind: SocketAddr,
     source_root: PathBuf,
+    #[cfg(unix)]
     source_startup: Arc<Mutex<Option<SourceStartupValidation>>>,
     web_root: StaticWebRoot,
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 struct SourceStartupValidation {
-    #[cfg(unix)]
     pinned: PinnedDirectory,
-    #[cfg(not(unix))]
-    canonical_path: PathBuf,
     lifetime: Arc<()>,
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct SourceStartupLease {
-    #[cfg(unix)]
     operational: PinnedDirectory,
-    #[cfg(not(unix))]
-    canonical_path: PathBuf,
     lifetime: Arc<()>,
 }
 
@@ -114,15 +113,11 @@ impl ServerConfig {
             pinned: pinned_source,
             lifetime: Arc::new(()),
         };
-        #[cfg(not(unix))]
-        let source_startup = SourceStartupValidation {
-            canonical_path: source_root.clone(),
-            lifetime: Arc::new(()),
-        };
         Ok(Self {
             local,
             bind: bind.unwrap_or("127.0.0.1:8080").parse()?,
             source_root,
+            #[cfg(unix)]
             source_startup: Arc::new(Mutex::new(Some(source_startup))),
             web_root,
         })
@@ -161,9 +156,16 @@ impl ServerConfig {
             .map_err(ConfigError::from_local_state)
     }
 
+    #[cfg(any(not(unix), debug_assertions))]
+    pub(crate) fn prepare_source_roots(&self, source_roots: &[PathBuf]) -> Result<(), ConfigError> {
+        self.local
+            .prepare(source_roots)
+            .map_err(ConfigError::from_local_state)
+    }
+
     pub(crate) fn prepare_prevalidated_source_keys(
         &self,
-        source_roots: &[PathBuf],
+        source_roots: &PrevalidatedSourceKeys,
     ) -> Result<(), ConfigError> {
         self.local
             .prepare_prevalidated_source_keys(source_roots)
@@ -172,7 +174,7 @@ impl ServerConfig {
 
     pub(crate) fn validate_prevalidated_source_keys(
         &self,
-        source_roots: &[PathBuf],
+        source_roots: &PrevalidatedSourceKeys,
     ) -> Result<(), ConfigError> {
         self.local
             .validate_prevalidated_source_keys(source_roots)
@@ -209,6 +211,7 @@ impl ServerConfig {
         self.web_root.clone()
     }
 
+    #[cfg(unix)]
     pub(crate) fn take_source_startup(&self) -> Result<SourceStartupLease, ConfigError> {
         let validation = self
             .source_startup
@@ -219,7 +222,7 @@ impl ServerConfig {
         validation.validate(&self.source_root)
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, unix))]
     #[doc(hidden)]
     pub fn source_startup_release_probe(&self) -> Option<Weak<()>> {
         self.source_startup
@@ -230,61 +233,45 @@ impl ServerConfig {
     }
 }
 
+#[cfg(unix)]
 impl SourceStartupValidation {
     fn validate(self, path: &Path) -> Result<SourceStartupLease, ConfigError> {
-        #[cfg(unix)]
-        {
-            let operational =
-                PinnedDirectory::open(path).map_err(|_| ConfigError::SourceRootChanged)?;
-            if !self.pinned.same_object_as(&operational) {
-                return Err(ConfigError::SourceRootChanged);
-            }
-            Ok(SourceStartupLease {
-                operational,
-                lifetime: self.lifetime,
-            })
+        let operational =
+            PinnedDirectory::open(path).map_err(|_| ConfigError::SourceRootChanged)?;
+        if !self.pinned.same_object_as(&operational) {
+            return Err(ConfigError::SourceRootChanged);
         }
-        #[cfg(not(unix))]
-        {
-            let canonical_path = path
-                .canonicalize()
-                .map_err(|_| ConfigError::SourceRootChanged)?;
-            if canonical_path != self.canonical_path || !canonical_path.is_dir() {
-                return Err(ConfigError::SourceRootChanged);
-            }
-            Ok(SourceStartupLease {
-                canonical_path,
-                lifetime: self.lifetime,
-            })
-        }
+        Ok(SourceStartupLease {
+            operational,
+            lifetime: self.lifetime,
+        })
     }
 }
 
+#[cfg(unix)]
 impl SourceStartupLease {
     pub(crate) fn into_prevalidated_source(
         self,
         operational_path: PathBuf,
         canonical_key: PathBuf,
     ) -> Result<PrevalidatedHostedSource, ConfigError> {
-        #[cfg(unix)]
-        {
-            let SourceStartupLease {
-                operational,
-                lifetime,
-            } = self;
-            let source = PrevalidatedHostedSource::from_server_validated_directory(
+        let SourceStartupLease {
+            operational,
+            lifetime,
+        } = self;
+        // SAFETY: `operational` was opened and identity-matched against the
+        // descriptor retained from `ServerConfig::new`; both keys are the
+        // normalized canonical path captured for that same pinned directory.
+        let source = unsafe {
+            PrevalidatedHostedSource::from_server_validated_directory(
                 operational.into_file(),
                 lifetime,
                 operational_path,
                 canonical_key,
-            );
-            Ok(source)
+            )
         }
-        #[cfg(not(unix))]
-        {
-            let _ = (self, operational_path, canonical_key);
-            Err(ConfigError::SourceRootChanged)
-        }
+        .map_err(|_| ConfigError::SourceRootChanged)?;
+        Ok(source)
     }
 }
 

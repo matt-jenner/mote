@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "server-internal-prevalidated-source")]
+use photo_core::PrevalidatedSourceKeys;
 use photo_core::{LocalStateError, LocalStatePaths};
 
 #[derive(Clone, Debug)]
@@ -37,7 +39,7 @@ impl AppConfig {
     #[cfg(feature = "server-internal-prevalidated-source")]
     pub(crate) fn validate_prevalidated_source_keys(
         &self,
-        roots: &[PathBuf],
+        roots: &PrevalidatedSourceKeys,
     ) -> Result<(), LocalStateError> {
         self.local.validate_prevalidated_source_keys(roots)
     }
@@ -45,7 +47,7 @@ impl AppConfig {
     #[cfg(feature = "server-internal-prevalidated-source")]
     pub(crate) fn prepare_prevalidated_source_keys(
         &self,
-        roots: &[PathBuf],
+        roots: &PrevalidatedSourceKeys,
     ) -> Result<(), LocalStateError> {
         self.local.prepare_prevalidated_source_keys(roots)
     }

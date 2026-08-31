@@ -10,5 +10,8 @@ pub use library_service::{
     AddLibraryError, LibraryService, PreparedSourceSelection, RelinkError, SourceSelection,
     SourceValidator, ValidatedSourceFolder,
 };
+#[cfg(feature = "server-internal-prevalidated-source")]
+#[doc(hidden)]
+pub use local_state::PrevalidatedSourceKeys;
 pub use local_state::{LocalStateError, LocalStatePaths, normalize_prevalidated_source_key};
 pub use source_fs::{RealSourceFs, SourceFs};

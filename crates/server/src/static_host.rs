@@ -60,6 +60,17 @@ impl StaticWebRoot {
     pub fn path(&self) -> &Path {
         self.path.as_ref()
     }
+
+    /// Builds the fail-closed backend used on unsupported platforms without
+    /// weakening the descriptor-backed production path on Linux or macOS.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn unavailable_for_test(path: PathBuf) -> Self {
+        Self {
+            path: Arc::new(path),
+            backend: SecureBackend::unavailable(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -921,7 +932,7 @@ impl SecureBackend {
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(any(not(any(target_os = "linux", target_os = "macos")), debug_assertions))]
     fn unavailable() -> Self {
         Self {
             root: None,

@@ -13,6 +13,8 @@ use axum::routing::{any, get};
 use photo_app_service::{AppConfig, AppServiceError, GalleryEngine};
 use photo_cache::{CacheReconcileReport, CacheWriter};
 use photo_catalog::Catalog;
+#[cfg(unix)]
+use photo_core::PrevalidatedSourceKeys;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 
@@ -82,10 +84,17 @@ impl AppState {
     }
 
     pub fn open(config: &ServerConfig) -> Result<(Self, CacheReconcileReport), StartupError> {
-        Self::open_inner(config, |_| {})
+        #[cfg(unix)]
+        {
+            Self::open_hosted_inner(config, |_| {})
+        }
+        #[cfg(not(unix))]
+        {
+            Self::open_source_disabled(config)
+        }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, unix))]
     #[doc(hidden)]
     pub fn open_with_source_startup_hook<F>(
         config: &ServerConfig,
@@ -95,7 +104,7 @@ impl AppState {
         F: FnOnce(),
     {
         let mut before_operational_validation = Some(before_operational_validation);
-        Self::open_inner(config, move |stage| {
+        Self::open_hosted_inner(config, move |stage| {
             if stage == SourceStartupTestStage::BeforeOperationalValidation
                 && let Some(hook) = before_operational_validation.take()
             {
@@ -104,7 +113,7 @@ impl AppState {
         })
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, unix))]
     #[doc(hidden)]
     pub fn open_with_source_construction_hook<F>(
         config: &ServerConfig,
@@ -113,10 +122,11 @@ impl AppState {
     where
         F: FnMut(SourceStartupTestStage),
     {
-        Self::open_inner(config, hook)
+        Self::open_hosted_inner(config, hook)
     }
 
-    fn open_inner<F>(
+    #[cfg(unix)]
+    fn open_hosted_inner<F>(
         config: &ServerConfig,
         mut source_startup_hook: F,
     ) -> Result<(Self, CacheReconcileReport), StartupError>
@@ -128,8 +138,14 @@ impl AppState {
         source_startup_hook(SourceStartupTestStage::AfterOperationalValidation);
         let mut preflight_roots = Catalog::read_library_root_paths(&config.catalog_path())?;
         preflight_roots.push(config.source_root().to_owned());
-        config.validate_prevalidated_source_keys(&preflight_roots)?;
-        config.prepare_prevalidated_source_keys(&preflight_roots)?;
+        // SAFETY: catalog roots are typed canonical identity keys and the
+        // configured root is tied to the live startup lease above. They are
+        // used only for no-source-I/O lexical overlap checks.
+        let preflight_keys =
+            unsafe { PrevalidatedSourceKeys::from_validated_identity_keys(preflight_roots) }
+                .map_err(|_| StartupError::InvalidCatalogPath)?;
+        config.validate_prevalidated_source_keys(&preflight_keys)?;
+        config.prepare_prevalidated_source_keys(&preflight_keys)?;
 
         let mut catalog = Catalog::open(&config.catalog_path())?;
         let cataloged_roots = catalog
@@ -144,7 +160,12 @@ impl AppState {
             .collect::<Result<Vec<_>, _>>()?;
         let mut startup_roots = cataloged_roots;
         startup_roots.push(config.source_root().to_owned());
-        config.validate_prevalidated_source_keys(&startup_roots)?;
+        // SAFETY: same provenance and restricted lexical use as the preflight
+        // capability; the catalog was reopened after local-state preparation.
+        let startup_keys =
+            unsafe { PrevalidatedSourceKeys::from_validated_identity_keys(startup_roots) }
+                .map_err(|_| StartupError::InvalidCatalogPath)?;
+        config.validate_prevalidated_source_keys(&startup_keys)?;
 
         let writer = CacheWriter::new(config.cache_dir())?;
         let report = writer.reconcile_catalog(&mut catalog)?;
@@ -177,6 +198,42 @@ impl AppState {
             },
             report,
         ))
+    }
+
+    #[cfg(any(not(unix), debug_assertions))]
+    fn open_source_disabled(
+        config: &ServerConfig,
+    ) -> Result<(Self, CacheReconcileReport), StartupError> {
+        let mut preflight_roots = Catalog::read_library_root_paths(&config.catalog_path())?;
+        preflight_roots.push(config.source_root().to_owned());
+        config.validate_source_roots(&preflight_roots)?;
+        config.prepare_source_roots(&preflight_roots)?;
+
+        let mut catalog = Catalog::open(&config.catalog_path())?;
+        let cataloged_roots = catalog
+            .list_libraries()?
+            .into_iter()
+            .map(|library| {
+                library
+                    .canonical_root_key
+                    .to_path_buf()
+                    .map_err(|_| StartupError::InvalidCatalogPath)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        config.validate_source_roots(&cataloged_roots)?;
+        let writer = CacheWriter::new(config.cache_dir())?;
+        let report = writer.reconcile_catalog(&mut catalog)?;
+        Ok((Self::new(catalog, config.cache_dir().to_owned()), report))
+    }
+
+    /// Exercises the exact non-Unix source-disabled composer on the current
+    /// debug target without making it selectable by Unix release builds.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn open_source_disabled_for_test(
+        config: &ServerConfig,
+    ) -> Result<(Self, CacheReconcileReport), StartupError> {
+        Self::open_source_disabled(config)
     }
 
     #[cfg(debug_assertions)]

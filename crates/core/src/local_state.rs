@@ -16,6 +16,46 @@ pub enum LocalStateError {
     Io(#[from] std::io::Error),
 }
 
+/// Server-internal capability for source identity keys whose provenance was
+/// validated outside the path-based local-state layer.
+///
+/// Safe callers cannot construct this type. Possessing it only permits
+/// no-source-I/O overlap checks; it does not grant filesystem access.
+#[cfg(feature = "server-internal-prevalidated-source")]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct PrevalidatedSourceKeys {
+    keys: Vec<PathBuf>,
+}
+
+#[cfg(feature = "server-internal-prevalidated-source")]
+impl PrevalidatedSourceKeys {
+    /// Constructs a source-key capability at an audited identity boundary.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure every input is an established source identity
+    /// key for which lexical overlap comparison is appropriate. This function
+    /// verifies that inputs are absolute and stores only normalized keys, but
+    /// cannot prove their descriptor or catalog provenance.
+    #[doc(hidden)]
+    pub unsafe fn from_validated_identity_keys(keys: Vec<PathBuf>) -> std::io::Result<Self> {
+        let keys = keys
+            .into_iter()
+            .map(|key| {
+                if !key.is_absolute() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "prevalidated source key is invalid",
+                    ));
+                }
+                normalize_prevalidated_source_key(&key)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { keys })
+    }
+}
+
 impl LocalStatePaths {
     pub fn new(data_dir: PathBuf, cache_dir: PathBuf) -> Self {
         Self {
@@ -52,20 +92,20 @@ impl LocalStatePaths {
         Ok(())
     }
 
-    /// Validates source identities already established by a trusted caller.
-    /// Source keys are normalized lexically and are never reopened here.
+    /// Validates source identities established by an explicit capability.
+    /// Source keys are never reopened here.
+    #[cfg(feature = "server-internal-prevalidated-source")]
     pub fn validate_prevalidated_source_keys(
         &self,
-        sources: &[PathBuf],
+        sources: &PrevalidatedSourceKeys,
     ) -> Result<(), LocalStateError> {
         let data = resolve_for_comparison(&self.data_dir)?;
         let cache = resolve_for_comparison(&self.cache_dir)?;
         let catalog = resolve_for_comparison(&self.catalog_path())?;
-        for source in sources {
-            let source = normalize_prevalidated_source_key(source)?;
-            if paths_overlap(&data, &source)
-                || paths_overlap(&cache, &source)
-                || paths_overlap(&catalog, &source)
+        for source in &sources.keys {
+            if paths_overlap(&data, source)
+                || paths_overlap(&cache, source)
+                || paths_overlap(&catalog, source)
             {
                 return Err(LocalStateError::InsideSourceRoot);
             }
@@ -82,9 +122,10 @@ impl LocalStatePaths {
 
     /// Prepares local state after source identities were pinned and validated
     /// by a trusted startup boundary. This method performs no source I/O.
+    #[cfg(feature = "server-internal-prevalidated-source")]
     pub fn prepare_prevalidated_source_keys(
         &self,
-        sources: &[PathBuf],
+        sources: &PrevalidatedSourceKeys,
     ) -> Result<(), LocalStateError> {
         self.validate_prevalidated_source_keys(sources)?;
         create_private_directory(&self.data_dir)?;
