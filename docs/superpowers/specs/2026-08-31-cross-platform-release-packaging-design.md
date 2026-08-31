@@ -123,6 +123,7 @@ The release gates cover:
 - source-media write and delete safety tests
 - platform package creation on its native runner
 - container startup, health endpoint, folder browsing, wall loading, and derivative delivery against read-only fixture media
+- browser navigation through two contained child-folder levels, child-folder selection, and distinct current-folder and include-subfolders results
 - confirmation that the catalogue and cache survive container recreation
 
 The release workflow limits Rust build concurrency where appropriate. CI jobs clean up their exact containers, networks, volumes, and temporary browser state after testing.
@@ -138,6 +139,7 @@ The design is complete when:
 - the published OCI image runs on AMD64 and ARM64 hosts
 - Docker and Podman can also build the checked-in `Containerfile`
 - an operator can select the hosted photo root by setting `PHOTO_PATH`
+- a browser can select any readable child folder beneath that root without seeing or navigating to its host path
 - the hosted source mount remains read-only
 - every installation creates and uses only its own catalogue and cache
 - release failure never publishes a partial set of desktop artifacts

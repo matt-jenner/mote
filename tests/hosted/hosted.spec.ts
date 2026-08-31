@@ -189,6 +189,25 @@ async function firstTile(page: Page, filename: string) {
 	return tile;
 }
 
+async function visibleTile(page: Page, filename: string) {
+	const image = page.getByAltText(filename, { exact: true });
+	await expect(image).toBeVisible();
+	await expect
+		.poll(() =>
+			image.evaluate(
+				(node) => node instanceof HTMLImageElement && node.complete,
+			),
+		)
+		.toBe(true);
+	await expect
+		.poll(() =>
+			image.evaluate((node) =>
+				node instanceof HTMLImageElement ? node.naturalWidth : 0,
+			),
+		)
+		.toBeGreaterThan(0);
+}
+
 async function originRelativeUrl(
 	page: Page,
 	rawUrl: string,
@@ -578,5 +597,51 @@ test(`hosted lifecycle phase: ${phase}`, async ({ browser, baseURL }) => {
 	} finally {
 		await contextA.close();
 		await contextB.close();
+	}
+});
+
+test("mounted root allows contained child selection and scoped browsing", async ({
+	browser,
+	baseURL,
+}) => {
+	test.skip(
+		phase !== "beforeRestart",
+		"The mounted-folder journey runs before retained-volume restart",
+	);
+	expect(baseURL).toBeTruthy();
+	const context = await newContext(browser, baseURL ?? "");
+	try {
+		const page = await context.newPage();
+		await page.goto("/", { waitUntil: "domcontentloaded" });
+		const folders = page.getByRole("button", { name: "Folders", exact: true });
+		await expect(folders).toBeEnabled();
+		await folders.click();
+		const dialog = page.getByRole("dialog", { name: "Choose a folder" });
+		await expect(dialog.getByRole("button", { name: "Back" })).toBeDisabled();
+		const nested = dialog.getByRole("button", {
+			name: "Nested",
+			exact: true,
+		});
+		await expect(nested).toBeVisible({ timeout: 5_000 });
+		await nested.click();
+		await dialog.getByRole("button", { name: "Album", exact: true }).click();
+		await dialog
+			.getByRole("button", { name: "Open this folder", exact: true })
+			.click();
+		await expect(dialog).toBeHidden();
+		await expect(
+			page.locator("header").getByText("Album", { exact: true }),
+		).toBeVisible();
+
+		await setPressed(page, "Include subfolders", false);
+		await visibleTile(page, "album-current.jpg");
+		await expect(
+			page.getByAltText("album-descendant.jpg", { exact: true }),
+		).toHaveCount(0);
+
+		await setPressed(page, "Include subfolders", true);
+		await visibleTile(page, "album-descendant.jpg");
+	} finally {
+		await context.close();
 	}
 });

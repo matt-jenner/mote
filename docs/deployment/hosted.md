@@ -2,6 +2,8 @@
 
 The hosted image serves the web interface and API on port 8080. It runs as UID and GID 10001, reads photos from `/photos`, and writes only to its data and cache mounts. Every browser URL is origin-relative. A deployment at `https://photos.docker.jenner.lan` needs no hostname or public-URL environment variable.
 
+The `/photos` mount is the highest folder the web interface can browse. Choose **Folders** in the hosted interface to list its child directories, move through nested directories, and open any contained folder as the gallery source. The browser never receives the host path and cannot navigate above the mounted root. **Include subfolders** controls whether the gallery shows only photos directly inside the selected folder or also includes its descendants.
+
 ## Build the image
 
 Build with Podman:

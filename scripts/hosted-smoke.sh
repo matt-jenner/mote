@@ -165,17 +165,25 @@ command -v podman >/dev/null 2>&1 || { printf '%s\n' "podman is required" >&2; e
 command -v curl >/dev/null 2>&1 || { printf '%s\n' "curl is required" >&2; exit 1; }
 command -v node >/dev/null 2>&1 || { printf '%s\n' "node is required" >&2; exit 1; }
 
-mkdir -p "$source_dir/A/child" "$source_dir/B" "$state_dir"
+mkdir -p \
+	"$source_dir/A/child" \
+	"$source_dir/B" \
+	"$source_dir/Nested/Album/grandchild" \
+	"$state_dir"
 cp "$project_dir/apps/interface/public/demo-photos/mountain.jpg" "$source_dir/A/a-01.jpg"
 cp "$project_dir/apps/interface/public/demo-photos/coast.jpg" "$source_dir/A/a-02.jpg"
 cp "$project_dir/apps/interface/public/demo-photos/forest.jpg" "$source_dir/A/child/a-child-uncached.jpg"
 cp "$project_dir/apps/interface/public/demo-photos/interior.jpg" "$source_dir/B/b-01.jpg"
 cp "$project_dir/apps/interface/public/demo-photos/portrait.jpg" "$source_dir/B/b-02.jpg"
+cp "$project_dir/apps/interface/public/demo-photos/city.jpg" "$source_dir/Nested/Album/album-current.jpg"
+cp "$project_dir/apps/interface/public/demo-photos/mountain.jpg" "$source_dir/Nested/Album/grandchild/album-descendant.jpg"
 touch -t 202001010101 "$source_dir/A/a-01.jpg"
 touch -t 202001020101 "$source_dir/A/a-02.jpg"
 touch -t 202001030101 "$source_dir/A/child/a-child-uncached.jpg"
 touch -t 202001050101 "$source_dir/B/b-01.jpg"
 touch -t 202001040101 "$source_dir/B/b-02.jpg"
+touch -t 202001060101 "$source_dir/Nested/Album/album-current.jpg"
+touch -t 202001070101 "$source_dir/Nested/Album/grandchild/album-descendant.jpg"
 ln -s /etc "$source_dir/Escape"
 find "$source_dir" -type f -exec chmod 0444 {} \;
 find "$source_dir" -type d -exec chmod "$source_mode" {} \;
@@ -221,4 +229,4 @@ probe_rejected "file-as-folder" "/api/v1/folders?path=A%2Fa-01.jpg"
 probe_rejected "symlink escape" "/api/v1/folders?path=Escape"
 assert_source_unchanged "traversal and limit probes"
 
-printf '%s\n' "hosted smoke passed: independent browsers, restart restoration, stable ETags, offline cache, request rejection, unchanged source"
+printf '%s\n' "hosted smoke passed: nested folder selection, scoped browsing, independent browsers, restart restoration, stable ETags, offline cache, request rejection, unchanged source"
