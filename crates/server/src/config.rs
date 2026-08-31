@@ -1,9 +1,11 @@
 use std::env;
 use std::net::{AddrParseError, SocketAddr};
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::sync::Arc;
+#[cfg(debug_assertions)]
+use std::sync::Weak;
+use std::sync::{Arc, Mutex};
 
+use photo_app_service::PrevalidatedHostedSource;
 use photo_core::{LocalStateError, LocalStatePaths};
 
 #[cfg(unix)]
@@ -15,16 +17,17 @@ pub struct ServerConfig {
     local: LocalStatePaths,
     bind: SocketAddr,
     source_root: PathBuf,
-    source_startup: SourceStartupValidation,
+    source_startup: Arc<Mutex<Option<SourceStartupValidation>>>,
     web_root: StaticWebRoot,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct SourceStartupValidation {
     #[cfg(unix)]
-    pinned: Arc<PinnedDirectory>,
+    pinned: PinnedDirectory,
     #[cfg(not(unix))]
     canonical_path: PathBuf,
+    lifetime: Arc<()>,
 }
 
 #[derive(Debug)]
@@ -33,6 +36,7 @@ pub(crate) struct SourceStartupLease {
     operational: PinnedDirectory,
     #[cfg(not(unix))]
     canonical_path: PathBuf,
+    lifetime: Arc<()>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -49,6 +53,8 @@ pub enum ConfigError {
     SourceRootNotDirectory,
     #[error("configured source root changed before startup")]
     SourceRootChanged,
+    #[error("configured source startup validation is unavailable")]
+    SourceStartupUnavailable,
     #[error("configured web root is unavailable")]
     WebRootUnavailable,
     #[error("configured web root must not overlap the source root")]
@@ -105,17 +111,19 @@ impl ServerConfig {
             .map_err(|_| ConfigError::WebRootUnavailable)?;
         #[cfg(unix)]
         let source_startup = SourceStartupValidation {
-            pinned: Arc::new(pinned_source),
+            pinned: pinned_source,
+            lifetime: Arc::new(()),
         };
         #[cfg(not(unix))]
         let source_startup = SourceStartupValidation {
             canonical_path: source_root.clone(),
+            lifetime: Arc::new(()),
         };
         Ok(Self {
             local,
             bind: bind.unwrap_or("127.0.0.1:8080").parse()?,
             source_root,
-            source_startup,
+            source_startup: Arc::new(Mutex::new(Some(source_startup))),
             web_root,
         })
     }
@@ -153,6 +161,24 @@ impl ServerConfig {
             .map_err(ConfigError::from_local_state)
     }
 
+    pub(crate) fn prepare_prevalidated_source_keys(
+        &self,
+        source_roots: &[PathBuf],
+    ) -> Result<(), ConfigError> {
+        self.local
+            .prepare_prevalidated_source_keys(source_roots)
+            .map_err(ConfigError::from_local_state)
+    }
+
+    pub(crate) fn validate_prevalidated_source_keys(
+        &self,
+        source_roots: &[PathBuf],
+    ) -> Result<(), ConfigError> {
+        self.local
+            .validate_prevalidated_source_keys(source_roots)
+            .map_err(ConfigError::from_local_state)
+    }
+
     pub fn data_dir(&self) -> &Path {
         self.local.data_dir()
     }
@@ -183,13 +209,29 @@ impl ServerConfig {
         self.web_root.clone()
     }
 
-    pub(crate) fn validate_source_startup(&self) -> Result<SourceStartupLease, ConfigError> {
-        self.source_startup.validate(&self.source_root)
+    pub(crate) fn take_source_startup(&self) -> Result<SourceStartupLease, ConfigError> {
+        let validation = self
+            .source_startup
+            .lock()
+            .map_err(|_| ConfigError::SourceStartupUnavailable)?
+            .take()
+            .ok_or(ConfigError::SourceStartupUnavailable)?;
+        validation.validate(&self.source_root)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn source_startup_release_probe(&self) -> Option<Weak<()>> {
+        self.source_startup
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|validation| Arc::downgrade(&validation.lifetime))
     }
 }
 
 impl SourceStartupValidation {
-    fn validate(&self, path: &Path) -> Result<SourceStartupLease, ConfigError> {
+    fn validate(self, path: &Path) -> Result<SourceStartupLease, ConfigError> {
         #[cfg(unix)]
         {
             let operational =
@@ -197,7 +239,10 @@ impl SourceStartupValidation {
             if !self.pinned.same_object_as(&operational) {
                 return Err(ConfigError::SourceRootChanged);
             }
-            Ok(SourceStartupLease { operational })
+            Ok(SourceStartupLease {
+                operational,
+                lifetime: self.lifetime,
+            })
         }
         #[cfg(not(unix))]
         {
@@ -207,31 +252,38 @@ impl SourceStartupValidation {
             if canonical_path != self.canonical_path || !canonical_path.is_dir() {
                 return Err(ConfigError::SourceRootChanged);
             }
-            Ok(SourceStartupLease { canonical_path })
+            Ok(SourceStartupLease {
+                canonical_path,
+                lifetime: self.lifetime,
+            })
         }
     }
 }
 
 impl SourceStartupLease {
-    pub(crate) fn revalidate(&self, path: &Path) -> Result<(), ConfigError> {
+    pub(crate) fn into_prevalidated_source(
+        self,
+        operational_path: PathBuf,
+        canonical_key: PathBuf,
+    ) -> Result<PrevalidatedHostedSource, ConfigError> {
         #[cfg(unix)]
         {
-            let current =
-                PinnedDirectory::open(path).map_err(|_| ConfigError::SourceRootChanged)?;
-            if !self.operational.same_object_as(&current) {
-                return Err(ConfigError::SourceRootChanged);
-            }
-            Ok(())
+            let SourceStartupLease {
+                operational,
+                lifetime,
+            } = self;
+            let source = PrevalidatedHostedSource::from_server_validated_directory(
+                operational.into_file(),
+                lifetime,
+                operational_path,
+                canonical_key,
+            );
+            Ok(source)
         }
         #[cfg(not(unix))]
         {
-            let current = path
-                .canonicalize()
-                .map_err(|_| ConfigError::SourceRootChanged)?;
-            if current != self.canonical_path || !current.is_dir() {
-                return Err(ConfigError::SourceRootChanged);
-            }
-            Ok(())
+            let _ = (self, operational_path, canonical_key);
+            Err(ConfigError::SourceRootChanged)
         }
     }
 }

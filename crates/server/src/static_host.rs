@@ -354,6 +354,10 @@ impl PinnedDirectory {
         self.identity == other.identity
     }
 
+    pub(crate) fn into_file(self) -> std::fs::File {
+        self.directory
+    }
+
     pub(crate) fn overlaps(&self, other: &Self) -> io::Result<bool> {
         if self.identity == other.identity {
             return Ok(true);

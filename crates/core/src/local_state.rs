@@ -52,8 +52,41 @@ impl LocalStatePaths {
         Ok(())
     }
 
+    /// Validates source identities already established by a trusted caller.
+    /// Source keys are normalized lexically and are never reopened here.
+    pub fn validate_prevalidated_source_keys(
+        &self,
+        sources: &[PathBuf],
+    ) -> Result<(), LocalStateError> {
+        let data = resolve_for_comparison(&self.data_dir)?;
+        let cache = resolve_for_comparison(&self.cache_dir)?;
+        let catalog = resolve_for_comparison(&self.catalog_path())?;
+        for source in sources {
+            let source = normalize_prevalidated_source_key(source)?;
+            if paths_overlap(&data, &source)
+                || paths_overlap(&cache, &source)
+                || paths_overlap(&catalog, &source)
+            {
+                return Err(LocalStateError::InsideSourceRoot);
+            }
+        }
+        Ok(())
+    }
+
     pub fn prepare(&self, sources: &[PathBuf]) -> Result<(), LocalStateError> {
         self.validate_source_roots(sources)?;
+        create_private_directory(&self.data_dir)?;
+        create_private_directory(&self.cache_dir)?;
+        Ok(())
+    }
+
+    /// Prepares local state after source identities were pinned and validated
+    /// by a trusted startup boundary. This method performs no source I/O.
+    pub fn prepare_prevalidated_source_keys(
+        &self,
+        sources: &[PathBuf],
+    ) -> Result<(), LocalStateError> {
+        self.validate_prevalidated_source_keys(sources)?;
         create_private_directory(&self.data_dir)?;
         create_private_directory(&self.cache_dir)?;
         Ok(())
@@ -70,6 +103,23 @@ fn normalize_absolute(path: &Path) -> Result<PathBuf, std::io::Error> {
                 normalized.pop();
             }
             _ => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+/// Lexically normalizes an already-validated source identity without touching
+/// the source filesystem.
+pub fn normalize_prevalidated_source_key(path: &Path) -> Result<PathBuf, std::io::Error> {
+    let normalized = normalize_absolute(path)?;
+    #[cfg(target_os = "macos")]
+    for (alias, canonical) in [
+        (Path::new("/var"), Path::new("/private/var")),
+        (Path::new("/tmp"), Path::new("/private/tmp")),
+        (Path::new("/etc"), Path::new("/private/etc")),
+    ] {
+        if let Ok(remainder) = normalized.strip_prefix(alias) {
+            return Ok(canonical.join(remainder));
         }
     }
     Ok(normalized)

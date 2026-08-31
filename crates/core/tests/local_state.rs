@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use photo_core::normalize_prevalidated_source_key;
 use photo_core::{LocalStateError, LocalStatePaths};
 
 #[test]
@@ -50,4 +52,41 @@ fn prepared_directories_are_private() {
             0o700
         );
     }
+}
+
+#[test]
+fn prevalidated_missing_source_keys_are_checked_without_resolving_the_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing_source = temp.path().join("missing-photos");
+    let state = LocalStatePaths::new(
+        missing_source.join("data"),
+        temp.path().join("cache-not-created"),
+    );
+
+    assert!(matches!(
+        state.prepare_prevalidated_source_keys(std::slice::from_ref(&missing_source)),
+        Err(LocalStateError::InsideSourceRoot)
+    ));
+    assert!(!missing_source.exists());
+
+    let disjoint_source = temp.path().join("other-missing-photos");
+    let disjoint = LocalStatePaths::new(temp.path().join("data"), temp.path().join("cache"));
+    assert!(
+        disjoint
+            .validate_prevalidated_source_keys(&[disjoint_source])
+            .is_ok()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn prevalidated_keys_normalize_only_exact_builtin_macos_aliases() {
+    assert_eq!(
+        normalize_prevalidated_source_key(std::path::Path::new("/var/photos/../family")).unwrap(),
+        std::path::Path::new("/private/var/family")
+    );
+    assert_eq!(
+        normalize_prevalidated_source_key(std::path::Path::new("/various/family")).unwrap(),
+        std::path::Path::new("/various/family")
+    );
 }

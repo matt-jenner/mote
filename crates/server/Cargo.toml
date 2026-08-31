@@ -9,7 +9,7 @@ photo-cache = { path = "../cache" }
 photo-catalog = { path = "../catalog" }
 photo-domain = { path = "../domain" }
 photo-core = { path = "../core" }
-photo-app-service = { path = "../app-service" }
+photo-app-service = { path = "../app-service", features = ["server-internal-prevalidated-source"] }
 axum.workspace = true
 futures-util.workspace = true
 libc = "0.2.189"

@@ -23,6 +23,17 @@ pub use health::{
 };
 pub use static_host::StaticWebRoot;
 
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceStartupTestStage {
+    BeforeOperationalValidation,
+    AfterOperationalValidation,
+    BeforeFolderConstruction,
+    AfterFolderConstruction,
+    BeforeGalleryConstruction,
+    AfterGalleryConstruction,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) catalog: Arc<Mutex<Catalog>>,
@@ -71,7 +82,7 @@ impl AppState {
     }
 
     pub fn open(config: &ServerConfig) -> Result<(Self, CacheReconcileReport), StartupError> {
-        Self::open_inner(config, || {})
+        Self::open_inner(config, |_| {})
     }
 
     #[cfg(debug_assertions)]
@@ -83,21 +94,42 @@ impl AppState {
     where
         F: FnOnce(),
     {
-        Self::open_inner(config, before_operational_validation)
+        let mut before_operational_validation = Some(before_operational_validation);
+        Self::open_inner(config, move |stage| {
+            if stage == SourceStartupTestStage::BeforeOperationalValidation
+                && let Some(hook) = before_operational_validation.take()
+            {
+                hook();
+            }
+        })
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn open_with_source_construction_hook<F>(
+        config: &ServerConfig,
+        hook: F,
+    ) -> Result<(Self, CacheReconcileReport), StartupError>
+    where
+        F: FnMut(SourceStartupTestStage),
+    {
+        Self::open_inner(config, hook)
     }
 
     fn open_inner<F>(
         config: &ServerConfig,
-        before_operational_validation: F,
+        mut source_startup_hook: F,
     ) -> Result<(Self, CacheReconcileReport), StartupError>
     where
-        F: FnOnce(),
+        F: FnMut(SourceStartupTestStage),
     {
-        before_operational_validation();
-        let source_startup = config.validate_source_startup()?;
-        let preflight_roots = Catalog::read_library_root_paths(&config.catalog_path())?;
-        config.validate_source_roots(&preflight_roots)?;
-        config.prepare()?;
+        source_startup_hook(SourceStartupTestStage::BeforeOperationalValidation);
+        let source_startup = config.take_source_startup()?;
+        source_startup_hook(SourceStartupTestStage::AfterOperationalValidation);
+        let mut preflight_roots = Catalog::read_library_root_paths(&config.catalog_path())?;
+        preflight_roots.push(config.source_root().to_owned());
+        config.validate_prevalidated_source_keys(&preflight_roots)?;
+        config.prepare_prevalidated_source_keys(&preflight_roots)?;
 
         let mut catalog = Catalog::open(&config.catalog_path())?;
         let cataloged_roots = catalog
@@ -110,22 +142,34 @@ impl AppState {
                     .map_err(|_| StartupError::InvalidCatalogPath)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        config.validate_source_roots(&cataloged_roots)?;
+        let mut startup_roots = cataloged_roots;
+        startup_roots.push(config.source_root().to_owned());
+        config.validate_prevalidated_source_keys(&startup_roots)?;
 
         let writer = CacheWriter::new(config.cache_dir())?;
         let report = writer.reconcile_catalog(&mut catalog)?;
-        source_startup.revalidate(config.source_root())?;
-        let state = Self::new_with_source_root(
-            catalog,
-            config.cache_dir().to_owned(),
+        source_startup_hook(SourceStartupTestStage::BeforeFolderConstruction);
+        let state = Self {
+            catalog: Arc::new(Mutex::new(catalog)),
+            cache_root: Arc::new(config.cache_dir().to_owned()),
+            folder_root: Some(Arc::new(
+                ContainedFolderRoot::from_prevalidated_operational_path(
+                    config.source_root().to_owned(),
+                ),
+            )),
+            gallery: None,
+        };
+        source_startup_hook(SourceStartupTestStage::AfterFolderConstruction);
+        source_startup_hook(SourceStartupTestStage::BeforeGalleryConstruction);
+        let source = source_startup.into_prevalidated_source(
+            config.source_root().to_owned(),
             config.source_root().to_owned(),
         )?;
-        source_startup.revalidate(config.source_root())?;
-        let gallery = GalleryEngine::open(
+        let gallery = GalleryEngine::open_prevalidated_hosted(
             AppConfig::new(config.data_dir().to_owned(), config.cache_dir().to_owned()),
-            config.source_root().to_owned(),
+            source,
         )?;
-        source_startup.revalidate(config.source_root())?;
+        source_startup_hook(SourceStartupTestStage::AfterGalleryConstruction);
         Ok((
             Self {
                 gallery: Some(Arc::new(gallery)),

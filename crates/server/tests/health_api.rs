@@ -5,6 +5,8 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use photo_catalog::{Catalog, NewAsset, NewDerivative, NewFolderGroup, NewLibrary};
 use photo_domain::{Availability, DerivativeId, FolderGroupId, MediaKind, RelativePathKey};
+#[cfg(unix)]
+use photo_server::SourceStartupTestStage;
 use photo_server::{AppState, ConfigError, ServerConfig, StaticWebRoot, build_router};
 use tower::ServiceExt;
 
@@ -258,6 +260,277 @@ fn unchanged_source_identity_crosses_the_operational_startup_boundary() {
     let result = AppState::open_with_source_startup_hook(&config, || {});
 
     assert!(result.is_ok());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn transient_source_swap_cannot_retarget_the_folder_root() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let moved_source = temp.path().join("validated-source");
+    let replacement = temp.path().join("replacement");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(source.join("safe-album")).unwrap();
+    std::fs::create_dir(&replacement).unwrap();
+    std::fs::create_dir(replacement.join("source-sentinel-album")).unwrap();
+    let config = ServerConfig::new(
+        temp.path().join("data"),
+        temp.path().join("cache"),
+        None,
+        source.clone(),
+        web_root(&temp),
+    )
+    .unwrap();
+
+    let (state, _) = AppState::open_with_source_construction_hook(&config, |stage| match stage {
+        SourceStartupTestStage::BeforeFolderConstruction => {
+            std::fs::rename(&source, &moved_source).unwrap();
+            symlink(&replacement, &source).unwrap();
+        }
+        SourceStartupTestStage::AfterFolderConstruction => {
+            std::fs::remove_file(&source).unwrap();
+            std::fs::rename(&moved_source, &source).unwrap();
+        }
+        _ => {}
+    })
+    .unwrap();
+    let app = build_router(state, config.static_web_root());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/folders")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+
+    assert_eq!(value["children"][0]["name"], "safe-album");
+    assert!(!value.to_string().contains("source-sentinel-album"));
+}
+
+#[cfg(unix)]
+#[test]
+fn transient_source_swap_cannot_change_the_configured_library_key() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let moved_source = temp.path().join("validated-source");
+    let replacement = temp.path().join("replacement");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&replacement).unwrap();
+    std::fs::write(replacement.join("source-sentinel.jpg"), b"SOURCE SENTINEL").unwrap();
+    let config = ServerConfig::new(
+        temp.path().join("data"),
+        temp.path().join("cache"),
+        None,
+        source.clone(),
+        web_root(&temp),
+    )
+    .unwrap();
+
+    let result = AppState::open_with_source_construction_hook(&config, |stage| match stage {
+        SourceStartupTestStage::BeforeGalleryConstruction => {
+            std::fs::rename(&source, &moved_source).unwrap();
+            symlink(&replacement, &source).unwrap();
+        }
+        SourceStartupTestStage::AfterGalleryConstruction => {
+            std::fs::remove_file(&source).unwrap();
+            std::fs::rename(&moved_source, &source).unwrap();
+        }
+        _ => {}
+    });
+
+    assert!(result.is_ok());
+    assert_eq!(
+        Catalog::read_library_root_paths(&config.catalog_path()).unwrap(),
+        vec![source.canonicalize().unwrap()]
+    );
+    assert_eq!(
+        std::fs::read(replacement.join("source-sentinel.jpg")).unwrap(),
+        b"SOURCE SENTINEL"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn prevalidated_startup_does_not_reopen_the_source_path_during_construction() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let offline_source = temp.path().join("photos-offline");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("safe.jpg"), b"SAFE SOURCE").unwrap();
+    let config = ServerConfig::new(
+        temp.path().join("data"),
+        temp.path().join("cache"),
+        None,
+        source.clone(),
+        web_root(&temp),
+    )
+    .unwrap();
+
+    let result = AppState::open_with_source_construction_hook(&config, |stage| match stage {
+        SourceStartupTestStage::AfterOperationalValidation => {
+            std::fs::rename(&source, &offline_source).unwrap();
+        }
+        SourceStartupTestStage::AfterGalleryConstruction => {
+            std::fs::rename(&offline_source, &source).unwrap();
+        }
+        _ => {}
+    });
+
+    assert!(result.is_ok());
+    assert_eq!(
+        Catalog::read_library_root_paths(&config.catalog_path()).unwrap(),
+        vec![source.canonicalize().unwrap()]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn source_startup_validation_is_one_shot_and_released_after_success() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    let config = ServerConfig::new(
+        temp.path().join("data"),
+        temp.path().join("cache"),
+        None,
+        source.clone(),
+        web_root(&temp),
+    )
+    .unwrap();
+    let clone = config.clone();
+    let release = config.source_startup_release_probe().unwrap();
+
+    let first = AppState::open(&config);
+    let second = AppState::open(&clone);
+
+    assert!(first.is_ok());
+    assert!(release.upgrade().is_none());
+    assert!(matches!(
+        &second,
+        Err(photo_server::StartupError::Config(
+            ConfigError::SourceStartupUnavailable
+        ))
+    ));
+    let error = match second {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("second startup unexpectedly succeeded"),
+    };
+    assert!(!error.contains(source.to_string_lossy().as_ref()));
+}
+
+#[cfg(unix)]
+#[test]
+fn source_startup_descriptor_is_released_on_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    let config = ServerConfig::new(
+        temp.path().join("data"),
+        temp.path().join("cache"),
+        None,
+        source,
+        web_root(&temp),
+    )
+    .unwrap();
+    std::fs::create_dir_all(config.catalog_path().parent().unwrap()).unwrap();
+    std::fs::write(config.catalog_path(), b"not a sqlite catalog").unwrap();
+    let release = config.source_startup_release_probe().unwrap();
+
+    let result = AppState::open(&config);
+
+    assert!(result.is_err());
+    assert!(release.upgrade().is_none());
+    assert!(matches!(
+        AppState::open(&config),
+        Err(photo_server::StartupError::Config(
+            ConfigError::SourceStartupUnavailable
+        ))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn source_startup_descriptor_is_released_during_unwind() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    let config = ServerConfig::new(
+        temp.path().join("data"),
+        temp.path().join("cache"),
+        None,
+        source,
+        web_root(&temp),
+    )
+    .unwrap();
+    let release = config.source_startup_release_probe().unwrap();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = AppState::open_with_source_construction_hook(&config, |stage| {
+            if stage == SourceStartupTestStage::AfterOperationalValidation {
+                panic!("deterministic startup panic");
+            }
+        });
+    }));
+
+    assert!(result.is_err());
+    assert!(release.upgrade().is_none());
+    assert!(matches!(
+        AppState::open(&config),
+        Err(photo_server::StartupError::Config(
+            ConfigError::SourceStartupUnavailable
+        ))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn normalized_prevalidated_library_key_rejects_catalog_overlap() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    let config = ServerConfig::new(
+        temp.path().join("data"),
+        temp.path().join("cache"),
+        None,
+        source.clone(),
+        web_root(&temp),
+    )
+    .unwrap();
+    let mut catalog = Catalog::open(&config.catalog_path()).unwrap();
+    catalog
+        .add_library(&NewLibrary::configured(
+            "Nested",
+            &source.join("child").join("..").join("child"),
+        ))
+        .unwrap();
+    drop(catalog);
+    let release = config.source_startup_release_probe().unwrap();
+
+    let result = AppState::open(&config);
+
+    assert!(matches!(
+        result,
+        Err(photo_server::StartupError::Gallery(
+            photo_app_service::AppServiceError::OpenRecent(
+                photo_core::AddLibraryError::Overlaps { .. }
+            )
+        ))
+    ));
+    assert!(release.upgrade().is_none());
+    assert!(matches!(
+        AppState::open(&config),
+        Err(photo_server::StartupError::Config(
+            ConfigError::SourceStartupUnavailable
+        ))
+    ));
 }
 
 #[cfg(unix)]

@@ -1,4 +1,6 @@
 use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "server-internal-prevalidated-source")]
+use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 #[cfg(any(test, debug_assertions))]
 use std::sync::atomic::AtomicBool;
@@ -11,7 +13,11 @@ use photo_cache::{
     CacheBudget, CacheWriter, DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget,
     ImageDerivativeGenerator,
 };
+#[cfg(feature = "server-internal-prevalidated-source")]
+use photo_catalog::NewLibrary;
 use photo_catalog::{Catalog, CatalogError, NewDerivative, NewFolderGroup, WallOrder};
+#[cfg(feature = "server-internal-prevalidated-source")]
+use photo_core::{AddLibraryError, normalize_prevalidated_source_key};
 use photo_core::{LibraryService, RealSourceFs};
 use photo_domain::{FolderGroupId, GalleryScope, LibraryId, RelativePathKey};
 use photo_indexer::{DefaultMetadataReader, IndexEvent, Indexer, MetadataReader, ScanRequest};
@@ -448,6 +454,36 @@ pub struct GalleryEngine {
     hosted_link_removal_failure_test_hook: Arc<AtomicBool>,
 }
 
+/// Server-internal capability proving that the hosted source was pinned and
+/// identity-validated at the startup boundary. The owned directory descriptor
+/// prevents this from becoming a path-only trust bypass.
+#[cfg(feature = "server-internal-prevalidated-source")]
+#[doc(hidden)]
+pub struct PrevalidatedHostedSource {
+    validated_directory: File,
+    validation_lifetime: Arc<()>,
+    operational_path: PathBuf,
+    canonical_key: PathBuf,
+}
+
+#[cfg(feature = "server-internal-prevalidated-source")]
+impl PrevalidatedHostedSource {
+    #[doc(hidden)]
+    pub fn from_server_validated_directory(
+        validated_directory: File,
+        validation_lifetime: Arc<()>,
+        operational_path: PathBuf,
+        canonical_key: PathBuf,
+    ) -> Self {
+        Self {
+            validated_directory,
+            validation_lifetime,
+            operational_path,
+            canonical_key,
+        }
+    }
+}
+
 impl GalleryEngine {
     pub fn open(config: AppConfig, source_root: PathBuf) -> Result<Self, AppServiceError> {
         Self::open_with_reader(config, source_root, Arc::new(DefaultMetadataReader))
@@ -501,6 +537,84 @@ impl GalleryEngine {
                 )?
                 .id
         };
+        Self::finish_open(config, reader, libraries, hosted_library_id)
+    }
+
+    #[cfg(feature = "server-internal-prevalidated-source")]
+    #[doc(hidden)]
+    pub fn open_prevalidated_hosted(
+        config: AppConfig,
+        source: PrevalidatedHostedSource,
+    ) -> Result<Self, AppServiceError> {
+        let PrevalidatedHostedSource {
+            validated_directory,
+            validation_lifetime,
+            operational_path,
+            canonical_key,
+        } = source;
+        let canonical_key = normalize_prevalidated_source_key(&canonical_key)
+            .map_err(AppServiceError::LibrarySetup)?;
+        let mut cataloged_roots = Catalog::read_library_root_paths(&config.catalog_path())?;
+        cataloged_roots.push(canonical_key.clone());
+        config.validate_prevalidated_source_keys(&cataloged_roots)?;
+        config.prepare_prevalidated_source_keys(&cataloged_roots)?;
+        let mut catalog = Catalog::open(&config.catalog_path())?;
+        CacheWriter::new(config.cache_dir())?.reconcile_catalog(&mut catalog)?;
+        let mut libraries = LibraryService::new(
+            catalog,
+            RealSourceFs,
+            vec![config.data_dir().to_owned(), config.cache_dir().to_owned()],
+        )
+        .map_err(AppServiceError::LibrarySetup)?;
+
+        let mut hosted_library_id = None;
+        for existing in libraries.catalog().list_libraries()? {
+            let existing_key = existing
+                .canonical_root_key
+                .to_path_buf()
+                .map_err(|error| AddLibraryError::InvalidCatalogPath(error.to_string()))?;
+            let existing_key =
+                normalize_prevalidated_source_key(&existing_key).map_err(AddLibraryError::Io)?;
+            if existing_key == canonical_key {
+                hosted_library_id = Some(existing.id);
+                break;
+            }
+            if existing_key.starts_with(&canonical_key) || canonical_key.starts_with(&existing_key)
+            {
+                return Err(AppServiceError::OpenRecent(AddLibraryError::Overlaps {
+                    existing_id: existing.id,
+                }));
+            }
+        }
+        let hosted_library_id = match hosted_library_id {
+            Some(id) => id,
+            None => {
+                let display_name = operational_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Hosted photos".to_owned());
+                let mut library = NewLibrary::configured(display_name, &canonical_key);
+                library.display_path = operational_path.to_string_lossy().into_owned();
+                libraries.catalog_mut().add_library(&library)?.id
+            }
+        };
+        let result = Self::finish_open(
+            config,
+            Arc::new(DefaultMetadataReader),
+            libraries,
+            hosted_library_id,
+        );
+        drop(validated_directory);
+        drop(validation_lifetime);
+        result
+    }
+
+    fn finish_open(
+        config: AppConfig,
+        reader: Arc<dyn MetadataReader>,
+        libraries: LibraryService<RealSourceFs>,
+        hosted_library_id: LibraryId,
+    ) -> Result<Self, AppServiceError> {
         let cache_root = config.cache_dir().to_owned();
         let cache_writer = CacheWriter::new(&cache_root)?;
         let catalog_path = config.catalog_path();

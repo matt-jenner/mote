@@ -17,6 +17,9 @@ pub use dto::{
     OrderState, ScanProgressDto, SortDirection, WallAsset, WallMediaKind, WallPage,
     WallQueryRequest, WallShapeState, WallUpdate, WallWarningState,
 };
+#[cfg(feature = "server-internal-prevalidated-source")]
+#[doc(hidden)]
+pub use gallery::PrevalidatedHostedSource;
 pub use gallery::{
     FolderBreadcrumb, GalleryEngine, GallerySelection, ManagedDerivative, SelectionSummary,
 };

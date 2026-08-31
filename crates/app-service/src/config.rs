@@ -33,4 +33,20 @@ impl AppConfig {
     pub(crate) fn prepare(&self, roots: &[PathBuf]) -> Result<(), LocalStateError> {
         self.local.prepare(roots)
     }
+
+    #[cfg(feature = "server-internal-prevalidated-source")]
+    pub(crate) fn validate_prevalidated_source_keys(
+        &self,
+        roots: &[PathBuf],
+    ) -> Result<(), LocalStateError> {
+        self.local.validate_prevalidated_source_keys(roots)
+    }
+
+    #[cfg(feature = "server-internal-prevalidated-source")]
+    pub(crate) fn prepare_prevalidated_source_keys(
+        &self,
+        roots: &[PathBuf],
+    ) -> Result<(), LocalStateError> {
+        self.local.prepare_prevalidated_source_keys(roots)
+    }
 }

@@ -48,6 +48,10 @@ impl ContainedFolderRoot {
         Ok(Self { root })
     }
 
+    pub(crate) fn from_prevalidated_operational_path(root: PathBuf) -> Self {
+        Self { root }
+    }
+
     pub fn resolve(&self, relative: &str) -> Result<PathBuf, FolderError> {
         let canonical = self.resolve_path(relative)?;
         fs::read_dir(&canonical).map_err(map_read_error)?;
