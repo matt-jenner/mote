@@ -1,6 +1,6 @@
 # Task 8 implementation report
 
-Status: fix round 3 complete, awaiting task-scoped re-review.
+Status: fix round 4 complete, awaiting task-scoped re-review.
 
 Initial implementation commit: `e5c96b9` (`feat: serve the hosted photo viewer securely`), based on `bce40c4`.
 
@@ -9,6 +9,8 @@ Fix round 1 implementation commit: `90d48d1` (`fix: contain hosted static file a
 Fix round 2 implementation commit: `9ee0916` (`fix: bind hosted static roots at validation`), based on `dd8ef60`.
 
 Fix round 3 implementation commit: `170071b` (`fix: pin hosted roots before validation`), based on `d480996`.
+
+Fix round 4 implementation commit: `6c0c47b` (`fix: enforce hosted mount boundaries`), based on `38a5f97`.
 
 ## Delivered behavior
 
@@ -404,7 +406,7 @@ The missing-local tests were characterization tests rather than claimed REDs: th
 - Source and web roots are opened independently and compared by device/inode identity. Each ancestry walk clones its starting descriptor and repeatedly opens `..` relative to the current descriptor until the root identity repeats. The walk checks ancestry in both directions, bounds cycles/depth, propagates permission or traversal errors as startup failure, and releases every short-lived descriptor through RAII.
 - Existing data/cache directories are opened and checked the same way. For a missing local-state path, validation lexically normalizes an absolute path, opens the nearest existing directory without creating anything, and retains the ordered missing-component remainder. If the pinned parent is inside source or web, startup fails; a disjoint missing child is allowed for later private-state preparation.
 - Focused tests cover identical independently owned descriptors with distinct informational labels, real symlink alias rejection, source/web parent-child overlap in both directions, a missing child beneath source, a missing child beneath web, and disjoint missing data/cache children. They also preserve the existing descendant/symlink/sidecar swap coverage.
-- The source descriptor and local-state validation descriptors are short-lived and close after configuration. The one web descriptor is intentionally retained for the router lifetime. Validation never creates or modifies source content.
+- The local-state validation descriptors are short-lived and close after configuration. Round 4 supersedes the source-descriptor lifetime described at this checkpoint: the configuration now retains the validated source descriptor through the operational startup boundary, then deliberately returns to path-based source access. The web descriptor remains retained for the router lifetime. Validation never creates or modifies source content.
 
 ### Focused GREEN evidence
 
@@ -478,3 +480,119 @@ The process was interrupted in the foreground, `lsof` found no listener on port 
 ### Round-3 limitation
 
 Only the installed `aarch64-apple-darwin` target was compiled and executed. The separately owned descriptor-alias test proves identity-based alias handling without requiring a privileged mount, but this environment did not create an actual bind mount. The non-Unix static branch remains explicit fail closed and was not compiled on Windows; Windows static interface hosting remains disabled until an equivalent handle-relative, no-reparse implementation exists.
+
+## Fix round 4: mount identity and source startup consistency
+
+The fourth review identified two different identity lifetimes. Device/inode ancestry alone cannot recognize a Linux bind-mounted web root because `..` follows the mountpoint namespace rather than the bound directory's physical ancestry. Separately, configuration validated a source descriptor but discarded it before `AppState` and `GalleryEngine` construction. Commit `6c0c47b` adds a static-only mount policy and retains a source validation lease through the operational startup boundary. It does not permanently pin the source inode.
+
+### Behavioral RED evidence
+
+The new tests were compiled against `38a5f97` before production changes:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --lib synthetic_bind_mounts_fail_closed_even_when_directory_identity_matches --jobs 2
+  RED (compile): MountIdentity, validate_mount_chain, and parse_fdinfo_mount_id did not exist.
+
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --lib every_static_open_rejects_a_mount_transition_with_an_empty_response --jobs 2
+  RED (compile): the mount provider and mount-aware pinned-root constructor did not exist.
+
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --test health_api application_rejects_a_source_swap_at_the_operational_startup_boundary --jobs 2
+  RED (compile): AppState had no source-startup validation seam.
+```
+
+An exploratory rootless Podman proof on Fedora 44, Linux 7.0.12, bind-mounted `/probe/source/child` at `/probe/app/web`. The source-child and web descriptors had the same `st_dev:st_ino` (`85:3`) but different mount IDs (`703` and `416`); the web descriptor's parent had mount ID `703`, and the exact `SOURCE_SENTINEL` was readable through the bind alias. This is supporting evidence for the production mount-ID abstraction, not an always-run or privileged repository test. The ephemeral container was removed.
+
+The offline/remount expansion was a characterization gate rather than a product-behavior RED. It preserves the existing contract: after an offline cached-browsing session, remounting the source path and opening a new path-based engine resolves the same opaque selection and cached wall.
+
+### Static mount policy
+
+- On Linux, the retained web descriptor obtains a stable mount ID with `statx(fd, "", AT_EMPTY_PATH | AT_NO_AUTOMOUNT, STATX_MNT_ID)`. If that facility or mask is unavailable, a strict, bounded parser reads `mnt_id` from `/proc/self/fdinfo/<fd>`. Missing, duplicate, non-decimal, trailing, oversized, or inaccessible provider data fails closed with a fixed path-free error.
+- Configuration walks retained ancestor descriptors to the stable namespace root. Linux permits no mount-ID transition. A web root that is itself a bind/separate mount, or is beneath an ancestor mount transition, is rejected before the router exists.
+- Every descriptor-relative intermediate directory, final asset, interface index, Brotli sidecar, and gzip sidecar must match the pinned web root's mount identity. Provider failure or mismatch becomes fixed `PermissionDenied`; `tower-http` returns an empty 404 and does not treat a rejected compressed sidecar as a missing representation eligible for identity fallback.
+- On macOS, mount identity is the strongest stable tuple exposed by `fstatfs`: raw `fsid`, filesystem type, mounted-on name, and mounted-from name. Every retained ancestor descriptor is inspected and every ordinary tuple transition is rejected. Every descendant/final static open still requires exact equality with the pinned web tuple.
+- Normal writable macOS paths cross the built-in APFS Data-to-System firmlink/volume-group boundary. The observed tuple was `apfs`, `/System/Volumes/Data`, `/dev/disk3s5`, fsid bytes `[17,0,0,1,26,0,0,0]` to `apfs`, `/`, `/dev/disk3s1s1`, fsid bytes `[19,0,0,1,26,0,0,0]`. The only exception requires those exact mount-on roles, `apfs` on both sides, canonical `/dev/diskNs...` sources, and the same physical `diskN`. Negative tests cover wrong child and parent mount points, `nullfs`, a different physical store, and malformed device sources.
+- Unix platforms other than Linux and macOS, and non-Unix platforms, retain the explicit unavailable static backend. API and health behavior remains fail closed rather than reopening static paths unsafely.
+
+### Source startup lease
+
+- `ServerConfig` retains the descriptor and device/inode identity captured by the configuration-time source open. `AppState::open` opens and fstats the operational source path before catalog preflight or local-state preparation, requires it to match, and holds that new lease through contained-folder and `GalleryEngine` construction.
+- The operational pathname is revalidated against the lease immediately before contained-folder construction, immediately before gallery construction, and immediately after gallery construction. A deterministic swap to a replacement directory is rejected before any library or sentinel is cataloged; unchanged identity succeeds.
+- The lease is intentionally dropped after successful startup. Gallery scans and later availability checks retain the product's existing path-based offline/remount behavior. This is startup identity consistency, not a promise that the source inode remains permanently pinned.
+
+### Focused GREEN evidence
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --lib --jobs 2
+  PASS: 16 tests, including synthetic bind identity, strict parser/provider failure, exact macOS boundary, and empty-response intermediate/final/Brotli/gzip mismatch coverage.
+
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --test health_api application_rejects_a_source_swap_at_the_operational_startup_boundary --jobs 2
+  PASS: replacement identity rejected before catalog admission.
+
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --test health_api unchanged_source_identity_crosses_the_operational_startup_boundary --jobs 2
+  PASS.
+
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-app-service --test hosted_selections completed_selection_reopens_for_cached_browsing_when_source_is_offline --jobs 2
+  PASS: offline cached browsing and path-based remount/reopen resolve the same selection and one-item cached wall.
+
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --jobs 2
+  PASS: 75 tests across library and integration targets.
+
+CARGO_BUILD_JOBS=2 cargo clippy --offline -p photo-server --all-targets -- -D warnings
+  PASS.
+```
+
+### Final round-4 gates
+
+All final gates ran on the exact implementation source committed as `6c0c47b`:
+
+```text
+cargo fmt --all -- --check
+  PASS
+
+npm run check
+  PASS: Biome checked 75 files, no fixes required
+
+npm run typecheck
+  PASS
+
+npm test
+  PASS: 18 files, 154 tests
+
+npm run test:browser
+  PASS on approved loopback rerun: 4 files, 165 tests
+
+npm run web:build
+  PASS: Vite 8.2.2 transformed 1,891 modules; index asset URLs remain root-relative `/assets/...` and application API URLs remain `/api/v1/...`
+
+CARGO_BUILD_JOBS=2 cargo test --workspace --all-targets --all-features --offline --jobs 2
+  PASS: all workspace targets and doc tests, including the source-safety harness and the new 26-test hosted-selection suite
+
+CARGO_BUILD_JOBS=2 cargo clippy --workspace --all-targets --all-features --offline --jobs 2 -- -D warnings
+  PASS
+
+CARGO_BUILD_JOBS=2 cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --offline --jobs 2
+  PASS
+
+CARGO_BUILD_JOBS=2 cargo build --release -p photo-server --offline --jobs 2
+  PASS
+
+git diff --check
+  PASS
+```
+
+The first browser attempt was blocked before test collection by sandboxed IPv6 loopback bind `EPERM`; the approved loopback rerun passed with only the branch's known non-fatal `ViewerStage` `act(...)` warning. The desktop check regenerated its known `image` and `libc` dependency-list entries; removing only those generated lines restored the prior nested-lock checksum `213cfa1d6961bb7bdb72326f64517afc2bda09ea`.
+
+### Round-4 live release-process evidence
+
+One foreground optimized process used the built hosted interface, the existing six-photo demo source, and fresh temporary data/cache directories:
+
+- `/gallery/live-demo` returned 200 HTML with `no-cache`, a quoted ETag, no redirect, and the exact CSP, `nosniff`, and referrer headers. Host `hostile.example` and forwarded host `forwarded.example` were absent from the body; all interface asset links remained origin-relative.
+- `/healthz` returned healthy path-free JSON with one available source. Encoded `/%61pi/v1/unknown` returned the fixed path-free JSON 404.
+- Selection creation returned 201 and the wall exposed all six photos. A bounded future replay returned 200 `text/event-stream`, `no-cache`, `x-accel-buffering: no`, and a framed path-free `resyncRequired` event with authoritative `id: 0`.
+- A visible wall-thumbnail request returned 204. The resulting opaque derivative returned 200 `image/jpeg`, 190,681 bytes, `public, max-age=31536000, immutable`, `nosniff`, and an opaque quoted ETag.
+
+The process was interrupted in its foreground session, `lsof` found no listener on port 18080, the explicit temporary tree was removed, and the source-photo aggregate checksum remained `aaf9c7784207843dd4ece72ddc799f196a7c3a7d`. Generated `apps/interface/dist` remains ignored. No background build, `cargo clean`, merge, push, OCI work, Task 9 packaging, or deployment work occurred.
+
+### Round-4 limitations
+
+Only `aarch64-apple-darwin` was compiled and executed in this workspace. Linux mount-ID behavior is backed by the real rootless-container proof and platform-independent synthetic/parser tests, but this report does not claim a Linux Rust build or runtime test. If both Linux `statx` and bounded `/proc/self/fdinfo` access are unavailable, static startup fails closed. macOS does not expose a Linux-equivalent mount ID through this API; the `fstatfs` tuple detects distinct mount identities but cannot prove separation if the kernel presents an alias with an identical full tuple. Windows and other unsupported platforms continue to disable static hosting until they have an equivalent handle-relative, no-reparse and stable-mount implementation.
