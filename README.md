@@ -2,6 +2,8 @@
 
 This repository implements the catalog foundation and the second macOS desktop checkpoint for a cross-platform photo viewer. It indexes local folders and mounted network shares into a local SQLite catalog, normalizes useful metadata, tracks offline sources without discarding their records, schedules progressive background work, and manages local derivative-cache accounting.
 
+Run the native app with the [macOS desktop development workflow](#run-the-macos-desktop-app), or package the same interface and API with the [hosted deployment guide](docs/deployment/hosted.md).
+
 Source media is read-only. Production code never writes, renames, or deletes files under a configured photo root. SQLite state and generated derivatives stay in explicit local data and cache directories; do not place either directory inside a photo source.
 
 ## Requirements

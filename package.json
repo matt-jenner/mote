@@ -14,10 +14,12 @@
     "typecheck": "npm run typecheck --workspace @photo-viewer/interface",
     "test": "npm run test --workspace @photo-viewer/interface",
     "test:browser": "npm run test:browser --workspace @photo-viewer/interface",
+    "test:hosted": "playwright test --config tests/hosted/playwright.config.ts",
     "web:build": "npm run build --workspace @photo-viewer/interface -- --mode hosted",
     "web:dev": "npm run dev --workspace @photo-viewer/interface -- --mode hosted"
   },
   "devDependencies": {
+    "@playwright/test": "1.62.1",
     "@testing-library/jest-dom": "7.0.1",
     "@testing-library/react": "16.3.2",
     "@biomejs/biome": "2.5.10"

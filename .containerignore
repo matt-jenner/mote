@@ -1,0 +1,12 @@
+.git
+.worktrees
+.superpowers
+.DS_Store
+node_modules
+target
+test-results
+apps/interface/dist
+apps/interface/.vite
+apps/interface/tsconfig.tsbuildinfo
+coverage
+*.log

@@ -1,0 +1,22 @@
+services:
+  photo-viewer:
+    image: localhost/photo-viewer:dev
+    build:
+      context: ..
+      dockerfile: Containerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      PHOTO_VIEWER_DATA_DIR: /var/lib/photo-viewer
+      PHOTO_VIEWER_CACHE_DIR: /var/cache/photo-viewer
+      PHOTO_VIEWER_SOURCE_ROOT: /photos
+      PHOTO_VIEWER_BIND: 0.0.0.0:8080
+    volumes:
+      - "${PHOTO_PATH:-/srv/photos}:/photos:ro"
+      - photo-viewer-data:/var/lib/photo-viewer
+      - photo-viewer-cache:/var/cache/photo-viewer
+
+volumes:
+  photo-viewer-data:
+  photo-viewer-cache:
