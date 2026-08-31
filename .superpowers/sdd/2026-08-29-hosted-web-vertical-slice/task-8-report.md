@@ -1,12 +1,14 @@
 # Task 8 implementation report
 
-Status: fix round 2 complete, awaiting task-scoped re-review.
+Status: fix round 3 complete, awaiting task-scoped re-review.
 
 Initial implementation commit: `e5c96b9` (`feat: serve the hosted photo viewer securely`), based on `bce40c4`.
 
 Fix round 1 implementation commit: `90d48d1` (`fix: contain hosted static file access`), based on `edfd339`.
 
 Fix round 2 implementation commit: `9ee0916` (`fix: bind hosted static roots at validation`), based on `dd8ef60`.
+
+Fix round 3 implementation commit: `170071b` (`fix: pin hosted roots before validation`), based on `d480996`.
 
 ## Delivered behavior
 
@@ -19,7 +21,7 @@ Fix round 2 implementation commit: `9ee0916` (`fix: bind hosted static roots at 
   default-src 'self'; img-src 'self' data: blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'
   ```
 
-- `ServerConfig` now requires an existing canonical web directory and rejects source/web or private-state/web overlap before startup. The existing source-root containment, read-only scan/derivative behavior, request-target limits, 64 KiB JSON limit, opaque errors, SSE streaming, and bounded derivative streaming remain unchanged.
+- On Unix, `ServerConfig` opens and pins the configured web directory before deriving any display path, then rejects descriptor-identity or ancestry overlap with the opened source and local-state locations. The existing source-root containment, read-only scan/derivative behavior, request-target limits, 64 KiB JSON limit, opaque errors, SSE streaming, and bounded derivative streaming remain unchanged.
 - Production startup passes the validated web root to `build_router(state, web_root)` and supplies peer `ConnectInfo`. Host and forwarded headers are recorded only in trace fields named as untrusted; they never participate in URL, path, authorization, or containment decisions.
 - Added root `web:build` and `web:dev` scripts for Vite hosted mode. `apps/interface/package.json` needed no edit because its existing build and dev scripts already accept the forwarded `--mode hosted` argument.
 - Enabled exactly the planned `tower-http` features: `catch-panic`, `fs`, `set-header`, and `trace`.
@@ -367,3 +369,112 @@ The process was interrupted in the foreground, port 18080 had no listener, and i
 ### Round-2 limitation
 
 Only the installed `aarch64-apple-darwin` target was compiled and executed. The non-Unix branch remains explicit fail-closed static behavior, but this round does not claim a Windows compile or runtime result. Windows static interface hosting remains disabled until an equivalent handle-relative, no-reparse implementation exists.
+
+## Fix round 3: open-first root identity and descriptor ancestry
+
+The final Sol review identified one remaining race in the round-2 design: it canonicalized the web-root pathname and then captured or reopened its identity. A pathname replacement between those operations could associate the earlier canonical path with a different directory. Path-only local-state checks also could not prove that two aliases referred to the same filesystem object. Commit `170071b` makes descriptor acquisition the identity-capture operation and uses held descriptors for the overlap decision.
+
+### Behavioral RED evidence
+
+The exact identity-capture seam was introduced as a test before the implementation:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --lib identity_capture_cannot_be_redirected_after_path_resolution --jobs 2
+  RED (compile): StaticWebRootValidation::capture_with_identity_hook did not exist.
+
+With a temporary hook placed between the old canonicalize and symlink_metadata calls:
+  RED (behavior): replacing the configured pathname with the source directory made the old code pin and return the exact bytes `SOURCE ROOT SENTINEL` instead of `SAFE WEB ROOT`.
+
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --lib pinned_root_survives_same_inode_rename_during_display_path_resolution --jobs 2
+  RED: the old pathname-reopen design returned ENOENT after the already-validated inode was renamed.
+```
+
+The missing-local tests were characterization tests rather than claimed REDs: the path-only code already rejected ordinary missing children beneath source/web and accepted ordinary disjoint missing children. The round-3 change adds descriptor-backed evidence for those decisions. A `/dev/fd/<n>` directory alias was considered as a macOS fixture, but macOS can stat that alias while rejecting an `O_DIRECTORY` reopen with `ENOTDIR`; it was discarded rather than reported as security evidence. The final identity-alias test instead obtains a second independently owned descriptor using `openat(fd, ".")` and gives it a deliberately different informational label.
+
+### Open-first retained identity
+
+- `PinnedDirectory::open` performs one `O_DIRECTORY | O_CLOEXEC` open of the configured directory and immediately obtains device/inode identity with `fstat` through that same descriptor. An explicitly configured root symlink may be followed by this one root open; no later pathname reopen selects the served directory.
+- `StaticWebRootValidation` owns that descriptor, and `pin` moves the same object into the cloneable static backend. Router clones share one `Arc<PinnedDirectory>` and every asset, index, Brotli, and gzip access remains descriptor-relative with no-follow descendant opens.
+- Canonical and absolute paths are diagnostic values only. A canonical display value is accepted only when its identity still matches the held descriptor; otherwise the absolute configured spelling is retained as an informational label. `StaticWebRoot::path`, `ServerConfig::web_root`, and `PinnedDirectory::display_path` document that they have no security role.
+- A same-inode rename during display-path resolution is accepted and serving continues through the retained descriptor. A different directory moved onto the configured pathname cannot affect the retained object or serve its sentinel.
+- On non-Unix targets the existing explicit unavailable backend remains fail closed; there is still no pathname static fallback.
+
+### Descriptor ancestry and missing local state
+
+- Source and web roots are opened independently and compared by device/inode identity. Each ancestry walk clones its starting descriptor and repeatedly opens `..` relative to the current descriptor until the root identity repeats. The walk checks ancestry in both directions, bounds cycles/depth, propagates permission or traversal errors as startup failure, and releases every short-lived descriptor through RAII.
+- Existing data/cache directories are opened and checked the same way. For a missing local-state path, validation lexically normalizes an absolute path, opens the nearest existing directory without creating anything, and retains the ordered missing-component remainder. If the pinned parent is inside source or web, startup fails; a disjoint missing child is allowed for later private-state preparation.
+- Focused tests cover identical independently owned descriptors with distinct informational labels, real symlink alias rejection, source/web parent-child overlap in both directions, a missing child beneath source, a missing child beneath web, and disjoint missing data/cache children. They also preserve the existing descendant/symlink/sidecar swap coverage.
+- The source descriptor and local-state validation descriptors are short-lived and close after configuration. The one web descriptor is intentionally retained for the router lifetime. Validation never creates or modifies source content.
+
+### Focused GREEN evidence
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --lib static_host --test health_api --jobs 2
+  PASS: 9 static-host library tests
+
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --test health_api --jobs 2
+  PASS: 13 tests
+
+CARGO_BUILD_JOBS=2 cargo test --offline -p photo-server --jobs 2
+  PASS: 68 tests across library and integration targets
+
+CARGO_BUILD_JOBS=2 cargo clippy --offline -p photo-server --all-targets --all-features --no-deps --jobs 2 -- -D warnings
+  PASS
+```
+
+### Final round-3 gates
+
+All commands below ran on the final implementation source before commit:
+
+```text
+cargo fmt --all -- --check
+  PASS
+
+npm run check
+  PASS: Biome checked 75 files, no fixes required
+
+npm run typecheck
+  PASS
+
+npm test
+  PASS: 18 files, 154 tests
+
+npm run test:browser
+  PASS: 4 files, 165 tests
+
+npm run web:build
+  PASS: Vite 8.2.2 transformed 1,891 modules
+  dist/index.html uses root-relative `/assets/...`; emitted application API calls use `/api/v1/...`
+
+CARGO_BUILD_JOBS=2 cargo test --workspace --all-targets --all-features --offline --jobs 2
+  PASS: all workspace targets, including 68 photo-server tests and the source-safety harness
+
+CARGO_BUILD_JOBS=2 cargo clippy --workspace --all-targets --all-features --offline --jobs 2 -- -D warnings
+  PASS
+
+CARGO_BUILD_JOBS=2 cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml --offline --jobs 2
+  PASS
+
+CARGO_BUILD_JOBS=2 cargo build --release -p photo-server --offline --jobs 2
+  PASS
+
+git diff --check
+  PASS
+```
+
+The browser gate emitted only the branch's known non-fatal `ViewerStage` `act(...)` warning. The desktop check regenerated the known `image` and `libc` dependency-list lines in its nested lockfile; those generated lines were removed, leaving the lockfile unchanged.
+
+### Round-3 live release-process evidence
+
+One foreground optimized process used the hosted build, the existing six-photo demo source, and fresh temporary data/cache directories:
+
+- `/` and `/gallery/live-demo` returned identical 200 HTML with `no-cache`, ETag, no redirect, and the exact CSP/nosniff/referrer headers. Supplied hostile Host and forwarded headers were absent from the response body and did not create an absolute origin.
+- `/healthz` returned healthy path-free JSON with one available source. Literal `/api/v1/unknown` and encoded `/%61pi/v1/unknown` returned the same fixed `{"code":"notFound","message":"That route is unavailable."}` JSON 404.
+- Selection creation returned 201. A bounded future replay returned 200 `text/event-stream`, `no-cache`, `x-accel-buffering: no`, and a framed path-free `resyncRequired` event with authoritative `id: 0`.
+- The wall contained all six demo photos. A visible wall-thumbnail request returned 204, after which the wall exposed an opaque derivative key. Its delivery returned 200 `image/jpeg`, 190,681 bytes, `public, max-age=31536000, immutable`, `nosniff`, and an opaque quoted ETag.
+
+The process was interrupted in the foreground, `lsof` found no listener on port 18080, and the explicit temporary tree was removed. The initial sandboxed bind failed with `EPERM`; the approved loopback-only rerun supplied the live evidence. Generated `apps/interface/dist` remains ignored, no source photo changed, and no background process, `cargo clean`, merge, push, OCI work, or Task 9 deployment work occurred.
+
+### Round-3 limitation
+
+Only the installed `aarch64-apple-darwin` target was compiled and executed. The separately owned descriptor-alias test proves identity-based alias handling without requiring a privileged mount, but this environment did not create an actual bind mount. The non-Unix static branch remains explicit fail closed and was not compiled on Windows; Windows static interface hosting remains disabled until an equivalent handle-relative, no-reparse implementation exists.
