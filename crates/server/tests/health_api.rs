@@ -208,6 +208,60 @@ fn missing_local_children_use_their_pinned_existing_parent() {
 
 #[cfg(unix)]
 #[test]
+fn application_rejects_a_source_swap_at_the_operational_startup_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let replacement = temp.path().join("replacement");
+    let moved_source = temp.path().join("validated-source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&replacement).unwrap();
+    std::fs::write(source.join("safe.jpg"), b"SAFE SOURCE").unwrap();
+    std::fs::write(replacement.join("sentinel.jpg"), b"SOURCE SENTINEL").unwrap();
+    let config = ServerConfig::new(
+        temp.path().join("data"),
+        temp.path().join("cache"),
+        None,
+        source.clone(),
+        web_root(&temp),
+    )
+    .unwrap();
+
+    let result = AppState::open_with_source_startup_hook(&config, || {
+        std::fs::rename(&source, &moved_source).unwrap();
+        std::fs::rename(&replacement, &source).unwrap();
+    });
+
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read(source.join("sentinel.jpg")).unwrap(),
+        b"SOURCE SENTINEL"
+    );
+    let catalog = Catalog::open(&config.catalog_path()).unwrap();
+    assert!(catalog.list_libraries().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn unchanged_source_identity_crosses_the_operational_startup_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    let config = ServerConfig::new(
+        temp.path().join("data"),
+        temp.path().join("cache"),
+        None,
+        source,
+        web_root(&temp),
+    )
+    .unwrap();
+
+    let result = AppState::open_with_source_startup_hook(&config, || {});
+
+    assert!(result.is_ok());
+}
+
+#[cfg(unix)]
+#[test]
 fn config_rejects_a_symlink_alias_into_a_source_root() {
     use std::os::unix::fs::symlink;
 

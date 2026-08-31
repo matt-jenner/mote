@@ -1,6 +1,8 @@
 use std::env;
 use std::net::{AddrParseError, SocketAddr};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::Arc;
 
 use photo_core::{LocalStateError, LocalStatePaths};
 
@@ -13,7 +15,24 @@ pub struct ServerConfig {
     local: LocalStatePaths,
     bind: SocketAddr,
     source_root: PathBuf,
+    source_startup: SourceStartupValidation,
     web_root: StaticWebRoot,
+}
+
+#[derive(Clone, Debug)]
+struct SourceStartupValidation {
+    #[cfg(unix)]
+    pinned: Arc<PinnedDirectory>,
+    #[cfg(not(unix))]
+    canonical_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub(crate) struct SourceStartupLease {
+    #[cfg(unix)]
+    operational: PinnedDirectory,
+    #[cfg(not(unix))]
+    canonical_path: PathBuf,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -28,6 +47,8 @@ pub enum ConfigError {
     InsideSourceRoot,
     #[error("configured source root is not a directory")]
     SourceRootNotDirectory,
+    #[error("configured source root changed before startup")]
+    SourceRootChanged,
     #[error("configured web root is unavailable")]
     WebRootUnavailable,
     #[error("configured web root must not overlap the source root")]
@@ -82,10 +103,19 @@ impl ServerConfig {
         let web_root = web_root
             .pin()
             .map_err(|_| ConfigError::WebRootUnavailable)?;
+        #[cfg(unix)]
+        let source_startup = SourceStartupValidation {
+            pinned: Arc::new(pinned_source),
+        };
+        #[cfg(not(unix))]
+        let source_startup = SourceStartupValidation {
+            canonical_path: source_root.clone(),
+        };
         Ok(Self {
             local,
             bind: bind.unwrap_or("127.0.0.1:8080").parse()?,
             source_root,
+            source_startup,
             web_root,
         })
     }
@@ -151,6 +181,58 @@ impl ServerConfig {
 
     pub fn static_web_root(&self) -> StaticWebRoot {
         self.web_root.clone()
+    }
+
+    pub(crate) fn validate_source_startup(&self) -> Result<SourceStartupLease, ConfigError> {
+        self.source_startup.validate(&self.source_root)
+    }
+}
+
+impl SourceStartupValidation {
+    fn validate(&self, path: &Path) -> Result<SourceStartupLease, ConfigError> {
+        #[cfg(unix)]
+        {
+            let operational =
+                PinnedDirectory::open(path).map_err(|_| ConfigError::SourceRootChanged)?;
+            if !self.pinned.same_object_as(&operational) {
+                return Err(ConfigError::SourceRootChanged);
+            }
+            Ok(SourceStartupLease { operational })
+        }
+        #[cfg(not(unix))]
+        {
+            let canonical_path = path
+                .canonicalize()
+                .map_err(|_| ConfigError::SourceRootChanged)?;
+            if canonical_path != self.canonical_path || !canonical_path.is_dir() {
+                return Err(ConfigError::SourceRootChanged);
+            }
+            Ok(SourceStartupLease { canonical_path })
+        }
+    }
+}
+
+impl SourceStartupLease {
+    pub(crate) fn revalidate(&self, path: &Path) -> Result<(), ConfigError> {
+        #[cfg(unix)]
+        {
+            let current =
+                PinnedDirectory::open(path).map_err(|_| ConfigError::SourceRootChanged)?;
+            if !self.operational.same_object_as(&current) {
+                return Err(ConfigError::SourceRootChanged);
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let current = path
+                .canonicalize()
+                .map_err(|_| ConfigError::SourceRootChanged)?;
+            if current != self.canonical_path || !current.is_dir() {
+                return Err(ConfigError::SourceRootChanged);
+            }
+            Ok(())
+        }
     }
 }
 

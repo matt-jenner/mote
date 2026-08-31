@@ -188,7 +188,7 @@ async fn completed_selection_reopens_for_cached_browsing_when_source_is_offline(
 
     let offline = temp.path().join("offline-photos");
     std::fs::rename(&source, &offline).unwrap();
-    let reopened = GalleryEngine::open(config, source).unwrap();
+    let reopened = GalleryEngine::open(config.clone(), source.clone()).unwrap();
     let selection = reopened.resolve_selection(&summary.id).unwrap();
     let page = reopened
         .query_wall(
@@ -236,6 +236,23 @@ async fn completed_selection_reopens_for_cached_browsing_when_source_is_offline(
         unavailable,
         photo_app_service::AppServiceError::DerivativeUnavailable
     ));
+
+    drop(offline_events);
+    drop(reopened);
+    std::fs::rename(&offline, &source).unwrap();
+    let remounted = GalleryEngine::open(config, source.clone()).unwrap();
+    let remounted_summary = remounted.select_relative(Path::new(".")).await.unwrap();
+    assert_eq!(remounted_summary.id, summary.id);
+    let remounted_selection = remounted.resolve_selection(&summary.id).unwrap();
+    let remounted_page = remounted
+        .query_wall(
+            &remounted_selection,
+            photo_app_service::GalleryScope::CurrentFolder,
+            photo_app_service::WallQueryRequest::oldest_first(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(remounted_page.items.len(), 1);
 }
 
 #[tokio::test]

@@ -1,5 +1,7 @@
 use std::future::Future;
 use std::io;
+#[cfg(target_os = "linux")]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
@@ -90,6 +92,13 @@ impl StaticWebRootValidation {
     {
         #[cfg(unix)]
         {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let pinned = PinnedDirectory::open_static_with_identity_hook(
+                &path,
+                MountIdentityProvider::system(),
+                after_identity_capture,
+            )?;
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             let pinned = PinnedDirectory::open_with_identity_hook(&path, after_identity_capture)?;
             Ok(Self { pinned })
         }
@@ -124,7 +133,7 @@ impl StaticWebRootValidation {
     }
 
     pub(crate) fn pin(self) -> io::Result<StaticWebRoot> {
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let path = Arc::new(self.pinned.display_path().to_owned());
             Ok(StaticWebRoot {
@@ -132,10 +141,14 @@ impl StaticWebRootValidation {
                 backend: SecureBackend::from_root(self.pinned),
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
+            #[cfg(unix)]
+            let path = self.pinned.display_path().to_owned();
+            #[cfg(not(unix))]
+            let path = self.path;
             Ok(StaticWebRoot {
-                path: Arc::new(self.path),
+                path: Arc::new(path),
                 backend: SecureBackend::unavailable(),
             })
         }
@@ -147,6 +160,115 @@ impl StaticWebRootValidation {
 struct DirectoryIdentity {
     device: u64,
     inode: u64,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MountIdentity {
+    #[cfg(target_os = "linux")]
+    Linux(u64),
+    #[cfg(target_os = "macos")]
+    MacOs {
+        fsid: Vec<u8>,
+        filesystem_type: Vec<u8>,
+        mounted_on: Vec<u8>,
+        mounted_from: Vec<u8>,
+    },
+    #[cfg(test)]
+    Synthetic(u64),
+}
+
+#[cfg(unix)]
+impl MountIdentity {
+    #[cfg(test)]
+    const fn synthetic(value: u64) -> Self {
+        Self::Synthetic(value)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct MountIdentityProvider(Arc<MountIdentityResolver>);
+
+#[cfg(unix)]
+type MountIdentityResolver = dyn Fn(&std::fs::File) -> io::Result<MountIdentity> + Send + Sync;
+
+#[cfg(unix)]
+impl std::fmt::Debug for MountIdentityProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MountIdentityProvider")
+    }
+}
+
+#[cfg(unix)]
+impl MountIdentityProvider {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn system() -> Self {
+        Self(Arc::new(system_mount_identity))
+    }
+
+    #[cfg(test)]
+    fn for_test<F>(provider: F) -> Self
+    where
+        F: Fn(&std::fs::File) -> io::Result<MountIdentity> + Send + Sync + 'static,
+    {
+        Self(Arc::new(provider))
+    }
+
+    fn identify(&self, file: &std::fs::File) -> io::Result<MountIdentity> {
+        (self.0)(file)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct MountPolicy {
+    identity: MountIdentity,
+    provider: MountIdentityProvider,
+}
+
+#[cfg(unix)]
+impl MountPolicy {
+    fn capture(file: &std::fs::File, provider: MountIdentityProvider) -> io::Result<Self> {
+        let identity = provider
+            .identify(file)
+            .map_err(|_| mount_transition_error())?;
+        Ok(Self { identity, provider })
+    }
+
+    fn validate(&self, file: &std::fs::File) -> io::Result<()> {
+        let actual = self
+            .provider
+            .identify(file)
+            .map_err(|_| mount_transition_error())?;
+        validate_mount_chain(&self.identity, [&actual])
+    }
+
+    fn identify(&self, file: &std::fs::File) -> io::Result<MountIdentity> {
+        self.provider
+            .identify(file)
+            .map_err(|_| mount_transition_error())
+    }
+}
+
+#[cfg(unix)]
+fn validate_mount_chain<'a>(
+    expected: &MountIdentity,
+    chain: impl IntoIterator<Item = &'a MountIdentity>,
+) -> io::Result<()> {
+    if chain.into_iter().all(|actual| actual == expected) {
+        Ok(())
+    } else {
+        Err(mount_transition_error())
+    }
+}
+
+#[cfg(unix)]
+fn mount_transition_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "static mount transition is not permitted",
+    )
 }
 
 #[cfg(unix)]
@@ -165,6 +287,7 @@ pub(crate) struct PinnedDirectory {
     directory: std::fs::File,
     identity: DirectoryIdentity,
     display_path: PathBuf,
+    mount_policy: Option<MountPolicy>,
 }
 
 #[cfg(unix)]
@@ -197,13 +320,38 @@ impl PinnedDirectory {
             directory,
             identity,
             display_path,
+            mount_policy: None,
         })
+    }
+
+    #[cfg(test)]
+    fn open_with_mount_provider(path: &Path, provider: MountIdentityProvider) -> io::Result<Self> {
+        Self::open_static_with_identity_hook(path, provider, || {})
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
+    fn open_static_with_identity_hook<F>(
+        path: &Path,
+        provider: MountIdentityProvider,
+        after_identity_capture: F,
+    ) -> io::Result<Self>
+    where
+        F: FnOnce(),
+    {
+        let mut pinned = Self::open_with_identity_hook(path, after_identity_capture)?;
+        pinned.mount_policy = Some(MountPolicy::capture(&pinned.directory, provider)?);
+        pinned.validate_static_mount_ancestry()?;
+        Ok(pinned)
     }
 
     /// This path is for diagnostics and path-based defense in depth only.
     /// Security decisions use the retained descriptor and its ancestry.
     pub(crate) fn display_path(&self) -> &Path {
         &self.display_path
+    }
+
+    pub(crate) fn same_object_as(&self, other: &Self) -> bool {
+        self.identity == other.identity
     }
 
     pub(crate) fn overlaps(&self, other: &Self) -> io::Result<bool> {
@@ -249,6 +397,230 @@ impl PinnedDirectory {
             current = parent;
         }
     }
+
+    fn validate_static_mount_ancestry(&self) -> io::Result<()> {
+        let policy = self.mount_policy.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "static mount policy is unavailable",
+            )
+        })?;
+        let mut identities = vec![self.identity];
+        let mut current = self.directory.try_clone()?;
+        let mut current_mount = policy.identify(&current)?;
+        validate_mount_chain(&policy.identity, [&current_mount])?;
+        loop {
+            let parent = openat(
+                current.as_raw_fd(),
+                std::ffi::OsStr::new(".."),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )?;
+            let parent_mount = policy.identify(&parent)?;
+            if parent_mount != current_mount
+                && !allowed_platform_ancestry_transition(&current_mount, &parent_mount)
+            {
+                return Err(mount_transition_error());
+            }
+            let parent_identity = DirectoryIdentity::from_metadata(&parent.metadata()?);
+            let current_identity = *identities.last().expect("ancestry contains the root");
+            if parent_identity == current_identity {
+                return Ok(());
+            }
+            if identities.contains(&parent_identity) || identities.len() >= 4096 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory ancestry did not reach a stable root",
+                ));
+            }
+            identities.push(parent_identity);
+            current = parent;
+            current_mount = parent_mount;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn allowed_platform_ancestry_transition(_child: &MountIdentity, _parent: &MountIdentity) -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn allowed_platform_ancestry_transition(child: &MountIdentity, parent: &MountIdentity) -> bool {
+    is_macos_apfs_data_to_system_firmlink(child, parent)
+}
+
+#[cfg(target_os = "macos")]
+fn is_macos_apfs_data_to_system_firmlink(child: &MountIdentity, parent: &MountIdentity) -> bool {
+    let (
+        Some((child_type, child_mounted_on, child_mounted_from)),
+        Some((parent_type, parent_mounted_on, parent_mounted_from)),
+    ) = (macos_mount_fields(child), macos_mount_fields(parent))
+    else {
+        return false;
+    };
+
+    child_type == b"apfs"
+        && parent_type == b"apfs"
+        && child_mounted_on == b"/System/Volumes/Data"
+        && parent_mounted_on == b"/"
+        && apfs_physical_store(child_mounted_from).is_some_and(|child_store| {
+            apfs_physical_store(parent_mounted_from)
+                .is_some_and(|parent_store| child_store == parent_store)
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mount_fields(identity: &MountIdentity) -> Option<(&[u8], &[u8], &[u8])> {
+    #[cfg(not(test))]
+    let MountIdentity::MacOs {
+        filesystem_type,
+        mounted_on,
+        mounted_from,
+        ..
+    } = identity;
+    #[cfg(test)]
+    let MountIdentity::MacOs {
+        filesystem_type,
+        mounted_on,
+        mounted_from,
+        ..
+    } = identity
+    else {
+        return None;
+    };
+    Some((filesystem_type, mounted_on, mounted_from))
+}
+
+#[cfg(target_os = "macos")]
+fn apfs_physical_store(source: &[u8]) -> Option<&[u8]> {
+    let suffix = source.strip_prefix(b"/dev/disk")?;
+    let disk_digits = suffix
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if disk_digits == 0 || suffix.get(disk_digits) != Some(&b's') {
+        return None;
+    }
+    let mut remainder = &suffix[disk_digits..];
+    while !remainder.is_empty() {
+        remainder = remainder.strip_prefix(b"s")?;
+        let digits = remainder
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digits == 0 {
+            return None;
+        }
+        remainder = &remainder[digits..];
+    }
+    Some(&suffix[..disk_digits])
+}
+
+#[cfg(target_os = "linux")]
+fn system_mount_identity(file: &std::fs::File) -> io::Result<MountIdentity> {
+    use std::mem::MaybeUninit;
+
+    let mut stat = MaybeUninit::<libc::statx>::zeroed();
+    let result = unsafe {
+        libc::statx(
+            file.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_NO_AUTOMOUNT,
+            libc::STATX_MNT_ID,
+            stat.as_mut_ptr(),
+        )
+    };
+    if result == 0 {
+        let stat = unsafe { stat.assume_init() };
+        if stat.stx_mask & libc::STATX_MNT_ID != 0 {
+            return Ok(MountIdentity::Linux(stat.stx_mnt_id));
+        }
+    }
+
+    let proc_path = format!("/proc/self/fdinfo/{}", file.as_raw_fd());
+    let mut fdinfo = std::fs::File::open(proc_path)?;
+    let mut contents = String::new();
+    fdinfo
+        .by_ref()
+        .take(16 * 1024)
+        .read_to_string(&mut contents)?;
+    if contents.len() == 16 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "descriptor mount metadata exceeded its fixed bound",
+        ));
+    }
+    parse_fdinfo_mount_id(&contents).map(|id| MountIdentity::Linux(id))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_fdinfo_mount_id(contents: &str) -> io::Result<u64> {
+    let mut mount_id = None;
+    for line in contents.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name != "mnt_id" {
+            continue;
+        }
+        let value = value.trim();
+        if mount_id.is_some()
+            || value.is_empty()
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(invalid_fdinfo());
+        }
+        mount_id = Some(value.parse().map_err(|_| invalid_fdinfo())?);
+    }
+    mount_id.ok_or_else(invalid_fdinfo)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn invalid_fdinfo() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "descriptor mount metadata is unavailable",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn system_mount_identity(file: &std::fs::File) -> io::Result<MountIdentity> {
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    let fsid = unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::addr_of!(stat.f_fsid).cast::<u8>(),
+            std::mem::size_of_val(&stat.f_fsid),
+        )
+        .to_vec()
+    };
+    Ok(MountIdentity::MacOs {
+        fsid,
+        filesystem_type: bounded_c_array(&stat.f_fstypename)?,
+        mounted_on: bounded_c_array(&stat.f_mntonname)?,
+        mounted_from: bounded_c_array(&stat.f_mntfromname)?,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn bounded_c_array<const N: usize>(value: &[libc::c_char; N]) -> io::Result<Vec<u8>> {
+    let bytes = unsafe { std::slice::from_raw_parts(value.as_ptr().cast::<u8>(), N) };
+    let length = bytes.iter().position(|byte| *byte == 0).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "mount metadata is not terminated",
+        )
+    })?;
+    if length == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "mount metadata is incomplete",
+        ));
+    }
+    Ok(bytes[..length].to_vec())
 }
 
 #[cfg(unix)]
@@ -503,9 +875,9 @@ fn hex_digit(value: u8) -> char {
 
 #[derive(Clone, Debug)]
 struct SecureBackend {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     root: Option<Arc<PinnedDirectory>>,
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     root: Option<Arc<SecureRoot>>,
     #[cfg(test)]
     filesystem_calls: Arc<AtomicUsize>,
@@ -514,17 +886,20 @@ struct SecureBackend {
 impl SecureBackend {
     #[cfg(test)]
     fn new(path: &Path) -> io::Result<Self> {
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            Ok(Self::from_root(PinnedDirectory::open(path)?))
+            Ok(Self::from_root(PinnedDirectory::open_with_mount_provider(
+                path,
+                MountIdentityProvider::system(),
+            )?))
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             Ok(Self::from_root(SecureRoot::open(path)?))
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn from_root(root: PinnedDirectory) -> Self {
         Self {
             root: Some(Arc::new(root)),
@@ -533,7 +908,7 @@ impl SecureBackend {
         }
     }
 
-    #[cfg(all(test, not(unix)))]
+    #[cfg(all(test, not(any(target_os = "linux", target_os = "macos"))))]
     fn from_root(root: SecureRoot) -> Self {
         Self {
             root: Some(Arc::new(root)),
@@ -542,7 +917,7 @@ impl SecureBackend {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn unavailable() -> Self {
         Self {
             root: None,
@@ -557,11 +932,11 @@ impl SecureBackend {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[derive(Debug)]
 struct SecureRoot {}
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl SecureRoot {
     #[cfg(test)]
     fn open(_path: &Path) -> io::Result<Self> {
@@ -614,6 +989,7 @@ impl PinnedDirectory {
     {
         let components = secure_components(path)?;
         let mut directory = self.directory.try_clone()?;
+        self.validate_open_mount(&directory)?;
         if components.is_empty() {
             if require_regular_file {
                 return Err(io::Error::new(
@@ -629,6 +1005,7 @@ impl PinnedDirectory {
                 component,
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )?;
+            self.validate_open_mount(&directory)?;
         }
         before_final_open();
         let file = openat(
@@ -636,6 +1013,7 @@ impl PinnedDirectory {
             components.last().expect("components are non-empty"),
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
         )?;
+        self.validate_open_mount(&file)?;
         let metadata = file.metadata()?;
         let valid = if require_regular_file {
             metadata.is_file()
@@ -649,6 +1027,14 @@ impl PinnedDirectory {
             ));
         }
         Ok(file)
+    }
+
+    fn validate_open_mount(&self, file: &std::fs::File) -> io::Result<()> {
+        if let Some(policy) = &self.mount_policy {
+            policy.validate(file)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -817,8 +1203,20 @@ mod secure_open_tests {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::symlink;
+    use std::sync::Arc;
 
-    use super::{PinnedDirectory, StaticWebRootValidation, openat, safe_open_error};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    #[cfg(target_os = "macos")]
+    use super::is_macos_apfs_data_to_system_firmlink;
+    use super::{
+        DirectoryIdentity, MountIdentity, MountIdentityProvider, PinnedDirectory, SecureBackend,
+        StaticWebRoot, StaticWebRootValidation, openat, parse_fdinfo_mount_id, router,
+        safe_open_error, validate_mount_chain,
+    };
 
     fn read(mut file: std::fs::File) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -920,6 +1318,7 @@ mod secure_open_tests {
             directory: aliased_directory,
             identity: pinned.identity,
             display_path: temp.path().join("different-informational-label"),
+            mount_policy: None,
         };
 
         assert_ne!(aliased.display_path(), pinned.display_path());
@@ -938,6 +1337,126 @@ mod secure_open_tests {
 
         assert!(parent.overlaps(&child).unwrap());
         assert!(child.overlaps(&parent).unwrap());
+    }
+
+    #[test]
+    fn synthetic_bind_mounts_fail_closed_even_when_directory_identity_matches() {
+        let root_mount = MountIdentity::synthetic(703);
+        let bind_mount = MountIdentity::synthetic(416);
+
+        assert!(validate_mount_chain(&root_mount, [&root_mount, &root_mount]).is_ok());
+        assert!(validate_mount_chain(&root_mount, [&root_mount, &bind_mount]).is_err());
+        assert!(validate_mount_chain(&bind_mount, [&bind_mount, &root_mount]).is_err());
+    }
+
+    #[test]
+    fn linux_fdinfo_mount_id_parser_is_strict_and_path_free() {
+        assert_eq!(
+            parse_fdinfo_mount_id("pos:\t0\nflags:\t0100000\nmnt_id:\t416\nino:\t3\n").unwrap(),
+            416
+        );
+        for malformed in [
+            "pos:\t0\n",
+            "mnt_id:\tnot-a-number\n",
+            "mnt_id:\t416\nmnt_id:\t703\n",
+            "mnt_id: 416 trailing\n",
+        ] {
+            let error = parse_fdinfo_mount_id(malformed).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+            assert!(!error.to_string().contains(malformed));
+        }
+    }
+
+    #[test]
+    fn mount_identity_provider_failure_is_path_free_and_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = MountIdentityProvider::for_test(|_| {
+            Err(std::io::Error::other("SOURCE SENTINEL PROVIDER DETAIL"))
+        });
+
+        let error = PinnedDirectory::open_with_mount_provider(temp.path(), provider).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!error.to_string().contains("SOURCE SENTINEL"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_the_exact_apfs_data_to_system_firmlink_transition_is_allowed() {
+        fn mount(filesystem: &[u8], on: &[u8], from: &[u8], fsid: u8) -> MountIdentity {
+            MountIdentity::MacOs {
+                fsid: vec![fsid],
+                filesystem_type: filesystem.to_vec(),
+                mounted_on: on.to_vec(),
+                mounted_from: from.to_vec(),
+            }
+        }
+
+        let data = mount(b"apfs", b"/System/Volumes/Data", b"/dev/disk3s5", 17);
+        let system = mount(b"apfs", b"/", b"/dev/disk3s1s1", 19);
+        assert!(is_macos_apfs_data_to_system_firmlink(&data, &system));
+
+        for near_miss in [
+            mount(b"apfs", b"/other", b"/dev/disk3s5", 17),
+            mount(b"nullfs", b"/System/Volumes/Data", b"/dev/disk3s5", 17),
+            mount(b"apfs", b"/System/Volumes/Data", b"/dev/disk4s5", 17),
+            mount(b"apfs", b"/System/Volumes/Data", b"disk3s5", 17),
+        ] {
+            assert!(!is_macos_apfs_data_to_system_firmlink(&near_miss, &system));
+        }
+        for near_miss in [
+            mount(b"apfs", b"/System", b"/dev/disk3s1s1", 19),
+            mount(b"nullfs", b"/", b"/dev/disk3s1s1", 19),
+            mount(b"apfs", b"/", b"/dev/disk4s1s1", 19),
+            mount(b"apfs", b"/", b"/dev/disk3", 19),
+        ] {
+            assert!(!is_macos_apfs_data_to_system_firmlink(&data, &near_miss));
+        }
+    }
+
+    #[tokio::test]
+    async fn every_static_open_rejects_a_mount_transition_with_an_empty_response() {
+        for (target, encoding) in [
+            ("assets", None),
+            ("assets/app.js", None),
+            ("assets/app.js.br", Some("br")),
+            ("assets/app.js.gz", Some("gzip")),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let web = temp.path().join("web");
+            let assets = web.join("assets");
+            std::fs::create_dir_all(&assets).unwrap();
+            std::fs::write(web.join("index.html"), b"SAFE INTERFACE").unwrap();
+            std::fs::write(assets.join("app.js"), b"SAFE ASSET").unwrap();
+            std::fs::write(assets.join("app.js.br"), b"SOURCE BR SENTINEL").unwrap();
+            std::fs::write(assets.join("app.js.gz"), b"SOURCE GZIP SENTINEL").unwrap();
+            let mismatched =
+                DirectoryIdentity::from_metadata(&std::fs::metadata(web.join(target)).unwrap());
+            let provider = MountIdentityProvider::for_test(move |file| {
+                let identity = DirectoryIdentity::from_metadata(&file.metadata()?);
+                Ok(if identity == mismatched {
+                    MountIdentity::synthetic(416)
+                } else {
+                    MountIdentity::synthetic(703)
+                })
+            });
+            let pinned = PinnedDirectory::open_with_mount_provider(&web, provider).unwrap();
+            let app = router(StaticWebRoot {
+                path: Arc::new(web),
+                backend: SecureBackend::from_root(pinned),
+            });
+            let mut request = Request::get("/assets/app.js").body(Body::empty()).unwrap();
+            if let Some(encoding) = encoding {
+                request
+                    .headers_mut()
+                    .insert(header::ACCEPT_ENCODING, encoding.parse().unwrap());
+            }
+
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{target}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(body.is_empty(), "{target}: {body:?}");
+        }
     }
 
     #[test]

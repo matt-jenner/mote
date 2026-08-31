@@ -71,6 +71,30 @@ impl AppState {
     }
 
     pub fn open(config: &ServerConfig) -> Result<(Self, CacheReconcileReport), StartupError> {
+        Self::open_inner(config, || {})
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn open_with_source_startup_hook<F>(
+        config: &ServerConfig,
+        before_operational_validation: F,
+    ) -> Result<(Self, CacheReconcileReport), StartupError>
+    where
+        F: FnOnce(),
+    {
+        Self::open_inner(config, before_operational_validation)
+    }
+
+    fn open_inner<F>(
+        config: &ServerConfig,
+        before_operational_validation: F,
+    ) -> Result<(Self, CacheReconcileReport), StartupError>
+    where
+        F: FnOnce(),
+    {
+        before_operational_validation();
+        let source_startup = config.validate_source_startup()?;
         let preflight_roots = Catalog::read_library_root_paths(&config.catalog_path())?;
         config.validate_source_roots(&preflight_roots)?;
         config.prepare()?;
@@ -90,15 +114,18 @@ impl AppState {
 
         let writer = CacheWriter::new(config.cache_dir())?;
         let report = writer.reconcile_catalog(&mut catalog)?;
+        source_startup.revalidate(config.source_root())?;
         let state = Self::new_with_source_root(
             catalog,
             config.cache_dir().to_owned(),
             config.source_root().to_owned(),
         )?;
+        source_startup.revalidate(config.source_root())?;
         let gallery = GalleryEngine::open(
             AppConfig::new(config.data_dir().to_owned(), config.cache_dir().to_owned()),
             config.source_root().to_owned(),
         )?;
+        source_startup.revalidate(config.source_root())?;
         Ok((
             Self {
                 gallery: Some(Arc::new(gallery)),
