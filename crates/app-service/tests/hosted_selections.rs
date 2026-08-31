@@ -240,10 +240,40 @@ async fn completed_selection_reopens_for_cached_browsing_when_source_is_offline(
     drop(offline_events);
     drop(reopened);
     std::fs::rename(&offline, &source).unwrap();
+    photo_catalog::Catalog::open(&config.catalog_path())
+        .unwrap()
+        .set_library_availability(
+            selection.library_id(),
+            photo_domain::Availability::Available,
+        )
+        .unwrap();
     let remounted = GalleryEngine::open(config, source.clone()).unwrap();
     let remounted_summary = remounted.select_relative(Path::new(".")).await.unwrap();
     assert_eq!(remounted_summary.id, summary.id);
     let remounted_selection = remounted.resolve_selection(&summary.id).unwrap();
+    let mut recovery_events = remounted.subscribe(
+        &remounted_selection,
+        "remounted-recovery".to_owned(),
+        photo_app_service::GalleryScope::CurrentFolder,
+        None,
+    );
+    remounted
+        .ensure_running(&remounted_selection)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let event = recovery_events.recv().await.unwrap();
+            if matches!(
+                event.update,
+                photo_app_service::WallUpdate::MetadataSettled { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("remounted stable selection did not reconcile offline assets");
     let remounted_page = remounted
         .query_wall(
             &remounted_selection,
@@ -253,6 +283,209 @@ async fn completed_selection_reopens_for_cached_browsing_when_source_is_offline(
         .await
         .unwrap();
     assert_eq!(remounted_page.items.len(), 1);
+    assert_eq!(
+        remounted_page.items[0].availability,
+        photo_app_service::SourceAvailability::Available
+    );
+    remounted
+        .request_derivatives(
+            &remounted_selection,
+            photo_app_service::GalleryScope::CurrentFolder,
+            photo_app_service::DerivativeRequest::visible(vec![remounted_page.items[0].id.clone()]),
+        )
+        .await
+        .expect("remounted source should generate a previously uncached derivative");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_recovery_requests_admit_one_scan_for_a_stable_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir_all(&source).unwrap();
+    ImageBuffer::from_pixel(3, 2, image::Rgb([220_u8, 180_u8, 80_u8]))
+        .save(source.join("photo.jpg"))
+        .unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config.clone(), source).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    let mut initial_events = engine.subscribe(
+        &selection,
+        "initial-scan".to_owned(),
+        photo_app_service::GalleryScope::CurrentFolder,
+        None,
+    );
+    engine.ensure_running(&selection).await.unwrap();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), initial_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(
+            event.update,
+            photo_app_service::WallUpdate::MetadataSettled { .. }
+        ) {
+            break;
+        }
+    }
+    let after_initial = engine.current_event_id_for_test(&selection);
+    let mut recovery_events = engine.subscribe(
+        &selection,
+        "recovery-scan".to_owned(),
+        photo_app_service::GalleryScope::CurrentFolder,
+        Some(after_initial),
+    );
+
+    let mut catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    catalog.mark_root_offline(selection.library_id()).unwrap();
+    catalog
+        .set_library_availability(
+            selection.library_id(),
+            photo_domain::Availability::Available,
+        )
+        .unwrap();
+    drop(catalog);
+
+    let mut requests = Vec::new();
+    for _ in 0..8 {
+        let engine = engine.clone();
+        let selection = selection.clone();
+        requests.push(tokio::spawn(async move {
+            engine.ensure_running(&selection).await
+        }));
+    }
+    for request in requests {
+        request.await.unwrap().unwrap();
+    }
+    let recovered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let event = recovery_events.recv().await.unwrap();
+            if matches!(
+                event.update,
+                photo_app_service::WallUpdate::MetadataSettled { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        recovered.is_ok(),
+        "stable selection did not run a recovery scan"
+    );
+    let page = engine
+        .query_wall(
+            &selection,
+            photo_app_service::GalleryScope::CurrentFolder,
+            photo_app_service::WallQueryRequest::oldest_first(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.items[0].availability,
+        photo_app_service::SourceAvailability::Available
+    );
+
+    for _ in 0..8 {
+        engine.ensure_running(&selection).await.unwrap();
+    }
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            recovery_events.recv()
+        )
+        .await
+        .is_err(),
+        "one recovery transition admitted more than one scan"
+    );
+}
+
+#[tokio::test]
+async fn recovery_epoch_rescans_a_completed_empty_selection_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir_all(&source).unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config.clone(), source.clone()).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    let mut events = engine.subscribe(
+        &selection,
+        "empty-initial".to_owned(),
+        photo_app_service::GalleryScope::CurrentFolder,
+        None,
+    );
+    engine.ensure_running(&selection).await.unwrap();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(
+            event.update,
+            photo_app_service::WallUpdate::MetadataSettled { .. }
+        ) {
+            break;
+        }
+    }
+    let after_initial = engine.current_event_id_for_test(&selection);
+    let mut recovered_events = engine.subscribe(
+        &selection,
+        "empty-recovery".to_owned(),
+        photo_app_service::GalleryScope::CurrentFolder,
+        Some(after_initial),
+    );
+    let mut catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    catalog.mark_root_offline(selection.library_id()).unwrap();
+    catalog
+        .set_library_availability(
+            selection.library_id(),
+            photo_domain::Availability::Available,
+        )
+        .unwrap();
+    drop(catalog);
+    ImageBuffer::from_pixel(3, 2, image::Rgb([220_u8, 180_u8, 80_u8]))
+        .save(source.join("arrived-while-offline.jpg"))
+        .unwrap();
+    assert!(engine.note_source_root_recovered(selection.library_id()));
+
+    engine.ensure_running(&selection).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let event = recovered_events.recv().await.unwrap();
+            if matches!(
+                event.update,
+                photo_app_service::WallUpdate::MetadataSettled { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("recovery epoch did not reconcile a previously empty selection");
+    let page = engine
+        .query_wall(
+            &selection,
+            photo_app_service::GalleryScope::CurrentFolder,
+            photo_app_service::WallQueryRequest::oldest_first(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(
+        page.items[0].availability,
+        photo_app_service::SourceAvailability::Available
+    );
+    engine.ensure_running(&selection).await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            recovered_events.recv()
+        )
+        .await
+        .is_err(),
+        "a reconciled recovery epoch admitted another scan"
+    );
 }
 
 #[tokio::test]

@@ -2,6 +2,8 @@
 .worktrees
 .superpowers
 .DS_Store
+.env
+.env.*
 node_modules
 target
 test-results
@@ -10,3 +12,5 @@ apps/interface/.vite
 apps/interface/tsconfig.tsbuildinfo
 coverage
 *.log
+*.sqlite
+*.sqlite-*

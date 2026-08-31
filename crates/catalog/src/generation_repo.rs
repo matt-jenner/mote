@@ -335,6 +335,31 @@ impl Catalog {
         Ok(retained as u64)
     }
 
+    pub fn group_has_root_offline_assets(
+        &self,
+        library: LibraryId,
+        folder_group: FolderGroupId,
+    ) -> Result<bool, CatalogError> {
+        ensure_group_belongs_to_library(&self.connection, library, folder_group)?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM folder_group_assets fga
+                    JOIN assets a ON a.id = fga.asset_id
+                    WHERE fga.folder_group_id = ?1
+                      AND a.library_id = ?2
+                      AND a.availability = 'root_offline'
+                )",
+                params![
+                    folder_group.as_uuid().as_bytes(),
+                    library.as_uuid().as_bytes()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn asset_count(&self, library: LibraryId) -> Result<u64, CatalogError> {
         let count: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM assets WHERE library_id = ?1",

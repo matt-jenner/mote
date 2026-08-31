@@ -4,8 +4,8 @@ use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 #[cfg(any(test, debug_assertions))]
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Mutex as TokioMutex, Notify, OwnedSemaphorePermit, Semaphore};
 
@@ -402,6 +402,7 @@ pub struct GalleryEngine {
     pub(crate) runtimes: Arc<Mutex<HashMap<FolderGroupId, Weak<SelectionRuntime>>>>,
     pub(crate) metadata_reader: ReaderAdapter,
     hosted_library_id: Option<LibraryId>,
+    hosted_source_recovery_epoch: Arc<AtomicU64>,
     pub(crate) shared_coordinator:
         Option<Arc<crate::derivative_coordinator::DerivativeCoordinator>>,
     pub(crate) cache_root: PathBuf,
@@ -659,6 +660,7 @@ impl GalleryEngine {
             runtimes: Arc::new(Mutex::new(HashMap::new())),
             metadata_reader: ReaderAdapter::new(reader),
             hosted_library_id: Some(hosted_library_id),
+            hosted_source_recovery_epoch: Arc::new(AtomicU64::new(0)),
             shared_coordinator: None,
             cache_root,
             cache_writer,
@@ -725,6 +727,7 @@ impl GalleryEngine {
             runtimes: Arc::new(Mutex::new(HashMap::new())),
             metadata_reader,
             hosted_library_id: None,
+            hosted_source_recovery_epoch: Arc::new(AtomicU64::new(0)),
             shared_coordinator: Some(shared_coordinator),
             cache_root,
             cache_writer,
@@ -1057,6 +1060,52 @@ impl GalleryEngine {
     ) -> Result<(), AppServiceError> {
         let runtime = self.runtime(selection);
         runtime.begin_scan(self.clone()).await
+    }
+
+    #[doc(hidden)]
+    pub fn note_source_root_recovered(&self, library_id: LibraryId) -> bool {
+        if self.hosted_library_id != Some(library_id) {
+            return false;
+        }
+        self.hosted_source_recovery_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.wrapping_add(1).max(1))
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn source_recovery_epoch(&self, library_id: LibraryId) -> u64 {
+        if self.hosted_library_id != Some(library_id) {
+            return 0;
+        }
+        self.hosted_source_recovery_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn runtime_recovery_required(
+        &self,
+        runtime: &SelectionRuntime,
+        recovery_epoch: u64,
+    ) -> Result<bool, AppServiceError> {
+        if self.hosted_library_id != Some(runtime.selection.library_id) {
+            return Ok(false);
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| AppServiceError::StatePoisoned)?;
+        let catalog = state.libraries.catalog();
+        let library = catalog
+            .find_library(runtime.selection.library_id)?
+            .ok_or(AppServiceError::UnknownAsset)?;
+        if library.availability != photo_domain::Availability::Available {
+            return Ok(false);
+        }
+        if runtime.recovery_required(recovery_epoch) {
+            return Ok(true);
+        }
+        catalog
+            .group_has_root_offline_assets(runtime.selection.library_id, runtime.selection.group_id)
+            .map_err(Into::into)
     }
 
     pub async fn query_wall(

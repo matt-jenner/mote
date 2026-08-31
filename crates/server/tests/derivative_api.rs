@@ -441,6 +441,134 @@ async fn cached_derivatives_remain_stable_after_root_refresh_marks_source_offlin
     drop(restore);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn stable_selection_recovers_and_generates_an_uncached_derivative_after_root_returns() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (temp, app) = make_app();
+    let source = temp.path().join("photos");
+    let source_file = source.join("photo.jpg");
+    let source_before = std::fs::read(&source_file).unwrap();
+    let (selection_id, asset_id) = selection_and_asset(&app).await;
+    let initial = wall(&app, &selection_id).await;
+    assert_eq!(
+        initial["items"][0]["wallThumbnail"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        initial["items"][0]["screenPreview"],
+        serde_json::Value::Null
+    );
+
+    let permissions = std::fs::metadata(&source).unwrap().permissions();
+    let mut unreadable = permissions.clone();
+    unreadable.set_mode(0o000);
+    std::fs::set_permissions(&source, unreadable).unwrap();
+    let restore = PermissionRestore {
+        path: source.clone(),
+        permissions: permissions.clone(),
+    };
+    let unavailable = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/folders?path=")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        wall(&app, &selection_id).await["items"][0]["availability"],
+        "rootOffline"
+    );
+
+    std::fs::set_permissions(&source, permissions).unwrap();
+    let recovered_root = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/folders?path=")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered_root.status(), StatusCode::OK);
+    let reselected = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/selections")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"path": ""}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reselected.status(), StatusCode::CREATED);
+    assert_eq!(body(reselected).await["id"], selection_id);
+
+    let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let page = wall(&app, &selection_id).await;
+            if page["items"][0]["availability"] == "available" {
+                break page;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("stable selection did not reconcile after root recovery");
+    assert_eq!(
+        recovered["items"][0]["wallThumbnail"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        recovered["items"][0]["screenPreview"],
+        serde_json::Value::Null
+    );
+
+    let generated = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/selections/{selection_id}/derivatives"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "scope": "currentFolder",
+                        "request": {
+                            "assetIds": [asset_id],
+                            "priority": "visible",
+                            "kind": "screenPreview"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(generated.status(), StatusCode::NO_CONTENT);
+    let with_derivatives = wall(&app, &selection_id).await;
+    for field in ["wallThumbnail", "screenPreview"] {
+        let key = with_derivatives["items"][0][field]["key"]
+            .as_str()
+            .expect("requested derivative reference was not published");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/derivatives/{key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(std::fs::read(source_file).unwrap(), source_before);
+    drop(restore);
+}
+
 #[tokio::test]
 async fn derivative_route_rejects_oversized_decoded_id_and_query_before_lookup() {
     let (_temp, app) = make_app();

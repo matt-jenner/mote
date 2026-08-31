@@ -13,8 +13,14 @@ state_dir="${temporary_root}/browser-state"
 baseline_metadata="${temporary_root}/source-metadata.before"
 baseline_hashes="${temporary_root}/source-hashes.before"
 source_mode=0555
+cleanup_started=false
 
 cleanup() {
+	if [ "$cleanup_started" = true ]; then
+		return
+	fi
+	cleanup_started=true
+	trap - HUP INT TERM
 	if [ -d "$source_dir" ]; then
 		chmod u+rwx "$source_dir" >/dev/null 2>&1 || true
 		find "$source_dir" -type d -exec chmod u+rwx {} \; >/dev/null 2>&1 || true
@@ -28,7 +34,10 @@ cleanup() {
 		*) printf '%s\n' "refusing to remove unexpected path: $temporary_root" >&2 ;;
 	esac
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 metadata_manifest() {
 	destination=$1
