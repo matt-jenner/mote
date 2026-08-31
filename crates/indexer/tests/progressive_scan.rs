@@ -403,12 +403,13 @@ async fn cancellation_completes_when_enrichment_queue_is_backpressured() {
     for index in 0..160 {
         write_png(&fixture.path().join(format!("{index:04}.png")), [1, 2, 3]);
     }
-    let (reader, _notifications, _release) = AdmissionReader::new();
+    let (reader, _notifications, release) = AdmissionReader::new();
     let mut scan = Indexer::new(reader, empty_policy_engine())
         .start(ScanRequest::new(fixture.path()))
         .unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(1), scan.events.recv()).await;
     scan.cancel().unwrap();
+    release.release();
     tokio::time::timeout(Duration::from_secs(1), scan.join())
         .await
         .expect("cancelled scan must not deadlock")
@@ -416,7 +417,7 @@ async fn cancellation_completes_when_enrichment_queue_is_backpressured() {
 }
 
 #[tokio::test]
-async fn cancellation_joins_before_blocked_metadata_gate_is_released() {
+async fn cancellation_join_waits_for_admitted_metadata_without_starting_more_work() {
     let fixture = tempfile::tempdir().unwrap();
     for index in 0..160 {
         write_png(&fixture.path().join(format!("{index:04}.png")), [1, 2, 3]);
@@ -440,13 +441,27 @@ async fn cancellation_joins_before_blocked_metadata_gate_is_released() {
     assert_eq!(reader.starts.load(Ordering::SeqCst), 2);
 
     scan.cancel().unwrap();
-    let summary = tokio::time::timeout(Duration::from_secs(1), scan.join())
+    let mut join = tokio::spawn(async move { scan.join().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut join)
+            .await
+            .is_err(),
+        "join must wait for already-admitted blocking metadata work"
+    );
+    assert_eq!(
+        reader.starts.load(Ordering::SeqCst),
+        2,
+        "cancellation must not admit more metadata work while quiescing"
+    );
+    release.release();
+    let summary = tokio::time::timeout(Duration::from_secs(1), join)
         .await
-        .expect("join must return while metadata reads remain blocked")
+        .expect("join did not finish after admitted metadata work quiesced")
+        .expect("join task panicked")
         .unwrap();
     assert!(summary.cancelled);
     assert!(summary.discovered < 160);
-    release.release();
+    assert_eq!(reader.starts.load(Ordering::SeqCst), 2);
 }
 
 #[test]

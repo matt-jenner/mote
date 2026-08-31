@@ -107,19 +107,31 @@ impl Catalog {
         group: FolderGroupId,
         generation: u64,
     ) -> Result<u64, CatalogError> {
+        self.finish_group_generation_count_at_recovery(library, group, generation, 0)
+    }
+
+    pub(crate) fn finish_group_generation_count_at_recovery(
+        &mut self,
+        library: LibraryId,
+        group: FolderGroupId,
+        generation: u64,
+        expected_recovery_token: u64,
+    ) -> Result<u64, CatalogError> {
         let generation = i64::try_from(generation).map_err(|_| CatalogError::ValueOutOfRange)?;
+        let expected_recovery_token =
+            i64::try_from(expected_recovery_token).map_err(|_| CatalogError::ValueOutOfRange)?;
         let transaction = self.connection.transaction()?;
         ensure_group_library(&transaction, library, group)?;
-        let source_online: i64 = transaction
+        let (source_online, stored_recovery_token): (i64, i64) = transaction
             .query_row(
-                "SELECT source_was_online FROM scan_generations
+                "SELECT source_was_online, recovery_token FROM scan_generations
                  WHERE library_id = ?1 AND folder_group_id = ?2 AND generation = ?3",
                 params![
                     library.as_uuid().as_bytes(),
                     group.as_uuid().as_bytes(),
                     generation
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
             .ok_or_else(|| {
@@ -127,6 +139,11 @@ impl Catalog {
                     "scan generation {generation} is missing for folder group"
                 ))
             })?;
+        if stored_recovery_token != expected_recovery_token {
+            return Err(CatalogError::InvalidData(
+                "scan recovery token does not match its generation".to_owned(),
+            ));
+        }
 
         let mut marked_missing = 0;
         if source_online != 0 {
@@ -174,6 +191,21 @@ impl Catalog {
                  WHERE id = ?1",
                 [library.as_uuid().as_bytes()],
             )?;
+            let advanced = transaction.execute(
+                "UPDATE folder_groups
+                 SET recovery_reconciled = MAX(recovery_reconciled, ?3)
+                 WHERE id = ?1 AND library_id = ?2 AND recovery_requested >= ?3",
+                params![
+                    group.as_uuid().as_bytes(),
+                    library.as_uuid().as_bytes(),
+                    stored_recovery_token,
+                ],
+            )?;
+            if advanced != 1 {
+                return Err(CatalogError::InvalidData(
+                    "scan recovery token is newer than the folder request".to_owned(),
+                ));
+            }
         }
         transaction.commit()?;
         Ok(marked_missing)

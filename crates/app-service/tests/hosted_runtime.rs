@@ -230,6 +230,168 @@ impl MetadataReader for BlockingReader {
     }
 }
 
+#[derive(Clone)]
+struct GatedConcurrencyReader {
+    entered: Arc<tokio::sync::Notify>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+    starts: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+}
+
+impl GatedConcurrencyReader {
+    fn new() -> Self {
+        Self {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            gate: Arc::new((Mutex::new(false), Condvar::new())),
+            starts: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn release(&self) {
+        let (released, changed) = &*self.gate;
+        *released.lock().unwrap() = true;
+        changed.notify_all();
+    }
+}
+
+impl MetadataReader for GatedConcurrencyReader {
+    fn read(
+        &self,
+        media_path: &Path,
+        sidecar_path: Option<&Path>,
+    ) -> Result<MetadataBundle, MetadataReadWarning> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        self.entered.notify_waiters();
+        let (released, changed) = &*self.gate;
+        let mut released = released.lock().unwrap();
+        while !*released {
+            released = changed.wait(released).unwrap();
+        }
+        drop(released);
+        let result = photo_indexer::DefaultMetadataReader.read(media_path, sidecar_path);
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_recovery_waits_for_the_old_worker_to_quiesce_before_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    write_jpeg(&source.join("photo.jpg"));
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+
+    let initial = GalleryEngine::open(config.clone(), source.clone()).unwrap();
+    let summary = initial.select_relative(Path::new("")).await.unwrap();
+    let selection = initial.resolve_selection(&summary.id).unwrap();
+    let mut initial_events = initial.subscribe(
+        &selection,
+        "initial".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    initial.ensure_running(&selection).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                initial_events.recv().await.unwrap().update,
+                WallUpdate::MetadataSettled { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(initial_events);
+    drop(initial);
+
+    let mut catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    catalog.mark_root_offline(selection.library_id()).unwrap();
+    catalog
+        .set_library_availability(
+            selection.library_id(),
+            photo_domain::Availability::Available,
+        )
+        .unwrap();
+    drop(catalog);
+
+    let reader = GatedConcurrencyReader::new();
+    let engine = GalleryEngine::open_with_reader(config, source, Arc::new(reader.clone())).unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    let mut events = engine.subscribe(
+        &selection,
+        "recovery".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    let entered = reader.entered.notified();
+    tokio::pin!(entered);
+    entered.as_mut().enable();
+    engine.ensure_running(&selection).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .expect("recovery worker did not enter the metadata reader");
+
+    engine.cancel_runtime_scan_for_test(&selection);
+    for _ in 0..4 {
+        engine.ensure_running(&selection).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let starts_before_release = reader.starts.load(Ordering::SeqCst);
+    let max_active_before_release = reader.max_active.load(Ordering::SeqCst);
+    reader.release();
+    assert_eq!(
+        starts_before_release, 1,
+        "a cancelled but active worker must block recovery retry admission"
+    );
+    assert_eq!(max_active_before_release, 1);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while reader.active.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled worker did not quiesce");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let mut retries = Vec::new();
+    for _ in 0..8 {
+        let engine = engine.clone();
+        let selection = selection.clone();
+        retries.push(tokio::spawn(async move {
+            engine.ensure_running(&selection).await
+        }));
+    }
+    for retry in retries {
+        retry.await.unwrap().unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().update,
+                WallUpdate::MetadataSettled { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("recovery retry did not settle after the old worker quiesced");
+    assert_eq!(reader.starts.load(Ordering::SeqCst), 2);
+    assert_eq!(reader.max_active.load(Ordering::SeqCst), 1);
+    engine.ensure_running(&selection).await.unwrap();
+    assert_eq!(reader.starts.load(Ordering::SeqCst), 2);
+}
+
 #[tokio::test]
 async fn same_selection_shares_one_scan_and_different_selections_start_two() {
     let temp = tempfile::tempdir().unwrap();

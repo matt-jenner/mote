@@ -4,8 +4,8 @@ use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 #[cfg(any(test, debug_assertions))]
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Mutex as TokioMutex, Notify, OwnedSemaphorePermit, Semaphore};
 
@@ -25,7 +25,9 @@ use photo_indexer::{DefaultMetadataReader, IndexEvent, Indexer, MetadataReader, 
 use crate::derivative_coordinator::{
     HostedAttemptLease, HostedCancellationDecision, WorkKey, WorkLane, WorkTicket,
 };
-use crate::hosted_runtime::{SelectionEventSubscription, SelectionRuntime, SubscriptionOrigin};
+use crate::hosted_runtime::{
+    ScanAdmission, SelectionEventSubscription, SelectionRuntime, SubscriptionOrigin,
+};
 use crate::service::{ReaderAdapter, ServiceState};
 use crate::{
     AppConfig, AppServiceError, DerivativeClass, DerivativePriority, DerivativeReference,
@@ -402,7 +404,6 @@ pub struct GalleryEngine {
     pub(crate) runtimes: Arc<Mutex<HashMap<FolderGroupId, Weak<SelectionRuntime>>>>,
     pub(crate) metadata_reader: ReaderAdapter,
     hosted_library_id: Option<LibraryId>,
-    hosted_source_recovery_epoch: Arc<AtomicU64>,
     pub(crate) shared_coordinator:
         Option<Arc<crate::derivative_coordinator::DerivativeCoordinator>>,
     pub(crate) cache_root: PathBuf,
@@ -660,7 +661,6 @@ impl GalleryEngine {
             runtimes: Arc::new(Mutex::new(HashMap::new())),
             metadata_reader: ReaderAdapter::new(reader),
             hosted_library_id: Some(hosted_library_id),
-            hosted_source_recovery_epoch: Arc::new(AtomicU64::new(0)),
             shared_coordinator: None,
             cache_root,
             cache_writer,
@@ -727,7 +727,6 @@ impl GalleryEngine {
             runtimes: Arc::new(Mutex::new(HashMap::new())),
             metadata_reader,
             hosted_library_id: None,
-            hosted_source_recovery_epoch: Arc::new(AtomicU64::new(0)),
             shared_coordinator: Some(shared_coordinator),
             cache_root,
             cache_writer,
@@ -994,31 +993,47 @@ impl GalleryEngine {
         // A desktop `start_scan` is an explicit refresh even when the
         // previous generation is complete. Hosted `ensure_running` keeps its
         // restart-idempotent catalog settlement semantics at epoch zero.
-        let settled = if self.shared_coordinator.is_some() && selection.epoch != 0 {
-            false
+        let (settled, reconciled_recovery_token) = if self.shared_coordinator.is_some()
+            && selection.epoch != 0
+        {
+            (false, 0)
         } else {
             self.state
                 .lock()
                 .ok()
                 .and_then(|state| {
-                    state
-                        .libraries
-                        .catalog()
+                    let catalog = state.libraries.catalog();
+                    let settled = catalog
                         .has_completed_generation_for_group(
                             selection.library_id,
                             selection.group_id,
                         )
-                        .ok()
+                        .ok()?;
+                    let reconciled = if self.hosted_library_id == Some(selection.library_id) {
+                        catalog
+                            .folder_group_recovery_state(selection.library_id, selection.group_id)
+                            .ok()?
+                            .reconciled
+                    } else {
+                        0
+                    };
+                    Some((settled, reconciled))
                 })
-                .unwrap_or(false)
+                .unwrap_or((false, 0))
         };
         let runtime = match &self.shared_coordinator {
-            Some(coordinator) => SelectionRuntime::new_with_coordinator(
+            Some(coordinator) => SelectionRuntime::new_with_coordinator_at_recovery(
                 selection.clone(),
                 coordinator.clone(),
                 settled,
+                reconciled_recovery_token,
             ),
-            None => SelectionRuntime::new(selection.clone(), self.scheduler.clone(), settled),
+            None => SelectionRuntime::new_at_recovery(
+                selection.clone(),
+                self.scheduler.clone(),
+                settled,
+                reconciled_recovery_token,
+            ),
         };
         runtimes.insert(selection.group_id, Arc::downgrade(&runtime));
         runtime
@@ -1054,6 +1069,12 @@ impl GalleryEngine {
         runtime.request_cancel();
     }
 
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn cancel_runtime_scan_for_test(&self, selection: &GallerySelection) {
+        self.cancel_runtime_scan(selection.group_id);
+    }
+
     pub async fn ensure_running(
         &self,
         selection: &GallerySelection,
@@ -1062,32 +1083,12 @@ impl GalleryEngine {
         runtime.begin_scan(self.clone()).await
     }
 
-    #[doc(hidden)]
-    pub fn note_source_root_recovered(&self, library_id: LibraryId) -> bool {
-        if self.hosted_library_id != Some(library_id) {
-            return false;
-        }
-        self.hosted_source_recovery_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.wrapping_add(1).max(1))
-            })
-            .is_ok()
-    }
-
-    pub(crate) fn source_recovery_epoch(&self, library_id: LibraryId) -> u64 {
-        if self.hosted_library_id != Some(library_id) {
-            return 0;
-        }
-        self.hosted_source_recovery_epoch.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn runtime_recovery_required(
+    pub(crate) fn runtime_recovery_state(
         &self,
         runtime: &SelectionRuntime,
-        recovery_epoch: u64,
-    ) -> Result<bool, AppServiceError> {
+    ) -> Result<Option<photo_catalog::FolderGroupRecoveryState>, AppServiceError> {
         if self.hosted_library_id != Some(runtime.selection.library_id) {
-            return Ok(false);
+            return Ok(None);
         }
         let state = self
             .state
@@ -1098,13 +1099,11 @@ impl GalleryEngine {
             .find_library(runtime.selection.library_id)?
             .ok_or(AppServiceError::UnknownAsset)?;
         if library.availability != photo_domain::Availability::Available {
-            return Ok(false);
-        }
-        if runtime.recovery_required(recovery_epoch) {
-            return Ok(true);
+            return Ok(None);
         }
         catalog
-            .group_has_root_offline_assets(runtime.selection.library_id, runtime.selection.group_id)
+            .folder_group_recovery_state(runtime.selection.library_id, runtime.selection.group_id)
+            .map(Some)
             .map_err(Into::into)
     }
 
@@ -2553,7 +2552,7 @@ impl GalleryEngine {
     pub(crate) async fn start_runtime_scan(
         &self,
         runtime: Arc<SelectionRuntime>,
-        scan_generation: u64,
+        admission: ScanAdmission,
     ) -> Result<(), AppServiceError> {
         #[cfg(test)]
         if self.fail_next_start.swap(false, Ordering::AcqRel) {
@@ -2563,7 +2562,7 @@ impl GalleryEngine {
         }
         if runtime.cancellation_requested() {
             runtime.finish_scan(
-                scan_generation,
+                admission.generation,
                 crate::hosted_runtime::ScanLifecycle::Cancelled,
             );
             return Ok(());
@@ -2601,7 +2600,7 @@ impl GalleryEngine {
         }
         if runtime.cancellation_requested() {
             runtime.finish_scan(
-                scan_generation,
+                admission.generation,
                 crate::hosted_runtime::ScanLifecycle::Cancelled,
             );
             return Ok(());
@@ -2626,10 +2625,14 @@ impl GalleryEngine {
                     photo_core::AddLibraryError::InvalidSelection,
                 ));
             }
-            state.libraries.catalog_mut().begin_generation_for_group(
-                runtime.selection.library_id,
-                runtime.selection.group_id,
-            )?
+            state
+                .libraries
+                .catalog_mut()
+                .begin_generation_for_group_at_recovery(
+                    runtime.selection.library_id,
+                    runtime.selection.group_id,
+                    admission.recovery_token,
+                )?
         };
         let indexer = Indexer::with_scheduler(
             self.metadata_reader.clone(),
@@ -2640,7 +2643,7 @@ impl GalleryEngine {
         let selection_root = root.join(&selected);
         if runtime.cancellation_requested() {
             runtime.finish_scan(
-                scan_generation,
+                admission.generation,
                 crate::hosted_runtime::ScanLifecycle::Cancelled,
             );
             return Ok(());
@@ -2653,11 +2656,11 @@ impl GalleryEngine {
                     .for_folder_group(runtime.selection.group_id),
             )
             .map_err(|e| AppServiceError::LibrarySetup(std::io::Error::other(e.to_string())))?;
-        runtime.install_scan_sender(scan_generation, handle.cancellation_sender());
+        runtime.install_scan_sender(admission.generation, handle.cancellation_sender());
         let engine = self.clone();
         tokio::spawn(async move {
             engine
-                .drain_runtime_scan(runtime, handle, generation, scan_generation)
+                .drain_runtime_scan(runtime, handle, generation, admission)
                 .await;
         });
         Ok(())
@@ -2860,7 +2863,7 @@ impl GalleryEngine {
         runtime: Arc<SelectionRuntime>,
         mut handle: photo_indexer::ScanHandle,
         generation: u64,
-        scan_generation: u64,
+        admission: ScanAdmission,
     ) {
         let mut batch = Vec::new();
         let mut persistence_failed = false;
@@ -2913,10 +2916,11 @@ impl GalleryEngine {
                 state
                     .libraries
                     .catalog_mut()
-                    .complete_generation_for_group(
+                    .complete_generation_for_group_at_recovery(
                         runtime.selection.library_id,
                         runtime.selection.group_id,
                         generation,
+                        admission.recovery_token,
                     )
                     .is_ok()
             } else {
@@ -2951,7 +2955,7 @@ impl GalleryEngine {
         } else {
             crate::hosted_runtime::ScanLifecycle::Failed
         };
-        runtime.finish_scan(scan_generation, terminal);
+        runtime.finish_scan(admission.generation, terminal);
         self.remove_runtime_if_dead(runtime.selection.group_id, &runtime);
     }
 

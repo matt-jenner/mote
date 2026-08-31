@@ -1,7 +1,33 @@
 use std::path::Path;
 
 use image::ImageBuffer;
-use photo_app_service::{AppConfig, GalleryEngine};
+use photo_app_service::{AppConfig, GalleryEngine, GallerySelection};
+
+async fn run_and_wait_for_settlement(
+    engine: &GalleryEngine,
+    selection: &GallerySelection,
+    client: &str,
+) {
+    let mut events = engine.subscribe(
+        selection,
+        client.to_owned(),
+        photo_app_service::GalleryScope::CurrentFolder,
+        None,
+    );
+    engine.ensure_running(selection).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().update,
+                photo_app_service::WallUpdate::MetadataSettled { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("selection did not settle for {client}"));
+}
 
 #[tokio::test]
 async fn selection_ids_are_stable_across_reopen_and_are_not_paths() {
@@ -401,7 +427,7 @@ async fn concurrent_recovery_requests_admit_one_scan_for_a_stable_selection() {
 }
 
 #[tokio::test]
-async fn recovery_epoch_rescans_a_completed_empty_selection_once() {
+async fn recovery_token_rescans_a_completed_empty_selection_once() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");
     std::fs::create_dir_all(&source).unwrap();
@@ -447,8 +473,6 @@ async fn recovery_epoch_rescans_a_completed_empty_selection_once() {
     ImageBuffer::from_pixel(3, 2, image::Rgb([220_u8, 180_u8, 80_u8]))
         .save(source.join("arrived-while-offline.jpg"))
         .unwrap();
-    assert!(engine.note_source_root_recovered(selection.library_id()));
-
     engine.ensure_running(&selection).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -462,7 +486,7 @@ async fn recovery_epoch_rescans_a_completed_empty_selection_once() {
         }
     })
     .await
-    .expect("recovery epoch did not reconcile a previously empty selection");
+    .expect("recovery token did not reconcile a previously empty selection");
     let page = engine
         .query_wall(
             &selection,
@@ -484,8 +508,110 @@ async fn recovery_epoch_rescans_a_completed_empty_selection_once() {
         )
         .await
         .is_err(),
-        "a reconciled recovery epoch admitted another scan"
+        "a reconciled recovery token admitted another scan"
     );
+}
+
+#[tokio::test]
+async fn overlapping_group_recovery_survives_restart_and_shared_asset_updates() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let child_source = source.join("child");
+    std::fs::create_dir_all(&child_source).unwrap();
+    let original = child_source.join("original.jpg");
+    ImageBuffer::from_pixel(3, 2, image::Rgb([220_u8, 180_u8, 80_u8]))
+        .save(&original)
+        .unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+
+    let engine = GalleryEngine::open(config.clone(), source.clone()).unwrap();
+    let parent_summary = engine.select_relative(Path::new("")).await.unwrap();
+    let child_summary = engine.select_relative(Path::new("child")).await.unwrap();
+    let parent = engine.resolve_selection(&parent_summary.id).unwrap();
+    let child = engine.resolve_selection(&child_summary.id).unwrap();
+    run_and_wait_for_settlement(&engine, &parent, "parent-initial").await;
+    run_and_wait_for_settlement(&engine, &child, "child-initial").await;
+    drop(engine);
+
+    let mut catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    catalog.mark_root_offline(parent.library_id()).unwrap();
+    catalog
+        .set_library_availability(parent.library_id(), photo_domain::Availability::Available)
+        .unwrap();
+    drop(catalog);
+
+    let parent_recovery = GalleryEngine::open(config.clone(), source.clone()).unwrap();
+    let parent = parent_recovery
+        .resolve_selection(&parent_summary.id)
+        .unwrap();
+    run_and_wait_for_settlement(&parent_recovery, &parent, "parent-recovery").await;
+    let child_state = photo_catalog::Catalog::open(&config.catalog_path())
+        .unwrap()
+        .folder_group_recovery_state(parent.library_id(), child.group_id())
+        .unwrap();
+    assert!(
+        child_state.requested > child_state.reconciled,
+        "recovering the overlapping parent must not erase the child's request"
+    );
+    let parent_state = photo_catalog::Catalog::open(&config.catalog_path())
+        .unwrap()
+        .folder_group_recovery_state(parent.library_id(), parent.group_id())
+        .unwrap();
+    assert_eq!(parent_state.requested, parent_state.reconciled);
+    drop(parent_recovery);
+
+    let reconciled_parent = GalleryEngine::open(config.clone(), source.clone()).unwrap();
+    let parent = reconciled_parent
+        .resolve_selection(&parent_summary.id)
+        .unwrap();
+    let mut reconciled_events = reconciled_parent.subscribe(
+        &parent,
+        "parent-reconciled-restart".to_owned(),
+        photo_app_service::GalleryScope::CurrentFolder,
+        None,
+    );
+    reconciled_parent.ensure_running(&parent).await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            reconciled_events.recv()
+        )
+        .await
+        .is_err(),
+        "a persisted reconciled token must suppress a duplicate scan after restart"
+    );
+    drop(reconciled_events);
+    drop(reconciled_parent);
+
+    std::fs::remove_file(&original).unwrap();
+    ImageBuffer::from_pixel(3, 2, image::Rgb([30_u8, 60_u8, 90_u8]))
+        .save(child_source.join("arrived.jpg"))
+        .unwrap();
+
+    let child_recovery = GalleryEngine::open(config.clone(), source).unwrap();
+    let child_summary_after_restart = child_recovery
+        .select_relative(Path::new("child"))
+        .await
+        .unwrap();
+    assert_eq!(child_summary_after_restart.id, child_summary.id);
+    let child = child_recovery.resolve_selection(&child_summary.id).unwrap();
+    run_and_wait_for_settlement(&child_recovery, &child, "child-recovery").await;
+    let page = child_recovery
+        .query_wall(
+            &child,
+            photo_app_service::GalleryScope::CurrentFolder,
+            photo_app_service::WallQueryRequest::oldest_first(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].display_name, "arrived.jpg");
+    let reconciled = photo_catalog::Catalog::open(&config.catalog_path())
+        .unwrap()
+        .folder_group_recovery_state(child.library_id(), child.group_id())
+        .unwrap();
+    assert_eq!(reconciled.requested, child_state.requested);
+    assert_eq!(reconciled.reconciled, reconciled.requested);
 }
 
 #[tokio::test]

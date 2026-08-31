@@ -80,20 +80,13 @@ impl AppState {
         else {
             return;
         };
-        let recovered =
-            available && library.availability == photo_domain::Availability::RootOffline;
         let result = if available {
             catalog.set_library_availability(library.id, photo_domain::Availability::Available)
         } else {
             catalog.mark_root_offline(library.id).map(|_| ())
         };
         match result {
-            Ok(()) => {
-                drop(catalog);
-                if recovered && let Some(gallery) = self.gallery.as_ref() {
-                    gallery.note_source_root_recovered(library.id);
-                }
-            }
+            Ok(()) => {}
             Err(error) => {
                 tracing::warn!(%error, "source availability could not be persisted");
             }

@@ -31,9 +31,16 @@ struct ScanControl {
     state: ScanLifecycle,
     generation: u64,
     cancel_requested: bool,
+    scan_quiesced: bool,
     sender: Option<watch::Sender<bool>>,
-    reconciled_recovery_epoch: u64,
-    pending_recovery_epoch: Option<u64>,
+    reconciled_recovery_token: u64,
+    pending_recovery_token: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ScanAdmission {
+    pub(crate) generation: u64,
+    pub(crate) recovery_token: u64,
 }
 
 #[cfg(test)]
@@ -44,14 +51,15 @@ pub(crate) struct LifecyclePublishTestGate {
 }
 
 impl ScanControl {
-    fn new(state: ScanLifecycle) -> Self {
+    fn new(state: ScanLifecycle, reconciled_recovery_token: u64) -> Self {
         Self {
             state,
             generation: 0,
             cancel_requested: false,
+            scan_quiesced: true,
             sender: None,
-            reconciled_recovery_epoch: 0,
-            pending_recovery_epoch: None,
+            reconciled_recovery_token,
+            pending_recovery_token: None,
         }
     }
 }
@@ -101,12 +109,22 @@ pub struct SequencedWallUpdate {
 }
 
 impl SelectionRuntime {
+    #[cfg(test)]
     pub(crate) fn new(
         selection: GallerySelection,
         scheduler: Arc<photo_indexer::IndexScheduler>,
         settled: bool,
     ) -> Arc<Self> {
-        Self::new_with_coordinator(
+        Self::new_at_recovery(selection, scheduler, settled, 0)
+    }
+
+    pub(crate) fn new_at_recovery(
+        selection: GallerySelection,
+        scheduler: Arc<photo_indexer::IndexScheduler>,
+        settled: bool,
+        reconciled_recovery_token: u64,
+    ) -> Arc<Self> {
+        Self::new_with_coordinator_at_recovery(
             selection.clone(),
             Arc::new(
                 crate::derivative_coordinator::DerivativeCoordinator::with_selection(
@@ -115,13 +133,15 @@ impl SelectionRuntime {
                 ),
             ),
             settled,
+            reconciled_recovery_token,
         )
     }
 
-    pub(crate) fn new_with_coordinator(
+    pub(crate) fn new_with_coordinator_at_recovery(
         selection: GallerySelection,
         coordinator: Arc<crate::derivative_coordinator::DerivativeCoordinator>,
         settled: bool,
+        reconciled_recovery_token: u64,
     ) -> Arc<Self> {
         let (updates, _) = broadcast::channel(256);
         let initial_lifecycle = if settled {
@@ -132,7 +152,10 @@ impl SelectionRuntime {
         let (scan_lifecycle, _) = watch::channel(initial_lifecycle);
         Arc::new(Self {
             selection: selection.clone(),
-            scan_cancel: Mutex::new(ScanControl::new(initial_lifecycle)),
+            scan_cancel: Mutex::new(ScanControl::new(
+                initial_lifecycle,
+                reconciled_recovery_token,
+            )),
             scan_lifecycle,
             coordinator,
             updates,
@@ -186,27 +209,44 @@ impl SelectionRuntime {
 
     #[cfg(test)]
     pub(crate) fn admit_scan(&self) -> Option<u64> {
-        self.admit_scan_at_recovery_epoch(0)
+        self.admit_scan_at_recovery_token(0, 0)
+            .map(|admission| admission.generation)
     }
 
-    pub(crate) fn admit_scan_at_recovery_epoch(&self, recovery_epoch: u64) -> Option<u64> {
-        self.admit_scan_from(recovery_epoch, false)
+    pub(crate) fn admit_scan_at_recovery_token(
+        &self,
+        recovery_token: u64,
+        reconciled_recovery_token: u64,
+    ) -> Option<ScanAdmission> {
+        self.admit_scan_from(recovery_token, reconciled_recovery_token, false)
     }
 
-    pub(crate) fn admit_recovery_scan(&self, recovery_epoch: u64) -> Option<u64> {
-        self.admit_scan_from(recovery_epoch, true)
+    pub(crate) fn admit_recovery_scan(
+        &self,
+        recovery_token: u64,
+        reconciled_recovery_token: u64,
+    ) -> Option<ScanAdmission> {
+        self.admit_scan_from(recovery_token, reconciled_recovery_token, true)
     }
 
-    fn admit_scan_from(&self, recovery_epoch: u64, settled_recovery: bool) -> Option<u64> {
+    fn admit_scan_from(
+        &self,
+        recovery_token: u64,
+        reconciled_recovery_token: u64,
+        settled_recovery: bool,
+    ) -> Option<ScanAdmission> {
         let mut control = self.scan_cancel.lock().expect("scan control poisoned");
+        control.reconciled_recovery_token = control
+            .reconciled_recovery_token
+            .max(reconciled_recovery_token);
         let admissible = if settled_recovery {
+            if recovery_token <= control.reconciled_recovery_token {
+                return None;
+            }
             matches!(
                 control.state,
-                ScanLifecycle::Completed
-                    | ScanLifecycle::Cancelled
-                    | ScanLifecycle::SourceUnavailable
-                    | ScanLifecycle::Failed
-            )
+                ScanLifecycle::Completed | ScanLifecycle::SourceUnavailable | ScanLifecycle::Failed
+            ) || (control.state == ScanLifecycle::Cancelled && control.scan_quiesced)
         } else {
             matches!(
                 control.state,
@@ -219,19 +259,24 @@ impl SelectionRuntime {
         control.generation = control.generation.wrapping_add(1).max(1);
         control.state = ScanLifecycle::Starting;
         control.cancel_requested = false;
+        control.scan_quiesced = false;
         control.sender = None;
-        control.pending_recovery_epoch = Some(recovery_epoch);
+        control.pending_recovery_token = Some(recovery_token);
         self.terminal_event_id.store(0, Ordering::Release);
         #[cfg(test)]
         self.wait_lifecycle_publish_test_gate(ScanLifecycle::Starting);
         self.scan_lifecycle.send_replace(ScanLifecycle::Starting);
-        Some(control.generation)
+        Some(ScanAdmission {
+            generation: control.generation,
+            recovery_token,
+        })
     }
 
-    pub(crate) fn recovery_required(&self, recovery_epoch: u64) -> bool {
+    #[cfg(test)]
+    pub(crate) fn recovery_required(&self, recovery_token: u64) -> bool {
         let control = self.scan_cancel.lock().expect("scan control poisoned");
-        control.pending_recovery_epoch.is_some()
-            || control.reconciled_recovery_epoch < recovery_epoch
+        control.pending_recovery_token.is_some()
+            || control.reconciled_recovery_token < recovery_token
     }
 
     /// Installs the indexer's cancellation sender after scan admission. A
@@ -300,7 +345,15 @@ impl SelectionRuntime {
         requested_state: ScanLifecycle,
     ) -> ScanLifecycle {
         let mut control = self.scan_cancel.lock().expect("scan control poisoned");
-        if control.generation != generation || control.state.is_terminal() {
+        if control.generation != generation {
+            return control.state;
+        }
+        if control.state == ScanLifecycle::Cancelled {
+            control.sender = None;
+            control.scan_quiesced = true;
+            return ScanLifecycle::Cancelled;
+        }
+        if control.state.is_terminal() {
             return control.state;
         }
         let state = if control.cancel_requested || control.state == ScanLifecycle::Cancelled {
@@ -322,12 +375,13 @@ impl SelectionRuntime {
             .map(|_| self.publish_terminal_warning_locked().id);
         control.state = state;
         control.cancel_requested = state == ScanLifecycle::Cancelled;
+        control.scan_quiesced = true;
         control.sender = None;
         if state == ScanLifecycle::Completed
-            && let Some(recovery_epoch) = control.pending_recovery_epoch.take()
+            && let Some(recovery_token) = control.pending_recovery_token.take()
         {
-            control.reconciled_recovery_epoch =
-                control.reconciled_recovery_epoch.max(recovery_epoch);
+            control.reconciled_recovery_token =
+                control.reconciled_recovery_token.max(recovery_token);
         }
         self.terminal_event_id.store(
             failure_event_id.unwrap_or_else(|| self.next_event_id.load(Ordering::Acquire)),
@@ -527,19 +581,22 @@ impl SelectionRuntime {
         engine: GalleryEngine,
     ) -> Result<(), crate::AppServiceError> {
         let settled = self.settled.load(Ordering::Acquire);
-        let recovery_epoch = engine.source_recovery_epoch(self.selection.library_id);
-        let admitted_generation = if settled {
+        let recovery = engine.runtime_recovery_state(self)?;
+        let admitted = if settled {
             if !engine.ensure_runtime_source(self).await? {
                 return Ok(());
             }
-            if !engine.runtime_recovery_required(self, recovery_epoch)? {
-                return Ok(());
-            }
-            self.admit_recovery_scan(recovery_epoch)
+            recovery.and_then(|recovery| {
+                self.admit_recovery_scan(recovery.requested, recovery.reconciled)
+            })
         } else {
-            self.admit_scan_at_recovery_epoch(recovery_epoch)
+            let recovery = recovery.unwrap_or(photo_catalog::FolderGroupRecoveryState {
+                requested: 0,
+                reconciled: 0,
+            });
+            self.admit_scan_at_recovery_token(recovery.requested, recovery.reconciled)
         };
-        let Some(generation) = admitted_generation else {
+        let Some(admission) = admitted else {
             if !settled && !engine.ensure_runtime_source(self).await? {
                 return Ok(());
             }
@@ -548,7 +605,7 @@ impl SelectionRuntime {
         let source_available = match engine.ensure_runtime_source(self).await {
             Ok(source_available) => source_available,
             Err(error) => {
-                self.finish_scan(generation, ScanLifecycle::Failed);
+                self.finish_scan(admission.generation, ScanLifecycle::Failed);
                 return Err(error);
             }
         };
@@ -561,10 +618,10 @@ impl SelectionRuntime {
         self.coordinator
             .ensure_selection(self.selection.token())
             .await;
-        match engine.start_runtime_scan(self.clone(), generation).await {
+        match engine.start_runtime_scan(self.clone(), admission).await {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.finish_scan(generation, ScanLifecycle::Failed);
+                self.finish_scan(admission.generation, ScanLifecycle::Failed);
                 Err(error)
             }
         }
@@ -914,16 +971,16 @@ mod tests {
     }
 
     #[test]
-    fn recovery_epoch_advances_only_after_successful_completion() {
+    fn recovery_token_advances_only_after_successful_completion() {
         let initial = SelectionRuntime::new(
             selection(),
             Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
             false,
         );
         let initial_generation = initial
-            .admit_scan_at_recovery_epoch(6)
-            .expect("initial scan should capture the current recovery epoch");
-        initial.finish_scan(initial_generation, ScanLifecycle::Completed);
+            .admit_scan_at_recovery_token(6, 0)
+            .expect("initial scan should capture the current recovery token");
+        initial.finish_scan(initial_generation.generation, ScanLifecycle::Completed);
         assert!(!initial.recovery_required(6));
 
         let runtime = SelectionRuntime::new(
@@ -933,20 +990,20 @@ mod tests {
         );
         assert!(runtime.recovery_required(7));
         let failed = runtime
-            .admit_recovery_scan(7)
+            .admit_recovery_scan(7, 0)
             .expect("recovery scan should be admitted");
-        assert!(runtime.admit_recovery_scan(7).is_none());
+        assert!(runtime.admit_recovery_scan(7, 0).is_none());
         assert_eq!(
-            runtime.finish_scan(failed, ScanLifecycle::Failed),
+            runtime.finish_scan(failed.generation, ScanLifecycle::Failed),
             ScanLifecycle::Failed
         );
         assert!(runtime.recovery_required(7));
 
         let retry = runtime
-            .admit_recovery_scan(7)
+            .admit_recovery_scan(7, 0)
             .expect("failed recovery should remain retryable");
         assert_eq!(
-            runtime.finish_scan(retry, ScanLifecycle::Completed),
+            runtime.finish_scan(retry.generation, ScanLifecycle::Completed),
             ScanLifecycle::Completed
         );
         assert!(!runtime.recovery_required(7));
@@ -957,16 +1014,26 @@ mod tests {
             Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
             true,
         );
-        cancelled
-            .admit_recovery_scan(9)
+        let cancelled_generation = cancelled
+            .admit_recovery_scan(9, 0)
             .expect("cancelled recovery should first be admitted");
         cancelled.request_cancel();
         assert!(cancelled.recovery_required(9));
+        assert!(
+            cancelled.admit_recovery_scan(9, 0).is_none(),
+            "retry cannot overlap the cancelled generation while it drains"
+        );
+        cancelled.finish_scan(cancelled_generation.generation, ScanLifecycle::Cancelled);
         let retry_after_cancel = cancelled
-            .admit_recovery_scan(9)
-            .expect("cancelled recovery should remain retryable for the pending epoch");
-        cancelled.finish_scan(retry_after_cancel, ScanLifecycle::Completed);
+            .admit_recovery_scan(9, 0)
+            .expect("cancelled recovery should remain retryable for the pending token");
+        cancelled.finish_scan(retry_after_cancel.generation, ScanLifecycle::Completed);
         assert!(!cancelled.recovery_required(9));
+
+        assert!(
+            cancelled.admit_recovery_scan(9, 9).is_none(),
+            "persisted reconciliation rejects a stale caller token"
+        );
     }
 
     #[test]

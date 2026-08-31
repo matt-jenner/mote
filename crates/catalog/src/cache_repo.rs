@@ -177,8 +177,15 @@ impl Catalog {
         value: &NewFolderGroup,
     ) -> Result<FolderGroupId, CatalogError> {
         let id = self.connection.query_row(
-            "INSERT INTO folder_groups (id, library_id, relative_path_key, display_path, last_viewed_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5) \
+            "INSERT INTO folder_groups
+                (id, library_id, relative_path_key, display_path, last_viewed_at, recovery_requested) \
+             VALUES (
+                ?1, ?2, ?3, ?4, ?5,
+                COALESCE((
+                    SELECT CASE availability WHEN 'root_offline' THEN 1 ELSE 0 END
+                    FROM library_roots WHERE id = ?2
+                ), 0)
+             ) \
              ON CONFLICT(library_id, relative_path_key) DO UPDATE SET \
                 display_path = excluded.display_path, \
                 last_viewed_at = COALESCE(excluded.last_viewed_at, folder_groups.last_viewed_at) \

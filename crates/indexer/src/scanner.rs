@@ -316,7 +316,14 @@ impl<R: MetadataReader> Indexer<R> {
                         tokio::pin!(process);
                         let result = tokio::select! {
                             result = &mut process => Some(result),
-                            _ = cancel.changed() => None,
+                            _ = cancel.changed() => {
+                                // A blocking metadata read cannot be aborted by
+                                // dropping its JoinHandle. Wait for the admitted
+                                // work to quiesce so a cancelled recovery cannot
+                                // overlap its replacement scan.
+                                let _ = process.await;
+                                None
+                            },
                         };
                         let Some(result) = result else {
                             scheduler.release_enrichment();
