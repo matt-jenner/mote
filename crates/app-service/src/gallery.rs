@@ -454,6 +454,10 @@ pub struct GalleryEngine {
     #[cfg(debug_assertions)]
     hosted_pre_enqueue_test_gate: HostedAsyncTestGate,
     #[cfg(debug_assertions)]
+    hosted_scan_admission_test_gate: HostedAsyncTestGate,
+    #[cfg(debug_assertions)]
+    hosted_root_outage_snapshot_test_gate: HostedAsyncTestGate,
+    #[cfg(debug_assertions)]
     hosted_link_removal_failure_test_hook: Arc<AtomicBool>,
 }
 
@@ -709,6 +713,10 @@ impl GalleryEngine {
             #[cfg(debug_assertions)]
             hosted_pre_enqueue_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]
+            hosted_scan_admission_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
+            hosted_root_outage_snapshot_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
             hosted_link_removal_failure_test_hook: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -774,6 +782,10 @@ impl GalleryEngine {
             hosted_empty_authorization_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]
             hosted_pre_enqueue_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
+            hosted_scan_admission_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
+            hosted_root_outage_snapshot_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]
             hosted_link_removal_failure_test_hook: Arc::new(AtomicBool::new(false)),
         }
@@ -2236,6 +2248,56 @@ impl GalleryEngine {
 
     #[cfg(debug_assertions)]
     #[doc(hidden)]
+    pub async fn install_hosted_scan_admission_test_gate(
+        &self,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    ) {
+        *self.hosted_scan_admission_test_gate.lock().await = Some((entered, release));
+    }
+
+    #[cfg(debug_assertions)]
+    async fn wait_hosted_scan_admission_test_gate(&self) {
+        let gate = self.hosted_scan_admission_test_gate.lock().await.take();
+        let Some((entered, release)) = gate else {
+            return;
+        };
+        let notified = release.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        entered.notify_one();
+        notified.await;
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_hosted_root_outage_snapshot_test_gate(
+        &self,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    ) {
+        *self.hosted_root_outage_snapshot_test_gate.lock().await = Some((entered, release));
+    }
+
+    #[cfg(debug_assertions)]
+    async fn wait_hosted_root_outage_snapshot_test_gate(&self) {
+        let gate = self
+            .hosted_root_outage_snapshot_test_gate
+            .lock()
+            .await
+            .take();
+        let Some((entered, release)) = gate else {
+            return;
+        };
+        let notified = release.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        entered.notify_one();
+        notified.await;
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
     pub fn fail_next_hosted_cleanup_for_test(&self) {
         self.cache_writer.fail_next_cleanup_for_test();
     }
@@ -2594,7 +2656,58 @@ impl GalleryEngine {
             runtime.finish_unowned_scan(admission, crate::hosted_runtime::ScanLifecycle::Cancelled);
             return Ok(());
         }
-        let generation = {
+        let indexer = Indexer::with_scheduler(
+            self.metadata_reader.clone(),
+            photo_core::FolderPolicyEngine::new(Vec::new())
+                .map_err(|e| AppServiceError::LibrarySetup(std::io::Error::other(e.to_string())))?,
+            self.scheduler.clone(),
+        );
+        #[cfg(debug_assertions)]
+        self.wait_hosted_scan_admission_test_gate().await;
+        let _publication = self.hosted_publication_fence.lock().await;
+        if runtime.cancellation_requested() {
+            runtime.finish_unowned_scan(admission, crate::hosted_runtime::ScanLifecycle::Cancelled);
+            return Ok(());
+        }
+        let library_available = self.hosted_library_id != Some(runtime.selection.library_id) || {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| AppServiceError::StatePoisoned)?;
+            state
+                .libraries
+                .catalog()
+                .find_library(runtime.selection.library_id)?
+                .ok_or(AppServiceError::StatePoisoned)?
+                .availability
+                == photo_domain::Availability::Available
+        };
+        if !library_available {
+            runtime.request_source_unavailable();
+            let should_publish = !runtime
+                .source_unavailable_reported
+                .swap(true, Ordering::AcqRel);
+            drop(_publication);
+            if should_publish {
+                runtime
+                    .publish(WallUpdate::SourceUnavailable {
+                        selection_id: runtime.selection.id().to_owned(),
+                        source_id: runtime
+                            .selection
+                            .library_id
+                            .as_uuid()
+                            .hyphenated()
+                            .to_string(),
+                    })
+                    .await;
+            }
+            return Ok(());
+        }
+        let Some(owner) = runtime.claim_scan_worker(admission) else {
+            runtime.finish_unowned_scan(admission, crate::hosted_runtime::ScanLifecycle::Cancelled);
+            return Ok(());
+        };
+        let generation = match (|| {
             let mut state = self
                 .state
                 .lock()
@@ -2621,23 +2734,17 @@ impl GalleryEngine {
                     runtime.selection.library_id,
                     runtime.selection.group_id,
                     admission.recovery_token,
-                )?
+                )
+                .map_err(AppServiceError::from)
+        })() {
+            Ok(generation) => generation,
+            Err(error) => {
+                runtime.finish_owned_scan(owner, crate::hosted_runtime::ScanLifecycle::Failed);
+                return Err(error);
+            }
         };
-        let indexer = Indexer::with_scheduler(
-            self.metadata_reader.clone(),
-            photo_core::FolderPolicyEngine::new(Vec::new())
-                .map_err(|e| AppServiceError::LibrarySetup(std::io::Error::other(e.to_string())))?,
-            self.scheduler.clone(),
-        );
+        drop(_publication);
         let selection_root = root.join(&selected);
-        if runtime.cancellation_requested() {
-            runtime.finish_unowned_scan(admission, crate::hosted_runtime::ScanLifecycle::Cancelled);
-            return Ok(());
-        }
-        let Some(owner) = runtime.claim_scan_worker(admission) else {
-            runtime.finish_unowned_scan(admission, crate::hosted_runtime::ScanLifecycle::Cancelled);
-            return Ok(());
-        };
         if runtime.cancellation_requested() {
             runtime.finish_owned_scan(owner, crate::hosted_runtime::ScanLifecycle::Cancelled);
             return Ok(());
@@ -2792,19 +2899,24 @@ impl GalleryEngine {
         if self.hosted_library_id != Some(library_id) {
             return Ok(false);
         }
-        let runtimes = self
-            .runtimes
-            .lock()
-            .map_err(|_| AppServiceError::StatePoisoned)?
-            .values()
-            .filter_map(Weak::upgrade)
-            .filter(|runtime| runtime.selection.library_id == library_id)
-            .collect::<Vec<_>>();
-        for runtime in &runtimes {
-            runtime.request_source_unavailable();
-        }
-        {
+        let runtimes = {
             let _publication = self.hosted_publication_fence.lock().await;
+            let runtimes = {
+                let runtimes = self
+                    .runtimes
+                    .lock()
+                    .map_err(|_| AppServiceError::StatePoisoned)?;
+                runtimes
+                    .values()
+                    .filter_map(Weak::upgrade)
+                    .filter(|runtime| runtime.selection.library_id == library_id)
+                    .collect::<Vec<_>>()
+            };
+            #[cfg(debug_assertions)]
+            self.wait_hosted_root_outage_snapshot_test_gate().await;
+            for runtime in &runtimes {
+                runtime.request_source_unavailable();
+            }
             let mut state = self
                 .state
                 .lock()
@@ -2813,7 +2925,8 @@ impl GalleryEngine {
                 .libraries
                 .catalog_mut()
                 .mark_root_offline(library_id)?;
-        }
+            runtimes
+        };
         for runtime in runtimes {
             if !runtime
                 .source_unavailable_reported

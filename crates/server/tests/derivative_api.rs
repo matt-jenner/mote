@@ -569,6 +569,201 @@ async fn stable_selection_recovers_and_generates_an_uncached_derivative_after_ro
     drop(restore);
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn root_folder_outage_serializes_a_concurrent_stable_selection_scan() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let web = temp.path().join("web");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&web).unwrap();
+    std::fs::write(source.join("photo.jpg"), JPEG).unwrap();
+    let config = ServerConfig::new(
+        temp.path().join("data"),
+        temp.path().join("cache"),
+        None,
+        source.clone(),
+        web,
+    )
+    .unwrap();
+    let (state, _) = AppState::open(&config).unwrap();
+    let gallery = state.gallery_for_test().unwrap();
+    let app = build_router(state, config.static_web_root());
+    let (selection_id, _asset_id) = selection_and_asset(&app).await;
+    let selection = gallery.resolve_selection(&selection_id).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while gallery.runtime_count_for_test() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial runtime did not leave the registry");
+
+    let mut catalog =
+        photo_catalog::Catalog::open(&config.data_dir().join("catalog.sqlite")).unwrap();
+    catalog.mark_root_offline(selection.library_id()).unwrap();
+    catalog
+        .set_library_availability(
+            selection.library_id(),
+            photo_domain::Availability::Available,
+        )
+        .unwrap();
+    let pending = catalog
+        .folder_group_recovery_state(selection.library_id(), selection.group_id())
+        .unwrap();
+    assert_eq!(pending.requested, 1);
+    assert_eq!(pending.reconciled, 0);
+    drop(catalog);
+
+    let outage_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let outage_release = std::sync::Arc::new(tokio::sync::Notify::new());
+    gallery
+        .install_hosted_root_outage_snapshot_test_gate(
+            outage_entered.clone(),
+            outage_release.clone(),
+        )
+        .await;
+    let scan_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let scan_release = std::sync::Arc::new(tokio::sync::Notify::new());
+    gallery
+        .install_hosted_scan_admission_test_gate(scan_entered.clone(), scan_release.clone())
+        .await;
+
+    let permissions = std::fs::metadata(&source).unwrap().permissions();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let restore = PermissionRestore {
+        path: source.clone(),
+        permissions: permissions.clone(),
+    };
+    let folder_app = app.clone();
+    let unavailable = tokio::spawn(async move {
+        folder_app
+            .oneshot(
+                Request::get("/api/v1/folders?path=")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(5), outage_entered.notified())
+        .await
+        .expect("folder route did not reach the root-outage snapshot barrier");
+    std::fs::set_permissions(&source, permissions).unwrap();
+
+    let select_app = app.clone();
+    let mut concurrent_selection = tokio::spawn(async move {
+        select_app
+            .oneshot(
+                Request::post("/api/v1/selections")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"path": ""}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(5), scan_entered.notified())
+        .await
+        .expect("stable selection did not reach the scan-admission barrier");
+    scan_release.notify_one();
+    let mut early_response = None;
+    let selection_completed_before_outage =
+        match tokio::time::timeout(Duration::from_millis(250), &mut concurrent_selection).await {
+            Ok(response) => {
+                early_response = Some(response.unwrap());
+                true
+            }
+            Err(_) => false,
+        };
+
+    outage_release.notify_one();
+    let unavailable = unavailable.await.unwrap();
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let concurrent_selection = match early_response {
+        Some(response) => response,
+        None => concurrent_selection.await.unwrap(),
+    };
+    assert_eq!(concurrent_selection.status(), StatusCode::CREATED);
+
+    let catalog = photo_catalog::Catalog::open(&config.data_dir().join("catalog.sqlite")).unwrap();
+    let offline = catalog
+        .folder_group_recovery_state(selection.library_id(), selection.group_id())
+        .unwrap();
+    let pre_outage_token_reconciled = offline.reconciled;
+    assert_eq!(offline.requested, 2);
+    drop(catalog);
+    assert!(
+        !selection_completed_before_outage,
+        "the stable selection completed before the pending root outage persisted"
+    );
+    assert_eq!(
+        pre_outage_token_reconciled, 0,
+        "the pre-outage recovery token reconciled across the root outage"
+    );
+
+    let recovered_root = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/folders?path=")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered_root.status(), StatusCode::OK);
+    let reselected = app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/selections")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"path": ""}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reselected.status(), StatusCode::CREATED);
+    assert_eq!(body(reselected).await["id"], selection_id);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let catalog =
+                photo_catalog::Catalog::open(&config.data_dir().join("catalog.sqlite")).unwrap();
+            let recovery = catalog
+                .folder_group_recovery_state(selection.library_id(), selection.group_id())
+                .unwrap();
+            if recovery.requested == 2 && recovery.reconciled == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("post-outage stable selection did not reconcile");
+
+    let connection = rusqlite::Connection::open(config.data_dir().join("catalog.sqlite")).unwrap();
+    let completed_pre_outage: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM scan_generations
+             WHERE folder_group_id = ?1 AND recovery_token = 1 AND completed_at IS NOT NULL",
+            [selection.group_id().as_uuid().as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let completed_post_outage: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM scan_generations
+             WHERE folder_group_id = ?1 AND recovery_token = 2 AND completed_at IS NOT NULL",
+            [selection.group_id().as_uuid().as_bytes()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(completed_pre_outage, 0);
+    assert_eq!(completed_post_outage, 1);
+    drop(restore);
+}
+
 #[tokio::test]
 async fn derivative_route_rejects_oversized_decoded_id_and_query_before_lookup() {
     let (_temp, app) = make_app();

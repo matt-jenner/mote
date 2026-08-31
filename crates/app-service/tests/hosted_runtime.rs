@@ -597,6 +597,227 @@ async fn owner_drain_allows_exactly_one_successor_for_the_exact_recovery_token()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn root_outage_serializes_concurrent_runtime_creation_before_worker_claim() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    write_jpeg(&source.join("photo.jpg"));
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+
+    let initial = GalleryEngine::open(config.clone(), source.clone()).unwrap();
+    let summary = initial.select_relative(Path::new("")).await.unwrap();
+    let selection = initial.resolve_selection(&summary.id).unwrap();
+    let mut initial_events = initial.subscribe(
+        &selection,
+        "initial-race-setup".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    initial.ensure_running(&selection).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                initial_events.recv().await.unwrap().update,
+                WallUpdate::MetadataSettled { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("initial scan did not settle");
+    drop(initial_events);
+    drop(initial);
+
+    let mut catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    catalog.mark_root_offline(selection.library_id()).unwrap();
+    catalog
+        .set_library_availability(
+            selection.library_id(),
+            photo_domain::Availability::Available,
+        )
+        .unwrap();
+    let pending = catalog
+        .folder_group_recovery_state(selection.library_id(), selection.group_id())
+        .unwrap();
+    assert_eq!(pending.requested, 1);
+    assert_eq!(pending.reconciled, 0);
+    drop(catalog);
+
+    let reader = GatedConcurrencyReader::new();
+    let engine =
+        GalleryEngine::open_with_reader(config.clone(), source.clone(), Arc::new(reader.clone()))
+            .unwrap();
+    let selection = engine.resolve_selection(selection.id()).unwrap();
+    let outage_entered = Arc::new(tokio::sync::Notify::new());
+    let outage_release = Arc::new(tokio::sync::Notify::new());
+    engine
+        .install_hosted_root_outage_snapshot_test_gate(
+            outage_entered.clone(),
+            outage_release.clone(),
+        )
+        .await;
+    let scan_entered = Arc::new(tokio::sync::Notify::new());
+    let scan_release = Arc::new(tokio::sync::Notify::new());
+    engine
+        .install_hosted_scan_admission_test_gate(scan_entered.clone(), scan_release.clone())
+        .await;
+
+    let outage_engine = engine.clone();
+    let library_id = selection.library_id();
+    let outage = tokio::spawn(async move {
+        outage_engine
+            .mark_hosted_library_root_unavailable(library_id)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), outage_entered.notified())
+        .await
+        .expect("root outage did not reach the post-snapshot barrier");
+
+    let mut events = engine.subscribe(
+        &selection,
+        "concurrent-runtime".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    let ensure_engine = engine.clone();
+    let ensure_selection = selection.clone();
+    let ensure = tokio::spawn(async move { ensure_engine.ensure_running(&ensure_selection).await });
+    tokio::time::timeout(Duration::from_secs(5), scan_entered.notified())
+        .await
+        .expect("concurrent runtime did not reach the scan-admission barrier");
+
+    let reader_entered = reader.entered.notified();
+    tokio::pin!(reader_entered);
+    reader_entered.as_mut().enable();
+    scan_release.notify_one();
+    let worker_started_before_outage =
+        tokio::time::timeout(Duration::from_millis(250), &mut reader_entered)
+            .await
+            .is_ok();
+
+    outage_release.notify_one();
+    assert!(outage.await.unwrap().unwrap());
+    ensure.await.unwrap().unwrap();
+    let source_unavailable_seen = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().update,
+                WallUpdate::SourceUnavailable { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .is_ok();
+    let offline_head = engine.current_event_id_for_test(&selection);
+    let mut post_offline = engine.subscribe(
+        &selection,
+        "post-offline-audit".to_owned(),
+        GalleryScope::CurrentFolder,
+        Some(offline_head),
+    );
+    reader.release();
+    wait_for_gated_reader_to_quiesce(&reader).await;
+
+    let mut forbidden_post_offline = Vec::new();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(50), post_offline.recv()).await
+    {
+        if matches!(
+            event.update,
+            WallUpdate::CatalogBatch { .. }
+                | WallUpdate::Progress { .. }
+                | WallUpdate::MetadataSettled { .. }
+        ) {
+            forbidden_post_offline.push(event.id);
+        }
+    }
+    let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    let offline = catalog
+        .folder_group_recovery_state(selection.library_id(), selection.group_id())
+        .unwrap();
+    assert_eq!(offline.requested, 2);
+    let pre_outage_token_reconciled = offline.reconciled;
+    drop(catalog);
+
+    let mut catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    catalog
+        .set_library_availability(
+            selection.library_id(),
+            photo_domain::Availability::Available,
+        )
+        .unwrap();
+    drop(catalog);
+    let recovery_head = engine.current_event_id_for_test(&selection);
+    let mut recovery_events = engine.subscribe(
+        &selection,
+        "post-outage-recovery".to_owned(),
+        GalleryScope::CurrentFolder,
+        Some(recovery_head),
+    );
+    let mut retries = Vec::new();
+    for _ in 0..8 {
+        let retry_engine = engine.clone();
+        let retry_selection = selection.clone();
+        retries.push(tokio::spawn(async move {
+            retry_engine.ensure_running(&retry_selection).await
+        }));
+    }
+    for retry in retries {
+        retry.await.unwrap().unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                recovery_events.recv().await.unwrap().update,
+                WallUpdate::MetadataSettled { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("post-outage recovery successor did not settle");
+
+    let catalog = photo_catalog::Catalog::open(&config.catalog_path()).unwrap();
+    let recovered = catalog
+        .folder_group_recovery_state(selection.library_id(), selection.group_id())
+        .unwrap();
+    let assets = catalog.assets(selection.library_id()).unwrap();
+    assert!(
+        !worker_started_before_outage,
+        "a pre-outage worker claimed while the outage transition was pending"
+    );
+    assert!(
+        source_unavailable_seen,
+        "the stale admission did not publish sourceUnavailable"
+    );
+    assert_eq!(
+        pre_outage_token_reconciled, 0,
+        "the pre-outage recovery token reconciled after durable root loss"
+    );
+    assert!(
+        forbidden_post_offline.is_empty(),
+        "old-generation events published after durable root loss: {forbidden_post_offline:?}"
+    );
+    assert_eq!(recovered.requested, 2);
+    assert_eq!(recovered.reconciled, 2);
+    assert_eq!(reader.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(reader.max_active.load(Ordering::SeqCst), 1);
+    assert!(
+        assets
+            .iter()
+            .all(|asset| asset.availability == photo_domain::Availability::Available)
+    );
+
+    drop(events);
+    drop(post_offline);
+    drop(recovery_events);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authoritative_root_loss_cancels_every_active_scope_for_the_hosted_library() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");
