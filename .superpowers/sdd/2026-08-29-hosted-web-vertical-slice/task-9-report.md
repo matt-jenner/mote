@@ -14,6 +14,8 @@ Terminal replay review-fix commit: `1e3fd6f` (`fix: render terminal hosted cache
 
 Worker-owner/fence review-fix commit: `00fce21` (`fix: require scan owner to certify recovery drain`), based on `32ae80f`.
 
+Outage-admission serialization review-fix commit: `8b7d641` (`fix: serialize hosted outage scan admission`), based on `4deee57`.
+
 ## Delivered deployment contract
 
 - `Containerfile` builds the hosted interface with Node 24, builds `photo-server` with Rust 1.97.1 and two Cargo jobs, and copies both products into a Debian Bookworm runtime image.
@@ -72,6 +74,17 @@ An independent closing review then found that same-generation completion was sti
 - requests cancellation before taking the hosted publication fence, then rechecks exact owner authorization at the catalog-write and completion boundaries;
 - keeps computed batch events behind the same ordering fence and rechecks authorization before publication, so no old-generation catalog update, progress, catalog batch, or settlement can appear after durable offline persistence;
 - routes authoritative hosted root-list failure through `GalleryEngine`, cancelling every active runtime for the matching library before the fenced root-offline transaction. Nested group failures remain isolated.
+
+The last review found one remaining boundary around that repair: authoritative root loss captured the runtime list before taking the publication fence, while a newly registered stable runtime could create its recovery generation and claim a worker outside the fence. The new runtime was absent from the cancellation snapshot and could reconcile or publish across the pending outage. The closing serialization fix now:
+
+- takes the publication fence before capturing and cancelling the matching runtime set and keeps it through the durable root-offline transaction;
+- drops the synchronous runtime-registry guard before any await;
+- takes the same fence before a hosted runtime claims worker ownership or creates its exact recovery generation;
+- re-reads the hosted library's catalog availability while fenced and terminalizes an admission that lost the race to `RootOffline`, publishing `sourceUnavailable` once after releasing the fence;
+- rechecks cancellation after the fence and before `Indexer::start`, while the existing sender handoff and batch/completion fences cover later races;
+- leaves explicit desktop recovery scans unchanged, so a desktop rescan can still restore a cataloged offline source.
+
+This gives the race one linear order. A claim that wins is already registered and included in the outage cancellation set. An outage that wins persists `RootOffline` before the later claim can proceed, so that stale admission creates no generation and owns no worker.
 
 The browser regressions reproduce both relevant orders. The first covers a restored current-folder page, scope broadening, source-unavailable event, authoritative broad page containing the uncached offline child, and a stale available catalog replay. The closing regression adds synchronous scope reconnect/replay, a resync replacement request, a provisional authoritative page, and the same-selection React reset. Terminal scan knowledge now survives `sourceUnavailable`, resync, and same-selection scope reset while items, cursor, and page exhaustion still reset for the authoritative refetch. A different selection always clears that knowledge.
 
@@ -148,6 +161,18 @@ exact recovery successor
   RED: successor started before owner-certified drain (2, expected 1)
 ```
 
+The final admission review added two barriers around a pending authoritative outage and a concurrent stable runtime:
+
+```text
+photo-app-service post-snapshot runtime creation
+  RED: a pre-outage worker claimed while the outage transition was pending
+
+photo-server GET /api/v1/folders?path= with concurrent stable selection
+  RED: the stable selection completed before the pending root outage persisted
+```
+
+After the ordering fix, a third focused RED showed that the refused late admission reached terminal `SourceUnavailable` state without emitting the corresponding runtime event. The final branch now emits that path-free event once after releasing the fence.
+
 ## Focused GREEN evidence
 
 ```text
@@ -186,6 +211,8 @@ photo-server derivative/folder/health focused suites
 
 The final owner repair passed all four former REDs individually, the direct owner-terminal unit contract, and a two-selection test proving authoritative root loss cancels every active scope for the hosted library. The post-claim injected startup failure still emitted exactly one warning, released ownership, and admitted one clean same-token retry. Affected complete crate gates passed: app-service 223 tests, server 86 tests, and indexer 39 tests.
 
+The final outage-admission barriers prove that recovery token 1 neither creates post-offline scan events nor reconciles across the outage, while eight concurrent recovery calls create exactly one completed token-2 successor. The real folder route asserts the same token transition in SQLite. Complete affected gates on the final source passed 224 app-service tests and 87 server tests. The gate also preserved the two existing desktop RootOffline recovery cases.
+
 ## Pre-commit gates
 
 All commands ran serially. Cargo used offline mode and at most two jobs.
@@ -216,13 +243,13 @@ npm run test:browser
   PASS: 4 files, 168 tests
 
 podman build -t localhost/photo-viewer:dev -f Containerfile .
-  PASS: 6ff0a6746c71091f7a766531c470f479c014cbd6ea225d35f87c0b635e8d7d9a
+  PASS: 522422b76250881188aa2c4b694fdf3a7034abe77c70fca64090c93d06d112fc
 
 git diff --check
   PASS
 ```
 
-The typed-owner repair was followed by the complete offline workspace all-target/all-feature test gate and exact workspace Clippy from the final source. Desktop check, Biome, typecheck, all 160 unit tests, and all 168 browser tests passed. The first sandboxed browser attempt could not bind its loopback test server; the identical approved local-listener run passed. The browser suite emitted only the branch's existing non-fatal `ViewerStage` `act(...)` warning.
+The outage-admission serialization repair was followed by the complete offline workspace all-target/all-feature test gate and exact workspace Clippy from the final source. Desktop check, Biome, typecheck, all 160 unit tests, and all 168 browser tests passed. The approved local-listener browser run emitted only the branch's existing non-fatal `ViewerStage` `act(...)` warning.
 
 ## Final lifecycle run
 
@@ -233,7 +260,7 @@ The accepted run was:
   PASS
 ```
 
-The explicit image build rebuilt the updated Rust product once with two Cargo jobs. The final smoke build reused every image layer. The resulting accepted image was `6ff0a6746c71091f7a766531c470f479c014cbd6ea225d35f87c0b635e8d7d9a`.
+The explicit image build rebuilt the updated Rust product once with two Cargo jobs. The final smoke build reused every image layer. The resulting accepted image was `522422b76250881188aa2c4b694fdf3a7034abe77c70fca64090c93d06d112fc`.
 
 Observed phase results:
 
@@ -259,6 +286,6 @@ The run reported unchanged source metadata and hashes after every required check
 - The only removed test artifacts were the exact RED screenshot and Vitest attachment, followed by their empty generated directories.
 - No source fixture was modified. No unrelated container, volume, or image was removed by the Task 9 implementation.
 - The nested desktop lockfile's generated dependency-list churn was removed before commit.
-- Host disk had 14 GiB free after the final owner/fence build, smoke, and cleanup.
+- Host disk had 12 GiB free after the final outage-admission build, smoke, and cleanup.
 - The image and lifecycle were exercised through Podman on macOS. This report does not claim a Windows container runtime or Windows source-loss execution.
 - No merge or push occurred.
