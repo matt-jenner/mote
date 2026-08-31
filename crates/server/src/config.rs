@@ -4,12 +4,14 @@ use std::path::{Path, PathBuf};
 
 use photo_core::{LocalStateError, LocalStatePaths};
 
+use crate::static_host::{StaticWebRoot, StaticWebRootValidation};
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     local: LocalStatePaths,
     bind: SocketAddr,
     source_root: PathBuf,
-    web_root: PathBuf,
+    web_root: StaticWebRoot,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -44,19 +46,18 @@ impl ServerConfig {
         if !source_root.is_dir() {
             return Err(ConfigError::SourceRootNotDirectory);
         }
-        let web_root = web_root
-            .canonicalize()
+        let web_root = StaticWebRootValidation::capture(web_root)
             .map_err(|_| ConfigError::WebRootUnavailable)?;
-        if !web_root.is_dir() {
-            return Err(ConfigError::WebRootUnavailable);
-        }
-        if web_root.starts_with(&source_root) || source_root.starts_with(&web_root) {
+        if web_root.path().starts_with(&source_root) || source_root.starts_with(web_root.path()) {
             return Err(ConfigError::WebRootOverlapsSourceRoot);
         }
         let local = LocalStatePaths::new(data_dir, cache_dir);
         local
-            .validate_source_roots(&[source_root.clone(), web_root.clone()])
+            .validate_source_roots(&[source_root.clone(), web_root.path().to_owned()])
             .map_err(ConfigError::from_local_state)?;
+        let web_root = web_root
+            .pin()
+            .map_err(|_| ConfigError::WebRootUnavailable)?;
         Ok(Self {
             local,
             bind: bind.unwrap_or("127.0.0.1:8080").parse()?,
@@ -119,7 +120,11 @@ impl ServerConfig {
     }
 
     pub fn web_root(&self) -> &Path {
-        &self.web_root
+        self.web_root.path()
+    }
+
+    pub fn static_web_root(&self) -> StaticWebRoot {
+        self.web_root.clone()
     }
 }
 

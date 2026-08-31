@@ -3,7 +3,8 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use photo_catalog::Catalog;
 use photo_server::{
-    AppState, ConfigError, ContainedFolderRoot, FolderError, ServerConfig, build_router,
+    AppState, ConfigError, ContainedFolderRoot, FolderError, ServerConfig, StaticWebRoot,
+    build_router,
 };
 use tower::ServiceExt;
 
@@ -212,7 +213,7 @@ async fn folder_api_returns_bootstrap_and_rejects_oversized_or_repeated_paths() 
         source,
     )
     .unwrap();
-    let app = build_router(state, web_root(&temp));
+    let app = build_router(state, StaticWebRoot::open(web_root(&temp)).unwrap());
 
     let response = app
         .clone()
@@ -301,7 +302,7 @@ async fn invalid_folder_queries_are_rejected_before_filesystem_access() {
     )
     .unwrap();
     std::fs::remove_dir(&source).unwrap();
-    let app = build_router(state, web_root(&temp));
+    let app = build_router(state, StaticWebRoot::open(web_root(&temp)).unwrap());
 
     let oversized = format!("/api/v1/folders?path={}", "x".repeat(4097));
     let response = app
@@ -349,7 +350,7 @@ async fn mounted_root_missing_file_and_unreadable_fail_as_source_unavailable() {
     )
     .unwrap();
     std::fs::remove_dir(&source).unwrap();
-    let app = build_router(state, web_root(&temp));
+    let app = build_router(state, StaticWebRoot::open(web_root(&temp)).unwrap());
     let response = app
         .oneshot(
             Request::builder()
@@ -374,7 +375,7 @@ async fn mounted_root_missing_file_and_unreadable_fail_as_source_unavailable() {
     .unwrap();
     std::fs::remove_dir(&source).unwrap();
     std::fs::write(&source, b"not a directory").unwrap();
-    let app = build_router(state, web_root(&temp));
+    let app = build_router(state, StaticWebRoot::open(web_root(&temp)).unwrap());
     let response = app
         .oneshot(
             Request::builder()
@@ -411,7 +412,7 @@ async fn mounted_root_missing_file_and_unreadable_fail_as_source_unavailable() {
     }
     #[cfg(not(unix))]
     return;
-    let app = build_router(state, web_root(&temp));
+    let app = build_router(state, StaticWebRoot::open(web_root(&temp)).unwrap());
     let response = app
         .oneshot(
             Request::builder()

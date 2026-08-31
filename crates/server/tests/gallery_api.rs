@@ -26,7 +26,7 @@ fn app() -> (TempDir, axum::Router) {
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    (temp, build_router(state, web))
+    (temp, build_router(state, config.static_web_root()))
 }
 
 fn app_with_photos() -> (TempDir, AppState, axum::Router) {
@@ -50,7 +50,11 @@ fn app_with_photos() -> (TempDir, AppState, axum::Router) {
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    (temp, state.clone(), build_router(state, web))
+    (
+        temp,
+        state.clone(),
+        build_router(state, config.static_web_root()),
+    )
 }
 
 fn jpeg_with_capture_date(captured_at: &str) -> Vec<u8> {
@@ -124,7 +128,7 @@ fn app_with_state() -> (TempDir, AppState, axum::Router) {
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    let app = build_router(state.clone(), web);
+    let app = build_router(state.clone(), config.static_web_root());
     (temp, state, app)
 }
 
@@ -166,7 +170,7 @@ async fn create_and_restore_selection_returns_stable_summary() {
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    let restored = build_router(state, config.web_root().to_owned())
+    let restored = build_router(state, config.static_web_root())
         .oneshot(
             Request::get(format!("/api/v1/selections/{selection_id}"))
                 .body(Body::empty())

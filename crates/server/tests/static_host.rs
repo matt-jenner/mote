@@ -6,7 +6,7 @@ use axum::http::header::{
 use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use photo_catalog::Catalog;
-use photo_server::{AppState, build_router};
+use photo_server::{AppState, ServerConfig, StaticWebRoot, build_router};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -15,6 +15,9 @@ const JAVASCRIPT: &str = "globalThis.photoViewer = true;";
 const BROTLI_JAVASCRIPT: &[u8] = b"precompressed-javascript";
 const BROTLI_INDEX: &[u8] = b"precompressed-index";
 const GZIP_JAVASCRIPT: &[u8] = b"gzip-precompressed-javascript";
+const API_SHADOW: &str = "PHYSICAL API SHADOW";
+const HEALTH_SHADOW: &str = "PHYSICAL HEALTH SHADOW";
+const APIARY_ASSET: &str = "BOUNDARY ASSET";
 const CSP: &str = "default-src 'self'; img-src 'self' data: blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
 
 fn app() -> (TempDir, axum::Router) {
@@ -29,8 +32,14 @@ fn app() -> (TempDir, axum::Router) {
     std::fs::write(assets.join("app-immutable.js"), JAVASCRIPT).unwrap();
     std::fs::write(assets.join("app-immutable.js.br"), BROTLI_JAVASCRIPT).unwrap();
     std::fs::write(assets.join("app-immutable.js.gz"), GZIP_JAVASCRIPT).unwrap();
+    std::fs::create_dir_all(web.join("api/v1")).unwrap();
+    std::fs::write(web.join("api/v1/unknown"), API_SHADOW).unwrap();
+    std::fs::create_dir(web.join("healthz")).unwrap();
+    std::fs::write(web.join("healthz/unknown"), HEALTH_SHADOW).unwrap();
+    std::fs::create_dir_all(web.join("apiary/v1")).unwrap();
+    std::fs::write(web.join("apiary/v1/unknown"), APIARY_ASSET).unwrap();
     let state = AppState::new(Catalog::open_in_memory().unwrap(), cache);
-    let app = build_router(state, web);
+    let app = build_router(state, StaticWebRoot::open(web).unwrap());
     (temp, app)
 }
 
@@ -224,6 +233,92 @@ async fn encoded_or_malformed_paths_are_rejected_before_file_or_spa_routing() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
         assert_ne!(body_bytes(response).await, INDEX, "{uri}");
     }
+}
+
+#[tokio::test]
+async fn encoded_reserved_namespaces_return_the_fixed_api_miss_before_static_lookup() {
+    let (_temp, app) = app();
+    for (uri, shadow) in [
+        ("/%61pi/v1/unknown", API_SHADOW),
+        ("/a%70i/v1/unknown", API_SHADOW),
+        ("/%68ealthz/unknown", HEALTH_SHADOW),
+        ("/h%65althz/unknown", HEALTH_SHADOW),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(hostile_request(Method::GET, uri))
+            .await
+            .unwrap();
+        let status = response.status();
+        let content_type = response.headers().get(CONTENT_TYPE).cloned();
+        let body = body_bytes(response).await;
+        assert_ne!(String::from_utf8_lossy(&body), shadow, "{uri}");
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(content_type.unwrap(), "application/json", "{uri}");
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["code"], "notFound", "{uri}");
+        assert_eq!(value["message"], "That route is unavailable.", "{uri}");
+    }
+
+    let response = app
+        .oneshot(hostile_request(Method::GET, "/%61piary/v1/unknown"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await, APIARY_ASSET);
+}
+
+#[tokio::test]
+async fn oversized_static_paths_are_rejected_with_a_fixed_path_free_response() {
+    let (_temp, app) = app();
+    let oversized_total = format!("/{}", vec!["a".repeat(240); 18].join("/"));
+    let too_many_components = format!("/{}", vec!["a"; 65].join("/"));
+    let oversized_component = format!("/{}", "%61".repeat(256));
+
+    for uri in [oversized_total, too_many_components, oversized_component] {
+        let response = app
+            .clone()
+            .oneshot(hostile_request(Method::GET, &uri))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::URI_TOO_LONG);
+        let body = body_bytes(response).await;
+        assert!(body.is_empty());
+        assert!(!String::from_utf8_lossy(&body).contains(&uri));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn configured_web_root_swap_cannot_pin_and_serve_the_source_inode() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let web = temp.path().join("web");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&web).unwrap();
+    std::fs::write(source.join("index.html"), b"SOURCE ROOT SENTINEL").unwrap();
+    std::fs::write(web.join("index.html"), b"VALIDATED WEB ROOT").unwrap();
+    let config = ServerConfig::new(
+        temp.path().join("data"),
+        temp.path().join("cache"),
+        None,
+        source.clone(),
+        web.clone(),
+    )
+    .unwrap();
+    let (state, _) = AppState::open(&config).unwrap();
+
+    std::fs::rename(&web, temp.path().join("validated-web-moved")).unwrap();
+    std::fs::rename(&source, &web).unwrap();
+
+    let response = build_router(state, config.static_web_root())
+        .oneshot(hostile_request(Method::GET, "/"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    assert_ne!(body, b"SOURCE ROOT SENTINEL".as_slice());
+    assert_eq!(body, b"VALIDATED WEB ROOT".as_slice());
 }
 
 #[tokio::test]

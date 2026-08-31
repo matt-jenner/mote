@@ -21,6 +21,7 @@ pub use folders::{ContainedFolderRoot, FolderBreadcrumb, FolderEntry, FolderErro
 pub use health::{
     ComponentHealth, ComponentStatus, HealthReport, HealthStatus, SourceHealthCounts,
 };
+pub use static_host::StaticWebRoot;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -114,7 +115,7 @@ impl AppState {
     }
 }
 
-pub fn build_router(state: AppState, web_root: PathBuf) -> Router {
+pub fn build_router(state: AppState, web_root: StaticWebRoot) -> Router {
     Router::new()
         .route("/api/v1/bootstrap", get(api::bootstrap))
         .route("/api/v1/folders", get(api::folders))

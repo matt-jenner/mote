@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(bind = %config.bind(), "photo viewer server started");
     axum::serve(
         listener,
-        build_router(state, config.web_root().to_owned())
+        build_router(state, config.static_web_root())
             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await?;

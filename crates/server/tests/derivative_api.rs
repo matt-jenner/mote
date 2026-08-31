@@ -25,7 +25,7 @@ fn make_app() -> (TempDir, axum::Router) {
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    (temp, build_router(state, web))
+    (temp, build_router(state, config.static_web_root()))
 }
 
 async fn body(response: axum::response::Response) -> serde_json::Value {

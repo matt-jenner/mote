@@ -52,7 +52,7 @@ fn test_state() -> (tempfile::TempDir, AppState, axum::Router) {
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    let app = build_router(state.clone(), config.web_root().to_owned());
+    let app = build_router(state.clone(), config.static_web_root());
     (temp, state, app)
 }
 
@@ -79,7 +79,7 @@ fn nested_state() -> (tempfile::TempDir, AppState, axum::Router) {
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    let app = build_router(state.clone(), config.web_root().to_owned());
+    let app = build_router(state.clone(), config.static_web_root());
     (temp, state, app)
 }
 
@@ -143,7 +143,7 @@ async fn events_route_declares_sse_headers() {
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    let app = build_router(state, config.web_root().to_owned());
+    let app = build_router(state, config.static_web_root());
     let created = app
         .clone()
         .oneshot(
@@ -190,7 +190,7 @@ async fn future_replay_uses_authoritative_head_and_sse_framing() {
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
     let gallery = state.gallery_for_test().unwrap();
-    let app = build_router(state, config.web_root().to_owned());
+    let app = build_router(state, config.static_web_root());
     let created = app
         .clone()
         .oneshot(
@@ -254,7 +254,7 @@ async fn interaction_for_an_unknown_client_is_an_idempotent_no_content() {
         )
         .unwrap();
         let (state, _) = AppState::open(&config).unwrap();
-        (temp, build_router(state, config.web_root().to_owned()))
+        (temp, build_router(state, config.static_web_root()))
     };
     let created = app
         .clone()
@@ -302,7 +302,7 @@ async fn event_query_and_identifier_limits_use_invalid_request() {
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    let app = build_router(state, config.web_root().to_owned());
+    let app = build_router(state, config.static_web_root());
     for query in [
         "clientId=x&scope=currentFolder&scope=currentFolder",
         &format!("clientId={}&scope=currentFolder", "x".repeat(129)),

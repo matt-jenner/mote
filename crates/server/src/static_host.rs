@@ -5,12 +5,17 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 #[cfg(unix)]
 use std::ffi::CString;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::path::Component;
 
@@ -21,6 +26,7 @@ use axum::http::header::{
     CACHE_CONTROL, CONTENT_SECURITY_POLICY, HeaderValue, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
+use axum::response::IntoResponse;
 use axum::routing::any;
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 use tower::ServiceExt;
@@ -31,20 +37,111 @@ use tower_http::set_header::SetResponseHeaderLayer;
 const CONTENT_SECURITY_POLICY_VALUE: &str = "default-src 'self'; img-src 'self' data: blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const HTML_CACHE: &str = "no-cache";
+const MAX_STATIC_RAW_PATH_BYTES: usize = 4096;
+const MAX_STATIC_DECODED_PATH_BYTES: usize = 4096;
+const MAX_STATIC_COMPONENTS: usize = 64;
+const MAX_STATIC_COMPONENT_BYTES: usize = 255;
+
+#[derive(Clone, Debug)]
+pub struct StaticWebRoot {
+    path: Arc<PathBuf>,
+    backend: SecureBackend,
+}
+
+impl StaticWebRoot {
+    pub fn open(path: PathBuf) -> io::Result<Self> {
+        StaticWebRootValidation::capture(path)?.pin()
+    }
+
+    pub fn path(&self) -> &Path {
+        self.path.as_ref()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct StaticWebRootValidation {
+    path: PathBuf,
+    #[cfg(unix)]
+    identity: DirectoryIdentity,
+}
+
+impl StaticWebRootValidation {
+    pub(crate) fn capture(path: PathBuf) -> io::Result<Self> {
+        let path = path.canonicalize()?;
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "static root is not a directory",
+            ));
+        }
+        Ok(Self {
+            path,
+            #[cfg(unix)]
+            identity: DirectoryIdentity::from_metadata(&metadata),
+        })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn pin(self) -> io::Result<StaticWebRoot> {
+        #[cfg(unix)]
+        {
+            self.pin_with_hook(|| {})
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(StaticWebRoot {
+                path: Arc::new(self.path),
+                backend: SecureBackend::unavailable(),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    fn pin_with_hook<F>(self, before_descriptor_open: F) -> io::Result<StaticWebRoot>
+    where
+        F: FnOnce(),
+    {
+        before_descriptor_open();
+        let root = SecureRoot::open_validated(&self.path, self.identity)?;
+        Ok(StaticWebRoot {
+            path: Arc::new(self.path),
+            backend: SecureBackend::from_root(root),
+        })
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl DirectoryIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct StaticHost {
     backend: SecureBackend,
 }
 
-pub(crate) fn router(web_root: PathBuf) -> Router {
-    let backend = SecureBackend::new(&web_root).unwrap_or_else(|error| {
-        tracing::error!(%error, "static web root is unavailable; static serving is disabled");
-        SecureBackend::unavailable()
-    });
+pub(crate) fn router(web_root: StaticWebRoot) -> Router {
     Router::new()
         .fallback(any(serve))
-        .with_state(StaticHost { backend })
+        .with_state(StaticHost {
+            backend: web_root.backend,
+        })
         .layer(SetResponseHeaderLayer::overriding(
             CONTENT_SECURITY_POLICY,
             HeaderValue::from_static(CONTENT_SECURITY_POLICY_VALUE),
@@ -60,15 +157,18 @@ pub(crate) fn router(web_root: PathBuf) -> Router {
 }
 
 async fn serve(State(host): State<StaticHost>, request: Request<Body>) -> Response<Body> {
+    let normalized = match NormalizedPath::parse(request.uri().path()) {
+        Ok(path) => path,
+        Err(StaticPathError::Invalid) => return empty_response(StatusCode::BAD_REQUEST),
+        Err(StaticPathError::TooLong) => return empty_response(StatusCode::URI_TOO_LONG),
+    };
+    if normalized.is_reserved_namespace() {
+        return crate::api::route_not_found().await.into_response();
+    }
     let method = request.method().clone();
     if method != Method::GET && method != Method::HEAD {
         return empty_response(StatusCode::METHOD_NOT_ALLOWED);
     }
-
-    let normalized = match NormalizedPath::parse(request.uri().path()) {
-        Ok(path) => path,
-        Err(()) => return empty_response(StatusCode::BAD_REQUEST),
-    };
     let headers = request.headers().clone();
     let mut request = request;
     *request.uri_mut() = normalized.uri();
@@ -138,10 +238,19 @@ struct NormalizedPath {
     uri: Uri,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StaticPathError {
+    Invalid,
+    TooLong,
+}
+
 impl NormalizedPath {
-    fn parse(raw: &str) -> Result<Self, ()> {
+    fn parse(raw: &str) -> Result<Self, StaticPathError> {
+        if raw.len() > MAX_STATIC_RAW_PATH_BYTES {
+            return Err(StaticPathError::TooLong);
+        }
         if !raw.starts_with('/') {
-            return Err(());
+            return Err(StaticPathError::Invalid);
         }
         let raw = raw.as_bytes();
         let mut decoded = Vec::with_capacity(raw.len());
@@ -149,41 +258,49 @@ impl NormalizedPath {
         while index < raw.len() {
             match raw[index] {
                 b'%' if index + 2 < raw.len() => {
-                    let high = hex(raw[index + 1]).ok_or(())?;
-                    let low = hex(raw[index + 2]).ok_or(())?;
+                    let high = hex(raw[index + 1]).ok_or(StaticPathError::Invalid)?;
+                    let low = hex(raw[index + 2]).ok_or(StaticPathError::Invalid)?;
                     let byte = high << 4 | low;
                     if matches!(byte, b'.' | b'/' | b'\\' | 0) {
-                        return Err(());
+                        return Err(StaticPathError::Invalid);
                     }
                     decoded.push(byte);
                     index += 3;
                 }
-                b'%' => return Err(()),
-                b'\\' | 0 => return Err(()),
+                b'%' => return Err(StaticPathError::Invalid),
+                b'\\' | 0 => return Err(StaticPathError::Invalid),
                 byte => {
                     decoded.push(byte);
                     index += 1;
                 }
             }
+            if decoded.len() > MAX_STATIC_DECODED_PATH_BYTES {
+                return Err(StaticPathError::TooLong);
+            }
         }
-        let decoded = String::from_utf8(decoded).map_err(|_| ())?;
-        let relative = decoded.strip_prefix('/').ok_or(())?;
-        let mut components = if relative.is_empty() {
-            Vec::new()
-        } else {
-            relative.split('/').map(str::to_owned).collect::<Vec<_>>()
-        };
-        if components.last().is_some_and(String::is_empty) {
-            components.pop();
-        }
-        if components
-            .iter()
-            .any(|component| component.is_empty() || component == "." || component == "..")
-        {
-            return Err(());
+        let decoded = String::from_utf8(decoded).map_err(|_| StaticPathError::Invalid)?;
+        let relative = decoded.strip_prefix('/').ok_or(StaticPathError::Invalid)?;
+        let mut components = Vec::new();
+        if !relative.is_empty() {
+            let relative = relative.strip_suffix('/').unwrap_or(relative);
+            if relative.is_empty() {
+                return Err(StaticPathError::Invalid);
+            }
+            for component in relative.split('/') {
+                if component.is_empty() || component == "." || component == ".." {
+                    return Err(StaticPathError::Invalid);
+                }
+                if component.len() > MAX_STATIC_COMPONENT_BYTES {
+                    return Err(StaticPathError::TooLong);
+                }
+                if components.len() == MAX_STATIC_COMPONENTS {
+                    return Err(StaticPathError::TooLong);
+                }
+                components.push(component.to_owned());
+            }
         }
         let canonical = canonical_uri_path(&components);
-        let uri = Uri::from_str(&canonical).map_err(|_| ())?;
+        let uri = Uri::from_str(&canonical).map_err(|_| StaticPathError::Invalid)?;
         Ok(Self { components, uri })
     }
 
@@ -199,14 +316,13 @@ impl NormalizedPath {
                 .is_some_and(|value| value == "assets")
     }
 
-    fn is_interface_route(&self) -> bool {
-        if self
-            .components
+    fn is_reserved_namespace(&self) -> bool {
+        self.components
             .first()
             .is_some_and(|value| value == "api" || value == "healthz")
-        {
-            return false;
-        }
+    }
+
+    fn is_interface_route(&self) -> bool {
         self.components
             .last()
             .is_none_or(|name| Path::new(name).extension().is_none())
@@ -252,17 +368,36 @@ fn hex_digit(value: u8) -> char {
 #[derive(Clone, Debug)]
 struct SecureBackend {
     root: Option<Arc<SecureRoot>>,
+    #[cfg(test)]
+    filesystem_calls: Arc<AtomicUsize>,
 }
 
 impl SecureBackend {
+    #[cfg(test)]
     fn new(path: &Path) -> io::Result<Self> {
-        Ok(Self {
-            root: Some(Arc::new(SecureRoot::open(path)?)),
-        })
+        Ok(Self::from_root(SecureRoot::open(path)?))
     }
 
+    fn from_root(root: SecureRoot) -> Self {
+        Self {
+            root: Some(Arc::new(root)),
+            #[cfg(test)]
+            filesystem_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[cfg(not(unix))]
     fn unavailable() -> Self {
-        Self { root: None }
+        Self {
+            root: None,
+            #[cfg(test)]
+            filesystem_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[cfg(test)]
+    fn filesystem_calls(&self) -> Arc<AtomicUsize> {
+        self.filesystem_calls.clone()
     }
 }
 
@@ -273,12 +408,24 @@ struct SecureRoot {
 }
 
 impl SecureRoot {
-    #[cfg(unix)]
+    #[cfg(all(test, unix))]
     fn open(path: &Path) -> io::Result<Self> {
+        let canonical = path.canonicalize()?;
+        let metadata = std::fs::symlink_metadata(&canonical)?;
+        if !metadata.file_type().is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "static root is not a directory",
+            ));
+        }
+        Self::open_validated(&canonical, DirectoryIdentity::from_metadata(&metadata))
+    }
+
+    #[cfg(unix)]
+    fn open_validated(path: &Path, expected: DirectoryIdentity) -> io::Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
 
-        let canonical = path.canonicalize()?;
-        if !canonical.is_absolute() {
+        if !path.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "static root is not absolute",
@@ -288,7 +435,7 @@ impl SecureRoot {
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open("/")?;
-        for component in canonical.components() {
+        for component in path.components() {
             match component {
                 Component::RootDir => {}
                 Component::Normal(name) => {
@@ -307,16 +454,17 @@ impl SecureRoot {
                 }
             }
         }
-        if !directory.metadata()?.is_dir() {
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() || DirectoryIdentity::from_metadata(&metadata) != expected {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "static root is not a directory",
+                "static root identity changed during validation",
             ));
         }
         Ok(Self { directory })
     }
 
-    #[cfg(not(unix))]
+    #[cfg(all(test, not(unix)))]
     fn open(_path: &Path) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -440,7 +588,11 @@ fn openat(
 fn safe_open_error(error: io::Error) -> io::Error {
     if matches!(
         error.raw_os_error(),
-        Some(libc::ELOOP) | Some(libc::ENOTDIR) | Some(libc::EACCES) | Some(libc::EPERM)
+        Some(libc::ELOOP)
+            | Some(libc::ENOTDIR)
+            | Some(libc::EACCES)
+            | Some(libc::EPERM)
+            | Some(libc::ENAMETOOLONG)
     ) {
         io::Error::new(io::ErrorKind::NotFound, "static file is unavailable")
     } else {
@@ -491,6 +643,8 @@ impl Backend for SecureBackend {
     type MetadataFuture = Pin<Box<dyn Future<Output = io::Result<std::fs::Metadata>> + Send>>;
 
     fn open(&self, path: PathBuf) -> Self::OpenFuture {
+        #[cfg(test)]
+        self.filesystem_calls.fetch_add(1, Ordering::Relaxed);
         let root = self.root.clone();
         Box::pin(async move {
             let root = root.ok_or_else(static_unavailable)?;
@@ -502,6 +656,8 @@ impl Backend for SecureBackend {
     }
 
     fn metadata(&self, path: PathBuf) -> Self::MetadataFuture {
+        #[cfg(test)]
+        self.filesystem_calls.fetch_add(1, Ordering::Relaxed);
         let root = self.root.clone();
         Box::pin(async move {
             let root = root.ok_or_else(static_unavailable)?;
@@ -514,6 +670,39 @@ impl Backend for SecureBackend {
 
 fn static_unavailable() -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, "static serving is unavailable")
+}
+
+#[cfg(test)]
+mod path_limit_tests {
+    use std::sync::atomic::Ordering;
+
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{Request, StatusCode};
+
+    use super::{SecureBackend, StaticHost, serve};
+
+    #[tokio::test]
+    async fn every_static_path_bound_rejects_before_a_filesystem_call() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = SecureBackend::new(temp.path()).unwrap();
+        let calls = backend.filesystem_calls();
+        let oversized_total = format!("/{}", vec!["a".repeat(240); 18].join("/"));
+        let too_many_components = format!("/{}", vec!["a"; 65].join("/"));
+        let oversized_component = format!("/{}", "%61".repeat(256));
+
+        for uri in [oversized_total, too_many_components, oversized_component] {
+            let response = serve(
+                State(StaticHost {
+                    backend: backend.clone(),
+                }),
+                Request::get(uri).body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::URI_TOO_LONG);
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+        }
+    }
 }
 
 #[cfg(all(test, not(unix)))]
@@ -532,7 +721,7 @@ mod secure_open_tests {
     use std::io::Read;
     use std::os::unix::fs::symlink;
 
-    use super::SecureRoot;
+    use super::{SecureRoot, StaticWebRootValidation, safe_open_error};
 
     fn read(mut file: std::fs::File) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -560,6 +749,37 @@ mod secure_open_tests {
             .unwrap();
 
         assert_eq!(read(file), b"SAFE ASSET");
+    }
+
+    #[test]
+    fn validated_root_identity_rejects_a_different_inode_before_pin() {
+        let temp = tempfile::tempdir().unwrap();
+        let web = temp.path().join("web");
+        let source = temp.path().join("photos");
+        std::fs::create_dir(&web).unwrap();
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(web.join("index.html"), b"SAFE WEB ROOT").unwrap();
+        std::fs::write(source.join("index.html"), b"SOURCE ROOT SENTINEL").unwrap();
+        let validation = StaticWebRootValidation::capture(web.clone()).unwrap();
+
+        let result = validation.pin_with_hook(|| {
+            std::fs::rename(&web, temp.path().join("validated-web-moved")).unwrap();
+            std::fs::rename(&source, &web).unwrap();
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(web.join("index.html")).unwrap(),
+            b"SOURCE ROOT SENTINEL"
+        );
+    }
+
+    #[test]
+    fn operating_system_name_limit_errors_are_path_free_not_found_errors() {
+        let error = safe_open_error(std::io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), "static file is unavailable");
     }
 
     #[test]

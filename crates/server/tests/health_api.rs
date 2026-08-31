@@ -5,7 +5,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use photo_catalog::{Catalog, NewAsset, NewDerivative, NewFolderGroup, NewLibrary};
 use photo_domain::{Availability, DerivativeId, FolderGroupId, MediaKind, RelativePathKey};
-use photo_server::{AppState, ConfigError, ServerConfig, build_router};
+use photo_server::{AppState, ConfigError, ServerConfig, StaticWebRoot, build_router};
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -21,7 +21,7 @@ async fn health_reports_database_cache_and_source_counts_without_paths() {
     );
     let app = build_router(
         AppState::new(catalog, cache.path().to_owned()),
-        cache.path().join("web"),
+        StaticWebRoot::open(web_root(&cache)).unwrap(),
     );
 
     let response = app
@@ -53,7 +53,10 @@ async fn unwritable_cache_is_unhealthy_and_returns_service_unavailable() {
     let not_a_directory = temp.path().join("cache-file");
     std::fs::write(&not_a_directory, b"not a directory").unwrap();
     let catalog = Catalog::open_in_memory().unwrap();
-    let app = build_router(AppState::new(catalog, not_a_directory), web_root(&temp));
+    let app = build_router(
+        AppState::new(catalog, not_a_directory),
+        StaticWebRoot::open(web_root(&temp)).unwrap(),
+    );
 
     let response = app
         .oneshot(
