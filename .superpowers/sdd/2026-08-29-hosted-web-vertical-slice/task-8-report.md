@@ -711,3 +711,123 @@ All six source hashes were identical before and after the live probe. The server
 - Source identity is guaranteed across the hosted startup admission boundary, not pinned for the process lifetime. This is deliberate: after startup, path-based offline/remount semantics remain the product contract.
 - The installed and executed target remains `aarch64-apple-darwin`. Linux mount-ID behavior retains the round-4 synthetic/parser and rootless-container evidence; unsupported Unix and non-Unix static hosting remains fail closed.
 - The macOS no-I/O key normalizer handles only the three exact built-in aliases above. Arbitrary source symlink aliases are admitted initially only through the pinned configuration descriptor and stored under its canonical configured key; the prevalidated catalog path never follows arbitrary aliases.
+
+## Fix round 6: explicit trust capabilities and source-disabled startup
+
+The sixth review found two bounded problems. Core local-state code still exposed safe raw-path methods for checks that intentionally skip source I/O, and the server-only hosted-source constructor was safe even though a caller could supply an unrelated regular file and arbitrary paths. Separately, non-Unix startup always tried to convert its source validation into a Unix-only token and returned `SourceRootChanged`, so API and health could not start even though static hosting was already designed to fail closed there.
+
+Implementation commit `6825f70` makes both trust boundaries explicit and restores the non-Unix source-disabled composition.
+
+### Behavioral RED evidence
+
+The new tests ran against `81a729a` before production changes:
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline --jobs 2 -p photo-app-service --features server-internal-prevalidated-source arbitrary_regular_file_cannot_fabricate_a_prevalidated_hosted_source -- --nocapture
+  RED: the safe constructor accepted a regular-file descriptor containing `source sentinel`; `GalleryEngine::open_prevalidated_hosted` returned success and cataloged it, so the rejection assertion failed.
+
+CARGO_BUILD_JOBS=2 cargo test --offline --jobs 2 -p photo-server --test source_disabled --no-run
+  RED: E0599 for both missing seams, `AppState::open_source_disabled_for_test` and `StaticWebRoot::unavailable_for_test`.
+```
+
+The first result is a behavioral trust-bypass reproduction. The second is compile evidence that the source-disabled composition did not exist; it is not presented as a Windows runtime failure.
+
+### Sealed trust entry points
+
+- `PrevalidatedSourceKeys` has private fields and exists only behind the internal feature. Its doc-hidden constructor is `unsafe`, rejects relative inputs with a fixed error, and stores normalized keys. `LocalStatePaths::{validate,prepare}_prevalidated_source_keys` now accept only this capability, not raw `PathBuf` slices.
+- `PrevalidatedHostedSource::from_server_validated_directory` is doc-hidden and `unsafe`. It requires an owned validation descriptor, rejects a non-directory descriptor, and rejects non-absolute or non-normalized operational and canonical keys with fixed path-free errors.
+- The constructor's Safety contract states the part runtime checks cannot prove: the descriptor, operational path, and canonical key must identify the same directory and must have been validated together without a pathname reopen interval. `SourceStartupLease` is the production constructor call site and has an audited safety comment tying that obligation to the retained and identity-matched descriptor.
+- The server and hosted gallery create source-key capabilities only in small documented unsafe blocks. The configured key comes from the pinned startup validation. Other keys come from the catalog's typed canonical-root field and are used only for no-source-I/O lexical overlap checks.
+
+Safe callers cannot fabricate either capability or invoke either unsafe constructor. Rust cannot stop a caller that explicitly enables the internal feature and writes an incorrect unsafe block, so this report does not claim absolute impossibility. Runtime directory and key checks still reject the demonstrated regular-file and malformed-key misuse.
+
+### Non-Unix source-disabled composition
+
+- Unix keeps the one-shot pinned-source startup path. Release Unix builds do not contain a way to select the source-disabled helper.
+- On non-Unix, `AppState::open` now uses a separate composer. It reads persisted catalog roots, performs the ordinary path-based local-state overlap validation and preparation, opens the catalog, reconciles the cache, and returns `AppState::new`. The resulting state has no folder root or gallery engine.
+- API and health stay available in that state. Bootstrap reports `folderBrowser: false` and `sourceAvailable: false`. Folder, selection, wall, event, and derivative handlers retain their existing fixed, path-free `sourceUnavailable` responses. The unsupported static backend returns an empty 404 and never opens the web pathname.
+- A debug-only seam runs the exact composer on the installed macOS target. Its test also creates and verifies removal of a partial cache file, so the evidence covers preparation and reconciliation rather than state construction alone. A `cfg(not(unix))` test calls the production branch when such a target is available.
+
+Desktop continues to use the ordinary path-based `GalleryEngine` constructors. Hosted Unix source startup still drops its one-shot descriptor before returning and later uses the configured operational path, so offline and remount behavior is unchanged.
+
+### Focused GREEN evidence
+
+```text
+CARGO_BUILD_JOBS=2 cargo test --offline --jobs 2 -p photo-app-service --features server-internal-prevalidated-source prevalidated_hosted_source_tests -- --nocapture
+  PASS: 2 tests. Regular-file descriptors and non-normalized absolute keys return fixed `InvalidInput` errors.
+
+CARGO_BUILD_JOBS=2 cargo test --offline --jobs 2 -p photo-core --features server-internal-prevalidated-source --test local_state -- --nocapture
+  PASS: 6 tests, including relative capability rejection and no-I/O checks for missing source keys.
+
+CARGO_BUILD_JOBS=2 cargo test --offline --jobs 2 -p photo-server --test source_disabled -- --nocapture
+  PASS: 1 test. Local-state directories were prepared, one partial cache file was reconciled, health returned 200, API source routes returned fixed path-free 503 envelopes, and static returned an empty 404.
+
+CARGO_BUILD_JOBS=2 cargo test --offline --jobs 2 -p photo-server --test health_api --test static_host --test source_disabled
+  PASS: health 22, static host 12, source-disabled composition 1.
+
+CARGO_BUILD_JOBS=2 cargo clippy --offline --jobs 2 -p photo-core -p photo-app-service -p photo-server --all-targets --all-features -- -D warnings
+  PASS.
+```
+
+One source-disabled test fixture first used the invalid query value `direction=newest`; the API correctly rejected it with 400 before the missing-gallery guard. Changing the fixture to the contract value `newestFirst` made the intended 503 assertion reach the source-disabled path. One Clippy finding was a mechanical needless borrow in the new capability loop.
+
+### Final round-6 gates
+
+All final gates ran on the source committed as `6825f70`:
+
+```text
+cargo fmt --all -- --check
+  PASS
+
+npm run check
+  PASS: Biome checked 75 files, no fixes required
+
+npm run typecheck
+  PASS
+
+npm test
+  PASS: 18 files, 154 tests
+
+npm run test:browser
+  PASS on the approved loopback rerun: 4 files, 165 tests
+
+npm run web:build
+  PASS: Vite 8.2.2 transformed 1,891 modules; generated script and stylesheet URLs are root-relative `/assets/...`, and application API/EventSource URLs remain `/api/v1/...`
+
+CARGO_BUILD_JOBS=2 cargo test --offline --workspace --all-targets --all-features --jobs 2
+  PASS: every workspace target, including app-service 104 unit tests, hosted selections 26, progressive wall 57, source safety, server library 16, health 22, static host 12, source-disabled 1, and core local-state 6
+
+CARGO_BUILD_JOBS=2 cargo clippy --offline --workspace --all-targets --all-features --jobs 2 -- -D warnings
+  PASS
+
+CARGO_BUILD_JOBS=2 cargo clippy --offline --jobs 2 -p photo-app-service --all-targets --no-default-features -- -D warnings
+  PASS: the ordinary desktop/non-hosted feature shape remains warning-free
+
+CARGO_BUILD_JOBS=2 cargo check --offline --manifest-path apps/desktop/src-tauri/Cargo.toml --jobs 2
+  PASS
+
+CARGO_BUILD_JOBS=2 cargo build --offline --release -p photo-server --jobs 2
+  PASS without warnings
+
+git diff --check
+  PASS
+```
+
+The first workspace-test attempt reached linking and stopped with `errno=28`, no space left on device; no test assertion failed. The worktree target directory was 26 GiB, including 8.4 GiB of regenerable incremental cache. Removing only `target/debug/incremental`, rather than running `cargo clean`, restored enough space. The exact workspace command then passed, and it passed again after the final release-only `cfg` cleanup. The sandboxed browser attempt was blocked before collection by IPv6 loopback bind `EPERM`; the approved rerun passed with the branch's existing non-fatal `ViewerStage` `act(...)` warning. The desktop check regenerated its known `image` and `libc` dependency-list lines; removing only those generated lines restored the nested lockfile checksum `60ddf95256a7c20613c9f9f700db5793ab4bc04ce11cfa9375d9076612594a4c`.
+
+### Round-6 live release-process evidence
+
+One foreground optimized process used the built hosted interface, the six-photo demo source, and fresh explicit temporary data and cache directories:
+
+- `/gallery/live-demo` returned 200 HTML with `no-cache`, a quoted ETag, no redirect, the exact CSP, `nosniff`, and referrer headers. Host `hostile.example` and forwarded host `forwarded.example` were absent from the body. The script and stylesheet references were root-relative.
+- `/healthz` returned healthy path-free JSON with one available source. Encoded `/%61pi/v1/unknown` returned the fixed JSON 404 envelope.
+- Root selection creation returned 201 and the settled wall contained all six photos. A bounded future replay returned 200 `text/event-stream`, `no-cache`, `x-accel-buffering: no`, and the framed path-free `resyncRequired` event with authoritative `id: 0`.
+- A visible wall-thumbnail request returned 204. Its opaque derivative key returned 200 `image/jpeg`, 190,681 bytes, `public, max-age=31536000, immutable`, `nosniff`, and an opaque quoted ETag.
+
+The six source hashes matched before and after the probe. The server was interrupted in its foreground session, `lsof` found no listener on port 18080, and the explicit temporary directory was removed. Generated `apps/interface/dist` remains ignored. No source photo changed, and no background build, `cargo clean`, merge, push, OCI work, Task 9 packaging, or deployment work occurred.
+
+### Round-6 limitations
+
+- Only `aarch64-apple-darwin` was compiled and executed. The debug seam exercises the source-disabled state on macOS, and a `cfg(not(unix))` test describes the production branch, but this round has no Windows-target compile or runtime evidence.
+- Windows and other unsupported static platforms still return the explicit unavailable backend. API and health can start there, but the interface remains disabled until a handle-relative, no-reparse static implementation exists.
+- Hosted source identity remains a startup guarantee. Runtime scans intentionally retain path-based offline and remount behavior after the startup capability is consumed.
