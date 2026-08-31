@@ -117,6 +117,10 @@ impl ContainedFolderRoot {
     pub(crate) fn is_available(&self) -> bool {
         fs::read_dir(&self.root).is_ok()
     }
+
+    pub(crate) fn canonical_root(&self) -> &Path {
+        &self.root
+    }
 }
 
 fn validate_relative(relative: &str) -> Result<(), FolderError> {

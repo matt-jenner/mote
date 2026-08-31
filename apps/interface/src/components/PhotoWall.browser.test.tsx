@@ -15,6 +15,7 @@ import type {
 	GalleryScope,
 	PhotoService,
 	SortDirection,
+	SourceAvailability,
 	WallAsset,
 	WallPage,
 	WallQueryRequest,
@@ -142,6 +143,8 @@ class ControlledWallService implements PhotoService {
 		locateFolder: false,
 	};
 	readonly queryRequests: WallQueryRequest[] = [];
+	readonly queryScopes: GalleryScope[] = [];
+	readonly watchedScopes: GalleryScope[] = [];
 	readonly derivativeRequests: DerivativeRequest[] = [];
 	derivativeRejectsRemaining = 0;
 	derivativeHoldPriority: DerivativeRequest["priority"] | null = null;
@@ -156,14 +159,16 @@ class ControlledWallService implements PhotoService {
 	constructor(
 		sourceId = "source-a",
 		private readonly restoredDirection: SortDirection = "oldestFirst",
+		sourceAvailability: SourceAvailability = "available",
+		private currentGalleryScope: GalleryScope = "includeSubfolders",
 	) {
 		this.sourceState = {
-			settings: { appearance: "system", galleryScope: "includeSubfolders" },
+			settings: { appearance: "system", galleryScope: currentGalleryScope },
 			activeSource: {
 				id: sourceId,
 				selectionId: sourceId,
 				displayName: sourceId,
-				availability: "available",
+				availability: sourceAvailability,
 			},
 		};
 	}
@@ -187,12 +192,14 @@ class ControlledWallService implements PhotoService {
 		...this.sourceState,
 		settings: { ...this.sourceState.settings, appearance },
 	});
-	updateGalleryScope = async (galleryScope: GalleryScope) => ({
-		...this.sourceState,
-		settings: { ...this.sourceState.settings, galleryScope },
-	});
+	updateGalleryScope = async (galleryScope: GalleryScope) => {
+		this.currentGalleryScope = galleryScope;
+		this.sourceState.settings.galleryScope = galleryScope;
+		return structuredClone(this.sourceState);
+	};
 	queryWall = (request: WallQueryRequest) => {
 		this.queryRequests.push(request);
+		this.queryScopes.push(this.currentGalleryScope);
 		const next = gate<WallPage>();
 		this.gates.push(next);
 		return next.promise;
@@ -216,6 +223,7 @@ class ControlledWallService implements PhotoService {
 		this.interactionCalls.push(active);
 	};
 	watchWallUpdates = (listener: (update: WallUpdate) => void) => {
+		this.watchedScopes.push(this.currentGalleryScope);
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
 	};
@@ -1319,6 +1327,179 @@ describe("progressive photo wall", () => {
 			screen.getByRole("dialog", { name: "Photo viewer" }).query(),
 		).toBeNull();
 		expect(tile.querySelector("button")).toBeNull();
+		screen.unmount();
+	});
+
+	it("opens a root-offline photo from cached wall and screen derivatives", async () => {
+		await page.viewport(1440, 1024);
+		const restoreReducedMotion = overrideReducedMotion(true);
+		const service = new ControlledWallService(
+			"source-a",
+			"newestFirst",
+			"rootOffline",
+		);
+		service.setDerivativeUrl(
+			"root-offline-wall",
+			"/demo-photos/coast.jpg?root-offline-wall=1",
+		);
+		service.setDerivativeUrl(
+			"root-offline-screen",
+			"/demo-photos/mountain.jpg?root-offline-screen=1",
+		);
+		try {
+			const screen = await renderWall(service);
+			await expect.poll(() => service.queryRequests.length).toBe(1);
+			expect(service.queryRequests[0]?.direction).toBe("newestFirst");
+			service.emit({
+				kind: "sourceUnavailable",
+				selectionId: "source-a",
+				sourceId: "source-a",
+			});
+			service.releaseQuery(
+				0,
+				pageOf(
+					[
+						asset("root-offline", "Root offline", 1, {
+							availability: "rootOffline",
+							warning: { code: "sourceUnavailable", retryable: true },
+							wallThumbnail: {
+								assetId: "root-offline",
+								kind: "wallThumbnail",
+								key: "root-offline-wall",
+							},
+							screenPreview: {
+								assetId: "root-offline",
+								kind: "screenPreview",
+								key: "root-offline-screen",
+							},
+						}),
+					],
+					"settled",
+				),
+			);
+
+			await expect
+				.element(screen.getByRole("img", { name: "Root offline" }))
+				.toBeVisible();
+			const open = screen.getByRole("button", {
+				name: "Open Root offline",
+				exact: true,
+			});
+			await expect.element(open).toBeVisible();
+			await open.click();
+			await expect
+				.element(screen.getByRole("dialog", { name: "Photo viewer" }))
+				.toBeVisible();
+			await expect
+				.element(screen.getByTestId("viewer-status"))
+				.toHaveTextContent("Root offline, photo 1 of 1");
+			screen.unmount();
+		} finally {
+			restoreReducedMotion();
+		}
+	});
+
+	it("shows an uncached offline child after broadening the restored scope", async () => {
+		await page.viewport(1280, 800);
+		const service = new ControlledWallService(
+			"source-a",
+			"oldestFirst",
+			"rootOffline",
+			"currentFolder",
+		);
+		service.setDerivativeUrl(
+			"offline-parent-wall",
+			"/demo-photos/coast.jpg?offline-parent-wall=1",
+		);
+		const parent = asset("offline-parent", "Parent", 1, {
+			availability: "rootOffline",
+			wallThumbnail: {
+				assetId: "offline-parent",
+				kind: "wallThumbnail",
+				key: "offline-parent-wall",
+			},
+		});
+		const child = asset("offline-child", "Child", 2, {
+			availability: "rootOffline",
+		});
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		expect(service.queryScopes).toEqual(["currentFolder"]);
+		service.releaseQuery(0, pageOf([parent], "settled"));
+		await expect
+			.element(screen.getByRole("img", { name: "Parent" }))
+			.toBeVisible();
+
+		await screen
+			.getByRole("button", { name: "Include subfolders", exact: true })
+			.click();
+		await expect.poll(() => service.queryRequests.length).toBe(2);
+		expect(service.queryScopes).toEqual(["currentFolder", "includeSubfolders"]);
+		expect(service.watchedScopes).toEqual([
+			"currentFolder",
+			"includeSubfolders",
+		]);
+		service.emit({
+			kind: "sourceUnavailable",
+			selectionId: "source-a",
+			sourceId: "source-a",
+		});
+		service.releaseQuery(1, pageOf([parent, child], "settled"));
+
+		await expect
+			.poll(
+				() =>
+					document.querySelector('figure[data-asset-id="offline-child"]')
+						?.textContent,
+			)
+			.toContain("File unavailable");
+		service.emit({
+			kind: "catalogBatch",
+			selectionId: "source-a",
+			generation: 1,
+			orderState: "provisional",
+			progress: { discovered: 2, shaped: 2, enriched: 0, total: 2 },
+			assets: [
+				{
+					...child,
+					availability: "available",
+					representativeRgb: 0x123456,
+				},
+			],
+		});
+		await expect
+			.poll(() =>
+				document
+					.querySelector<HTMLElement>('figure[data-asset-id="offline-child"]')
+					?.getAttribute("style"),
+			)
+			.toContain("rgb(18, 52, 86)");
+		await expect
+			.poll(
+				() =>
+					document.querySelector('figure[data-asset-id="offline-child"]')
+						?.textContent,
+			)
+			.toContain("File unavailable");
+		expect(
+			screen.getByRole("button", { name: "Open Child", exact: true }).query(),
+		).toBeNull();
+
+		await screen
+			.getByRole("button", { name: "Newest first", exact: true })
+			.click();
+		await expect.poll(() => service.queryRequests.length).toBe(3);
+		service.releaseQuery(
+			2,
+			pageOf([parent, { ...child, availability: "available" }], "settled"),
+		);
+		await expect
+			.poll(
+				() =>
+					document.querySelector('figure[data-asset-id="offline-child"]')
+						?.textContent,
+			)
+			.not.toContain("File unavailable");
 		screen.unmount();
 	});
 

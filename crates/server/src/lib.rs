@@ -61,6 +61,35 @@ pub enum StartupError {
 }
 
 impl AppState {
+    pub(crate) fn record_source_root_listing(&self, available: bool) {
+        let Some(folder_root) = self.folder_root.as_ref() else {
+            return;
+        };
+        let canonical_root = photo_domain::NativePathKey::from_path(folder_root.canonical_root());
+        let Ok(mut catalog) = self.catalog.lock() else {
+            tracing::warn!("source availability could not acquire the catalog");
+            return;
+        };
+        let Ok(libraries) = catalog.list_libraries() else {
+            tracing::warn!("source availability could not read the catalog");
+            return;
+        };
+        let Some(library) = libraries
+            .into_iter()
+            .find(|library| library.canonical_root_key == canonical_root)
+        else {
+            return;
+        };
+        let result = if available {
+            catalog.set_library_availability(library.id, photo_domain::Availability::Available)
+        } else {
+            catalog.mark_root_offline(library.id).map(|_| ())
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error, "source availability could not be persisted");
+        }
+    }
+
     pub fn new(catalog: Catalog, cache_root: PathBuf) -> Self {
         Self {
             catalog: Arc::new(Mutex::new(catalog)),

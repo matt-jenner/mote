@@ -119,7 +119,17 @@ pub(crate) async fn folders(
             "The photo source is unavailable.",
         )
     })?;
-    root.list(&path)
+    let listing = root.list(&path);
+    if path.is_empty() {
+        match &listing {
+            Ok(_) => state.record_source_root_listing(true),
+            Err(FolderError::Unavailable | FolderError::NotDirectory | FolderError::Unreadable) => {
+                state.record_source_root_listing(false);
+            }
+            Err(FolderError::InvalidPath | FolderError::OutsideRoot) => {}
+        }
+    }
+    listing
         .map(Json)
         .map_err(|error| map_folder_error(error, path.is_empty()))
 }

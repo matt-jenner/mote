@@ -286,6 +286,24 @@ function mergeAssets(
 	return { items: [...byId.values()], changed };
 }
 
+function preserveCatalogAvailability(
+	current: readonly WallAsset[],
+	incoming: readonly WallAsset[],
+): WallAsset[] {
+	const byId = new Map(current.map((asset) => [asset.id, asset]));
+	return incoming.map((asset) => {
+		const previous = byId.get(asset.id);
+		if (
+			previous === undefined ||
+			previous.availability === "available" ||
+			asset.availability !== "available"
+		) {
+			return asset;
+		}
+		return { ...asset, availability: previous.availability };
+	});
+}
+
 function mergeDerivativeReferences(
 	current: readonly WallAsset[],
 	incoming: readonly WallAsset[],
@@ -430,11 +448,15 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 		}
 		case "catalogBatch": {
 			if (!matchesSelection(state, action.selectionId)) return state;
-			const catalogAssets = state.sortPending
+			const matchingAssets = state.sortPending
 				? action.assets.filter((asset) =>
 						state.items.some((current) => current.id === asset.id),
 					)
 				: action.assets;
+			const catalogAssets = preserveCatalogAvailability(
+				state.items,
+				matchingAssets,
+			);
 			const remembered = rememberWarnings(
 				state.assetWarnings,
 				state.warningTombstones,
@@ -596,7 +618,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 		}
 		case "wallError":
 			if (!matchesSource(state, action.sourceGeneration)) return state;
-			return { ...state, activeRequest: null, error: action.error };
+			return { ...state, error: action.error };
 		case "derivativesReady": {
 			if (action.derivatives.length === 0 || state.items.length === 0)
 				return state;

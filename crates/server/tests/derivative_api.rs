@@ -72,6 +72,35 @@ async fn selection_and_asset(app: &axum::Router) -> (String, String) {
     (selection_id, asset_id)
 }
 
+async fn wall(app: &axum::Router, selection_id: &str) -> serde_json::Value {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/v1/selections/{selection_id}/wall?scope=currentFolder&direction=oldestFirst&limit=50"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body(response).await
+}
+
+#[cfg(unix)]
+struct PermissionRestore {
+    path: std::path::PathBuf,
+    permissions: std::fs::Permissions,
+}
+
+#[cfg(unix)]
+impl Drop for PermissionRestore {
+    fn drop(&mut self) {
+        std::fs::set_permissions(&self.path, self.permissions.clone()).unwrap();
+    }
+}
+
 #[tokio::test]
 async fn derivative_route_delivers_managed_jpeg_with_immutable_headers() {
     let (temp, app) = make_app();
@@ -299,6 +328,117 @@ async fn derivative_route_delivers_managed_jpeg_with_immutable_headers() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(std::fs::read(&outside).unwrap(), JPEG);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cached_derivatives_remain_stable_after_root_refresh_marks_source_offline() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (temp, app) = make_app();
+    let (selection_id, asset_id) = selection_and_asset(&app).await;
+    let generated = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/selections/{selection_id}/derivatives"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "scope": "currentFolder",
+                        "request": {
+                            "assetIds": [asset_id],
+                            "priority": "visible",
+                            "kind": "screenPreview"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(generated.status(), StatusCode::NO_CONTENT);
+
+    let online_wall = wall(&app, &selection_id).await;
+    let wall_key = online_wall["items"][0]["wallThumbnail"]["key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let screen_key = online_wall["items"][0]["screenPreview"]["key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut online_etags = Vec::new();
+    for key in [&wall_key, &screen_key] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/derivatives/{key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        online_etags.push(response.headers()["etag"].clone());
+    }
+
+    let source = temp.path().join("photos");
+    let permissions = std::fs::metadata(&source).unwrap().permissions();
+    let mut unreadable = permissions.clone();
+    unreadable.set_mode(0o000);
+    std::fs::set_permissions(&source, unreadable).unwrap();
+    let restore = PermissionRestore {
+        path: source.clone(),
+        permissions,
+    };
+
+    let refresh = app
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/folders?path=")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refresh.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let health = app
+        .clone()
+        .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    let health = body(health).await;
+    assert_eq!(health["status"], "degraded");
+    assert_eq!(health["sources"]["available"], 0);
+    assert_eq!(health["sources"]["unavailable"], 1);
+    assert!(
+        !health
+            .to_string()
+            .contains(source.to_string_lossy().as_ref())
+    );
+
+    let offline_wall = wall(&app, &selection_id).await;
+    assert_eq!(offline_wall["items"][0]["availability"], "rootOffline");
+    assert_eq!(offline_wall["items"][0]["wallThumbnail"]["key"], wall_key);
+    assert_eq!(offline_wall["items"][0]["screenPreview"]["key"], screen_key);
+    for (index, key) in [&wall_key, &screen_key].into_iter().enumerate() {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/derivatives/{key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["etag"], online_etags[index]);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..3], &[0xff, 0xd8, 0xff]);
+    }
+    drop(restore);
 }
 
 #[tokio::test]

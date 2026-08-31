@@ -77,6 +77,74 @@ async fn unwritable_cache_is_unhealthy_and_returns_service_unavailable() {
     assert_eq!(value["cache"]["status"], "unhealthy");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn root_folder_refresh_drives_path_free_source_health() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let nested = source.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let cache = temp.path().join("cache");
+    std::fs::create_dir(&cache).unwrap();
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = NewLibrary::configured("Photos", &source.canonicalize().unwrap());
+    catalog.add_library(&library).unwrap();
+    let app = build_router(
+        AppState::new_with_source_root(catalog, cache, source.clone()).unwrap(),
+        StaticWebRoot::open(web_root(&temp)).unwrap(),
+    );
+
+    let (status, healthy) = request_json(&app, "/healthz").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(healthy["status"], "healthy");
+    assert_eq!(healthy["sources"]["available"], 1);
+    assert_eq!(healthy["sources"]["unavailable"], 0);
+
+    let nested_permissions = std::fs::metadata(&nested).unwrap().permissions();
+    let mut unreadable_nested = nested_permissions.clone();
+    unreadable_nested.set_mode(0o000);
+    std::fs::set_permissions(&nested, unreadable_nested).unwrap();
+    let nested_response = request_json(&app, "/api/v1/folders?path=nested").await;
+    std::fs::set_permissions(&nested, nested_permissions).unwrap();
+    assert_eq!(nested_response.0, StatusCode::FORBIDDEN);
+    assert_eq!(request_json(&app, "/healthz").await.1["status"], "healthy");
+
+    let source_permissions = std::fs::metadata(&source).unwrap().permissions();
+    let mut unreadable_source = source_permissions.clone();
+    unreadable_source.set_mode(0o000);
+    std::fs::set_permissions(&source, unreadable_source).unwrap();
+    let root_response = request_json(&app, "/api/v1/folders?path=").await;
+    std::fs::set_permissions(&source, source_permissions).unwrap();
+    assert_eq!(root_response.0, StatusCode::SERVICE_UNAVAILABLE);
+
+    let (status, degraded) = request_json(&app, "/healthz").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(degraded["status"], "degraded");
+    assert_eq!(degraded["sources"]["available"], 0);
+    assert_eq!(degraded["sources"]["unavailable"], 1);
+    assert!(
+        !degraded
+            .to_string()
+            .contains(source.to_string_lossy().as_ref())
+    );
+
+    assert_eq!(
+        request_json(&app, "/api/v1/folders?path=").await.0,
+        StatusCode::OK
+    );
+    let (_, recovered) = request_json(&app, "/healthz").await;
+    assert_eq!(recovered["status"], "healthy");
+    assert_eq!(recovered["sources"]["available"], 1);
+    assert_eq!(recovered["sources"]["unavailable"], 0);
+    assert!(
+        !recovered
+            .to_string()
+            .contains(source.to_string_lossy().as_ref())
+    );
+}
+
 #[test]
 fn config_defaults_to_loopback_and_rejects_local_state_inside_a_source() {
     let temp = tempfile::tempdir().unwrap();
@@ -729,6 +797,18 @@ fn add_library(catalog: &mut Catalog, root: &str, availability: Availability) {
     catalog
         .set_library_availability(library.id, availability)
         .unwrap();
+}
+
+async fn request_json(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    (status, value)
 }
 
 fn web_root(temp: &tempfile::TempDir) -> PathBuf {

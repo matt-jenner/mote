@@ -296,6 +296,117 @@ describe("wallReducer", () => {
 		expect(errored.activeRequest).toBeNull();
 	});
 
+	it("accepts a cached page after a source error races its active request", () => {
+		const source = reduce(initialWallState, {
+			type: "resetSource",
+			sourceGeneration: 4,
+			selectionId: "selection-a",
+		});
+		const request = reduce(source, {
+			type: "pageRequestStarted",
+			requestId: "cached-offline",
+			requestCursor: null,
+			requestEpoch: 0,
+			sourceGeneration: 4,
+		});
+		const errored = reduce(request, {
+			type: "wallError",
+			sourceGeneration: 4,
+			error: "Source unavailable. Try again.",
+		});
+		expect(errored.activeRequest).toEqual(request.activeRequest);
+
+		const cachedAsset = {
+			...wallAsset("offline", 1),
+			availability: "rootOffline" as const,
+			wallThumbnail: thumbnail("offline"),
+			screenPreview: {
+				assetId: "offline",
+				kind: "screenPreview" as const,
+				key: "offline-screen",
+			},
+		};
+		const loaded = reduce(errored, {
+			type: "pageLoaded",
+			assets: [cachedAsset],
+			orderState: "settled",
+			nextCursor: null,
+			requestCursor: null,
+			requestEpoch: 0,
+			requestId: "cached-offline",
+			sourceGeneration: 4,
+		});
+		expect(loaded.items).toEqual([cachedAsset]);
+		expect(loaded.activeRequest).toBeNull();
+		expect(loaded.error).toBeNull();
+	});
+
+	it("does not let a replayed catalog batch upgrade offline availability", () => {
+		const offline = {
+			...wallAsset("child", 1),
+			availability: "rootOffline" as const,
+		};
+		const replayed = reduce(loadedState([offline]), {
+			type: "catalogBatch",
+			selectionId: "selection-a",
+			orderState: "settled",
+			assets: [
+				{
+					...wallAsset("child", 1),
+					representativeRgb: 0x123456,
+					wallThumbnail: thumbnail("child"),
+					screenPreview: {
+						assetId: "child",
+						kind: "screenPreview",
+						key: "child-screen",
+					},
+				},
+			],
+		});
+
+		expect(replayed.items[0]).toMatchObject({
+			availability: "rootOffline",
+			representativeRgb: 0x123456,
+			wallThumbnail: { key: "child-thumb" },
+			screenPreview: { key: "child-screen" },
+		});
+
+		const request = reduce(replayed, {
+			type: "pageRequestStarted",
+			requestId: "authoritative-recovery",
+			requestCursor: null,
+			requestEpoch: replayed.scrollEpoch,
+			sourceGeneration: replayed.sourceGeneration,
+		});
+		const recovered = reduce(request, {
+			type: "pageLoaded",
+			assets: [wallAsset("child", 1)],
+			orderState: "settled",
+			nextCursor: null,
+			requestCursor: null,
+			requestEpoch: request.scrollEpoch,
+			requestId: "authoritative-recovery",
+			sourceGeneration: request.sourceGeneration,
+		});
+		expect(recovered.items[0]?.availability).toBe("available");
+	});
+
+	it("keeps a conservative unavailable catalog replay over available state", () => {
+		const replayed = reduce(loadedState([wallAsset("child", 1)]), {
+			type: "catalogBatch",
+			selectionId: "selection-a",
+			orderState: "settled",
+			assets: [
+				{
+					...wallAsset("child", 1),
+					availability: "rootOffline",
+				},
+			],
+		});
+
+		expect(replayed.items[0]?.availability).toBe("rootOffline");
+	});
+
 	it("merges idempotently, refines in place, and resets once at settlement", () => {
 		const provisional = reduce(initialWallState, {
 			type: "catalogBatch",
