@@ -296,6 +296,129 @@ describe("wallReducer", () => {
 		expect(errored.activeRequest).toBeNull();
 	});
 
+	it("marks source unavailability terminal without inventing page exhaustion", () => {
+		const source = reduce(initialWallState, {
+			type: "resetSource",
+			sourceGeneration: 4,
+		});
+		const request = reduce(source, {
+			type: "pageRequestStarted",
+			requestId: "cached-offline",
+			requestCursor: null,
+			requestEpoch: 0,
+			sourceGeneration: 4,
+		});
+		const errored = reduce(request, {
+			type: "wallError",
+			sourceGeneration: 4,
+			error: "Source unavailable. Try again.",
+		});
+
+		expect(errored.scanComplete).toBe(true);
+		expect(errored.pagesExhausted).toBe(false);
+		expect(errored.activeRequest).toEqual(request.activeRequest);
+	});
+
+	it("preserves terminal source knowledge through resync and its provisional replacement", () => {
+		const source = reduce(initialWallState, {
+			type: "resetSource",
+			sourceGeneration: 4,
+			selectionId: "selection-a",
+		});
+		const firstRequest = reduce(source, {
+			type: "pageRequestStarted",
+			requestId: "before-resync",
+			requestCursor: null,
+			requestEpoch: 0,
+			sourceGeneration: 4,
+		});
+		const firstPage = reduce(firstRequest, {
+			type: "pageLoaded",
+			assets: [wallAsset("stale", 1)],
+			orderState: "provisional",
+			nextCursor: "stale-next",
+			requestCursor: null,
+			requestEpoch: 0,
+			requestId: "before-resync",
+			sourceGeneration: 4,
+		});
+		const unavailable = reduce(firstPage, {
+			type: "wallError",
+			sourceGeneration: 4,
+			error: "Source unavailable. Try again.",
+		});
+		const resync = reduce(unavailable, {
+			type: "resyncRequired",
+			selectionId: "selection-a",
+		});
+
+		expect(resync.scanComplete).toBe(true);
+		expect(resync.items).toEqual([]);
+		expect(resync.cursor).toBeNull();
+		expect(resync.pagesExhausted).toBe(false);
+		expect(resync.activeRequest).toBeNull();
+
+		const replacementRequest = reduce(resync, {
+			type: "pageRequestStarted",
+			requestId: "replacement",
+			requestCursor: null,
+			requestEpoch: 1,
+			sourceGeneration: 4,
+		});
+		const replacement = reduce(replacementRequest, {
+			type: "pageLoaded",
+			assets: [
+				{
+					...wallAsset("offline-child", 1),
+					availability: "rootOffline",
+					wallThumbnail: null,
+					screenPreview: null,
+				},
+			],
+			orderState: "provisional",
+			nextCursor: null,
+			requestCursor: null,
+			requestEpoch: 1,
+			requestId: "replacement",
+			sourceGeneration: 4,
+		});
+
+		expect(replacement.scanComplete).toBe(true);
+		expect(replacement.pagesExhausted).toBe(true);
+		expect(isWallLayoutComplete(replacement)).toBe(true);
+	});
+
+	it("preserves scan completion only when resetting the same non-null selection", () => {
+		const selected = reduce(initialWallState, {
+			type: "resetSource",
+			sourceGeneration: 4,
+			selectionId: "selection-a",
+		});
+		const complete = reduce(selected, {
+			type: "wallError",
+			sourceGeneration: 4,
+			error: "Source unavailable. Try again.",
+		});
+		const sameSelection = reduce(complete, {
+			type: "resetSource",
+			sourceGeneration: 5,
+			selectionId: "selection-a",
+		});
+		const differentSelection = reduce(complete, {
+			type: "resetSource",
+			sourceGeneration: 5,
+			selectionId: "selection-b",
+		});
+		const noSelection = reduce(complete, {
+			type: "resetSource",
+			sourceGeneration: 5,
+		});
+
+		expect(sameSelection.scanComplete).toBe(true);
+		expect(differentSelection.scanComplete).toBe(false);
+		expect(noSelection.scanComplete).toBe(false);
+	});
+
 	it("accepts a cached page after a source error races its active request", () => {
 		const source = reduce(initialWallState, {
 			type: "resetSource",

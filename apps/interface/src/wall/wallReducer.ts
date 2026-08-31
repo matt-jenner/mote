@@ -618,7 +618,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 		}
 		case "wallError":
 			if (!matchesSource(state, action.sourceGeneration)) return state;
-			return { ...state, error: action.error };
+			return { ...state, scanComplete: true, error: action.error };
 		case "derivativesReady": {
 			if (action.derivatives.length === 0 || state.items.length === 0)
 				return state;
@@ -705,6 +705,10 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			return {
 				...initialWallState,
 				direction: state.direction,
+				scanComplete:
+					state.selectionId !== null &&
+					action.selectionId === state.selectionId &&
+					state.scanComplete,
 				sourceGeneration: action.sourceGeneration,
 				selectionId: action.selectionId ?? null,
 			};
@@ -767,6 +771,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				...initialWallState,
 				direction: state.direction,
 				scrollEpoch: state.scrollEpoch + 1,
+				scanComplete: state.scanComplete,
 				sourceGeneration: state.sourceGeneration,
 				selectionId: action.selectionId,
 			};

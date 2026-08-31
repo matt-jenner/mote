@@ -152,6 +152,7 @@ class ControlledWallService implements PhotoService {
 	readonly interactionCalls: boolean[] = [];
 	readonly rememberedDirections: SortDirection[] = [];
 	readonly gates: Gate<WallPage>[] = [];
+	scopeUpdateReplay: (() => void) | null = null;
 	private readonly listeners = new Set<(update: WallUpdate) => void>();
 	private readonly urls = new Map<string, string>();
 	private readonly sourceState: BootstrapState;
@@ -195,6 +196,7 @@ class ControlledWallService implements PhotoService {
 	updateGalleryScope = async (galleryScope: GalleryScope) => {
 		this.currentGalleryScope = galleryScope;
 		this.sourceState.settings.galleryScope = galleryScope;
+		this.scopeUpdateReplay?.();
 		return structuredClone(this.sourceState);
 	};
 	queryWall = (request: WallQueryRequest) => {
@@ -1500,6 +1502,88 @@ describe("progressive photo wall", () => {
 						?.textContent,
 			)
 			.not.toContain("File unavailable");
+		screen.unmount();
+	});
+
+	it("keeps an uncached offline child visible when scope replay ends during a provisional page", async () => {
+		await page.viewport(1280, 800);
+		const service = new ControlledWallService(
+			"source-a",
+			"oldestFirst",
+			"rootOffline",
+			"currentFolder",
+		);
+		service.setDerivativeUrl(
+			"offline-parent-wall",
+			"/demo-photos/coast.jpg?offline-parent-wall=1",
+		);
+		const parent = asset("offline-parent", "Parent", 1, {
+			availability: "rootOffline",
+			wallThumbnail: {
+				assetId: "offline-parent",
+				kind: "wallThumbnail",
+				key: "offline-parent-wall",
+			},
+		});
+		const child = asset("offline-child", "Child", 2, {
+			availability: "rootOffline",
+		});
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(0, pageOf([parent], "settled"));
+		await expect
+			.element(screen.getByRole("img", { name: "Parent" }))
+			.toBeVisible();
+
+		service.scopeUpdateReplay = () => {
+			service.emit({
+				kind: "catalogBatch",
+				selectionId: "source-a",
+				generation: 1,
+				orderState: "provisional",
+				progress: { discovered: 2, shaped: 2, enriched: 0, total: 2 },
+				assets: [{ ...child, availability: "available" }],
+			});
+			service.emit({
+				kind: "sourceUnavailable",
+				selectionId: "source-a",
+				sourceId: "source-a",
+			});
+			service.emit({ kind: "resyncRequired", selectionId: "source-a" });
+		};
+		await screen
+			.getByRole("button", { name: "Include subfolders", exact: true })
+			.click();
+		await expect.poll(() => service.queryRequests.length).toBe(3);
+		expect(service.queryScopes).toEqual([
+			"currentFolder",
+			"includeSubfolders",
+			"includeSubfolders",
+		]);
+		service.releaseQuery(2, pageOf([parent, child], "provisional"));
+		service.emit({
+			kind: "catalogBatch",
+			selectionId: "source-a",
+			generation: 1,
+			orderState: "provisional",
+			progress: { discovered: 2, shaped: 2, enriched: 0, total: 2 },
+			assets: [{ ...child, availability: "available" }],
+		});
+
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("Preparing previews · 1 of 2");
+		const figure = () =>
+			document.querySelector<HTMLElement>(
+				'figure[data-asset-id="offline-child"]',
+			);
+		await expect.poll(() => figure()).not.toBeNull();
+		await expect
+			.poll(() => figure()?.textContent)
+			.toContain("File unavailable");
+		expect(
+			screen.getByRole("button", { name: "Open Child", exact: true }).query(),
+		).toBeNull();
 		screen.unmount();
 	});
 
