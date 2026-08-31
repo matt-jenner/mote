@@ -171,6 +171,43 @@ fn server_config_rejects_web_root_overlap_with_source_or_private_state() {
 
 #[cfg(unix)]
 #[test]
+fn missing_local_children_use_their_pinned_existing_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let web = temp.path().join("web");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&web).unwrap();
+
+    let beneath_source = ServerConfig::new(
+        source.join("missing-data"),
+        temp.path().join("cache-a"),
+        None,
+        source.clone(),
+        web.clone(),
+    );
+    assert!(matches!(beneath_source, Err(ConfigError::InsideSourceRoot)));
+
+    let beneath_web = ServerConfig::new(
+        temp.path().join("data-b"),
+        web.join("missing-cache"),
+        None,
+        source.clone(),
+        web.clone(),
+    );
+    assert!(matches!(beneath_web, Err(ConfigError::InsideSourceRoot)));
+
+    let disjoint = ServerConfig::new(
+        temp.path().join("disjoint-data"),
+        temp.path().join("disjoint-cache"),
+        None,
+        source,
+        web,
+    );
+    assert!(disjoint.is_ok());
+}
+
+#[cfg(unix)]
+#[test]
 fn config_rejects_a_symlink_alias_into_a_source_root() {
     use std::os::unix::fs::symlink;
 

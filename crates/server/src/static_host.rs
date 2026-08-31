@@ -53,6 +53,8 @@ impl StaticWebRoot {
         StaticWebRootValidation::capture(path)?.pin()
     }
 
+    /// Returns an informational path for diagnostics. Static access and
+    /// containment use the retained directory descriptor, never this path.
     pub fn path(&self) -> &Path {
         self.path.as_ref()
     }
@@ -60,36 +62,75 @@ impl StaticWebRoot {
 
 #[derive(Debug)]
 pub(crate) struct StaticWebRootValidation {
-    path: PathBuf,
     #[cfg(unix)]
-    identity: DirectoryIdentity,
+    pinned: PinnedDirectory,
+    #[cfg(not(unix))]
+    path: PathBuf,
 }
 
 impl StaticWebRootValidation {
     pub(crate) fn capture(path: PathBuf) -> io::Result<Self> {
-        let path = path.canonicalize()?;
-        let metadata = std::fs::symlink_metadata(&path)?;
-        if !metadata.file_type().is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "static root is not a directory",
-            ));
+        Self::capture_with_identity_hook_inner(path, || {})
+    }
+
+    #[cfg(test)]
+    fn capture_with_identity_hook<F>(path: PathBuf, after_identity_capture: F) -> io::Result<Self>
+    where
+        F: FnOnce(),
+    {
+        Self::capture_with_identity_hook_inner(path, after_identity_capture)
+    }
+
+    fn capture_with_identity_hook_inner<F>(
+        path: PathBuf,
+        after_identity_capture: F,
+    ) -> io::Result<Self>
+    where
+        F: FnOnce(),
+    {
+        #[cfg(unix)]
+        {
+            let pinned = PinnedDirectory::open_with_identity_hook(&path, after_identity_capture)?;
+            Ok(Self { pinned })
         }
-        Ok(Self {
-            path,
-            #[cfg(unix)]
-            identity: DirectoryIdentity::from_metadata(&metadata),
-        })
+        #[cfg(not(unix))]
+        {
+            let path = path.canonicalize()?;
+            after_identity_capture();
+            if !path.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "static root is not a directory",
+                ));
+            }
+            Ok(Self { path })
+        }
     }
 
     pub(crate) fn path(&self) -> &Path {
-        &self.path
+        #[cfg(unix)]
+        {
+            self.pinned.display_path()
+        }
+        #[cfg(not(unix))]
+        {
+            &self.path
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn pinned_directory(&self) -> &PinnedDirectory {
+        &self.pinned
     }
 
     pub(crate) fn pin(self) -> io::Result<StaticWebRoot> {
         #[cfg(unix)]
         {
-            self.pin_with_hook(|| {})
+            let path = Arc::new(self.pinned.display_path().to_owned());
+            Ok(StaticWebRoot {
+                path,
+                backend: SecureBackend::from_root(self.pinned),
+            })
         }
         #[cfg(not(unix))]
         {
@@ -98,19 +139,6 @@ impl StaticWebRootValidation {
                 backend: SecureBackend::unavailable(),
             })
         }
-    }
-
-    #[cfg(unix)]
-    fn pin_with_hook<F>(self, before_descriptor_open: F) -> io::Result<StaticWebRoot>
-    where
-        F: FnOnce(),
-    {
-        before_descriptor_open();
-        let root = SecureRoot::open_validated(&self.path, self.identity)?;
-        Ok(StaticWebRoot {
-            path: Arc::new(self.path),
-            backend: SecureBackend::from_root(root),
-        })
     }
 }
 
@@ -128,6 +156,114 @@ impl DirectoryIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
         }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct PinnedDirectory {
+    directory: std::fs::File,
+    identity: DirectoryIdentity,
+    display_path: PathBuf,
+}
+
+#[cfg(unix)]
+impl PinnedDirectory {
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        Self::open_with_identity_hook(path, || {})
+    }
+
+    fn open_with_identity_hook<F>(path: &Path, after_identity_capture: F) -> io::Result<Self>
+    where
+        F: FnOnce(),
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(path)?;
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "configured path is not a directory",
+            ));
+        }
+        let identity = DirectoryIdentity::from_metadata(&metadata);
+        after_identity_capture();
+        let display_path = informational_display_path(path, identity)?;
+        Ok(Self {
+            directory,
+            identity,
+            display_path,
+        })
+    }
+
+    /// This path is for diagnostics and path-based defense in depth only.
+    /// Security decisions use the retained descriptor and its ancestry.
+    pub(crate) fn display_path(&self) -> &Path {
+        &self.display_path
+    }
+
+    pub(crate) fn overlaps(&self, other: &Self) -> io::Result<bool> {
+        if self.identity == other.identity {
+            return Ok(true);
+        }
+        let self_ancestry = self.ancestry()?;
+        if self_ancestry.contains(&other.identity) {
+            return Ok(true);
+        }
+        let other_ancestry = other.ancestry()?;
+        Ok(other_ancestry.contains(&self.identity))
+    }
+
+    pub(crate) fn identity_is_in_ancestry_of(&self, other: &Self) -> io::Result<bool> {
+        if self.identity == other.identity {
+            return Ok(true);
+        }
+        Ok(other.ancestry()?.contains(&self.identity))
+    }
+
+    fn ancestry(&self) -> io::Result<Vec<DirectoryIdentity>> {
+        let mut identities = vec![self.identity];
+        let mut current = self.directory.try_clone()?;
+        loop {
+            let parent = openat(
+                current.as_raw_fd(),
+                std::ffi::OsStr::new(".."),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )?;
+            let parent_identity = DirectoryIdentity::from_metadata(&parent.metadata()?);
+            let current_identity = *identities.last().expect("ancestry contains the root");
+            if parent_identity == current_identity {
+                return Ok(identities);
+            }
+            if identities.contains(&parent_identity) || identities.len() >= 4096 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory ancestry did not reach a stable root",
+                ));
+            }
+            identities.push(parent_identity);
+            current = parent;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn informational_display_path(path: &Path, expected: DirectoryIdentity) -> io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let Ok(canonical) = path.canonicalize() else {
+        return Ok(absolute);
+    };
+    let Ok(metadata) = std::fs::metadata(&canonical) else {
+        return Ok(absolute);
+    };
+    if DirectoryIdentity::from_metadata(&metadata) == expected {
+        Ok(canonical)
+    } else {
+        Ok(absolute)
     }
 }
 
@@ -367,6 +503,9 @@ fn hex_digit(value: u8) -> char {
 
 #[derive(Clone, Debug)]
 struct SecureBackend {
+    #[cfg(unix)]
+    root: Option<Arc<PinnedDirectory>>,
+    #[cfg(not(unix))]
     root: Option<Arc<SecureRoot>>,
     #[cfg(test)]
     filesystem_calls: Arc<AtomicUsize>,
@@ -375,9 +514,26 @@ struct SecureBackend {
 impl SecureBackend {
     #[cfg(test)]
     fn new(path: &Path) -> io::Result<Self> {
-        Ok(Self::from_root(SecureRoot::open(path)?))
+        #[cfg(unix)]
+        {
+            Ok(Self::from_root(PinnedDirectory::open(path)?))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self::from_root(SecureRoot::open(path)?))
+        }
     }
 
+    #[cfg(unix)]
+    fn from_root(root: PinnedDirectory) -> Self {
+        Self {
+            root: Some(Arc::new(root)),
+            #[cfg(test)]
+            filesystem_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[cfg(all(test, not(unix)))]
     fn from_root(root: SecureRoot) -> Self {
         Self {
             root: Some(Arc::new(root)),
@@ -401,70 +557,13 @@ impl SecureBackend {
     }
 }
 
+#[cfg(not(unix))]
 #[derive(Debug)]
-struct SecureRoot {
-    #[cfg(unix)]
-    directory: std::fs::File,
-}
+struct SecureRoot {}
 
+#[cfg(not(unix))]
 impl SecureRoot {
-    #[cfg(all(test, unix))]
-    fn open(path: &Path) -> io::Result<Self> {
-        let canonical = path.canonicalize()?;
-        let metadata = std::fs::symlink_metadata(&canonical)?;
-        if !metadata.file_type().is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "static root is not a directory",
-            ));
-        }
-        Self::open_validated(&canonical, DirectoryIdentity::from_metadata(&metadata))
-    }
-
-    #[cfg(unix)]
-    fn open_validated(path: &Path, expected: DirectoryIdentity) -> io::Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        if !path.is_absolute() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "static root is not absolute",
-            ));
-        }
-        let mut directory = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open("/")?;
-        for component in path.components() {
-            match component {
-                Component::RootDir => {}
-                Component::Normal(name) => {
-                    directory = openat(
-                        directory.as_raw_fd(),
-                        name,
-                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )?;
-                }
-                Component::CurDir => {}
-                Component::ParentDir | Component::Prefix(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "invalid static root",
-                    ));
-                }
-            }
-        }
-        let metadata = directory.metadata()?;
-        if !metadata.is_dir() || DirectoryIdentity::from_metadata(&metadata) != expected {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "static root identity changed during validation",
-            ));
-        }
-        Ok(Self { directory })
-    }
-
-    #[cfg(all(test, not(unix)))]
+    #[cfg(test)]
     fn open(_path: &Path) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -472,12 +571,6 @@ impl SecureRoot {
         ))
     }
 
-    #[cfg(unix)]
-    fn open_file(&self, path: &Path) -> io::Result<std::fs::File> {
-        self.open_file_with_hook(path, || {})
-    }
-
-    #[cfg(not(unix))]
     fn open_file(&self, _path: &Path) -> io::Result<std::fs::File> {
         Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -485,29 +578,32 @@ impl SecureRoot {
         ))
     }
 
-    #[cfg(unix)]
-    fn open_file_with_hook<F>(&self, path: &Path, before_final_open: F) -> io::Result<std::fs::File>
-    where
-        F: FnOnce(),
-    {
-        self.open_with_hook(path, true, before_final_open)
-    }
-
-    #[cfg(unix)]
-    fn metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
-        self.open_with_hook(path, false, || {})?.metadata()
-    }
-
-    #[cfg(not(unix))]
     fn metadata(&self, _path: &Path) -> io::Result<std::fs::Metadata> {
         Err(io::Error::new(
             io::ErrorKind::NotFound,
             "static serving is unavailable",
         ))
     }
+}
 
-    #[cfg(unix)]
-    fn open_with_hook<F>(
+#[cfg(unix)]
+impl PinnedDirectory {
+    fn open_file(&self, path: &Path) -> io::Result<std::fs::File> {
+        self.open_file_with_hook(path, || {})
+    }
+
+    fn open_file_with_hook<F>(&self, path: &Path, before_final_open: F) -> io::Result<std::fs::File>
+    where
+        F: FnOnce(),
+    {
+        self.open_relative_with_hook(path, true, before_final_open)
+    }
+
+    fn metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
+        self.open_relative_with_hook(path, false, || {})?.metadata()
+    }
+
+    fn open_relative_with_hook<F>(
         &self,
         path: &Path,
         require_regular_file: bool,
@@ -719,9 +815,10 @@ mod unsupported_platform_tests {
 #[cfg(all(test, unix))]
 mod secure_open_tests {
     use std::io::Read;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::symlink;
 
-    use super::{SecureRoot, StaticWebRootValidation, safe_open_error};
+    use super::{PinnedDirectory, StaticWebRootValidation, openat, safe_open_error};
 
     fn read(mut file: std::fs::File) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -739,7 +836,7 @@ mod secure_open_tests {
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(assets.join("app.js"), b"SAFE ASSET").unwrap();
         std::fs::write(outside.join("app.js"), b"SOURCE SENTINEL").unwrap();
-        let root = SecureRoot::open(&web).unwrap();
+        let root = PinnedDirectory::open(&web).unwrap();
 
         let file = root
             .open_file_with_hook(std::path::Path::new("assets/app.js"), || {
@@ -752,26 +849,95 @@ mod secure_open_tests {
     }
 
     #[test]
-    fn validated_root_identity_rejects_a_different_inode_before_pin() {
+    fn identity_capture_cannot_be_redirected_after_path_resolution() {
         let temp = tempfile::tempdir().unwrap();
         let web = temp.path().join("web");
         let source = temp.path().join("photos");
+        let moved_web = temp.path().join("validated-web-moved");
         std::fs::create_dir(&web).unwrap();
         std::fs::create_dir(&source).unwrap();
         std::fs::write(web.join("index.html"), b"SAFE WEB ROOT").unwrap();
         std::fs::write(source.join("index.html"), b"SOURCE ROOT SENTINEL").unwrap();
-        let validation = StaticWebRootValidation::capture(web.clone()).unwrap();
 
-        let result = validation.pin_with_hook(|| {
-            std::fs::rename(&web, temp.path().join("validated-web-moved")).unwrap();
+        let validation = StaticWebRootValidation::capture_with_identity_hook(web.clone(), || {
+            std::fs::rename(&web, &moved_web).unwrap();
             std::fs::rename(&source, &web).unwrap();
-        });
+        })
+        .unwrap();
+        let pinned = validation.pin().unwrap();
+        let file = pinned
+            .backend
+            .root
+            .as_ref()
+            .unwrap()
+            .open_file(std::path::Path::new("index.html"))
+            .unwrap();
 
-        assert!(result.is_err());
+        assert_eq!(read(file), b"SAFE WEB ROOT");
         assert_eq!(
             std::fs::read(web.join("index.html")).unwrap(),
             b"SOURCE ROOT SENTINEL"
         );
+    }
+
+    #[test]
+    fn pinned_root_survives_same_inode_rename_during_display_path_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let web = temp.path().join("web");
+        let moved_web = temp.path().join("renamed-web");
+        std::fs::create_dir(&web).unwrap();
+        std::fs::write(web.join("index.html"), b"SAFE WEB ROOT").unwrap();
+
+        let validation = StaticWebRootValidation::capture_with_identity_hook(web.clone(), || {
+            std::fs::rename(&web, &moved_web).unwrap();
+        })
+        .unwrap();
+        let pinned = validation.pin().unwrap();
+        let file = pinned
+            .backend
+            .root
+            .as_ref()
+            .unwrap()
+            .open_file(std::path::Path::new("index.html"))
+            .unwrap();
+
+        assert_eq!(read(file), b"SAFE WEB ROOT");
+    }
+
+    #[test]
+    fn held_descriptor_alias_has_the_same_security_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir(&source).unwrap();
+        let pinned = PinnedDirectory::open(&source).unwrap();
+        let aliased_directory = openat(
+            pinned.directory.as_raw_fd(),
+            std::ffi::OsStr::new("."),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+        .unwrap();
+        let aliased = PinnedDirectory {
+            directory: aliased_directory,
+            identity: pinned.identity,
+            display_path: temp.path().join("different-informational-label"),
+        };
+
+        assert_ne!(aliased.display_path(), pinned.display_path());
+        assert_eq!(aliased.identity, pinned.identity);
+        assert!(aliased.overlaps(&pinned).unwrap());
+    }
+
+    #[test]
+    fn descriptor_ancestry_detects_parent_child_overlap_in_both_directions() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_path = temp.path().join("photos");
+        let child_path = parent_path.join("nested");
+        std::fs::create_dir_all(&child_path).unwrap();
+        let parent = PinnedDirectory::open(&parent_path).unwrap();
+        let child = PinnedDirectory::open(&child_path).unwrap();
+
+        assert!(parent.overlaps(&child).unwrap());
+        assert!(child.overlaps(&parent).unwrap());
     }
 
     #[test]
@@ -791,7 +957,7 @@ mod secure_open_tests {
         std::fs::create_dir_all(&assets).unwrap();
         std::fs::write(assets.join("app.js"), b"SAFE ASSET").unwrap();
         std::fs::write(&outside, b"SOURCE SENTINEL").unwrap();
-        let root = SecureRoot::open(&web).unwrap();
+        let root = PinnedDirectory::open(&web).unwrap();
 
         let result = root.open_file_with_hook(std::path::Path::new("assets/app.js"), || {
             std::fs::remove_file(assets.join("app.js")).unwrap();
@@ -807,7 +973,7 @@ mod secure_open_tests {
         let web = temp.path().join("web");
         let assets = web.join("assets");
         std::fs::create_dir_all(&assets).unwrap();
-        let root = SecureRoot::open(&web).unwrap();
+        let root = PinnedDirectory::open(&web).unwrap();
 
         for extension in ["br", "gz"] {
             let sidecar = assets.join(format!("app.js.{extension}"));
