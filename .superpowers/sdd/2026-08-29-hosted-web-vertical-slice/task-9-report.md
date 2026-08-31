@@ -12,6 +12,8 @@ Persisted recovery review-fix commit: `d9fe53c` (`fix: persist hosted recovery r
 
 Terminal replay review-fix commit: `1e3fd6f` (`fix: render terminal hosted cache after replay`), based on `d9fe53c`.
 
+Worker-owner/fence review-fix commit: `00fce21` (`fix: require scan owner to certify recovery drain`), based on `32ae80f`.
+
 ## Delivered deployment contract
 
 - `Containerfile` builds the hosted interface with Node 24, builds `photo-server` with Rust 1.97.1 and two Cargo jobs, and copies both products into a Debian Bookworm runtime image.
@@ -60,6 +62,16 @@ Task-scoped review then found a separate recovery defect: marking a root offline
 - leave desktop runtimes, nested-folder isolation, cached offline reads, and path-free health behavior unchanged.
 
 The smoke cleanup trap was also corrected to use EXIT for idempotent cleanup and explicit conventional HUP/INT/TERM exit codes. It still restores source permissions first and removes only exact smoke-owned names.
+
+An independent closing review then found that same-generation completion was still not proof of worker ownership. A root-list or `ensure_running` source check could mark a runtime terminal and call the same completion helper while a detached blocking metadata read still owned the scan. That falsely certified quiescence, admitted an overlapping recovery, and allowed the old generation to persist or publish after the durable offline transition. The final owner/fence repair now:
+
+- claims a typed, move-only worker owner before `Indexer::start`, closing the start/sender-install gap;
+- requires that exact owner for sender installation, final drain completion, and quiescence certification; an unowned completion cannot clear active ownership;
+- lets `SourceUnavailable` or `Cancelled` be published by a non-owner without reconciling the recovery token, while the eventual owner drain clears ownership and preserves that terminal state;
+- requires owner-certified quiescence before recovery admission from either terminal state;
+- requests cancellation before taking the hosted publication fence, then rechecks exact owner authorization at the catalog-write and completion boundaries;
+- keeps computed batch events behind the same ordering fence and rechecks authorization before publication, so no old-generation catalog update, progress, catalog batch, or settlement can appear after durable offline persistence;
+- routes authoritative hosted root-list failure through `GalleryEngine`, cancelling every active runtime for the matching library before the fenced root-offline transaction. Nested group failures remain isolated.
 
 The browser regressions reproduce both relevant orders. The first covers a restored current-folder page, scope broadening, source-unavailable event, authoritative broad page containing the uncached offline child, and a stale available catalog replay. The closing regression adds synchronous scope reconnect/replay, a resync replacement request, a provisional authoritative page, and the same-selection React reset. Terminal scan knowledge now survives `sourceUnavailable`, resync, and same-selection scope reset while items, cursor, and page exhaustion still reset for the authoritative refetch. A different selection always clears that knowledge.
 
@@ -120,6 +132,22 @@ terminal offline browser replay
 
 The browser RED traced the final failure past the HTTP and reducer boundaries: the replacement page was accepted (`Preparing previews · 1 of 2`), the child remained `rootOffline`, and the stale replay could not upgrade it. The figure was omitted because provisional layout withholds the final row until scan completion, while source-unavailable completion was lost across resync and the same-selection scope reset.
 
+The independent owner review added four real blocking-worker barriers. Every test releases its gate and waits for `active == 0` before asserting, so a RED cannot leak detached work:
+
+```text
+source loss during an owned worker
+  RED: metadata starts before owner drain = 2, expected 1
+
+cancellation followed by concurrent source loss
+  RED: metadata starts before owner drain = 2, expected 1
+
+durable offline publication fence
+  RED: old generation published Progress event id 2 after root-offline persistence
+
+exact recovery successor
+  RED: successor started before owner-certified drain (2, expected 1)
+```
+
 ## Focused GREEN evidence
 
 ```text
@@ -156,6 +184,8 @@ photo-server derivative/folder/health focused suites
   PASS
 ```
 
+The final owner repair passed all four former REDs individually, the direct owner-terminal unit contract, and a two-selection test proving authoritative root loss cancels every active scope for the hosted library. The post-claim injected startup failure still emitted exactly one warning, released ownership, and admitted one clean same-token retry. Affected complete crate gates passed: app-service 223 tests, server 86 tests, and indexer 39 tests.
+
 ## Pre-commit gates
 
 All commands ran serially. Cargo used offline mode and at most two jobs.
@@ -186,13 +216,13 @@ npm run test:browser
   PASS: 4 files, 168 tests
 
 podman build -t localhost/photo-viewer:dev -f Containerfile .
-  PASS
+  PASS: 6ff0a6746c71091f7a766531c470f479c014cbd6ea225d35f87c0b635e8d7d9a
 
 git diff --check
   PASS
 ```
 
-The persisted recovery review fix was followed by the complete Rust gate from the updated source. After the final frontend-only reducer change, Biome, typecheck, all 160 unit tests, and all 168 browser tests passed again. The first sandboxed browser attempt could not bind its loopback test server; the identical approved local-listener run passed. The browser suite emitted only the branch's existing non-fatal `ViewerStage` `act(...)` warning.
+The typed-owner repair was followed by the complete offline workspace all-target/all-feature test gate and exact workspace Clippy from the final source. Desktop check, Biome, typecheck, all 160 unit tests, and all 168 browser tests passed. The first sandboxed browser attempt could not bind its loopback test server; the identical approved local-listener run passed. The browser suite emitted only the branch's existing non-fatal `ViewerStage` `act(...)` warning.
 
 ## Final lifecycle run
 
@@ -203,7 +233,7 @@ The accepted run was:
   PASS
 ```
 
-The explicit image build rebuilt the updated Rust product once with two Cargo jobs. The final smoke build reused every Rust layer and rebuilt only the hosted web stage after the reducer fix. The resulting accepted image was `a52039cd7f66937eae5ab2fe341e6c6f10f3136ee1a693bd60716af840cbbd95`.
+The explicit image build rebuilt the updated Rust product once with two Cargo jobs. The final smoke build reused every image layer. The resulting accepted image was `6ff0a6746c71091f7a766531c470f479c014cbd6ea225d35f87c0b635e8d7d9a`.
 
 Observed phase results:
 
@@ -229,6 +259,6 @@ The run reported unchanged source metadata and hashes after every required check
 - The only removed test artifacts were the exact RED screenshot and Vitest attachment, followed by their empty generated directories.
 - No source fixture was modified. No unrelated container, volume, or image was removed by the Task 9 implementation.
 - The nested desktop lockfile's generated dependency-list churn was removed before commit.
-- Host disk had 13 GiB free at the closing review-fix commit checkpoint.
+- Host disk had 14 GiB free after the final owner/fence build, smoke, and cleanup.
 - The image and lifecycle were exercised through Podman on macOS. This report does not claim a Windows container runtime or Windows source-loss execution.
 - No merge or push occurred.
