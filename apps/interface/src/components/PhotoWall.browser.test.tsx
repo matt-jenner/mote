@@ -490,6 +490,37 @@ describe("progressive photo wall", () => {
 		expect(service.rememberedDirections).toEqual(["oldestFirst"]);
 	});
 
+	it("reorders provisional photos immediately when the direction changes", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(0, pageOf(settledFixtures, "provisional"));
+		const wall = screen.getByRole("region", { name: "Photos" });
+		await expect
+			.poll(
+				() =>
+					wall.element().querySelector<HTMLElement>("[data-asset-id]")?.dataset
+						.assetId,
+			)
+			.toBe("coast");
+		const visibleImagesBefore = wall.element().querySelectorAll("img").length;
+
+		await screen.getByRole("button", { name: "Newest first" }).click();
+
+		await expect.poll(() => service.queryRequests.length).toBe(2);
+		await expect
+			.poll(
+				() =>
+					wall.element().querySelector<HTMLElement>("[data-asset-id]")?.dataset
+						.assetId,
+			)
+			.toBe("interior");
+		expect(
+			wall.element().querySelectorAll("img").length,
+		).toBeGreaterThanOrEqual(visibleImagesBefore);
+		screen.unmount();
+	});
+
 	it("shows a complete row before metadata settles and preserves exact geometry through JPEG refinement", async () => {
 		await page.viewport(1440, 1024);
 		const service = new ControlledWallService();
@@ -1097,7 +1128,7 @@ describe("progressive photo wall", () => {
 		expect(service.derivativeRequests).toHaveLength(1);
 	});
 
-	it("keeps loaded images painted while a replacement sort query is pending", async () => {
+	it("reorders loaded images while a replacement sort query is pending", async () => {
 		const service = new ControlledWallService();
 		const screen = await renderWall(service);
 		await expect.poll(() => service.queryRequests.length).toBe(1);
@@ -1109,7 +1140,7 @@ describe("progressive photo wall", () => {
 		await expect.poll(() => service.queryRequests.length).toBe(2);
 		expect(wall.element().getAttribute("aria-busy")).toBe("true");
 		expect(screen.getByRole("img").first().element().getAttribute("alt")).toBe(
-			"Coast",
+			"Interior",
 		);
 		service.releaseQuery(1, pageOf([...settledFixtures].reverse(), "settled"));
 		await expect
@@ -1701,9 +1732,7 @@ describe("progressive photo wall", () => {
 			loadCaptureActive = false;
 			image.element().dispatchEvent(new Event("load"));
 
-			await expect
-				.poll(() => getComputedStyle(imageElement).opacity)
-				.toBe("1");
+			await expect.poll(() => getComputedStyle(imageElement).opacity).toBe("1");
 			expect(image.element()).toBe(imageElement);
 			expect(
 				screen

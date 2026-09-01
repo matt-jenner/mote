@@ -60,10 +60,73 @@ function activeState() {
 }
 
 describe("wallReducer", () => {
+	it("sorts known provisional dates immediately and keeps undated photos last", () => {
+		const old = {
+			...wallAsset("old", 1, 1),
+			capturedAtUtc: "2024-01-01T12:00:00Z",
+			wallThumbnail: thumbnail("old"),
+		};
+		const undated = {
+			...wallAsset("undated", 1, 2),
+			wallThumbnail: thumbnail("undated"),
+		};
+		const recent = {
+			...wallAsset("recent", 1, 3),
+			capturedAtUtc: "2024-03-01T12:00:00Z",
+			wallThumbnail: thumbnail("recent"),
+		};
+		const state = {
+			...activeState(),
+			items: [old, undated, recent],
+		};
+
+		const sorted = reduce(state, {
+			type: "setDirection",
+			direction: "newestFirst",
+		});
+
+		expect(sorted.items.map((item) => item.id)).toEqual([
+			"recent",
+			"old",
+			"undated",
+		]);
+		expect(sorted.items.map((item) => item.wallThumbnail?.key)).toEqual([
+			"recent-thumb",
+			"old-thumb",
+			"undated-thumb",
+		]);
+	});
+
+	it("repositions a provisional photo when its capture date arrives", () => {
+		const old = {
+			...wallAsset("old", 1, 1),
+			capturedAtUtc: "2024-01-01T12:00:00Z",
+		};
+		const pending = wallAsset("pending", 1, 2);
+		const state = {
+			...activeState(),
+			direction: "newestFirst" as const,
+			items: [old, pending],
+		};
+
+		const updated = reduce(state, {
+			type: "catalogBatch",
+			assets: [
+				{
+					...pending,
+					capturedAtUtc: "2024-03-01T12:00:00Z",
+				},
+			],
+			orderState: "provisional",
+		});
+
+		expect(updated.items.map((item) => item.id)).toEqual(["pending", "old"]);
+	});
+
 	it("keeps populated thumbnails visible until the replacement sort page arrives", () => {
 		const populated = loadedState([
-			{ ...wallAsset("old", 1), wallThumbnail: thumbnail("old") },
-			{ ...wallAsset("new", 1), wallThumbnail: thumbnail("new") },
+			{ ...wallAsset("old", 1, 1), wallThumbnail: thumbnail("old") },
+			{ ...wallAsset("new", 1, 2), wallThumbnail: thumbnail("new") },
 		]);
 		const pending = wallReducer(populated, {
 			type: "setDirection",
@@ -589,7 +652,7 @@ describe("wallReducer", () => {
 			direction: "newestFirst",
 		});
 		expect(reversed).toMatchObject({
-			items: settled.items,
+			items: refined.items,
 			cursor: null,
 			scrollEpoch: settled.scrollEpoch + 1,
 			direction: "newestFirst",

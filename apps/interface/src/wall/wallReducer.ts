@@ -404,12 +404,25 @@ function rememberSourceWarnings(
 	return { warnings, tombstones, changed };
 }
 
-function sortProvisional(assets: readonly WallAsset[]): WallAsset[] {
-	return [...assets].sort(
-		(left, right) =>
+function sortProgressive(
+	assets: readonly WallAsset[],
+	direction: SortDirection,
+): WallAsset[] {
+	return [...assets].sort((left, right) => {
+		if (left.capturedAtUtc !== null && right.capturedAtUtc !== null) {
+			const dateOrder = left.capturedAtUtc.localeCompare(right.capturedAtUtc);
+			if (dateOrder !== 0)
+				return direction === "newestFirst" ? -dateOrder : dateOrder;
+		} else if (left.capturedAtUtc !== null) {
+			return -1;
+		} else if (right.capturedAtUtc !== null) {
+			return 1;
+		}
+		return (
 			left.provisionalOrder - right.provisionalOrder ||
-			left.id.localeCompare(right.id),
-	);
+			left.id.localeCompare(right.id)
+		);
+	});
 }
 
 function reuseSequence(previous: WallAsset[], next: WallAsset[]): WallAsset[] {
@@ -486,7 +499,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				return state;
 			const sorted =
 				state.settledGeneration === null && action.orderState === "provisional"
-					? sortProvisional(merged.items)
+					? sortProgressive(merged.items, state.direction)
 					: merged.items;
 			const items = reuseSequence(state.items, sorted);
 			return {
@@ -565,7 +578,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				state.settledGeneration === null &&
 				!settledPage &&
 				action.orderState === "provisional"
-					? sortProvisional(merged.items)
+					? sortProgressive(merged.items, state.direction)
 					: merged.items;
 			const items = reuseSequence(state.items, sorted);
 			const pagesExhausted = action.nextCursor === null;
@@ -781,7 +794,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			if (state.direction === action.direction) return state;
 			return {
 				...state,
-				items: state.items,
+				items: sortProgressive(state.items, action.direction),
 				cursor: null,
 				pagesExhausted: false,
 				activeRequest: null,
