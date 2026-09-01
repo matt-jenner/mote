@@ -14,6 +14,7 @@ use tokio::sync::{Mutex, Notify, oneshot};
 
 pub(crate) const RECENT_CAPACITY: usize = 250;
 pub(crate) const SCHEDULER_OWNER_PREFIX: &str = "photo-derivative-coordinator:";
+const HOSTED_HTTP_PENDING_JOB_LIMIT: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum WorkLane {
@@ -173,6 +174,12 @@ struct CollectionState {
     cursor: Option<WallCursorKey>,
 }
 
+struct EnqueueGuards<'a> {
+    collection_token: Option<&'a CollectionProgressToken>,
+    authorizer: Option<ScopeAuthorizer>,
+    pending_job_limit: Option<usize>,
+}
+
 /// An exact snapshot of the collection driver's position.
 ///
 /// Collection work may spend a long time resolving a page.  The driver must
@@ -222,6 +229,26 @@ struct WorkWaiter {
     scope: GalleryScope,
     authorized: bool,
     sender: oneshot::Sender<DerivativeResult>,
+}
+
+fn compact_closed_scope_waiters(waiters: &mut Vec<WorkWaiter>) {
+    let mut retained_current = false;
+    let mut retained_recursive = false;
+    waiters.retain(|waiter| {
+        if !waiter.sender.is_closed() {
+            return true;
+        }
+        let retained = match waiter.scope {
+            GalleryScope::CurrentFolder => &mut retained_current,
+            GalleryScope::IncludeSubfolders => &mut retained_recursive,
+        };
+        if *retained {
+            false
+        } else {
+            *retained = true;
+            true
+        }
+    });
 }
 
 #[derive(Clone)]
@@ -597,10 +624,14 @@ impl DerivativeCoordinator {
             lane,
             prerequisite_key,
             observed_completion_generation,
-            None,
-            None,
+            EnqueueGuards {
+                collection_token: None,
+                authorizer: None,
+                pending_job_limit: None,
+            },
         )
         .await
+        .0
     }
 
     pub(crate) async fn enqueue_hosted_with_prerequisite_observed(
@@ -616,10 +647,54 @@ impl DerivativeCoordinator {
             lane,
             prerequisite_key,
             observed_completion_generation,
-            None,
-            Some(authorizer),
+            EnqueueGuards {
+                collection_token: None,
+                authorizer: Some(authorizer),
+                pending_job_limit: None,
+            },
         )
         .await
+        .0
+    }
+
+    /// Admits hosted work without retaining a completion observer for every
+    /// HTTP caller. A closed waiter is kept as the scope authorization marker,
+    /// while repeated admissions for the same work and scope are compacted.
+    pub(crate) async fn admit_hosted_with_prerequisite_observed(
+        &self,
+        key: WorkKey,
+        lane: WorkLane,
+        prerequisite_key: Option<String>,
+        observed_completion_generation: Option<u64>,
+        authorizer: ScopeAuthorizer,
+    ) -> bool {
+        let compact_key = key.clone();
+        let (receiver, admitted) = self
+            .enqueue_with_prerequisite_observed_guarded(
+                key,
+                lane,
+                prerequisite_key,
+                observed_completion_generation,
+                EnqueueGuards {
+                    collection_token: None,
+                    authorizer: Some(authorizer),
+                    pending_job_limit: Some(HOSTED_HTTP_PENDING_JOB_LIMIT),
+                },
+            )
+            .await;
+        drop(receiver);
+
+        if !admitted {
+            return false;
+        }
+
+        let mut state = self.state.lock().await;
+        let Some(work) = state.jobs.get_mut(&compact_key) else {
+            return true;
+        };
+        compact_closed_scope_waiters(&mut work.foreground_waiters);
+        compact_closed_scope_waiters(&mut work.background_waiters);
+        true
     }
 
     /// Enqueues collection-owned background work only when the caller still
@@ -639,10 +714,14 @@ impl DerivativeCoordinator {
             lane,
             prerequisite_key,
             observed_completion_generation,
-            Some(token),
-            None,
+            EnqueueGuards {
+                collection_token: Some(token),
+                authorizer: None,
+                pending_job_limit: None,
+            },
         )
         .await
+        .0
     }
 
     async fn enqueue_with_prerequisite_observed_guarded(
@@ -651,17 +730,17 @@ impl DerivativeCoordinator {
         lane: WorkLane,
         prerequisite_key: Option<String>,
         observed_completion_generation: Option<u64>,
-        collection_token: Option<&CollectionProgressToken>,
-        authorizer: Option<ScopeAuthorizer>,
-    ) -> WorkResultReceiver {
+        guards: EnqueueGuards<'_>,
+    ) -> (WorkResultReceiver, bool) {
         let (sender, receiver) = oneshot::channel();
         let mut sender = Some(sender);
         let mut schedule = None;
         let mut immediate_none = false;
         let mut immediate_result = None;
+        let mut capacity_exceeded = false;
         {
             let mut state = self.state.lock().await;
-            if collection_token.is_some_and(|token| {
+            if guards.collection_token.is_some_and(|token| {
                 token.selection != key.selection || !Self::collection_token_matches(&state, token)
             }) {
                 immediate_none = true;
@@ -677,7 +756,8 @@ impl DerivativeCoordinator {
             }
 
             if !immediate_none {
-                let waiter_authorized = authorizer
+                let waiter_authorized = guards
+                    .authorizer
                     .as_ref()
                     .is_none_or(|authorizer| authorizer(&key, key.scope));
                 if !waiter_authorized {
@@ -708,9 +788,9 @@ impl DerivativeCoordinator {
                                 let admitted =
                                     work.commit_allowed_scopes.as_ref().is_none_or(|allowed| {
                                         allowed.contains(&key.scope)
-                                            || authorizer.as_ref().is_some_and(|authorizer| {
-                                                authorizer(&key, key.scope)
-                                            })
+                                            || guards.authorizer.as_ref().is_some_and(
+                                                |authorizer| authorizer(&key, key.scope),
+                                            )
                                     });
                                 immediate_result = Some(if admitted {
                                     work.commit_result
@@ -759,6 +839,12 @@ impl DerivativeCoordinator {
                     && let Some(completed) = current_completed(&state, &key)
                 {
                     immediate_result = Some(completed.result);
+                } else if guards
+                    .pending_job_limit
+                    .is_some_and(|limit| state.jobs.len() >= limit)
+                {
+                    immediate_none = true;
+                    capacity_exceeded = true;
                 } else {
                     queue_new_job(
                         &mut state,
@@ -792,7 +878,7 @@ impl DerivativeCoordinator {
                 .await;
         }
         self.notify_waiters();
-        receiver
+        (receiver, !capacity_exceeded)
     }
 
     pub(crate) async fn next_work(&self) -> Option<WorkTicket> {
@@ -2431,6 +2517,70 @@ mod tests {
 
     fn reference() -> DerivativeReference {
         reference_for(fixture_id(1), DerivativeClass::ScreenPreview, "screen-v1")
+    }
+
+    #[tokio::test]
+    async fn hosted_http_admission_caps_unique_jobs_but_keeps_duplicates_idempotent() {
+        let fixture = fixture();
+        let authorizer: super::ScopeAuthorizer = Arc::new(|_, _| true);
+        for index in 0..super::HOSTED_HTTP_PENDING_JOB_LIMIT {
+            let key = screen_key_for(
+                fixture.selection,
+                fixture_id(index as u128 + 1),
+                &format!("screen-{index}"),
+            );
+            assert!(
+                fixture
+                    .coordinator
+                    .admit_hosted_with_prerequisite_observed(
+                        key,
+                        WorkLane::ViewerPreview,
+                        None,
+                        None,
+                        authorizer.clone(),
+                    )
+                    .await
+            );
+        }
+        assert_eq!(
+            fixture.coordinator.pending_job_count().await,
+            super::HOSTED_HTTP_PENDING_JOB_LIMIT
+        );
+
+        let duplicate = screen_key_for(fixture.selection, fixture_id(1), "screen-0");
+        assert!(
+            fixture
+                .coordinator
+                .admit_hosted_with_prerequisite_observed(
+                    duplicate,
+                    WorkLane::ViewerPreview,
+                    None,
+                    None,
+                    authorizer.clone(),
+                )
+                .await
+        );
+        let overflow = screen_key_for(
+            fixture.selection,
+            fixture_id(super::HOSTED_HTTP_PENDING_JOB_LIMIT as u128 + 2),
+            "overflow",
+        );
+        assert!(
+            !fixture
+                .coordinator
+                .admit_hosted_with_prerequisite_observed(
+                    overflow,
+                    WorkLane::ViewerPreview,
+                    None,
+                    None,
+                    authorizer,
+                )
+                .await
+        );
+        assert_eq!(
+            fixture.coordinator.pending_job_count().await,
+            super::HOSTED_HTTP_PENDING_JOB_LIMIT
+        );
     }
 
     fn reference_for(asset_id: AssetId, kind: DerivativeClass, key: &str) -> DerivativeReference {

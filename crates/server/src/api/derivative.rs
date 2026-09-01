@@ -32,7 +32,7 @@ pub(crate) async fn request_derivatives(
     for asset_id in &request.request.asset_ids {
         validate_ascii_identifier(asset_id, 128)?;
     }
-    let engine = gallery(&state)?;
+    let engine = gallery(&state)?.clone();
     let selection = engine.resolve_selection(&id).map_err(map_service_error)?;
     engine
         .validate_derivative_request(&selection, request.scope, &request.request)
@@ -42,7 +42,7 @@ pub(crate) async fn request_derivatives(
         .await
         .map_err(map_service_error)?;
     engine
-        .request_derivatives(&selection, request.scope, request.request)
+        .admit_derivatives(&selection, request.scope, request.request)
         .await
         .map_err(map_service_error)?;
     Ok(StatusCode::NO_CONTENT)

@@ -704,7 +704,7 @@ POST /api/v1/selections/{id}/derivatives
 GET  /api/v1/derivatives/{id}
 ```
 
-The derivative request body contains a concrete scope plus the existing request, for example `{ "scope": "includeSubfolders", "request": { "assetIds": ["68c51f56-bbe6-4e6b-8ca0-e6e48f1a2cd1"], "priority": "visible", "kind": "wallThumbnail" } }`, and waits for the existing success or typed-failure boundary.
+The derivative request body contains a concrete scope plus the existing request, for example `{ "scope": "includeSubfolders", "request": { "assetIds": ["68c51f56-bbe6-4e6b-8ca0-e6e48f1a2cd1"], "priority": "visible", "kind": "wallThumbnail" } }`. The original implementation waited for the success or typed-failure boundary. The later connection-starvation remediation validates and admits the request before returning, coalesces work by immutable cache key across clients and scopes for the stable folder selection, compacts duplicate scope authorization markers, caps unique pending HTTP work at 1,024 jobs per selection, and reports completion or one retryable generation warning per settled failed attempt through the event stream.
 
 - [ ] **Step 4: Verify caching, deduplication, and source safety**
 

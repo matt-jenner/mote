@@ -152,8 +152,12 @@ short user-safe message. They contain no source or cache path.
 - `GET /api/v1/selections/{id}/wall` accepts scope, direction, cursor, and a
   limit of at most 250.
 - `POST /api/v1/selections/{id}/derivatives` accepts scope plus a bounded
-  derivative request and returns after the requested foreground work reaches
-  its existing success or typed-failure boundary.
+  derivative request, validates and admits it, then returns immediately. Work
+  with the same immutable cache key in that stable folder selection is
+  generated once across clients and scopes. Duplicate admissions retain only
+  one authorization marker per scope, and unique pending HTTP work is capped
+  at 1,024 jobs per selection. Completion and one retryable warning per failed
+  attempt arrive through the event stream after the attempt has settled.
 - `POST /api/v1/selections/{id}/interaction` records a client's active or idle
   wall interaction lease for scheduling.
 - `GET /api/v1/selections/{id}/events` opens a client-identified server-sent

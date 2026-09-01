@@ -23,7 +23,8 @@ use photo_domain::{FolderGroupId, GalleryScope, LibraryId, RelativePathKey};
 use photo_indexer::{DefaultMetadataReader, IndexEvent, Indexer, MetadataReader, ScanRequest};
 
 use crate::derivative_coordinator::{
-    HostedAttemptLease, HostedCancellationDecision, WorkKey, WorkLane, WorkTicket,
+    HostedAttemptLease, HostedCancellationDecision, WorkKey, WorkLane, WorkResultReceiver,
+    WorkTicket,
 };
 use crate::hosted_runtime::{
     ScanAdmission, ScanWorkerOwner, SelectionEventSubscription, SelectionRuntime,
@@ -57,6 +58,7 @@ fn canonicalize_for_identity(path: &Path) -> PathBuf {
 
 const DERIVATIVE_DECODER_VERSION: &str = "image-0.25-v1";
 const MAX_MANAGED_DERIVATIVE_BYTES: u64 = 64 * 1024 * 1024;
+const HOSTED_ASSET_DERIVATIVE_WARNING: &str = "derivative_generation_failed";
 
 fn derivative_spec_for_gallery(
     asset: &photo_catalog::AssetRecord,
@@ -325,6 +327,21 @@ impl Drop for HostedAdmission {
 enum HostedDerivativePrepared {
     Wall(photo_cache::EncodedScreenPreview),
     Screen(photo_cache::EncodedScreenPreview),
+}
+
+#[derive(Clone, Copy)]
+enum HostedDerivativeRequestMode {
+    AwaitCompletion,
+    AdmitOnly,
+}
+
+struct HostedDerivativeBatch<'a> {
+    selection: &'a GallerySelection,
+    scope: GalleryScope,
+    priority: DerivativePriority,
+    class: DerivativeClass,
+    assets: &'a [photo_catalog::AssetRecord],
+    mode: HostedDerivativeRequestMode,
 }
 
 impl ProtectedGroupGuard {
@@ -1209,6 +1226,41 @@ impl GalleryEngine {
         scope: GalleryScope,
         request: DerivativeRequest,
     ) -> Result<(), AppServiceError> {
+        self.run_derivative_request(
+            selection,
+            scope,
+            request,
+            HostedDerivativeRequestMode::AwaitCompletion,
+        )
+        .await
+    }
+
+    /// Validates, reuses, or queues hosted derivative work before returning,
+    /// without retaining one completion task per HTTP request. The coordinator
+    /// keeps a compact authorization marker per scope and publishes completion
+    /// through the selection event stream.
+    pub async fn admit_derivatives(
+        &self,
+        selection: &GallerySelection,
+        scope: GalleryScope,
+        request: DerivativeRequest,
+    ) -> Result<(), AppServiceError> {
+        self.run_derivative_request(
+            selection,
+            scope,
+            request,
+            HostedDerivativeRequestMode::AdmitOnly,
+        )
+        .await
+    }
+
+    async fn run_derivative_request(
+        &self,
+        selection: &GallerySelection,
+        scope: GalleryScope,
+        request: DerivativeRequest,
+        mode: HostedDerivativeRequestMode,
+    ) -> Result<(), AppServiceError> {
         let assets = self.validate_derivative_request(selection, scope, &request)?;
 
         let runtime = self.runtime(selection);
@@ -1224,135 +1276,26 @@ impl GalleryEngine {
             vec![DerivativeClass::WallThumbnail]
         };
         for class in classes {
-            let mut receivers = Vec::new();
-            for asset in &assets {
-                if asset.media_kind == photo_domain::MediaKind::Video {
-                    continue;
-                }
-                let spec = derivative_spec_for_gallery(asset, class);
-                let key = DerivativeKey::compute(&spec);
-                let existing = async {
-                    let _publication = self.hosted_publication_fence.lock().await;
-                    let existing = {
-                        let state = self
-                            .state
-                            .lock()
-                            .map_err(|_| AppServiceError::StatePoisoned)?;
-                        state.libraries.catalog().find_derivative(
-                            asset.id,
-                            derivative_kind_name_for_gallery(class),
-                            key.as_str(),
-                        )?
-                    };
-                    let existing_is_valid = match existing.as_ref() {
-                        Some(record) => self.derivative_record_is_valid_async(record).await,
-                        None => false,
-                    };
-                    let mut state = self
-                        .state
-                        .lock()
-                        .map_err(|_| AppServiceError::StatePoisoned)?;
-                    let result = if let Some(record) = existing.as_ref() {
-                        if existing_is_valid {
-                            let authorized =
-                                state.libraries.catalog().wall_records_for_assets_scoped(
-                                    selection.group_id,
-                                    scope,
-                                    &[asset.id],
-                                )?;
-                            if authorized.is_empty() {
-                                return Err(AppServiceError::DerivativeUnavailable);
-                            }
-                            state
-                                .libraries
-                                .catalog_mut()
-                                .link_derivative_group(record.id, selection.group_id)?;
-                            Some(record.cache_key.clone())
-                        } else {
-                            self.remove_requester_derivative_link(
-                                state.libraries.catalog_mut(),
-                                record,
-                                selection.group_id,
-                            )?;
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    Ok::<_, AppServiceError>(result)
-                }
-                .await
-                .map_err(|_| AppServiceError::DerivativeFailed)?;
-                if let Some(key) = existing {
-                    runtime
-                        .publish(WallUpdate::DerivativesReady {
-                            selection_id: selection.id.clone(),
-                            derivatives: vec![DerivativeReference {
-                                asset_id: asset.id.as_uuid().hyphenated().to_string(),
-                                kind: class,
-                                key,
-                            }],
-                        })
-                        .await;
-                    continue;
-                }
-                let lane = match (class, request.priority) {
-                    (DerivativeClass::WallThumbnail, DerivativePriority::Visible) => {
-                        WorkLane::VisibleWall
-                    }
-                    (DerivativeClass::WallThumbnail, DerivativePriority::NearViewport) => {
-                        WorkLane::NearWall
-                    }
-                    (DerivativeClass::ScreenPreview, DerivativePriority::Visible) => {
-                        WorkLane::ViewerPreview
-                    }
-                    (DerivativeClass::ScreenPreview, DerivativePriority::NearViewport) => {
-                        WorkLane::IdlePreview
-                    }
-                };
-                let prerequisite = (class == DerivativeClass::ScreenPreview).then(|| {
-                    DerivativeKey::compute(&derivative_spec_for_gallery(
-                        asset,
-                        DerivativeClass::WallThumbnail,
-                    ))
-                    .as_str()
-                    .to_owned()
-                });
-                let work_key = WorkKey {
-                    selection: selection.token(),
-                    asset_id: asset.id,
-                    class,
-                    cache_key: key.as_str().to_owned(),
-                    availability: asset.availability,
-                    scope,
-                };
-                runtime.coordinator.invalidate_completed(&work_key).await;
-                #[cfg(debug_assertions)]
-                if let Some((entered, release)) =
-                    self.hosted_pre_enqueue_test_gate.lock().await.take()
-                {
-                    let notified = release.notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
-                    entered.notify_one();
-                    notified.await;
-                }
-                let receiver = runtime
-                    .coordinator
-                    .enqueue_hosted_with_prerequisite_observed(
-                        work_key.clone(),
-                        lane,
-                        prerequisite,
-                        None,
-                        self.hosted_scope_authorizer(),
-                    )
-                    .await;
-                receivers.push((receiver, work_key));
-            }
-            if !receivers.is_empty() {
+            let (receivers, queued, capacity_exceeded) = self
+                .queue_requested_derivative_class(
+                    &runtime,
+                    HostedDerivativeBatch {
+                        selection,
+                        scope,
+                        priority: request.priority,
+                        class,
+                        assets: &assets,
+                        mode,
+                    },
+                )
+                .await?;
+            if queued {
                 self.start_hosted_derivative_driver(runtime.clone()).await;
             }
-            for (receiver, _work_key) in receivers {
+            if capacity_exceeded {
+                return Err(AppServiceError::DerivativeUnavailable);
+            }
+            for receiver in receivers {
                 match receiver.await {
                     Ok(crate::derivative_coordinator::DerivativeResult::Ready(_)) => {}
                     Ok(crate::derivative_coordinator::DerivativeResult::Failed) => {
@@ -1365,6 +1308,163 @@ impl GalleryEngine {
             }
         }
         Ok(())
+    }
+
+    async fn queue_requested_derivative_class(
+        &self,
+        runtime: &Arc<SelectionRuntime>,
+        batch: HostedDerivativeBatch<'_>,
+    ) -> Result<(Vec<WorkResultReceiver>, bool, bool), AppServiceError> {
+        let mut receivers = Vec::new();
+        let mut queued = false;
+        let mut capacity_exceeded = false;
+        for asset in batch.assets {
+            if asset.media_kind == photo_domain::MediaKind::Video {
+                continue;
+            }
+            let spec = derivative_spec_for_gallery(asset, batch.class);
+            let key = DerivativeKey::compute(&spec);
+            let existing = async {
+                let _publication = self.hosted_publication_fence.lock().await;
+                let existing = {
+                    let state = self
+                        .state
+                        .lock()
+                        .map_err(|_| AppServiceError::StatePoisoned)?;
+                    state.libraries.catalog().find_derivative(
+                        asset.id,
+                        derivative_kind_name_for_gallery(batch.class),
+                        key.as_str(),
+                    )?
+                };
+                let existing_is_valid = match existing.as_ref() {
+                    Some(record) => self.derivative_record_is_valid_async(record).await,
+                    None => false,
+                };
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| AppServiceError::StatePoisoned)?;
+                let result = if let Some(record) = existing.as_ref() {
+                    if existing_is_valid {
+                        let authorized = state.libraries.catalog().wall_records_for_assets_scoped(
+                            batch.selection.group_id,
+                            batch.scope,
+                            &[asset.id],
+                        )?;
+                        if authorized.is_empty() {
+                            return Err(AppServiceError::DerivativeUnavailable);
+                        }
+                        state
+                            .libraries
+                            .catalog_mut()
+                            .link_derivative_group(record.id, batch.selection.group_id)?;
+                        Some(record.cache_key.clone())
+                    } else {
+                        self.remove_requester_derivative_link(
+                            state.libraries.catalog_mut(),
+                            record,
+                            batch.selection.group_id,
+                        )?;
+                        None
+                    }
+                } else {
+                    None
+                };
+                Ok::<_, AppServiceError>(result)
+            }
+            .await
+            .map_err(|_| AppServiceError::DerivativeFailed)?;
+            if let Some(key) = existing {
+                self.clear_hosted_derivative_warning(runtime, batch.selection.token(), asset.id)
+                    .await;
+                runtime
+                    .publish(WallUpdate::DerivativesReady {
+                        selection_id: batch.selection.id.clone(),
+                        derivatives: vec![DerivativeReference {
+                            asset_id: asset.id.as_uuid().hyphenated().to_string(),
+                            kind: batch.class,
+                            key,
+                        }],
+                    })
+                    .await;
+                continue;
+            }
+            let lane = match (batch.class, batch.priority) {
+                (DerivativeClass::WallThumbnail, DerivativePriority::Visible) => {
+                    WorkLane::VisibleWall
+                }
+                (DerivativeClass::WallThumbnail, DerivativePriority::NearViewport) => {
+                    WorkLane::NearWall
+                }
+                (DerivativeClass::ScreenPreview, DerivativePriority::Visible) => {
+                    WorkLane::ViewerPreview
+                }
+                (DerivativeClass::ScreenPreview, DerivativePriority::NearViewport) => {
+                    WorkLane::IdlePreview
+                }
+            };
+            let prerequisite = (batch.class == DerivativeClass::ScreenPreview).then(|| {
+                DerivativeKey::compute(&derivative_spec_for_gallery(
+                    asset,
+                    DerivativeClass::WallThumbnail,
+                ))
+                .as_str()
+                .to_owned()
+            });
+            let work_key = WorkKey {
+                selection: batch.selection.token(),
+                asset_id: asset.id,
+                class: batch.class,
+                cache_key: key.as_str().to_owned(),
+                availability: asset.availability,
+                scope: batch.scope,
+            };
+            runtime.coordinator.invalidate_completed(&work_key).await;
+            #[cfg(debug_assertions)]
+            if let Some((entered, release)) = self.hosted_pre_enqueue_test_gate.lock().await.take()
+            {
+                let notified = release.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                entered.notify_one();
+                notified.await;
+            }
+            match batch.mode {
+                HostedDerivativeRequestMode::AwaitCompletion => {
+                    receivers.push(
+                        runtime
+                            .coordinator
+                            .enqueue_hosted_with_prerequisite_observed(
+                                work_key,
+                                lane,
+                                prerequisite,
+                                None,
+                                self.hosted_scope_authorizer(),
+                            )
+                            .await,
+                    );
+                }
+                HostedDerivativeRequestMode::AdmitOnly => {
+                    let admitted = runtime
+                        .coordinator
+                        .admit_hosted_with_prerequisite_observed(
+                            work_key,
+                            lane,
+                            prerequisite,
+                            None,
+                            self.hosted_scope_authorizer(),
+                        )
+                        .await;
+                    if !admitted {
+                        capacity_exceeded = true;
+                        break;
+                    }
+                }
+            }
+            queued = true;
+        }
+        Ok((receivers, queued, capacity_exceeded))
     }
 
     #[cfg(debug_assertions)]
@@ -1598,6 +1698,97 @@ impl GalleryEngine {
             .collect::<Result<Vec<_>, AppServiceError>>()
     }
 
+    fn persist_hosted_derivative_warning(&self, key: &WorkKey) {
+        let _ = self.state.lock().ok().and_then(|mut state| {
+            state
+                .libraries
+                .catalog_mut()
+                .record_warning_once(&photo_catalog::CatalogWarningRecord {
+                    library_id: key.selection.library_id,
+                    asset_id: Some(key.asset_id),
+                    code: HOSTED_ASSET_DERIVATIVE_WARNING.to_owned(),
+                    message: "A cached preview could not be generated. The app can retry it."
+                        .to_owned(),
+                })
+                .ok()
+        });
+    }
+
+    async fn emit_hosted_derivative_warning(&self, runtime: &SelectionRuntime, key: &WorkKey) {
+        runtime
+            .publish(WallUpdate::Warning {
+                selection_id: runtime.selection.id.clone(),
+                source_id: key.selection.library_id.as_uuid().hyphenated().to_string(),
+                asset_id: Some(key.asset_id.as_uuid().hyphenated().to_string()),
+                warning: crate::WallWarningState {
+                    code: "derivativeUnavailable".to_owned(),
+                    retryable: true,
+                },
+            })
+            .await;
+    }
+
+    fn hosted_work_remains_in_scope(&self, key: &WorkKey) -> bool {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| {
+                let asset = state.libraries.catalog().find_asset(key.asset_id).ok()??;
+                if asset.media_kind == photo_domain::MediaKind::Video
+                    || asset.availability != key.availability
+                    || DerivativeKey::compute(&derivative_spec_for_gallery(&asset, key.class))
+                        .as_str()
+                        != key.cache_key
+                {
+                    return None;
+                }
+                state
+                    .libraries
+                    .catalog()
+                    .wall_records_for_assets_scoped(
+                        key.selection.group_id,
+                        key.scope,
+                        &[key.asset_id],
+                    )
+                    .ok()
+            })
+            .is_some_and(|records| !records.is_empty())
+    }
+
+    async fn clear_hosted_derivative_warning(
+        &self,
+        runtime: &SelectionRuntime,
+        selection: crate::service::SelectionToken,
+        asset_id: photo_domain::AssetId,
+    ) {
+        let removed = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|mut state| {
+                state
+                    .libraries
+                    .catalog_mut()
+                    .clear_warning(
+                        selection.library_id,
+                        Some(asset_id),
+                        HOSTED_ASSET_DERIVATIVE_WARNING,
+                    )
+                    .ok()
+            })
+            .unwrap_or(0);
+        if removed > 0 {
+            runtime
+                .publish(WallUpdate::WarningCleared {
+                    selection_id: runtime.selection.id.clone(),
+                    source_id: selection.library_id.as_uuid().hyphenated().to_string(),
+                    asset_id: Some(asset_id.as_uuid().hyphenated().to_string()),
+                    code: "derivativeUnavailable".to_owned(),
+                })
+                .await;
+        }
+    }
+
     async fn start_hosted_derivative_driver(&self, runtime: Arc<SelectionRuntime>) {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
@@ -1681,6 +1872,7 @@ impl GalleryEngine {
                 *active_attempt_lease
                     .lock()
                     .expect("hosted active attempt lease poisoned") = Some(attempt_lease.clone());
+                let warning_key = key.clone();
                 let attempt = tokio::spawn({
                     let engine = engine.clone();
                     let runtime = runtime.clone();
@@ -1704,9 +1896,13 @@ impl GalleryEngine {
                     .lock()
                     .expect("hosted active attempt poisoned") = Some(attempt.abort_handle());
                 if attempt.await.is_err() {
+                    engine.persist_hosted_derivative_warning(&warning_key);
                     runtime
                         .coordinator
                         .abort_hosted_attempt_as_failure(ticket)
+                        .await;
+                    engine
+                        .emit_hosted_derivative_warning(&runtime, &warning_key)
                         .await;
                 } else {
                     runtime
@@ -1740,7 +1936,14 @@ impl GalleryEngine {
         attempt_lease: HostedAttemptLease,
     ) {
         let Some((asset, source, spec)) = self.pending_hosted_derivative(&key).await else {
+            let warn = self.hosted_work_remains_in_scope(&key);
+            if warn {
+                self.persist_hosted_derivative_warning(&key);
+            }
             runtime.coordinator.discard(ticket).await;
+            if warn {
+                self.emit_hosted_derivative_warning(&runtime, &key).await;
+            }
             return;
         };
         #[cfg(debug_assertions)]
@@ -1773,7 +1976,9 @@ impl GalleryEngine {
         }
         let group = key.selection.group_id;
         let Ok(_protected) = ProtectedGroupGuard::new(self.protected_groups.clone(), group) else {
+            self.persist_hosted_derivative_warning(&key);
             runtime.coordinator.fail_commit_with_error(permit).await;
+            self.emit_hosted_derivative_warning(&runtime, &key).await;
             return;
         };
         let cache_root = self.cache_root.clone();
@@ -1848,19 +2053,28 @@ impl GalleryEngine {
             Ok::<_, AppServiceError>((prepared, admission))
         })
         .await;
-        let Some((prepared, _admission)) = (match prepared {
-            Ok(Ok(prepared)) => Some(prepared),
-            Ok(Err(_)) | Err(_) => None,
-        }) else {
-            runtime.coordinator.fail_commit_with_error(permit).await;
-            return;
+        let (prepared, _admission) = match prepared {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(_)) | Err(_) => {
+                self.persist_hosted_derivative_warning(&key);
+                runtime.coordinator.fail_commit_with_error(permit).await;
+                self.emit_hosted_derivative_warning(&runtime, &key).await;
+                return;
+            }
         };
         if permit.was_cancelled() {
             runtime.coordinator.fail_commit_with_error(permit).await;
             return;
         }
         if self.pending_hosted_derivative(&key).await.is_none() {
+            let warn = self.hosted_work_remains_in_scope(&key);
+            if warn {
+                self.persist_hosted_derivative_warning(&key);
+            }
             runtime.coordinator.fail_commit(permit).await;
+            if warn {
+                self.emit_hosted_derivative_warning(&runtime, &key).await;
+            }
             return;
         }
         #[cfg(debug_assertions)]
@@ -1881,7 +2095,14 @@ impl GalleryEngine {
             return;
         }
         if self.pending_hosted_derivative(&key).await.is_none() {
+            let warn = self.hosted_work_remains_in_scope(&key);
+            if warn {
+                self.persist_hosted_derivative_warning(&key);
+            }
             runtime.coordinator.fail_commit(permit).await;
+            if warn {
+                self.emit_hosted_derivative_warning(&runtime, &key).await;
+            }
             return;
         }
         let authorizer = self.hosted_scope_authorizer();
@@ -1981,6 +2202,10 @@ impl GalleryEngine {
             // separate Catalog connection. If it trips, leave immutable
             // shared state intact and suppress this request's publication.
             if self.pending_hosted_derivative(&key).await.is_none() {
+                let warn = self.hosted_work_remains_in_scope(&key);
+                if warn {
+                    self.persist_hosted_derivative_warning(&key);
+                }
                 let _ = self.rollback_hosted_publication(&generated, group);
                 runtime
                     .coordinator
@@ -1989,6 +2214,9 @@ impl GalleryEngine {
                         crate::derivative_coordinator::DerivativeResult::Unavailable,
                     )
                     .await;
+                if warn {
+                    self.emit_hosted_derivative_warning(&runtime, &key).await;
+                }
                 return;
             }
             let reference = DerivativeReference {
@@ -1996,6 +2224,8 @@ impl GalleryEngine {
                 kind: class,
                 key: generated.key.as_str().to_owned(),
             };
+            self.clear_hosted_derivative_warning(&runtime, key.selection, asset_id)
+                .await;
             runtime
                 .publish(WallUpdate::DerivativesReady {
                     selection_id: runtime.selection.id.clone(),
@@ -2010,6 +2240,7 @@ impl GalleryEngine {
                 )
                 .await;
         } else {
+            self.persist_hosted_derivative_warning(&key);
             runtime
                 .coordinator
                 .finish_hosted_publication(
@@ -2017,6 +2248,7 @@ impl GalleryEngine {
                     crate::derivative_coordinator::DerivativeResult::Failed,
                 )
                 .await;
+            self.emit_hosted_derivative_warning(&runtime, &key).await;
         }
     }
 

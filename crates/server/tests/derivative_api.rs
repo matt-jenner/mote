@@ -1,6 +1,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use photo_app_service::{GalleryScope, WallUpdate};
 use photo_server::{AppState, ServerConfig, build_router};
 use serde_json::json;
 use std::time::Duration;
@@ -10,6 +11,15 @@ use tower::ServiceExt;
 const JPEG: &[u8] = include_bytes!("../../../apps/interface/public/demo-photos/mountain.jpg");
 
 fn make_app() -> (TempDir, axum::Router) {
+    let (temp, app, _) = make_app_with_gallery();
+    (temp, app)
+}
+
+fn make_app_with_gallery() -> (
+    TempDir,
+    axum::Router,
+    std::sync::Arc<photo_app_service::GalleryEngine>,
+) {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");
     let web = temp.path().join("web");
@@ -25,7 +35,8 @@ fn make_app() -> (TempDir, axum::Router) {
     )
     .unwrap();
     let (state, _) = AppState::open(&config).unwrap();
-    (temp, build_router(state, config.static_web_root()))
+    let gallery = state.gallery_for_test().unwrap();
+    (temp, build_router(state, config.static_web_root()), gallery)
 }
 
 async fn body(response: axum::response::Response) -> serde_json::Value {
@@ -73,11 +84,15 @@ async fn selection_and_asset(app: &axum::Router) -> (String, String) {
 }
 
 async fn wall(app: &axum::Router, selection_id: &str) -> serde_json::Value {
+    wall_for_scope(app, selection_id, "currentFolder").await
+}
+
+async fn wall_for_scope(app: &axum::Router, selection_id: &str, scope: &str) -> serde_json::Value {
     let response = app
         .clone()
         .oneshot(
             Request::get(format!(
-                "/api/v1/selections/{selection_id}/wall?scope=currentFolder&direction=oldestFirst&limit=50"
+                "/api/v1/selections/{selection_id}/wall?scope={scope}&direction=oldestFirst&limit=50"
             ))
             .body(Body::empty())
             .unwrap(),
@@ -86,6 +101,123 @@ async fn wall(app: &axum::Router, selection_id: &str) -> serde_json::Value {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     body(response).await
+}
+
+async fn wait_for_derivative_key(app: &axum::Router, selection_id: &str, field: &str) -> String {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let page = wall(app, selection_id).await;
+            if let Some(key) = page["items"][0][field]["key"].as_str() {
+                break key.to_owned();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{field} was not published after admission"))
+}
+
+fn wall_thumbnail_request(selection_id: &str, asset_id: &str, scope: &str) -> Request<Body> {
+    Request::post(format!("/api/v1/selections/{selection_id}/derivatives"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "scope": scope,
+                "request": {
+                    "assetIds": [asset_id],
+                    "priority": "visible",
+                    "kind": "wallThumbnail"
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn derivative_route_admits_shared_cache_work_without_holding_browser_connections() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (_temp, app, gallery) = make_app_with_gallery();
+    let (selection_id, asset_id) = selection_and_asset(&app).await;
+    let selection = gallery.resolve_selection(&selection_id).unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(AtomicBool::new(false));
+    gallery
+        .install_hosted_encode_test_gate(entered.clone(), release.clone())
+        .await;
+
+    let first = tokio::spawn(app.clone().oneshot(wall_thumbnail_request(
+        &selection_id,
+        &asset_id,
+        "currentFolder",
+    )));
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("encoder did not enter the deterministic test gate");
+    let first = tokio::time::timeout(Duration::from_millis(250), first)
+        .await
+        .expect("the admitted request held its browser connection while encoding")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::NO_CONTENT);
+
+    let second = tokio::time::timeout(
+        Duration::from_millis(250),
+        app.clone().oneshot(wall_thumbnail_request(
+            &selection_id,
+            &asset_id,
+            "includeSubfolders",
+        )),
+    )
+    .await
+    .expect("a duplicate cache-key request held its browser connection")
+    .unwrap();
+    assert_eq!(second.status(), StatusCode::NO_CONTENT);
+    assert_eq!(gallery.hosted_derivative_attempts_for_test(), 1);
+
+    for index in 0..32 {
+        let scope = if index % 2 == 0 {
+            "currentFolder"
+        } else {
+            "includeSubfolders"
+        };
+        let repeated = app
+            .clone()
+            .oneshot(wall_thumbnail_request(&selection_id, &asset_id, scope))
+            .await
+            .unwrap();
+        assert_eq!(repeated.status(), StatusCode::NO_CONTENT);
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        gallery.hosted_waiter_count_for_test(&selection).await <= 2,
+        "duplicate HTTP admissions must retain at most one waiter per scope"
+    );
+
+    let current_while_blocked = wall(&app, &selection_id).await;
+    let recursive_while_blocked = wall_for_scope(&app, &selection_id, "includeSubfolders").await;
+    assert_eq!(current_while_blocked["totalCount"], 1);
+    assert_eq!(recursive_while_blocked["totalCount"], 1);
+
+    release.store(true, Ordering::Release);
+    let cache_key = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let page = wall(&app, &selection_id).await;
+            if let Some(key) = page["items"][0]["wallThumbnail"]["key"].as_str() {
+                break key.to_owned();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the shared cache-key work did not publish its derivative");
+    assert_eq!(gallery.hosted_derivative_attempts_for_test(), 1);
+    let recursive = wall_for_scope(&app, &selection_id, "includeSubfolders").await;
+    assert_eq!(recursive["items"][0]["wallThumbnail"]["key"], cache_key);
+    assert_eq!(gallery.hosted_derivative_attempts_for_test(), 1);
 }
 
 #[cfg(unix)]
@@ -169,21 +301,7 @@ async fn derivative_route_delivers_managed_jpeg_with_immutable_headers() {
     let key = if let Some(key) = key {
         key
     } else {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::get(format!(
-                    "/api/v1/selections/{selection_id}/wall?scope=currentFolder&direction=oldestFirst&limit=50"
-                ))
-                .body(Body::empty())
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        body(response).await["items"][0]["wallThumbnail"]["key"]
-            .as_str()
-            .unwrap()
-            .to_owned()
+        wait_for_derivative_key(&app, &selection_id, "wallThumbnail").await
     };
     std::fs::remove_file(temp.path().join("photos/photo.jpg")).unwrap();
     let response = app
@@ -359,15 +477,8 @@ async fn cached_derivatives_remain_stable_after_root_refresh_marks_source_offlin
         .unwrap();
     assert_eq!(generated.status(), StatusCode::NO_CONTENT);
 
-    let online_wall = wall(&app, &selection_id).await;
-    let wall_key = online_wall["items"][0]["wallThumbnail"]["key"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let screen_key = online_wall["items"][0]["screenPreview"]["key"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let wall_key = wait_for_derivative_key(&app, &selection_id, "wallThumbnail").await;
+    let screen_key = wait_for_derivative_key(&app, &selection_id, "screenPreview").await;
     let mut online_etags = Vec::new();
     for key in [&wall_key, &screen_key] {
         let response = app
@@ -549,11 +660,8 @@ async fn stable_selection_recovers_and_generates_an_uncached_derivative_after_ro
         .await
         .unwrap();
     assert_eq!(generated.status(), StatusCode::NO_CONTENT);
-    let with_derivatives = wall(&app, &selection_id).await;
     for field in ["wallThumbnail", "screenPreview"] {
-        let key = with_derivatives["items"][0][field]["key"]
-            .as_str()
-            .expect("requested derivative reference was not published");
+        let key = wait_for_derivative_key(&app, &selection_id, field).await;
         let response = app
             .clone()
             .oneshot(
@@ -818,8 +926,8 @@ async fn derivative_route_rejects_oversized_decoded_id_and_query_before_lookup()
 }
 
 #[tokio::test]
-async fn derivative_request_exposes_invalid_unavailable_and_failed_envelopes() {
-    let (temp, app) = make_app();
+async fn derivative_request_validates_admission_before_async_generation() {
+    let (temp, app, gallery) = make_app_with_gallery();
     let (selection_id, asset_id) = selection_and_asset(&app).await;
 
     let response = app
@@ -845,6 +953,14 @@ async fn derivative_request_exposes_invalid_unavailable_and_failed_envelopes() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(body(response).await["code"], "invalidRequest");
 
+    let selection = gallery.resolve_selection(&selection_id).unwrap();
+    let after = gallery.current_event_id_for_test(&selection);
+    let mut unavailable_updates = gallery.subscribe(
+        &selection,
+        "unavailable-observer".to_owned(),
+        GalleryScope::CurrentFolder,
+        Some(after),
+    );
     std::fs::remove_file(temp.path().join("photos/photo.jpg")).unwrap();
     let response = app
         .clone()
@@ -866,8 +982,26 @@ async fn derivative_request_exposes_invalid_unavailable_and_failed_envelopes() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body(response).await["code"], "derivativeUnavailable");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = unavailable_updates.recv().await.unwrap();
+            if matches!(
+                event.update,
+                WallUpdate::Warning {
+                    asset_id: Some(ref warned_asset),
+                    ref warning,
+                    ..
+                } if warned_asset == &asset_id
+                    && warning.code == "derivativeUnavailable"
+                    && warning.retryable
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("source loss after admission did not publish a retryable warning");
 
     let (temp2, app2) = make_app();
     let (selection_id, asset_id) = selection_and_asset(&app2).await;
@@ -891,6 +1025,122 @@ async fn derivative_request_exposes_invalid_unavailable_and_failed_envelopes() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(body(response).await["code"], "derivativeFailed");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn admitted_generation_failure_warns_and_successful_retry_clears_it() {
+    let (temp, app, gallery) = make_app_with_gallery();
+    let (selection_id, asset_id) = selection_and_asset(&app).await;
+    let selection = gallery.resolve_selection(&selection_id).unwrap();
+    let after = gallery.current_event_id_for_test(&selection);
+    let mut updates = gallery.subscribe(
+        &selection,
+        "failure-observer".to_owned(),
+        GalleryScope::CurrentFolder,
+        Some(after),
+    );
+    let source = temp.path().join("photos/photo.jpg");
+    std::fs::write(&source, b"not a jpeg").unwrap();
+
+    let admitted = app
+        .clone()
+        .oneshot(wall_thumbnail_request(
+            &selection_id,
+            &asset_id,
+            "currentFolder",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(admitted.status(), StatusCode::NO_CONTENT);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = updates.recv().await.unwrap();
+            if matches!(
+                event.update,
+                WallUpdate::Warning {
+                    asset_id: ref warned_asset_id,
+                    ref warning,
+                    ..
+                } if warned_asset_id.as_deref() == Some(asset_id.as_str())
+                    && warning.code == "derivativeUnavailable"
+                    && warning.retryable
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("failed admitted generation did not publish a retryable warning");
+
+    let attempts_after_first_failure = gallery.hosted_derivative_attempts_for_test();
+    let readmitted = app
+        .clone()
+        .oneshot(wall_thumbnail_request(
+            &selection_id,
+            &asset_id,
+            "currentFolder",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(readmitted.status(), StatusCode::NO_CONTENT);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = updates.recv().await.unwrap();
+            if matches!(
+                event.update,
+                WallUpdate::Warning {
+                    asset_id: ref warned_asset_id,
+                    ref warning,
+                    ..
+                } if warned_asset_id.as_deref() == Some(asset_id.as_str())
+                    && warning.code == "derivativeUnavailable"
+                    && warning.retryable
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("a second failed generation did not publish a new retry signal");
+    assert!(
+        gallery.hosted_derivative_attempts_for_test() > attempts_after_first_failure,
+        "the warning-triggered retry rejoined the already failed attempt"
+    );
+
+    std::fs::write(&source, JPEG).unwrap();
+    let retried = app
+        .clone()
+        .oneshot(wall_thumbnail_request(
+            &selection_id,
+            &asset_id,
+            "currentFolder",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(retried.status(), StatusCode::NO_CONTENT);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut ready = false;
+        let mut cleared = false;
+        while !ready || !cleared {
+            match updates.recv().await.unwrap().update {
+                WallUpdate::DerivativesReady { derivatives, .. } => {
+                    ready |= derivatives.iter().any(|reference| {
+                        reference.asset_id == asset_id
+                            && reference.kind == photo_app_service::DerivativeClass::WallThumbnail
+                    });
+                }
+                WallUpdate::WarningCleared {
+                    asset_id: Some(ref warned_asset),
+                    ref code,
+                    ..
+                } if warned_asset == &asset_id && code == "derivativeUnavailable" => {
+                    cleared = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("successful retry did not publish readiness and clear its warning");
 }
