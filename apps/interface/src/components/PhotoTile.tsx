@@ -161,6 +161,7 @@ export function PhotoTile({
 				return;
 			loadSeen = true;
 			startDecode();
+			moveToFading();
 		};
 		const markCachedImageLoaded = () => {
 			if (

@@ -129,6 +129,29 @@ fn capture_date_uses_field_specific_source_order() {
 }
 
 #[test]
+fn embedded_original_capture_date_beats_sidecar_capture_date() {
+    let original = "2020-01-02T03:04:05+00:00";
+    let sidecar = "2021-01-02T03:04:05+00:00";
+    let resolved = MetadataResolver::resolve(MetadataBundle {
+        capture_dates: vec![
+            date(sidecar, MetadataSource::SidecarXmp),
+            date(original, MetadataSource::EmbeddedExifOriginal),
+        ],
+        ..MetadataBundle::default()
+    });
+
+    assert_eq!(resolved.captured_at.unwrap().to_rfc3339(), original);
+    assert_eq!(
+        resolved
+            .provenance
+            .iter()
+            .find(|record| record.chosen)
+            .map(|record| record.source),
+        Some(MetadataSource::EmbeddedExifOriginal)
+    );
+}
+
+#[test]
 fn filesystem_modified_is_the_final_capture_date_fallback() {
     let modified = "2024-01-02T03:04:05+00:00";
     let resolved = MetadataResolver::resolve(MetadataBundle {

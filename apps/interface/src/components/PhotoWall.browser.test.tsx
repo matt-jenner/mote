@@ -1659,6 +1659,57 @@ describe("progressive photo wall", () => {
 		}
 	});
 
+	it("reveals a thumbnail when decoding finishes before its load event", async () => {
+		const service = new ControlledWallService();
+		service.setDerivativeUrl(
+			"decode-before-load",
+			"/demo-photos/coast.jpg?decode-before-load=1",
+		);
+		const decodeGate = gate<void>();
+		const restoreImageRuntime = overrideImageRuntime({
+			complete: () => false,
+			naturalWidth: () => 0,
+			decode: () => decodeGate.promise,
+		});
+		const restoreReducedMotion = overrideReducedMotion(false);
+		const restoreLoadCapture = suppressCapture("load");
+		let loadCaptureActive = true;
+		const positioned = {
+			asset: asset("decode-before-load", "Photo A", 1, {
+				wallThumbnail: {
+					assetId: "decode-before-load",
+					kind: "wallThumbnail" as const,
+					key: "decode-before-load",
+				},
+			}),
+			left: 0,
+			width: 320,
+			height: 220,
+		};
+		try {
+			const screen = await render(
+				<PhotoTile positioned={positioned} service={service} />,
+			);
+			const image = screen.getByRole("img", { name: "Photo A" });
+			decodeGate.resolve();
+			await Promise.resolve();
+			expect(getComputedStyle(image.element()).opacity).toBe("0");
+
+			restoreLoadCapture();
+			loadCaptureActive = false;
+			image.element().dispatchEvent(new Event("load"));
+
+			await expect
+				.poll(() => getComputedStyle(image.element()).opacity)
+				.toBe("1");
+			screen.unmount();
+		} finally {
+			if (loadCaptureActive) restoreLoadCapture();
+			restoreImageRuntime();
+			restoreReducedMotion();
+		}
+	});
+
 	it("ignores a stale opacity transition after a thumbnail URL replacement", async () => {
 		const service = new ControlledWallService();
 		const onOpen = vi.fn();
