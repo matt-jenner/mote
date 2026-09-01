@@ -138,7 +138,7 @@ The service requires explicit local directories and binds to loopback port 8080 
 ```bash
 PHOTO_VIEWER_DATA_DIR=/path/to/local/photo-viewer-data \
 PHOTO_VIEWER_CACHE_DIR=/path/to/local/photo-viewer-cache \
-cargo run -p photo-server
+cargo run --release -p photo-server
 ```
 
 Set `PHOTO_VIEWER_BIND` only when a different socket is required. For example, `PHOTO_VIEWER_BIND=127.0.0.1:18080` keeps the service loopback-only on another port. `GET /healthz` reports database, cache, aggregate source, and warning health without exposing source paths or filenames.
@@ -148,8 +148,13 @@ PowerShell uses the same variables:
 ```powershell
 $env:PHOTO_VIEWER_DATA_DIR = "C:\PhotoViewer\Data"
 $env:PHOTO_VIEWER_CACHE_DIR = "C:\PhotoViewer\Cache"
-cargo run -p photo-server
+cargo run --release -p photo-server
 ```
+
+Use the release profile when viewing real collections. Image decoding, resizing,
+and JPEG encoding are intentionally CPU-heavy and are substantially slower in an
+unoptimised development build. The container image already builds and runs this
+optimised release binary.
 
 ## Run the catalog benchmark
 
