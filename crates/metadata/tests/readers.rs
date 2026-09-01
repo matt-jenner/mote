@@ -104,6 +104,41 @@ fn reads_sidecar_capture_dates_from_element_text_and_skips_invalid_values() {
 }
 
 #[test]
+fn capture_date_fields_require_their_namespace_uri() {
+    let xml = br#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+      <rdf:Description
+        xmlns:camera="http://ns.adobe.com/exif/1.0/"
+        camera:DateTimeOriginal="2022-01-02T03:04:05Z"/>
+      <rdf:Description
+        xmlns:xmp="urn:not-adobe-xmp"
+        xmp:CreateDate="2025-01-02T03:04:05Z"
+        CreateDate="2026-01-02T03:04:05Z"/>
+    </rdf:RDF>"#;
+
+    let bundle = XmpSidecarReader::read(xml).unwrap();
+
+    assert_eq!(bundle.capture_dates.len(), 1);
+    assert_eq!(bundle.capture_dates[0].raw_value, "2022-01-02T03:04:05Z");
+}
+
+#[test]
+fn a_valid_duplicate_capture_date_follows_an_invalid_value() {
+    let xml = br#"<rdf:Description
+      xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+      xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+      <xmp:CreateDate>not-a-date</xmp:CreateDate>
+      <xmp:CreateDate>2024-01-02T03:04:05Z</xmp:CreateDate>
+    </rdf:Description>"#;
+
+    let bundle = XmpSidecarReader::read(xml).unwrap();
+
+    assert_eq!(bundle.capture_dates.len(), 1);
+    assert_eq!(bundle.capture_dates[0].raw_value, "2024-01-02T03:04:05Z");
+    assert_eq!(bundle.warnings.len(), 1);
+    assert_eq!(bundle.warnings[0].code, "invalid_xmp_date");
+}
+
+#[test]
 fn reads_orientation_from_minimal_little_endian_tiff() {
     let tiff = [
         0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x12, 0x01, 0x03, 0x00, 0x01,

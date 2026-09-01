@@ -1661,6 +1661,7 @@ describe("progressive photo wall", () => {
 
 	it("reveals a thumbnail when decoding finishes before its load event", async () => {
 		const service = new ControlledWallService();
+		const onOpen = vi.fn();
 		service.setDerivativeUrl(
 			"decode-before-load",
 			"/demo-photos/coast.jpg?decode-before-load=1",
@@ -1688,9 +1689,10 @@ describe("progressive photo wall", () => {
 		};
 		try {
 			const screen = await render(
-				<PhotoTile positioned={positioned} service={service} />,
+				<PhotoTile onOpen={onOpen} positioned={positioned} service={service} />,
 			);
 			const image = screen.getByRole("img", { name: "Photo A" });
+			const imageElement = image.element();
 			decodeGate.resolve();
 			await Promise.resolve();
 			expect(getComputedStyle(image.element()).opacity).toBe("0");
@@ -1700,8 +1702,26 @@ describe("progressive photo wall", () => {
 			image.element().dispatchEvent(new Event("load"));
 
 			await expect
-				.poll(() => getComputedStyle(image.element()).opacity)
+				.poll(() => getComputedStyle(imageElement).opacity)
 				.toBe("1");
+			expect(image.element()).toBe(imageElement);
+			expect(
+				screen
+					.getByRole("button", { name: "Open Photo A", exact: true })
+					.query(),
+			).toBeNull();
+			imageElement.dispatchEvent(
+				new TransitionEvent("transitionend", {
+					bubbles: true,
+					propertyName: "opacity",
+				}),
+			);
+			await expect
+				.element(
+					screen.getByRole("button", { name: "Open Photo A", exact: true }),
+				)
+				.toBeVisible();
+			expect(onOpen).not.toHaveBeenCalled();
 			screen.unmount();
 		} finally {
 			if (loadCaptureActive) restoreLoadCapture();

@@ -2,8 +2,9 @@ use std::io::Read;
 use std::path::Path;
 
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone};
-use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
+use quick_xml::name::{NamespaceResolver, ResolveResult};
+use quick_xml::reader::NsReader;
 
 use crate::{
     KeywordCandidate, MetadataBundle, MetadataCandidate, MetadataReadWarning, MetadataSource,
@@ -12,6 +13,9 @@ use crate::{
 
 const MAX_SIDECAR_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
+const EXIF_NAMESPACE: &[u8] = b"http://ns.adobe.com/exif/1.0/";
+const PHOTOSHOP_NAMESPACE: &[u8] = b"http://ns.adobe.com/photoshop/1.0/";
+const XMP_NAMESPACE: &[u8] = b"http://ns.adobe.com/xap/1.0/";
 
 pub struct XmpSidecarReader;
 
@@ -30,21 +34,19 @@ enum CaptureDateKind {
 
 #[derive(Default)]
 struct CaptureDateValues {
-    original: Option<String>,
-    date_created: Option<String>,
-    create_date: Option<String>,
+    original: Vec<String>,
+    date_created: Vec<String>,
+    create_date: Vec<String>,
 }
 
 impl CaptureDateValues {
-    fn set(&mut self, kind: CaptureDateKind, value: &str) {
+    fn push(&mut self, kind: CaptureDateKind, value: &str) {
         let slot = match kind {
             CaptureDateKind::Original => &mut self.original,
             CaptureDateKind::DateCreated => &mut self.date_created,
             CaptureDateKind::CreateDate => &mut self.create_date,
         };
-        if slot.is_none() {
-            *slot = Some(value.trim().to_owned());
-        }
+        slot.push(value.trim().to_owned());
     }
 }
 
@@ -67,7 +69,7 @@ impl XmpSidecarReader {
             ));
         }
 
-        let mut reader = Reader::from_reader(bytes);
+        let mut reader = NsReader::from_reader(bytes);
         reader.config_mut().trim_text(true);
         let mut buffer = Vec::new();
         let mut bundle = MetadataBundle::default();
@@ -85,13 +87,14 @@ impl XmpSidecarReader {
                     if is_name(start.name().as_ref(), b"rdf:li", b"li") {
                         reading_keyword = keyword_context.is_some();
                     }
-                    reading_capture_date = capture_date_kind(start.name().as_ref());
+                    let (namespace, local_name) = reader.resolver().resolve_element(start.name());
+                    reading_capture_date = capture_date_kind(namespace, local_name.as_ref());
                     read_rating(&start, &mut bundle)?;
-                    read_capture_date_attributes(&start, &mut capture_dates)?;
+                    read_capture_date_attributes(&start, reader.resolver(), &mut capture_dates)?;
                 }
                 Ok(Event::Empty(start)) => {
                     read_rating(&start, &mut bundle)?;
-                    read_capture_date_attributes(&start, &mut capture_dates)?;
+                    read_capture_date_attributes(&start, reader.resolver(), &mut capture_dates)?;
                 }
                 Ok(Event::Text(text)) if reading_keyword => {
                     if text.as_ref().len() > MAX_TEXT_BYTES {
@@ -116,7 +119,7 @@ impl XmpSidecarReader {
                         let value = text.decode().map_err(|error| {
                             MetadataReadWarning::new("malformed_xmp", error.to_string())
                         })?;
-                        capture_dates.set(
+                        capture_dates.push(
                             reading_capture_date.expect("capture date context checked"),
                             value.trim(),
                         );
@@ -126,7 +129,8 @@ impl XmpSidecarReader {
                     if is_name(end.name().as_ref(), b"rdf:li", b"li") {
                         reading_keyword = false;
                     }
-                    if capture_date_kind(end.name().as_ref()).is_some() {
+                    let (namespace, local_name) = reader.resolver().resolve_element(end.name());
+                    if capture_date_kind(namespace, local_name.as_ref()).is_some() {
                         reading_capture_date = None;
                     }
                     update_context_on_end(end.name().as_ref(), &mut keyword_context);
@@ -180,36 +184,42 @@ fn read_rating(
 
 fn read_capture_date_attributes(
     start: &BytesStart<'_>,
+    resolver: &NamespaceResolver,
     values: &mut CaptureDateValues,
 ) -> Result<(), MetadataReadWarning> {
     for attribute in start.attributes() {
         let attribute = attribute
             .map_err(|error| MetadataReadWarning::new("malformed_xmp", error.to_string()))?;
-        let Some(kind) = capture_date_kind(attribute.key.as_ref()) else {
+        let (namespace, local_name) = resolver.resolve_attribute(attribute.key);
+        let Some(kind) = capture_date_kind(namespace, local_name.as_ref()) else {
             continue;
         };
         let raw = std::str::from_utf8(attribute.value.as_ref())
             .map_err(|error| MetadataReadWarning::new("malformed_xmp", error.to_string()))?;
-        values.set(kind, raw);
+        values.push(kind, raw);
     }
     Ok(())
 }
 
 fn append_capture_dates(bundle: &mut MetadataBundle, values: CaptureDateValues) {
-    for raw in [values.original, values.date_created, values.create_date]
-        .into_iter()
-        .flatten()
-    {
-        match parse_capture_date(&raw) {
-            Some(value) => bundle.capture_dates.push(MetadataCandidate {
+    for candidates in [values.original, values.date_created, values.create_date] {
+        let mut selected = None;
+        for raw in candidates {
+            match parse_capture_date(&raw) {
+                Some(value) if selected.is_none() => selected = Some((value, raw)),
+                Some(_) => {}
+                None => bundle.warnings.push(MetadataWarning {
+                    code: "invalid_xmp_date",
+                    message: format!("invalid XMP capture date {raw:?}"),
+                }),
+            }
+        }
+        if let Some((value, raw_value)) = selected {
+            bundle.capture_dates.push(MetadataCandidate {
                 value,
                 source: MetadataSource::SidecarXmp,
-                raw_value: raw,
-            }),
-            None => bundle.warnings.push(MetadataWarning {
-                code: "invalid_xmp_date",
-                message: format!("invalid XMP capture date {raw:?}"),
-            }),
+                raw_value,
+            });
         }
     }
 }
@@ -232,15 +242,15 @@ fn parse_capture_date(raw: &str) -> Option<DateTime<FixedOffset>> {
     })
 }
 
-fn capture_date_kind(name: &[u8]) -> Option<CaptureDateKind> {
-    if is_name(name, b"exif:DateTimeOriginal", b"DateTimeOriginal") {
-        Some(CaptureDateKind::Original)
-    } else if is_name(name, b"photoshop:DateCreated", b"DateCreated") {
-        Some(CaptureDateKind::DateCreated)
-    } else if is_name(name, b"xmp:CreateDate", b"CreateDate") {
-        Some(CaptureDateKind::CreateDate)
-    } else {
-        None
+fn capture_date_kind(namespace: ResolveResult<'_>, local_name: &[u8]) -> Option<CaptureDateKind> {
+    let ResolveResult::Bound(namespace) = namespace else {
+        return None;
+    };
+    match (namespace.as_ref(), local_name) {
+        (EXIF_NAMESPACE, b"DateTimeOriginal") => Some(CaptureDateKind::Original),
+        (PHOTOSHOP_NAMESPACE, b"DateCreated") => Some(CaptureDateKind::DateCreated),
+        (XMP_NAMESPACE, b"CreateDate") => Some(CaptureDateKind::CreateDate),
+        _ => None,
     }
 }
 
