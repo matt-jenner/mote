@@ -14,6 +14,8 @@ use crate::discover::{DiscoveredAsset, discover_asset};
 use crate::{IndexError, IndexEvent, ScanProgress, ScanStage, ScanSummary};
 use crate::{IndexScheduler, SchedulerConfig};
 
+const INVENTORY_TOTAL_UNKNOWN: u64 = u64::MAX;
+
 pub trait MetadataReader: Send + Sync + 'static {
     fn read(
         &self,
@@ -136,7 +138,9 @@ impl<R: MetadataReader> Indexer<R> {
         let enrichment_workers = self.scheduler.available_background_permits().clamp(1, 2);
         let scheduler = self.scheduler.clone();
         let discovery_root = root.clone();
+        let inventory_root = root.clone();
         let discovery_cancel = cancel_rx.clone();
+        let inventory_cancel = cancel_rx.clone();
         let library_id = request.library_id;
         let folder_group_id = request.folder_group_id;
         let discovery = tokio::task::spawn_blocking(move || {
@@ -150,9 +154,41 @@ impl<R: MetadataReader> Indexer<R> {
                 &policy_engine,
             )
         });
+        let inventory = tokio::task::spawn_blocking(move || {
+            count_photo_inventory(&inventory_root, &inventory_cancel)
+        });
         let join = tokio::spawn(async move {
             let summary = Arc::new(Mutex::new(ScanSummary::default()));
             let progress = Arc::new((AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)));
+            let inventory_total = Arc::new(AtomicU64::new(INVENTORY_TOTAL_UNKNOWN));
+            let inventory_publisher = tokio::spawn({
+                let events = events_tx.clone();
+                let progress = progress.clone();
+                let inventory_total = inventory_total.clone();
+                async move {
+                    match inventory.await {
+                        Ok(Ok(Some(total))) => {
+                            inventory_total.store(total, Ordering::Release);
+                            let _ = events
+                                .send(IndexEvent::Progress(ScanProgress {
+                                    stage: ScanStage::Discovering,
+                                    discovered: progress.0.load(Ordering::Relaxed),
+                                    shaped: progress.1.load(Ordering::Relaxed),
+                                    enriched: progress.2.load(Ordering::Relaxed),
+                                    total: Some(total),
+                                }))
+                                .await;
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(error)) => {
+                            tracing::debug!(%error, "photo inventory count was unavailable");
+                        }
+                        Err(error) => {
+                            tracing::debug!(%error, "photo inventory count task stopped");
+                        }
+                    }
+                }
+            });
             let (enrich_tx, enrich_rx) = mpsc::channel::<DiscoveredAsset>(64);
             let shared_discovered = Arc::new(Mutex::new(discovered_rx));
             let shared_enrich = Arc::new(Mutex::new(enrich_rx));
@@ -164,6 +200,7 @@ impl<R: MetadataReader> Indexer<R> {
                 let mut cancel = cancel_rx.clone();
                 let summary = summary.clone();
                 let progress = progress.clone();
+                let inventory_total = inventory_total.clone();
                 let scheduler = scheduler.clone();
                 workers.push(tokio::spawn(async move {
                     loop {
@@ -190,7 +227,7 @@ impl<R: MetadataReader> Indexer<R> {
                                         discovered,
                                         shaped: progress.1.load(Ordering::Relaxed),
                                         enriched: progress.2.load(Ordering::Relaxed),
-                                        total: None,
+                                        total: known_inventory_total(&inventory_total),
                                     }))
                                     .await;
                             }
@@ -238,7 +275,7 @@ impl<R: MetadataReader> Indexer<R> {
                                                 discovered: progress.0.load(Ordering::Relaxed),
                                                 shaped,
                                                 enriched: progress.2.load(Ordering::Relaxed),
-                                                total: None,
+                                                total: known_inventory_total(&inventory_total),
                                             }))
                                             .await;
                                     }
@@ -271,7 +308,7 @@ impl<R: MetadataReader> Indexer<R> {
                                                 discovered: progress.0.load(Ordering::Relaxed),
                                                 shaped,
                                                 enriched: progress.2.load(Ordering::Relaxed),
-                                                total: None,
+                                                total: known_inventory_total(&inventory_total),
                                             }))
                                             .await;
                                     }
@@ -294,6 +331,7 @@ impl<R: MetadataReader> Indexer<R> {
                 let mut cancel = cancel_rx.clone();
                 let summary = summary.clone();
                 let progress = progress.clone();
+                let inventory_total = inventory_total.clone();
                 let scheduler = scheduler.clone();
                 workers.push(tokio::spawn(async move {
                     loop {
@@ -372,7 +410,7 @@ impl<R: MetadataReader> Indexer<R> {
                                                 discovered: progress.0.load(Ordering::Relaxed),
                                                 shaped: progress.1.load(Ordering::Relaxed),
                                                 enriched,
-                                                total: None,
+                                                total: known_inventory_total(&inventory_total),
                                             }))
                                             .await;
                                     }
@@ -409,6 +447,7 @@ impl<R: MetadataReader> Indexer<R> {
                 Ok(Err(error)) => return Err(error),
                 Err(error) => return Err(IndexError::TaskJoin(error.to_string())),
             }
+            let _ = inventory_publisher.await;
             let _ = events_tx
                 .send(IndexEvent::Progress(ScanProgress {
                     stage: ScanStage::Completed,
@@ -427,6 +466,33 @@ impl<R: MetadataReader> Indexer<R> {
             join,
         })
     }
+}
+
+fn known_inventory_total(total: &AtomicU64) -> Option<u64> {
+    match total.load(Ordering::Acquire) {
+        INVENTORY_TOTAL_UNKNOWN => None,
+        total => Some(total),
+    }
+}
+
+fn count_photo_inventory(
+    root: &Path,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Option<u64>, IndexError> {
+    let mut total = 0_u64;
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        if *cancel.borrow() {
+            return Ok(None);
+        }
+        let entry = entry.map_err(IndexError::Walk)?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if MediaKind::from_path(entry.path()).is_some_and(|kind| kind != MediaKind::Video) {
+            total = total.saturating_add(1);
+        }
+    }
+    Ok(Some(total))
 }
 
 async fn admit_enrichment(cancel: &watch::Receiver<bool>, scheduler: &IndexScheduler) -> bool {

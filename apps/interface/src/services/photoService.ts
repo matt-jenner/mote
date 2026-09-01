@@ -106,6 +106,7 @@ export interface WallPage {
 	nextCursor: string | null;
 	orderState: OrderState;
 	sourceWarnings: WallWarningState[];
+	totalCount: number;
 }
 
 export interface WallQueryRequest {

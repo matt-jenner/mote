@@ -323,11 +323,13 @@ const pageOf = (
 	orderState: "provisional" | "settled" = "provisional",
 	nextCursor: string | null = null,
 	sourceWarnings: readonly WallWarningState[] = [],
+	totalCount = items.length,
 ): WallPage => ({
 	items: [...items],
 	orderState,
 	nextCursor,
 	sourceWarnings: [...sourceWarnings],
+	totalCount,
 });
 
 function renderWall(service: PhotoService) {
@@ -2576,6 +2578,24 @@ describe("progressive photo wall", () => {
 		expect(screen.getByRole("progressbar").element()).toHaveAttribute(
 			"value",
 			"0",
+		);
+	});
+
+	it("keeps the collection total independent from the first wall page", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(
+			0,
+			pageOf(realFixtureAssets.slice(0, 4), "provisional", "cursor-2", [], 469),
+		);
+
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("Preparing previews · 0 of 469");
+		expect(screen.getByRole("progressbar").element()).toHaveAttribute(
+			"max",
+			"469",
 		);
 	});
 

@@ -149,6 +149,7 @@ const emptyWallPage = {
 	nextCursor: null,
 	orderState: "settled",
 	sourceWarnings: [],
+	totalCount: 0,
 };
 
 function json(value: unknown, status = 200): Response {
@@ -878,6 +879,7 @@ describe("HTTP PhotoService", () => {
 					nextCursor: "cursor-a",
 					orderState: "settled",
 					sourceWarnings: [{ code: "sourceOffline", retryable: true }],
+					totalCount: 1,
 				});
 			throw new Error(`unexpected request ${url}`);
 		});
@@ -923,6 +925,7 @@ describe("HTTP PhotoService", () => {
 			items: [representativeAsset],
 			nextCursor: "cursor-a",
 			orderState: "settled",
+			totalCount: 1,
 			sourceWarnings: [{ code: "sourceOffline", retryable: true }],
 		});
 		expect(received).toEqual([

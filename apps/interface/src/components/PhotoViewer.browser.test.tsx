@@ -328,6 +328,7 @@ function previewService(
 			nextCursor: null,
 			orderState: "settled",
 			sourceWarnings: [],
+			totalCount: 0,
 		}),
 		requestDerivatives,
 		setWallInteraction: async () => undefined,
@@ -4689,11 +4690,20 @@ describe("immersive photo viewer checkpoint", () => {
 				</PhotoServiceProvider>,
 			);
 			await expect.poll(() => pending.has("a")).toBe(true);
+			const firstScreen = document.querySelector<HTMLImageElement>(
+				"[data-viewer-layer='screenPreview']",
+			);
+			expect(firstScreen).not.toBeNull();
 			// Keep A pending while changing the current asset and generation.
 			await view.getByTestId("switch-preview").click();
 			await expect
 				.element(view.getByTestId("viewer-stage"))
 				.toHaveAttribute("data-current-asset", "b");
+			const secondScreen = document.querySelector<HTMLImageElement>(
+				"[data-viewer-layer='screenPreview']",
+			);
+			expect(secondScreen).not.toBe(firstScreen);
+			expect(firstScreen?.isConnected).toBe(false);
 			await expect
 				.poll(
 					() =>

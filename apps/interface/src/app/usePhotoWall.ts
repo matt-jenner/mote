@@ -69,10 +69,11 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 			busy: state.activeRequest !== null || state.sortPending,
 		};
 	const known = state.items.length;
+	const total = Math.max(known, state.totalCount ?? 0);
 	const wallReady = state.items.filter((item) => item.wallThumbnail).length;
 	const screenReady = state.items.filter((item) => item.screenPreview).length;
-	const missingWall = known - wallReady;
-	const missingScreen = known - screenReady;
+	const missingWall = total - wallReady;
+	const missingScreen = total - screenReady;
 	const busy =
 		state.activeRequest !== null || missingWall > 0 || state.sortPending;
 	if (
@@ -87,23 +88,23 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 		};
 	if (state.derivativeRetrying)
 		return {
-			status: `Retrying previews · ${wallReady} of ${known}`,
+			status: `Retrying previews · ${wallReady} of ${total}`,
 			value: wallReady,
-			max: known > 0 ? known : null,
+			max: total > 0 ? total : null,
 			busy: true,
 		};
 	if (missingWall > 0)
 		return {
-			status: `Preparing previews · ${wallReady} of ${known}`,
+			status: `Preparing previews · ${wallReady} of ${total}`,
 			value: wallReady,
-			max: known > 0 ? known : null,
+			max: total > 0 ? total : null,
 			busy: true,
 		};
 	if (state.scanComplete && missingScreen > 0)
 		return {
-			status: `Photos ready · preparing larger previews · ${screenReady} of ${known}`,
+			status: `Photos ready · preparing larger previews · ${screenReady} of ${total}`,
 			value: screenReady,
-			max: known > 0 ? known : null,
+			max: total > 0 ? total : null,
 			busy,
 		};
 	if (!state.scanComplete) {
@@ -122,9 +123,9 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 	if (known === 0 && state.pagesExhausted && !state.activeRequest)
 		return { status: "No photos found", value: null, max: null, busy: false };
 	return {
-		status: `${known} photos ready`,
-		value: known,
-		max: known,
+		status: `${total} photos ready`,
+		value: total,
+		max: total,
 		busy,
 	};
 }
@@ -233,6 +234,7 @@ export function usePhotoWall(
 						dispatch({
 							type: "metadataSettled",
 							assets: page.items,
+							totalCount: page.totalCount,
 							nextCursor: page.nextCursor,
 							sourceWarnings: page.sourceWarnings,
 							requestEpoch: owner.epoch,
@@ -245,6 +247,7 @@ export function usePhotoWall(
 						dispatch({
 							type: "pageLoaded",
 							assets: page.items,
+							totalCount: page.totalCount,
 							orderState: page.orderState,
 							nextCursor: page.nextCursor,
 							sourceWarnings: page.sourceWarnings,

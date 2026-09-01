@@ -110,6 +110,7 @@ pub struct WallPage {
     pub next_cursor: Option<String>,
     pub order_state: OrderState,
     pub source_warnings: Vec<WallWarningState>,
+    pub total_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -289,6 +290,7 @@ mod tests {
                 code: "screenPreviewCacheUnavailable".to_owned(),
                 retryable: true,
             }],
+            total_count: 0,
         };
         let value = serde_json::to_value(page).unwrap();
         assert_eq!(

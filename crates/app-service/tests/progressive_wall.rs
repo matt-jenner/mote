@@ -4329,6 +4329,7 @@ fn wall_dtos_never_serialize_native_paths() {
         next_cursor: Some("opaque-cursor".to_owned()),
         order_state: OrderState::Settled,
         source_warnings: Vec::new(),
+        total_count: 1,
     };
     let json = serde_json::to_string(&page).unwrap();
     assert!(!json.contains("/Users/"));

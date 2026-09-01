@@ -149,6 +149,65 @@ fn parent_and_child_memberships_are_independent_scopes_and_generations() {
 }
 
 #[test]
+fn photo_count_includes_unshaped_members_but_excludes_videos_and_respects_scope() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured("Photos", Path::new("/Photos")))
+        .unwrap();
+    let selected = group(&mut catalog, library.id, "selected");
+    let direct = ready_asset(&mut catalog, library.id, selected, "selected/direct.jpg");
+    let nested = ready_asset(
+        &mut catalog,
+        library.id,
+        selected,
+        "selected/child/nested.jpg",
+    );
+    let pending = NewAsset {
+        folder_group_id: Some(selected),
+        ..NewAsset::minimal(
+            library.id,
+            RelativePathKey::from_relative_path(Path::new("selected/pending.jpg")).unwrap(),
+            "selected/pending.jpg",
+            MediaKind::Jpeg,
+            1,
+        )
+    };
+    let video = NewAsset {
+        folder_group_id: Some(selected),
+        ..NewAsset::minimal(
+            library.id,
+            RelativePathKey::from_relative_path(Path::new("selected/clip.mp4")).unwrap(),
+            "selected/clip.mp4",
+            MediaKind::Video,
+            1,
+        )
+    };
+    catalog.upsert_asset(&pending).unwrap();
+    catalog.upsert_asset(&video).unwrap();
+    let generation = catalog
+        .begin_generation_for_group(library.id, selected)
+        .unwrap();
+    for asset in [direct, nested, pending.id, video.id] {
+        catalog
+            .add_asset_membership(selected, asset, generation)
+            .unwrap();
+    }
+
+    assert_eq!(
+        catalog
+            .wall_photo_count_scoped(selected, GalleryScope::CurrentFolder)
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        catalog
+            .wall_photo_count_scoped(selected, GalleryScope::IncludeSubfolders)
+            .unwrap(),
+        3
+    );
+}
+
+#[test]
 fn one_immutable_derivative_can_be_reused_by_multiple_groups() {
     let mut catalog = Catalog::open_in_memory().unwrap();
     let library = catalog

@@ -9,6 +9,7 @@ import type {
 
 export interface WallState {
 	items: WallAsset[];
+	totalCount: number | null;
 	cursor: string | null;
 	orderState: OrderState;
 	direction: SortDirection;
@@ -50,6 +51,7 @@ export type WallAction =
 	| {
 			type: "pageLoaded";
 			assets: readonly WallAsset[];
+			totalCount?: number;
 			orderState: OrderState;
 			nextCursor: string | null;
 			requestCursor: string | null;
@@ -95,6 +97,7 @@ export type WallAction =
 	| {
 			type: "metadataSettled";
 			assets: readonly WallAsset[];
+			totalCount?: number;
 			nextCursor: string | null;
 			requestEpoch: number;
 			requestCursor: string | null;
@@ -122,6 +125,7 @@ export type WallAction =
 
 export const initialWallState: WallState = {
 	items: [],
+	totalCount: null,
 	cursor: null,
 	orderState: "provisional",
 	direction: "oldestFirst",
@@ -505,6 +509,10 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			return {
 				...state,
 				items,
+				totalCount:
+					acceptsProgress && action.progress?.total !== null
+						? (action.progress?.total ?? state.totalCount)
+						: state.totalCount,
 				orderState,
 				assetWarnings: remembered.changed
 					? remembered.warnings
@@ -529,6 +537,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				...state,
 				scanProgress: action.progress,
 				scanProgressGeneration: action.generation,
+				totalCount: action.progress.total ?? state.totalCount,
 			};
 		}
 		case "derivativeRetrying":
@@ -582,11 +591,16 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 					: merged.items;
 			const items = reuseSequence(state.items, sorted);
 			const pagesExhausted = action.nextCursor === null;
+			const totalCount =
+				state.scanProgress?.total ??
+				action.totalCount ??
+				Math.max(state.totalCount ?? 0, merged.items.length);
 			if (
 				!merged.changed &&
 				state.orderState === orderState &&
 				state.cursor === action.nextCursor &&
 				state.pagesExhausted === pagesExhausted &&
+				state.totalCount === totalCount &&
 				state.activeRequest === null &&
 				!remembered.changed &&
 				!rememberedSource.changed
@@ -596,6 +610,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			return {
 				...state,
 				items,
+				totalCount,
 				cursor: action.nextCursor,
 				orderState,
 				pagesExhausted,
@@ -697,6 +712,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			return {
 				...state,
 				items: merged.items,
+				totalCount: action.totalCount ?? merged.items.length,
 				cursor: action.nextCursor,
 				orderState: "settled",
 				scanComplete: true,

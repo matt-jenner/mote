@@ -319,6 +319,46 @@ async fn emits_shape_before_blocked_metadata_and_before_scan_completion() {
 }
 
 #[tokio::test]
+async fn inventory_total_arrives_while_image_reads_are_paused() {
+    let blocker = tempfile::tempdir().unwrap();
+    write_png(&blocker.path().join("blocker.png"), [9, 8, 7]);
+    let fixture = tempfile::tempdir().unwrap();
+    for index in 0..160 {
+        write_png(&fixture.path().join(format!("{index:04}.png")), [1, 2, 3]);
+    }
+    std::fs::write(fixture.path().join("clip.mp4"), b"not a video").unwrap();
+    let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig {
+        idle_workers: 1,
+        active_workers: 1,
+    }));
+    let (blocking_reader, notifications, release) = AdmissionReader::new();
+    let blocking_scan =
+        Indexer::with_scheduler(blocking_reader, empty_policy_engine(), scheduler.clone())
+            .start(ScanRequest::new(blocker.path()))
+            .unwrap();
+    let _notifications = wait_for_starts(notifications, 1).await;
+    let indexer = Indexer::with_scheduler(NoopMetadataReader, empty_policy_engine(), scheduler);
+    let mut scan = indexer.start(ScanRequest::new(fixture.path())).unwrap();
+
+    let total = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(IndexEvent::Progress(progress)) = scan.events.recv().await
+                && progress.total.is_some()
+            {
+                break (progress.total, progress.shaped);
+            }
+        }
+    })
+    .await;
+    let _ = scan.cancel();
+    release.release();
+    scan.join().await.unwrap();
+    blocking_scan.join().await.unwrap();
+
+    assert_eq!(total.unwrap(), (Some(160), 0));
+}
+
+#[tokio::test]
 async fn video_discovery_is_indexed_but_not_counted_in_photo_progress() {
     let fixture = tempfile::tempdir().unwrap();
     write_png(&fixture.path().join("a.jpg"), [255, 0, 0]);
@@ -385,10 +425,13 @@ async fn cancellation_stops_a_large_scan_at_a_bounded_partial_result() {
     }
     let indexer = Indexer::new(NoopMetadataReader, empty_policy_engine());
     let mut scan = indexer.start(ScanRequest::new(fixture.path())).unwrap();
-    assert!(matches!(
-        scan.events.recv().await,
-        Some(IndexEvent::Discovered { .. })
-    ));
+    loop {
+        match scan.events.recv().await {
+            Some(IndexEvent::Discovered { .. }) => break,
+            Some(_) => {}
+            None => panic!("scan ended before discovering an asset"),
+        }
+    }
 
     scan.cancel().unwrap();
     let summary = scan.join().await.unwrap();

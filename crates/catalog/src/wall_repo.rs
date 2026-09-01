@@ -84,6 +84,27 @@ pub struct PhotoAssetIdPage {
 }
 
 impl Catalog {
+    pub fn wall_photo_count_scoped(
+        &self,
+        group: FolderGroupId,
+        scope: GalleryScope,
+    ) -> Result<u64, CatalogError> {
+        let mut sql = String::from(
+            "SELECT COUNT(*) \
+             FROM assets JOIN folder_group_assets fga ON fga.asset_id = assets.id \
+             WHERE fga.folder_group_id = ?1 AND media_kind <> 'video'",
+        );
+        if scope == GalleryScope::CurrentFolder {
+            sql.push_str(
+                " AND relative_parent_key = (SELECT relative_path_key FROM folder_groups WHERE id = ?1)",
+            );
+        }
+        let count: i64 = self
+            .connection
+            .query_row(&sql, [group.as_uuid().as_bytes()], |row| row.get(0))?;
+        u64::try_from(count).map_err(|_| CatalogError::ValueOutOfRange)
+    }
+
     pub fn wall_records_for_assets(
         &self,
         group: FolderGroupId,

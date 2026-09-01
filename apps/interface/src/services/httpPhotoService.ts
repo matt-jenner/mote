@@ -278,12 +278,14 @@ function decodeWallPage(value: unknown): WallPage {
 		"nextCursor",
 		"orderState",
 		"sourceWarnings",
+		"totalCount",
 	]);
 	return {
 		items: arrayValue(page.items, decodeWallAsset),
 		nextCursor: nullable(page.nextCursor, stringValue),
 		orderState: enumValue(page.orderState, ["provisional", "settled"]),
 		sourceWarnings: arrayValue(page.sourceWarnings, decodeWarning),
+		totalCount: integerValue(page.totalCount),
 	};
 }
 

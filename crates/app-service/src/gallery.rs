@@ -1159,6 +1159,10 @@ impl GalleryEngine {
             cursor,
             request.limit,
         )?;
+        let total_count = state
+            .libraries
+            .catalog()
+            .wall_photo_count_scoped(selection.group_id, scope)?;
         let items = crate::service::wall_assets_with_derivatives(
             state.libraries.catalog(),
             &page.items,
@@ -1188,6 +1192,7 @@ impl GalleryEngine {
                 .into_iter()
                 .map(|w| crate::service::map_source_warning_code(&w.code))
                 .collect(),
+            total_count,
         })
     }
 

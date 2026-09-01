@@ -319,6 +319,7 @@ export function ViewerStage({
 								data-viewer-layer="wallThumbnail"
 								decoding="async"
 								draggable={false}
+								key={`base:${baseToken}`}
 								onLoad={(event) => reportBaseNaturalSize(event.currentTarget)}
 								onError={() => setFailedBaseUrl(baseUrl)}
 								src={baseUrl ?? undefined}
@@ -345,6 +346,7 @@ export function ViewerStage({
 								data-viewer-layer="screenPreview"
 								decoding="async"
 								draggable={false}
+								key={`preview:${decodeToken}`}
 								onLoad={(event) => {
 									if (decodedToken === decodeToken && !screenFailed)
 										reportDecodedPreviewNaturalSize(event.currentTarget);
