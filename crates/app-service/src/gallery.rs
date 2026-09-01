@@ -34,7 +34,7 @@ use crate::service::{ReaderAdapter, ServiceState};
 use crate::{
     AppConfig, AppServiceError, DerivativeClass, DerivativePriority, DerivativeReference,
     DerivativeRequest, InteractionState, OrderState, SourceAvailability, WallPage,
-    WallQueryRequest, WallUpdate,
+    WallPreviewCounts, WallQueryRequest, WallUpdate,
 };
 
 fn canonicalize_for_identity(path: &Path) -> PathBuf {
@@ -1181,6 +1181,10 @@ impl GalleryEngine {
             .libraries
             .catalog()
             .wall_photo_count_scoped(selection.group_id, scope)?;
+        let preview_counts = state
+            .libraries
+            .catalog()
+            .wall_preview_counts_scoped(selection.group_id, scope)?;
         let total_count = inventory_total.unwrap_or(catalog_total_count);
         let items = crate::service::wall_assets_with_derivatives(
             state.libraries.catalog(),
@@ -1212,6 +1216,10 @@ impl GalleryEngine {
                 .map(|w| crate::service::map_source_warning_code(&w.code))
                 .collect(),
             total_count,
+            preview_counts: WallPreviewCounts {
+                wall_ready: preview_counts.wall_ready,
+                screen_ready: preview_counts.screen_ready,
+            },
         })
     }
 
@@ -1386,6 +1394,7 @@ impl GalleryEngine {
                             kind: batch.class,
                             key,
                         }],
+                        preview_counts: None,
                     })
                     .await;
                 continue;
@@ -2230,6 +2239,7 @@ impl GalleryEngine {
                 .publish(WallUpdate::DerivativesReady {
                     selection_id: runtime.selection.id.clone(),
                     derivatives: vec![reference.clone()],
+                    preview_counts: None,
                 })
                 .await;
             runtime

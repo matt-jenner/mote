@@ -33,6 +33,7 @@ pub use settings_repo::{AppStateRecord, StoredSourceSelection};
 use thiserror::Error;
 pub use wall_repo::{
     PhotoAssetIdPage, ShapeStatus, WallCatalogPage, WallCatalogRecord, WallCursorKey, WallOrder,
+    WallPreviewCounts,
 };
 
 pub struct Catalog {

@@ -324,12 +324,17 @@ const pageOf = (
 	nextCursor: string | null = null,
 	sourceWarnings: readonly WallWarningState[] = [],
 	totalCount = items.length,
+	previewCounts = {
+		wallReady: items.filter((item) => item.wallThumbnail !== null).length,
+		screenReady: items.filter((item) => item.screenPreview !== null).length,
+	},
 ): WallPage => ({
 	items: [...items],
 	orderState,
 	nextCursor,
 	sourceWarnings: [...sourceWarnings],
 	totalCount,
+	previewCounts,
 });
 
 function renderWall(service: PhotoService) {
@@ -1104,6 +1109,62 @@ describe("progressive photo wall", () => {
 		TestIntersectionObserver.trigger("visible", wall.element(), ["ready-once"]);
 		await new Promise((resolve) => window.setTimeout(resolve, 25));
 		expect(service.derivativeRequests).toHaveLength(1);
+	});
+
+	it("re-requests a cached thumbnail when its ready event beat a stale wall page", async () => {
+		const service = new ControlledWallService();
+		await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseThumbnail("raced-ready", "/demo-photos/raced-ready.jpg");
+		service.releaseQuery(
+			0,
+			pageOf([asset("raced-ready", "Raced ready", 1)], "settled"),
+		);
+
+		await expect.poll(() => service.derivativeRequests.length).toBe(1);
+		expect(service.derivativeRequests[0]).toMatchObject({
+			assetIds: ["raced-ready"],
+			kind: "wallThumbnail",
+		});
+	});
+
+	it("preserves a live thumbnail when a stale first page follows its catalog batch", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.emit({
+			kind: "catalogBatch",
+			selectionId: "source-a",
+			generation: 1,
+			assets: [asset("known-race", "Known race", 1)],
+			orderState: "provisional",
+			progress: { discovered: 1, shaped: 1, enriched: 0, total: 1 },
+		});
+		service.releaseThumbnail("known-race", "/demo-photos/known-race.jpg");
+		service.setDerivativeUrl(
+			"known-race-old-wall",
+			"/demo-photos/known-race-old.jpg",
+		);
+		service.releaseQuery(
+			0,
+			pageOf(
+				[
+					asset("known-race", "Known race", 1, {
+						wallThumbnail: {
+							assetId: "known-race",
+							kind: "wallThumbnail",
+							key: "known-race-old-wall",
+						},
+					}),
+				],
+				"settled",
+			),
+		);
+
+		await expect
+			.element(screen.getByRole("img", { name: "Known race" }))
+			.toHaveAttribute("src", "/demo-photos/known-race.jpg");
+		expect(service.derivativeRequests).toHaveLength(0);
 	});
 
 	it("does not retry wall thumbnails for a screen-preview warning", async () => {
@@ -2597,6 +2658,45 @@ describe("progressive photo wall", () => {
 			"max",
 			"469",
 		);
+	});
+
+	it("keeps scope-wide cached preview progress independent from wall paging", async () => {
+		await page.viewport(1440, 1024);
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(
+			0,
+			pageOf(
+				realFixtureAssets.slice(0, 4),
+				"settled",
+				"cursor-2",
+				[],
+				2_092,
+				{ wallReady: 1_033, screenReady: 149 },
+			),
+		);
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("Preparing previews · 1,033 of 2,092");
+
+		const wall = screen.getByRole("region", { name: "Photos" });
+		TestIntersectionObserver.trigger("sentinel", wall.element());
+		await expect.poll(() => service.queryRequests.length).toBe(2);
+		service.releaseQuery(
+			1,
+			pageOf(
+				settledFixtures,
+				"settled",
+				null,
+				[],
+				2_092,
+				{ wallReady: 1_033, screenReady: 149 },
+			),
+		);
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("Preparing previews · 1,033 of 2,092");
 	});
 
 	it("switches repeatedly between direct and recursive inventory totals during indexing", async () => {

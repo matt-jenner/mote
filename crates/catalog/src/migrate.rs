@@ -18,6 +18,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0008_gallery_scope.sql"),
     include_str!("../migrations/0009_selection_membership.sql"),
     include_str!("../migrations/0010_folder_recovery.sql"),
+    include_str!("../migrations/0011_preview_counts.sql"),
 ];
 
 pub(crate) fn migrate_with(path: &Path, migrations: &[&str]) -> Result<Connection, CatalogError> {
@@ -246,9 +247,87 @@ fn remove_sqlite_sidecar(path: &Path, suffix: &str) -> Result<(), std::io::Error
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::Connection;
+    use rusqlite::{Connection, params};
 
-    use super::migrate_with;
+    use super::{MIGRATIONS, apply_migrations, migrate_with};
+
+    #[test]
+    fn preview_count_migration_backfills_an_existing_v10_catalog() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..10]).unwrap();
+        let library = vec![1_u8; 16];
+        let group = vec![2_u8; 16];
+        let asset = vec![3_u8; 16];
+        let derivative = vec![4_u8; 16];
+        connection
+            .execute(
+                "INSERT INTO library_roots
+                 (id, kind, display_name, canonical_root_key, display_path, availability)
+                 VALUES (?1, 'configured', 'Photos', ?2, '/Photos', 'available')",
+                params![&library, b"/Photos".as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO folder_groups
+                 (id, library_id, relative_path_key, display_path)
+                 VALUES (?1, ?2, ?3, 'selected')",
+                params![&group, &library, b"selected".as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO assets
+                 (id, library_id, folder_group_id, relative_path_key, relative_parent_key,
+                  display_path, media_kind, size_bytes, modified_unix_ns, width, height,
+                  availability, provisional_order, shape_status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'selected/photo.jpg', 'jpeg', 8, '1', 16, 9,
+                         'available', 1, 'ready')",
+                params![
+                    &asset,
+                    &library,
+                    &group,
+                    b"selected/photo.jpg".as_slice(),
+                    b"selected".as_slice()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO folder_group_assets(folder_group_id, asset_id, last_seen_generation)
+                 VALUES (?1, ?2, 1)",
+                params![&group, &asset],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO derivatives
+                 (id, asset_id, folder_group_id, kind, cache_key, relative_cache_path,
+                  size_bytes, durable, created_at)
+                 VALUES (?1, ?2, ?3, 'wall_thumbnail', 'wall-key', 'aa/wall.jpg', 8, 1, 1)",
+                params![&derivative, &asset, &group],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO derivative_folder_groups(derivative_id, folder_group_id)
+                 VALUES (?1, ?2)",
+                params![&derivative, &group],
+            )
+            .unwrap();
+
+        apply_migrations(&mut connection, MIGRATIONS).unwrap();
+
+        let counts: (i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT wall_ready, screen_ready, direct_wall_ready, direct_screen_ready
+                 FROM folder_group_preview_counts WHERE folder_group_id = ?1",
+                [&group],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 0, 1, 0));
+    }
 
     #[test]
     fn failed_migration_restores_the_pre_migration_database() {

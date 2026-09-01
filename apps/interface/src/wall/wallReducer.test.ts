@@ -154,6 +154,74 @@ describe("wallReducer", () => {
 		});
 	});
 
+	it("does not regress a live preview count when an older wall page arrives", () => {
+		const initial = {
+			...activeState(),
+			previewCounts: { wallReady: 1_033, screenReady: 149 },
+		};
+		const requested = reduce(initial, {
+			type: "pageRequestStarted",
+			requestId: "stale-count-page",
+			requestCursor: null,
+			requestEpoch: initial.scrollEpoch,
+		});
+		const live = reduce(requested, {
+			type: "derivativesReady",
+			derivatives: [],
+			previewCounts: { wallReady: 1_034, screenReady: 149 },
+		});
+		const paged = reduce(live, {
+			type: "pageLoaded",
+			assets: [],
+			orderState: "settled",
+			nextCursor: null,
+			requestCursor: null,
+			requestEpoch: live.scrollEpoch,
+			requestId: "stale-count-page",
+			previewCounts: { wallReady: 1_033, screenReady: 149 },
+		});
+
+		expect(paged.previewCounts).toEqual({
+			wallReady: 1_034,
+			screenReady: 149,
+		});
+	});
+
+	it("accepts a lower authoritative count from a page requested after live updates", () => {
+		const live = reduce(
+			{
+				...activeState(),
+				previewCounts: { wallReady: 1_033, screenReady: 149 },
+			},
+			{
+				type: "derivativesReady",
+				derivatives: [],
+				previewCounts: { wallReady: 1_034, screenReady: 149 },
+			},
+		);
+		const requested = reduce(live, {
+			type: "pageRequestStarted",
+			requestId: "newer-count-page",
+			requestCursor: null,
+			requestEpoch: live.scrollEpoch,
+		});
+		const paged = reduce(requested, {
+			type: "pageLoaded",
+			assets: [],
+			orderState: "settled",
+			nextCursor: null,
+			requestCursor: null,
+			requestEpoch: requested.scrollEpoch,
+			requestId: "newer-count-page",
+			previewCounts: { wallReady: 1_000, screenReady: 140 },
+		});
+
+		expect(paged.previewCounts).toEqual({
+			wallReady: 1_000,
+			screenReady: 140,
+		});
+	});
+
 	it("stores progress attached to an unchanged catalog batch", () => {
 		const current = reduce(activeState(), {
 			type: "catalogBatch",

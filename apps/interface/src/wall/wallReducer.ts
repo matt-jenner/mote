@@ -4,12 +4,15 @@ import type {
 	ScanProgressDto,
 	SortDirection,
 	WallAsset,
+	WallPreviewCounts,
 	WallWarningState,
 } from "../services/photoService";
 
 export interface WallState {
 	items: WallAsset[];
 	totalCount: number | null;
+	previewCounts: WallPreviewCounts | null;
+	previewCountVersion: number;
 	cursor: string | null;
 	orderState: OrderState;
 	direction: SortDirection;
@@ -37,6 +40,7 @@ export interface PageRequest {
 	id: WallRequestId;
 	cursor: string | null;
 	epoch: number;
+	previewCountVersion: number;
 }
 
 export type WallAction =
@@ -52,6 +56,7 @@ export type WallAction =
 			type: "pageLoaded";
 			assets: readonly WallAsset[];
 			totalCount?: number;
+			previewCounts?: WallPreviewCounts;
 			orderState: OrderState;
 			nextCursor: string | null;
 			requestCursor: string | null;
@@ -93,11 +98,16 @@ export type WallAction =
 	  }
 	| { type: "resetSource"; sourceGeneration: number; selectionId?: string }
 	| { type: "retryStarted" }
-	| { type: "derivativesReady"; derivatives: readonly DerivativeReference[] }
+	| {
+			type: "derivativesReady";
+			derivatives: readonly DerivativeReference[];
+			previewCounts?: WallPreviewCounts | null;
+	  }
 	| {
 			type: "metadataSettled";
 			assets: readonly WallAsset[];
 			totalCount?: number;
+			previewCounts?: WallPreviewCounts;
 			nextCursor: string | null;
 			requestEpoch: number;
 			requestCursor: string | null;
@@ -126,6 +136,8 @@ export type WallAction =
 export const initialWallState: WallState = {
 	items: [],
 	totalCount: null,
+	previewCounts: null,
+	previewCountVersion: 0,
 	cursor: null,
 	orderState: "provisional",
 	direction: "oldestFirst",
@@ -151,6 +163,48 @@ export function isWallLayoutComplete(
 	state: Pick<WallState, "scanComplete" | "pagesExhausted">,
 ): boolean {
 	return state.scanComplete && state.pagesExhausted;
+}
+
+function mergePreviewCounts(
+	current: WallPreviewCounts | null,
+	incoming: WallPreviewCounts | null | undefined,
+): WallPreviewCounts | null {
+	if (!incoming) return current;
+	if (!current) return incoming;
+	return {
+		wallReady: Math.max(current.wallReady, incoming.wallReady),
+		screenReady: Math.max(current.screenReady, incoming.screenReady),
+	};
+}
+
+function observedPreviewCounts(items: readonly WallAsset[]): WallPreviewCounts {
+	return {
+		wallReady: items.filter((item) => item.wallThumbnail !== null).length,
+		screenReady: items.filter((item) => item.screenPreview !== null).length,
+	};
+}
+
+function samePreviewCounts(
+	left: WallPreviewCounts | null,
+	right: WallPreviewCounts | null,
+): boolean {
+	return (
+		left === right ||
+		(left !== null &&
+			right !== null &&
+			left.wallReady === right.wallReady &&
+			left.screenReady === right.screenReady)
+	);
+}
+
+function pagePreviewCounts(
+	state: WallState,
+	incoming: WallPreviewCounts | undefined,
+): WallPreviewCounts | null {
+	if (!incoming) return state.previewCounts;
+	if (state.activeRequest?.previewCountVersion === state.previewCountVersion)
+		return incoming;
+	return mergePreviewCounts(state.previewCounts, incoming);
 }
 
 function matchesActiveRequest(
@@ -311,6 +365,7 @@ function preserveCatalogAvailability(
 function mergeDerivativeReferences(
 	current: readonly WallAsset[],
 	incoming: readonly WallAsset[],
+	preferCurrent = false,
 ): WallAsset[] {
 	const byId = new Map(current.map((asset) => [asset.id, asset]));
 	return incoming.map((asset) => {
@@ -318,8 +373,12 @@ function mergeDerivativeReferences(
 		if (!previous) return asset;
 		return {
 			...asset,
-			wallThumbnail: asset.wallThumbnail ?? previous.wallThumbnail,
-			screenPreview: asset.screenPreview ?? previous.screenPreview,
+			wallThumbnail: preferCurrent
+				? (previous.wallThumbnail ?? asset.wallThumbnail)
+				: (asset.wallThumbnail ?? previous.wallThumbnail),
+			screenPreview: preferCurrent
+				? (previous.screenPreview ?? asset.screenPreview)
+				: (asset.screenPreview ?? previous.screenPreview),
 		};
 	});
 }
@@ -448,6 +507,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				id: action.requestId,
 				cursor: action.requestCursor,
 				epoch: action.requestEpoch,
+				previewCountVersion: state.previewCountVersion,
 			};
 			if (
 				state.activeRequest?.id === activeRequest.id &&
@@ -572,9 +632,16 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				requestToken(state.activeRequest),
 				true,
 			);
+			const liveUpdateRacedPage =
+				state.activeRequest?.previewCountVersion !== state.previewCountVersion;
 			const replacementPage =
-				firstPage && state.sortPending
-					? mergeDerivativeReferences(state.items, remembered.assets)
+				firstPage &&
+				(state.sortPending || liveUpdateRacedPage)
+					? mergeDerivativeReferences(
+							state.items,
+							remembered.assets,
+							liveUpdateRacedPage,
+						)
 					: remembered.assets;
 			const merged = firstPage
 				? mergeAssets([], replacementPage)
@@ -595,12 +662,14 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				state.scanProgress?.total ??
 				action.totalCount ??
 				Math.max(state.totalCount ?? 0, merged.items.length);
+			const previewCounts = pagePreviewCounts(state, action.previewCounts);
 			if (
 				!merged.changed &&
 				state.orderState === orderState &&
 				state.cursor === action.nextCursor &&
 				state.pagesExhausted === pagesExhausted &&
 				state.totalCount === totalCount &&
+				samePreviewCounts(state.previewCounts, previewCounts) &&
 				state.activeRequest === null &&
 				!remembered.changed &&
 				!rememberedSource.changed
@@ -611,6 +680,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				...state,
 				items,
 				totalCount,
+				previewCounts,
 				cursor: action.nextCursor,
 				orderState,
 				pagesExhausted,
@@ -649,7 +719,16 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			return { ...state, scanComplete: true, error: action.error };
 		case "derivativesReady": {
 			if (action.derivatives.length === 0 || state.items.length === 0)
-				return state;
+				return action.previewCounts
+					? {
+							...state,
+							previewCounts: mergePreviewCounts(
+								state.previewCounts,
+								action.previewCounts,
+							),
+							previewCountVersion: state.previewCountVersion + 1,
+						}
+					: state;
 			let changed = false;
 			const derivativeByAssetAndKind = new Map(
 				action.derivatives.map((derivative) => [
@@ -671,7 +750,27 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				}
 				return nextAsset;
 			});
-			return changed ? { ...state, items } : state;
+			const previewCounts = mergePreviewCounts(
+				mergePreviewCounts(
+					state.previewCounts,
+					changed ? observedPreviewCounts(items) : null,
+				),
+				action.previewCounts,
+			);
+			const previewCountChanged = !samePreviewCounts(
+				state.previewCounts,
+				previewCounts,
+			);
+			return changed || previewCounts !== state.previewCounts
+				? {
+						...state,
+						...(changed ? { items } : {}),
+						previewCounts,
+						previewCountVersion:
+							state.previewCountVersion +
+							(action.previewCounts || previewCountChanged || changed ? 1 : 0),
+					}
+				: state;
 		}
 		case "metadataSettled": {
 			if (!matchesSource(state, action.sourceGeneration)) return state;
@@ -707,12 +806,15 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			const replacementPage = mergeDerivativeReferences(
 				state.items,
 				remembered.assets,
+				state.activeRequest?.previewCountVersion !== state.previewCountVersion,
 			);
 			const merged = mergeAssets([], replacementPage);
+			const previewCounts = pagePreviewCounts(state, action.previewCounts);
 			return {
 				...state,
 				items: merged.items,
 				totalCount: action.totalCount ?? merged.items.length,
+				previewCounts,
 				cursor: action.nextCursor,
 				orderState: "settled",
 				scanComplete: true,

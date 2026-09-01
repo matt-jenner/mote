@@ -208,6 +208,107 @@ fn photo_count_includes_unshaped_members_but_excludes_videos_and_respects_scope(
 }
 
 #[test]
+fn cached_preview_counts_cover_the_whole_scope_without_counting_old_versions_twice() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured("Photos", Path::new("/Photos")))
+        .unwrap();
+    let selected = group(&mut catalog, library.id, "selected");
+    let direct = ready_asset(&mut catalog, library.id, selected, "selected/direct.jpg");
+    let nested = ready_asset(
+        &mut catalog,
+        library.id,
+        selected,
+        "selected/child/nested.jpg",
+    );
+    let generation = catalog
+        .begin_generation_for_group(library.id, selected)
+        .unwrap();
+    for asset in [direct, nested] {
+        catalog
+            .add_asset_membership(selected, asset, generation)
+            .unwrap();
+    }
+    let derivatives = [
+        (direct, "wall_thumbnail", "direct-wall-old", 1),
+        (direct, "wall_thumbnail", "direct-wall-current", 2),
+        (nested, "wall_thumbnail", "nested-wall", 3),
+        (nested, "screen_preview", "nested-screen", 4),
+    ]
+    .map(|(asset_id, kind, key, created_at)| {
+        let derivative_id = DerivativeId::new();
+        catalog
+            .insert_derivative(&NewDerivative {
+                id: derivative_id,
+                asset_id,
+                folder_group_id: selected,
+                kind: kind.to_owned(),
+                cache_key: key.to_owned(),
+                relative_cache_path: Path::new(key).with_extension("jpg"),
+                size_bytes: 8,
+                durable: kind == "wall_thumbnail",
+                created_at,
+            })
+            .unwrap();
+        derivative_id
+    });
+
+    assert_eq!(
+        catalog
+            .wall_preview_counts_scoped(selected, GalleryScope::CurrentFolder)
+            .unwrap(),
+        photo_catalog::WallPreviewCounts {
+            wall_ready: 1,
+            screen_ready: 0,
+        }
+    );
+    assert_eq!(
+        catalog
+            .wall_preview_counts_scoped(selected, GalleryScope::IncludeSubfolders)
+            .unwrap(),
+        photo_catalog::WallPreviewCounts {
+            wall_ready: 2,
+            screen_ready: 1,
+        }
+    );
+
+    catalog
+        .begin_derivative_group_link_removal(derivatives[0], selected)
+        .unwrap()
+        .commit()
+        .unwrap();
+    assert_eq!(
+        catalog
+            .wall_preview_counts_scoped(selected, GalleryScope::CurrentFolder)
+            .unwrap()
+            .wall_ready,
+        1,
+        "removing one old derivative version must not lower asset readiness"
+    );
+    catalog
+        .begin_derivative_group_link_removal(derivatives[1], selected)
+        .unwrap()
+        .commit()
+        .unwrap();
+    assert_eq!(
+        catalog
+            .wall_preview_counts_scoped(selected, GalleryScope::CurrentFolder)
+            .unwrap()
+            .wall_ready,
+        0,
+        "removing the last derivative version must lower readiness"
+    );
+    assert!(catalog.remove_asset_membership(selected, nested).unwrap());
+    assert_eq!(
+        catalog
+            .wall_preview_counts_scoped(selected, GalleryScope::IncludeSubfolders)
+            .unwrap(),
+        photo_catalog::WallPreviewCounts::default(),
+        "membership removal must update both materialized preview counts"
+    );
+}
+
+#[test]
 fn one_immutable_derivative_can_be_reused_by_multiple_groups() {
     let mut catalog = Catalog::open_in_memory().unwrap();
     let library = catalog

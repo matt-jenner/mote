@@ -220,6 +220,7 @@ impl AppService {
                     .active_selection_id()
                     .unwrap_or_else(|| "selection-none".to_owned()),
                 derivatives: Vec::new(),
+                preview_counts: None,
             });
             return Ok(());
         }
@@ -2706,10 +2707,26 @@ impl AppService {
         {
             return false;
         }
+        let preview_counts = state
+            .libraries
+            .catalog()
+            .load_app_state()
+            .and_then(|stored| {
+                state
+                    .libraries
+                    .catalog()
+                    .wall_preview_counts_scoped(selection.group_id, stored.gallery_scope)
+            })
+            .ok()
+            .map(|counts| crate::WallPreviewCounts {
+                wall_ready: counts.wall_ready,
+                screen_ready: counts.screen_ready,
+            });
         let publication_started = std::time::Instant::now();
         let result = self.updates.send(WallUpdate::DerivativesReady {
             selection_id: selection.selection_id(),
             derivatives,
+            preview_counts,
         });
         record_timing_stage("derivative_publication", publication_started);
         result.is_ok()

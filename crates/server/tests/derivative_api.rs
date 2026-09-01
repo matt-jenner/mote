@@ -142,6 +142,12 @@ async fn derivative_route_admits_shared_cache_work_without_holding_browser_conne
     let (_temp, app, gallery) = make_app_with_gallery();
     let (selection_id, asset_id) = selection_and_asset(&app).await;
     let selection = gallery.resolve_selection(&selection_id).unwrap();
+    let mut updates = gallery.subscribe(
+        &selection,
+        "scope-wide-preview-count".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(AtomicBool::new(false));
     gallery
@@ -201,6 +207,7 @@ async fn derivative_route_admits_shared_cache_work_without_holding_browser_conne
     let recursive_while_blocked = wall_for_scope(&app, &selection_id, "includeSubfolders").await;
     assert_eq!(current_while_blocked["totalCount"], 1);
     assert_eq!(recursive_while_blocked["totalCount"], 1);
+    assert_eq!(current_while_blocked["previewCounts"]["wallReady"], 0);
 
     release.store(true, Ordering::Release);
     let cache_key = tokio::time::timeout(Duration::from_secs(5), async {
@@ -214,9 +221,26 @@ async fn derivative_route_admits_shared_cache_work_without_holding_browser_conne
     })
     .await
     .expect("the shared cache-key work did not publish its derivative");
+    let ready = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = updates.recv().await.unwrap();
+            if let WallUpdate::DerivativesReady {
+                preview_counts: Some(counts),
+                ..
+            } = event.update
+            {
+                break counts;
+            }
+        }
+    })
+    .await
+    .expect("readiness event did not include authoritative preview counts");
+    assert_eq!(ready.wall_ready, 1);
+    assert_eq!(ready.screen_ready, 0);
     assert_eq!(gallery.hosted_derivative_attempts_for_test(), 1);
     let recursive = wall_for_scope(&app, &selection_id, "includeSubfolders").await;
     assert_eq!(recursive["items"][0]["wallThumbnail"]["key"], cache_key);
+    assert_eq!(recursive["previewCounts"]["wallReady"], 1);
     assert_eq!(gallery.hosted_derivative_attempts_for_test(), 1);
 }
 

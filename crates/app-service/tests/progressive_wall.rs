@@ -291,6 +291,7 @@ fn derivative_update_observation(
             WallUpdate::DerivativesReady {
                 selection_id,
                 derivatives,
+                ..
             } => {
                 screen_publications.extend(
                     derivatives
@@ -1922,7 +1923,16 @@ async fn terminal_failure_retries_only_after_derivative_key_changes() {
         matches!(event, WallUpdate::DerivativesReady { derivatives, .. } if derivatives.iter().any(|item| item.asset_id == asset_id && item.kind == DerivativeClass::WallThumbnail))
     })
     .await;
-    assert!(matches!(ready, WallUpdate::DerivativesReady { .. }));
+    assert!(matches!(
+        ready,
+        WallUpdate::DerivativesReady {
+            preview_counts: Some(photo_app_service::WallPreviewCounts {
+                wall_ready: 1,
+                screen_ready: 0,
+            }),
+            ..
+        }
+    ));
 }
 
 #[cfg(debug_assertions)]
@@ -4330,6 +4340,7 @@ fn wall_dtos_never_serialize_native_paths() {
         order_state: OrderState::Settled,
         source_warnings: Vec::new(),
         total_count: 1,
+        preview_counts: photo_app_service::WallPreviewCounts::default(),
     };
     let json = serde_json::to_string(&page).unwrap();
     assert!(!json.contains("/Users/"));

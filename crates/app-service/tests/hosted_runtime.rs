@@ -1228,6 +1228,7 @@ async fn publish_child_updates(
                     kind: DerivativeClass::WallThumbnail,
                     key: "child-thumb".to_owned(),
                 }],
+                preview_counts: None,
             },
         )
         .await;
@@ -1426,6 +1427,7 @@ async fn mixed_scope_filters_catalog_derivatives_and_warning_events() {
                         key: "child-thumb".to_owned(),
                     },
                 ],
+                preview_counts: None,
             },
         )
         .await;

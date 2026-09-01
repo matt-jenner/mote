@@ -103,6 +103,13 @@ pub struct WallWarningState {
     pub retryable: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WallPreviewCounts {
+    pub wall_ready: u64,
+    pub screen_ready: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WallPage {
@@ -111,6 +118,7 @@ pub struct WallPage {
     pub order_state: OrderState,
     pub source_warnings: Vec<WallWarningState>,
     pub total_count: u64,
+    pub preview_counts: WallPreviewCounts,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -170,6 +178,8 @@ pub enum WallUpdate {
         #[serde(rename = "selectionId")]
         selection_id: String,
         derivatives: Vec<DerivativeReference>,
+        #[serde(rename = "previewCounts")]
+        preview_counts: Option<WallPreviewCounts>,
     },
     MetadataSettled {
         #[serde(rename = "selectionId")]
@@ -261,7 +271,36 @@ pub enum SourceAvailability {
 #[cfg(test)]
 mod tests {
     use super::{OrderState, SourceAvailability, WallMediaKind, WallShapeState};
-    use super::{ScanProgressDto, WallAsset, WallPage, WallUpdate, WallWarningState};
+    use super::{
+        ScanProgressDto, WallAsset, WallPage, WallPreviewCounts, WallUpdate, WallWarningState,
+    };
+
+    #[test]
+    fn wall_page_and_derivative_events_serialize_scope_wide_preview_counts() {
+        let counts = WallPreviewCounts {
+            wall_ready: 1033,
+            screen_ready: 149,
+        };
+        let page = WallPage {
+            items: Vec::new(),
+            next_cursor: None,
+            order_state: OrderState::Settled,
+            source_warnings: Vec::new(),
+            total_count: 2092,
+            preview_counts: counts,
+        };
+        let page_value = serde_json::to_value(page).unwrap();
+        assert_eq!(page_value["previewCounts"]["wallReady"], 1033);
+        assert_eq!(page_value["previewCounts"]["screenReady"], 149);
+
+        let update = WallUpdate::DerivativesReady {
+            selection_id: "selection-opaque".to_owned(),
+            derivatives: Vec::new(),
+            preview_counts: Some(counts),
+        };
+        let update_value = serde_json::to_value(update).unwrap();
+        assert_eq!(update_value["previewCounts"], page_value["previewCounts"]);
+    }
 
     #[test]
     fn wall_updates_serialize_selection_identity_and_generation() {
@@ -293,6 +332,7 @@ mod tests {
                 retryable: true,
             }],
             total_count: 0,
+            preview_counts: WallPreviewCounts::default(),
         };
         let value = serde_json::to_value(page).unwrap();
         assert_eq!(

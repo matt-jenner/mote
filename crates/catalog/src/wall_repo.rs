@@ -83,6 +83,12 @@ pub struct PhotoAssetIdPage {
     pub next: Option<WallCursorKey>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WallPreviewCounts {
+    pub wall_ready: u64,
+    pub screen_ready: u64,
+}
+
 impl Catalog {
     pub fn wall_photo_count_scoped(
         &self,
@@ -103,6 +109,32 @@ impl Catalog {
             .connection
             .query_row(&sql, [group.as_uuid().as_bytes()], |row| row.get(0))?;
         u64::try_from(count).map_err(|_| CatalogError::ValueOutOfRange)
+    }
+
+    pub fn wall_preview_counts_scoped(
+        &self,
+        group: FolderGroupId,
+        scope: GalleryScope,
+    ) -> Result<WallPreviewCounts, CatalogError> {
+        let sql = match scope {
+            GalleryScope::CurrentFolder => {
+                "SELECT direct_wall_ready, direct_screen_ready \
+                 FROM folder_group_preview_counts WHERE folder_group_id = ?1"
+            }
+            GalleryScope::IncludeSubfolders => {
+                "SELECT wall_ready, screen_ready \
+                 FROM folder_group_preview_counts WHERE folder_group_id = ?1"
+            }
+        };
+        let (wall_ready, screen_ready): (i64, i64) =
+            self.connection
+                .query_row(sql, [group.as_uuid().as_bytes()], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
+        Ok(WallPreviewCounts {
+            wall_ready: u64::try_from(wall_ready).map_err(|_| CatalogError::ValueOutOfRange)?,
+            screen_ready: u64::try_from(screen_ready).map_err(|_| CatalogError::ValueOutOfRange)?,
+        })
     }
 
     pub fn wall_records_for_assets(
@@ -385,6 +417,37 @@ mod tests {
                 .iter()
                 .any(|detail| detail.contains("assets_group_capture_photo")),
             "expected captured wall index in query plan: {details:?}"
+        );
+    }
+
+    #[test]
+    fn preview_count_lookup_uses_one_materialized_group_row() {
+        let catalog = Catalog::open_in_memory().unwrap();
+        let mut statement = catalog
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT wall_ready, screen_ready
+                 FROM folder_group_preview_counts
+                 WHERE folder_group_id = ?1",
+            )
+            .unwrap();
+        let details = statement
+            .query_map([vec![0_u8; 16]], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("PRIMARY KEY (folder_group_id=?)")),
+            "expected one primary-key preview-count lookup: {details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE")),
+            "preview counts must not rebuild distinct aggregates: {details:?}"
         );
     }
 

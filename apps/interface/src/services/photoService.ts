@@ -107,6 +107,12 @@ export interface WallPage {
 	orderState: OrderState;
 	sourceWarnings: WallWarningState[];
 	totalCount: number;
+	previewCounts: WallPreviewCounts;
+}
+
+export interface WallPreviewCounts {
+	wallReady: number;
+	screenReady: number;
 }
 
 export interface WallQueryRequest {
@@ -143,6 +149,7 @@ export type WallUpdateBase =
 			kind: "derivativesReady";
 			selectionId: string;
 			derivatives: DerivativeReference[];
+			previewCounts?: WallPreviewCounts | null;
 	  }
 	| {
 			kind: "metadataSettled";

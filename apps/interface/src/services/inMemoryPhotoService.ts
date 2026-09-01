@@ -194,6 +194,12 @@ export function createInMemoryPhotoService(
 				orderState: settled ? "settled" : "provisional",
 				sourceWarnings: clone(sourceWarnings),
 				totalCount: ordered.length,
+				previewCounts: {
+					wallReady: ordered.filter((item) => item.wallThumbnail !== null)
+						.length,
+					screenReady: ordered.filter((item) => item.screenPreview !== null)
+						.length,
+				},
 			};
 		},
 		async requestDerivatives(request: DerivativeRequest) {

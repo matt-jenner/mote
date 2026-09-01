@@ -15,7 +15,7 @@ pub use dto::{BootstrapState, SettingsState, SourceAvailability, SourceSummary};
 pub use dto::{
     DerivativeClass, DerivativePriority, DerivativeReference, DerivativeRequest, InteractionState,
     OrderState, ScanProgressDto, SortDirection, WallAsset, WallMediaKind, WallPage,
-    WallQueryRequest, WallShapeState, WallUpdate, WallWarningState,
+    WallPreviewCounts, WallQueryRequest, WallShapeState, WallUpdate, WallWarningState,
 };
 #[cfg(feature = "server-internal-prevalidated-source")]
 #[doc(hidden)]

@@ -119,8 +119,16 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 		};
 	const known = state.items.length;
 	const total = Math.max(known, state.totalCount ?? 0);
-	const wallReady = state.items.filter((item) => item.wallThumbnail).length;
-	const screenReady = state.items.filter((item) => item.screenPreview).length;
+	const wallReady = Math.min(
+		total,
+		state.previewCounts?.wallReady ??
+			state.items.filter((item) => item.wallThumbnail).length,
+	);
+	const screenReady = Math.min(
+		total,
+		state.previewCounts?.screenReady ??
+			state.items.filter((item) => item.screenPreview).length,
+	);
 	const missingWall = total - wallReady;
 	const missingScreen = total - screenReady;
 	const busy =
@@ -137,7 +145,7 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 		};
 	if (state.derivativeRetrying)
 		return {
-			status: `Retrying previews · ${wallReady} of ${total}`,
+			status: `Retrying previews · ${countFormatter.format(wallReady)} of ${countFormatter.format(total)}`,
 			value: wallReady,
 			max: total > 0 ? total : null,
 			busy: true,
@@ -161,14 +169,14 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 	}
 	if (missingWall > 0)
 		return {
-			status: `Preparing previews · ${wallReady} of ${total}`,
+			status: `Preparing previews · ${countFormatter.format(wallReady)} of ${countFormatter.format(total)}`,
 			value: wallReady,
 			max: total > 0 ? total : null,
 			busy: true,
 		};
 	if (missingScreen > 0)
 		return {
-			status: `Photos ready · preparing larger previews · ${screenReady} of ${total}`,
+			status: `Photos ready · preparing larger previews · ${countFormatter.format(screenReady)} of ${countFormatter.format(total)}`,
 			value: screenReady,
 			max: total > 0 ? total : null,
 			busy,
@@ -183,7 +191,7 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 	if (known === 0 && state.pagesExhausted && !state.activeRequest)
 		return { status: "No photos found", value: null, max: null, busy: false };
 	return {
-		status: `${total} photos ready`,
+		status: `${countFormatter.format(total)} photos ready`,
 		value: total,
 		max: total,
 		busy,
@@ -296,6 +304,7 @@ export function usePhotoWall(
 							type: "metadataSettled",
 							assets: page.items,
 							totalCount: page.totalCount,
+							previewCounts: page.previewCounts,
 							nextCursor: page.nextCursor,
 							sourceWarnings: page.sourceWarnings,
 							requestEpoch: owner.epoch,
@@ -309,6 +318,7 @@ export function usePhotoWall(
 							type: "pageLoaded",
 							assets: page.items,
 							totalCount: page.totalCount,
+							previewCounts: page.previewCounts,
 							orderState: page.orderState,
 							nextCursor: page.nextCursor,
 							sourceWarnings: page.sourceWarnings,
@@ -446,7 +456,12 @@ export function usePhotoWall(
 				}
 				case "derivativesReady":
 					for (const derivative of update.derivatives) {
-						if (derivative.kind === "wallThumbnail") {
+						if (
+							derivative.kind === "wallThumbnail" &&
+							stateRef.current.items.some(
+								(item) => item.id === derivative.assetId,
+							)
+						) {
 							readyWallIds.current.add(derivative.assetId);
 							derivativeRequests.current.delete(derivative.assetId);
 							derivativeRetryQueue.current.delete(derivative.assetId);
@@ -456,6 +471,7 @@ export function usePhotoWall(
 					dispatch({
 						type: "derivativesReady",
 						derivatives: update.derivatives,
+						previewCounts: update.previewCounts,
 					});
 					break;
 				case "metadataSettled":

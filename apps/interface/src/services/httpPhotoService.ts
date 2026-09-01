@@ -279,6 +279,7 @@ function decodeWallPage(value: unknown): WallPage {
 		"orderState",
 		"sourceWarnings",
 		"totalCount",
+		"previewCounts",
 	]);
 	return {
 		items: arrayValue(page.items, decodeWallAsset),
@@ -286,6 +287,15 @@ function decodeWallPage(value: unknown): WallPage {
 		orderState: enumValue(page.orderState, ["provisional", "settled"]),
 		sourceWarnings: arrayValue(page.sourceWarnings, decodeWarning),
 		totalCount: integerValue(page.totalCount),
+		previewCounts: decodePreviewCounts(page.previewCounts),
+	};
+}
+
+function decodePreviewCounts(value: unknown) {
+	const counts = record(value, ["wallReady", "screenReady"]);
+	return {
+		wallReady: integerValue(counts.wallReady),
+		screenReady: integerValue(counts.screenReady),
 	};
 }
 
@@ -333,11 +343,17 @@ function decodeWallUpdate(value: unknown): WallUpdate {
 			};
 		}
 		case "derivativesReady": {
-			const item = record(value, ["kind", "selectionId", "derivatives"]);
+			const item = record(value, [
+				"kind",
+				"selectionId",
+				"derivatives",
+				"previewCounts",
+			]);
 			return {
 				kind,
 				selectionId: stringValue(item.selectionId),
 				derivatives: arrayValue(item.derivatives, decodeDerivativeReference),
+				previewCounts: nullable(item.previewCounts, decodePreviewCounts),
 			};
 		}
 		case "metadataSettled": {

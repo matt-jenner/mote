@@ -866,7 +866,11 @@ impl SelectionEventSubscription {
                 });
                 if assets.is_empty() { None } else { Some(event) }
             }
-            WallUpdate::DerivativesReady { derivatives, .. } => {
+            WallUpdate::DerivativesReady {
+                derivatives,
+                preview_counts,
+                ..
+            } => {
                 let ids = derivatives
                     .iter()
                     .filter_map(|a| {
@@ -886,6 +890,13 @@ impl SelectionEventSubscription {
                 if derivatives.is_empty() {
                     None
                 } else {
+                    *preview_counts = catalog
+                        .wall_preview_counts_scoped(self.runtime.selection.group_id(), scope)
+                        .ok()
+                        .map(|counts| crate::WallPreviewCounts {
+                            wall_ready: counts.wall_ready,
+                            screen_ready: counts.screen_ready,
+                        });
                     Some(event)
                 }
             }
