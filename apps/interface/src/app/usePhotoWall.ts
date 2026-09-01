@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
 import type {
+	DerivativeClass,
 	DerivativePriority,
 	GalleryScope,
 	ScanProgressDto,
@@ -60,6 +61,20 @@ function isWallThumbnailWarning(code: string): boolean {
 	return (
 		code === "wallThumbnailUnavailable" || code === "derivativeUnavailable"
 	);
+}
+
+function isScreenPreviewWarning(code: string): boolean {
+	return (
+		code === "screenPreviewUnavailable" ||
+		code === "screenPreviewCacheUnavailable" ||
+		code === "derivativeUnavailable"
+	);
+}
+
+function isSweepWarning(code: string, kind: DerivativeClass): boolean {
+	return kind === "wallThumbnail"
+		? isWallThumbnailWarning(code)
+		: isScreenPreviewWarning(code);
 }
 
 const countFormatter = new Intl.NumberFormat();
@@ -235,6 +250,7 @@ export function usePhotoWall(
 	const derivativeRetryAttempts = useRef(new Map<string, number>());
 	const hostedSweepPending = useRef(new Set<string>());
 	const hostedSweepFailed = useRef(new Set<string>());
+	const hostedSweepKind = useRef<DerivativeClass | null>(null);
 	const hostedSweepWake = useRef<(() => void) | null>(null);
 	const requestDerivativesRef = useRef<
 		(assetIds: readonly string[], priority: DerivativePriority) => void
@@ -384,6 +400,7 @@ export function usePhotoWall(
 		derivativeRequests.current.clear();
 		hostedSweepPending.current.clear();
 		hostedSweepFailed.current.clear();
+		hostedSweepKind.current = null;
 		hostedSweepWake.current?.();
 		cancelDerivativeRetry();
 		if (wallInteractionTimer.current !== null) {
@@ -465,26 +482,53 @@ export function usePhotoWall(
 					break;
 				}
 				case "derivativesReady":
-					for (const derivative of update.derivatives) {
-						if (derivative.kind !== "wallThumbnail") continue;
-						if (
-							stateRef.current.items.some(
-								(item) => item.id === derivative.assetId,
-							)
-						)
-							readyWallIds.current.add(derivative.assetId);
-						derivativeRequests.current.delete(derivative.assetId);
-						derivativeRetryQueue.current.delete(derivative.assetId);
-						derivativeRetryAttempts.current.delete(derivative.assetId);
-						hostedSweepFailed.current.delete(derivative.assetId);
-						if (hostedSweepPending.current.delete(derivative.assetId))
-							hostedSweepWake.current?.();
+					{
+						let backgroundWallReady = 0;
+						let backgroundScreenReady = 0;
+						for (const derivative of update.derivatives) {
+							if (derivative.kind === "wallThumbnail") {
+								if (
+									stateRef.current.items.some(
+										(item) => item.id === derivative.assetId,
+									)
+								)
+									readyWallIds.current.add(derivative.assetId);
+								derivativeRequests.current.delete(derivative.assetId);
+								derivativeRetryQueue.current.delete(derivative.assetId);
+								derivativeRetryAttempts.current.delete(derivative.assetId);
+							}
+							if (
+								hostedSweepKind.current === derivative.kind &&
+								hostedSweepPending.current.delete(derivative.assetId)
+							) {
+								hostedSweepFailed.current.delete(derivative.assetId);
+								if (derivative.kind === "wallThumbnail")
+									backgroundWallReady += 1;
+								else backgroundScreenReady += 1;
+								hostedSweepWake.current?.();
+							}
+						}
+						const currentCounts = stateRef.current.previewCounts;
+						const optimisticCounts =
+							currentCounts &&
+							(backgroundWallReady > 0 || backgroundScreenReady > 0)
+								? {
+										wallReady: Math.min(
+											stateRef.current.totalCount ?? Number.MAX_SAFE_INTEGER,
+											currentCounts.wallReady + backgroundWallReady,
+										),
+										screenReady: Math.min(
+											stateRef.current.totalCount ?? Number.MAX_SAFE_INTEGER,
+											currentCounts.screenReady + backgroundScreenReady,
+										),
+									}
+								: null;
+						dispatch({
+							type: "derivativesReady",
+							derivatives: update.derivatives,
+							previewCounts: update.previewCounts ?? optimisticCounts,
+						});
 					}
-					dispatch({
-						type: "derivativesReady",
-						derivatives: update.derivatives,
-						previewCounts: update.previewCounts,
-					});
 					break;
 				case "metadataSettled":
 					{
@@ -525,7 +569,8 @@ export function usePhotoWall(
 						derivativeRequests.current.delete(update.assetId);
 					if (
 						update.assetId !== null &&
-						isWallThumbnailWarning(update.warning.code)
+						hostedSweepKind.current !== null &&
+						isSweepWarning(update.warning.code, hostedSweepKind.current)
 					) {
 						hostedSweepFailed.current.add(update.assetId);
 						if (hostedSweepPending.current.delete(update.assetId))
@@ -757,7 +802,8 @@ export function usePhotoWall(
 				wakeResolve = resolve;
 				wakeTimer = window.setTimeout(wake, 1_000);
 			});
-		const pruneFinishedRequests = () => {
+		const pruneFinishedRequests = (kind: DerivativeClass) => {
+			if (kind !== "wallThumbnail") return;
 			for (const assetId of hostedSweepPending.current) {
 				if (
 					!derivativeRequests.current.has(assetId) &&
@@ -768,13 +814,16 @@ export function usePhotoWall(
 		};
 		hostedSweepWake.current = wake;
 
-		void (async () => {
+		const runPass = async (kind: DerivativeClass) => {
+			hostedSweepKind.current = kind;
+			hostedSweepPending.current.clear();
+			hostedSweepFailed.current.clear();
 			let cursor: string | null = null;
 			let traversalComplete = false;
 			let requestedDuringTraversal = false;
 			const deferredIds: string[] = [];
 			while (isCurrent()) {
-				pruneFinishedRequests();
+				pruneFinishedRequests(kind);
 				if (
 					hostedSweepPending.current.size >
 					HOSTED_BACKGROUND_PENDING_LIMIT - HOSTED_BACKGROUND_REFILL_SIZE
@@ -801,8 +850,12 @@ export function usePhotoWall(
 						derivatives: [],
 						previewCounts: page.previewCounts,
 					});
+					const readyCount =
+						kind === "wallThumbnail"
+							? page.previewCounts.wallReady
+							: page.previewCounts.screenReady;
 					if (
-						page.previewCounts.wallReady >= page.totalCount &&
+						readyCount >= page.totalCount &&
 						hostedSweepPending.current.size === 0
 					)
 						return;
@@ -810,10 +863,13 @@ export function usePhotoWall(
 						...page.items
 							.filter(
 								(asset) =>
-									asset.wallThumbnail === null &&
+									(kind === "wallThumbnail"
+										? asset.wallThumbnail === null
+										: asset.screenPreview === null) &&
 									!hostedSweepPending.current.has(asset.id) &&
 									!hostedSweepFailed.current.has(asset.id) &&
-									(derivativeRetryAttempts.current.get(asset.id) ?? 0) <= 3,
+									(kind !== "wallThumbnail" ||
+										(derivativeRetryAttempts.current.get(asset.id) ?? 0) <= 3),
 							)
 							.map((asset) => asset.id),
 					);
@@ -830,7 +886,22 @@ export function usePhotoWall(
 				if (batch.length > 0) {
 					requestedDuringTraversal = true;
 					for (const assetId of batch) hostedSweepPending.current.add(assetId);
-					requestDerivativesRef.current(batch, "nearViewport");
+					if (kind === "wallThumbnail")
+						requestDerivativesRef.current(batch, "nearViewport");
+					else
+						void service
+							.requestDerivatives({
+								assetIds: batch,
+								priority: "nearViewport",
+								kind,
+							})
+							.catch(() => {
+								for (const assetId of batch) {
+									hostedSweepPending.current.delete(assetId);
+									hostedSweepFailed.current.add(assetId);
+								}
+								hostedSweepWake.current?.();
+							});
 					continue;
 				}
 
@@ -845,6 +916,11 @@ export function usePhotoWall(
 				cursor = null;
 				await waitForProgress();
 			}
+		};
+		void (async () => {
+			await runPass("wallThumbnail");
+			if (isCurrent()) await runPass("screenPreview");
+			if (isCurrent()) hostedSweepKind.current = null;
 		})();
 
 		return () => {
@@ -852,6 +928,7 @@ export function usePhotoWall(
 			wake();
 			if (hostedSweepWake.current === wake) hostedSweepWake.current = null;
 			hostedSweepPending.current.clear();
+			hostedSweepKind.current = null;
 		};
 	}, [
 		galleryScope,

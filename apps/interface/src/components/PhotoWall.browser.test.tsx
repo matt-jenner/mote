@@ -254,6 +254,19 @@ class ControlledWallService implements PhotoService {
 			derivatives: [reference],
 		});
 	};
+	releaseScreenPreview = (assetId: string, url: string) => {
+		const reference = {
+			assetId,
+			kind: "screenPreview" as const,
+			key: `${assetId}-screen`,
+		};
+		this.urls.set(reference.key, url);
+		this.emit({
+			kind: "derivativesReady",
+			selectionId: this.sourceState.activeSource?.selectionId ?? "",
+			derivatives: [reference],
+		});
+	};
 	setDerivativeUrl = (key: string, url: string) => {
 		this.urls.set(key, url);
 	};
@@ -747,6 +760,53 @@ describe("progressive photo wall", () => {
 			service.releaseThumbnail(item.id, `/demo-photos/${item.id}.jpg`);
 		await expect.poll(requestedHostedIds).toHaveLength(220);
 		expect(requestedHostedIds()).toEqual(waiting.map(({ id }) => id));
+		screen.unmount();
+	});
+
+	it("requests larger previews from unloaded hosted pages after thumbnails are ready", async () => {
+		const service = new ControlledWallService(
+			"source-a",
+			"oldestFirst",
+			"available",
+			"includeSubfolders",
+			"hosted",
+		);
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		const firstPage = settledFixtures.slice(0, 2);
+		const secondPage = settledFixtures.slice(2, 4);
+		const counts = { wallReady: 4, screenReady: 0 };
+		service.releaseQuery(
+			0,
+			pageOf(firstPage, "settled", "cursor-2", [], 4, counts),
+		);
+
+		await expect.poll(() => service.queryRequests.length).toBe(2);
+		service.releaseQuery(
+			1,
+			pageOf(firstPage, "settled", "cursor-2", [], 4, counts),
+		);
+		await expect.poll(() => service.queryRequests.length).toBe(3);
+		expect(service.queryRequests[2]?.cursor).toBeNull();
+		service.releaseQuery(
+			2,
+			pageOf(firstPage, "settled", "cursor-2", [], 4, counts),
+		);
+		await expect.poll(() => service.queryRequests.length).toBe(4);
+		expect(service.queryRequests[3]?.cursor).toBe("cursor-2");
+		service.releaseQuery(3, pageOf(secondPage, "settled", null, [], 4, counts));
+
+		await expect
+			.poll(() =>
+				service.derivativeRequests
+					.filter((request) => request.kind === "screenPreview")
+					.flatMap((request) => request.assetIds),
+			)
+			.toEqual(["coast", "forest", "city", "mountain"]);
+		service.releaseScreenPreview("city", "/demo-photos/city-screen.jpg");
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("Photos ready · preparing larger previews · 1 of 4");
 		screen.unmount();
 	});
 
