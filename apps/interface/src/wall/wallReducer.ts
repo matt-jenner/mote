@@ -635,8 +635,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			const liveUpdateRacedPage =
 				state.activeRequest?.previewCountVersion !== state.previewCountVersion;
 			const replacementPage =
-				firstPage &&
-				(state.sortPending || liveUpdateRacedPage)
+				firstPage && (state.sortPending || liveUpdateRacedPage)
 					? mergeDerivativeReferences(
 							state.items,
 							remembered.assets,

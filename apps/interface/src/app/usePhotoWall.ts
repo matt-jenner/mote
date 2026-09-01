@@ -4,6 +4,7 @@ import type {
 	GalleryScope,
 	ScanProgressDto,
 	SortDirection,
+	WallPage,
 	WallUpdate,
 } from "../services/photoService";
 import {
@@ -62,6 +63,9 @@ function isWallThumbnailWarning(code: string): boolean {
 }
 
 const countFormatter = new Intl.NumberFormat();
+const HOSTED_BACKGROUND_PAGE_SIZE = 250;
+const HOSTED_BACKGROUND_PENDING_LIMIT = 200;
+const HOSTED_BACKGROUND_REFILL_SIZE = 50;
 
 interface RetainedScanProgress {
 	sourceId: string;
@@ -229,6 +233,9 @@ export function usePhotoWall(
 		>(),
 	);
 	const derivativeRetryAttempts = useRef(new Map<string, number>());
+	const hostedSweepPending = useRef(new Set<string>());
+	const hostedSweepFailed = useRef(new Set<string>());
+	const hostedSweepWake = useRef<(() => void) | null>(null);
 	const requestDerivativesRef = useRef<
 		(assetIds: readonly string[], priority: DerivativePriority) => void
 	>(() => undefined);
@@ -375,6 +382,9 @@ export function usePhotoWall(
 		failedCursor.current = null;
 		readyWallIds.current.clear();
 		derivativeRequests.current.clear();
+		hostedSweepPending.current.clear();
+		hostedSweepFailed.current.clear();
+		hostedSweepWake.current?.();
 		cancelDerivativeRetry();
 		if (wallInteractionTimer.current !== null) {
 			window.clearTimeout(wallInteractionTimer.current);
@@ -456,17 +466,19 @@ export function usePhotoWall(
 				}
 				case "derivativesReady":
 					for (const derivative of update.derivatives) {
+						if (derivative.kind !== "wallThumbnail") continue;
 						if (
-							derivative.kind === "wallThumbnail" &&
 							stateRef.current.items.some(
 								(item) => item.id === derivative.assetId,
 							)
-						) {
+						)
 							readyWallIds.current.add(derivative.assetId);
-							derivativeRequests.current.delete(derivative.assetId);
-							derivativeRetryQueue.current.delete(derivative.assetId);
-							derivativeRetryAttempts.current.delete(derivative.assetId);
-						}
+						derivativeRequests.current.delete(derivative.assetId);
+						derivativeRetryQueue.current.delete(derivative.assetId);
+						derivativeRetryAttempts.current.delete(derivative.assetId);
+						hostedSweepFailed.current.delete(derivative.assetId);
+						if (hostedSweepPending.current.delete(derivative.assetId))
+							hostedSweepWake.current?.();
 					}
 					dispatch({
 						type: "derivativesReady",
@@ -511,6 +523,14 @@ export function usePhotoWall(
 						isWallThumbnailWarning(update.warning.code)
 					)
 						derivativeRequests.current.delete(update.assetId);
+					if (
+						update.assetId !== null &&
+						isWallThumbnailWarning(update.warning.code)
+					) {
+						hostedSweepFailed.current.add(update.assetId);
+						if (hostedSweepPending.current.delete(update.assetId))
+							hostedSweepWake.current?.();
+					}
 					dispatch({ type: "warning", ...update });
 					break;
 				case "warningCleared":
@@ -704,6 +724,144 @@ export function usePhotoWall(
 		(ids: readonly string[]) => requestDerivatives(ids, "nearViewport"),
 		[requestDerivatives],
 	);
+
+	useEffect(() => {
+		if (
+			service.capabilities.folderSelection !== "hosted" ||
+			!sourceId ||
+			!state.scanComplete ||
+			state.orderState !== "settled"
+		)
+			return;
+		const expectedSourceId = sourceId;
+		const expectedGeneration = sourceGeneration.current;
+		const expectedDirection = state.direction;
+		let cancelled = false;
+		let wakeTimer: number | null = null;
+		let wakeResolve: (() => void) | null = null;
+		const isCurrent = () =>
+			!cancelled &&
+			isLive(expectedGeneration, expectedSourceId) &&
+			galleryScopeRef.current === galleryScope &&
+			stateRef.current.direction === expectedDirection;
+		const wake = () => {
+			if (!wakeResolve) return;
+			const resolve = wakeResolve;
+			wakeResolve = null;
+			if (wakeTimer !== null) window.clearTimeout(wakeTimer);
+			wakeTimer = null;
+			resolve();
+		};
+		const waitForProgress = () =>
+			new Promise<void>((resolve) => {
+				wakeResolve = resolve;
+				wakeTimer = window.setTimeout(wake, 1_000);
+			});
+		const pruneFinishedRequests = () => {
+			for (const assetId of hostedSweepPending.current) {
+				if (
+					!derivativeRequests.current.has(assetId) &&
+					!derivativeRetryQueue.current.has(assetId)
+				)
+					hostedSweepPending.current.delete(assetId);
+			}
+		};
+		hostedSweepWake.current = wake;
+
+		void (async () => {
+			let cursor: string | null = null;
+			let traversalComplete = false;
+			let requestedDuringTraversal = false;
+			const deferredIds: string[] = [];
+			while (isCurrent()) {
+				pruneFinishedRequests();
+				if (
+					hostedSweepPending.current.size >
+					HOSTED_BACKGROUND_PENDING_LIMIT - HOSTED_BACKGROUND_REFILL_SIZE
+				) {
+					await waitForProgress();
+					continue;
+				}
+
+				if (deferredIds.length === 0 && !traversalComplete) {
+					let page: WallPage;
+					try {
+						page = await service.queryWall({
+							cursor,
+							limit: HOSTED_BACKGROUND_PAGE_SIZE,
+							direction: expectedDirection,
+						});
+					} catch {
+						await waitForProgress();
+						continue;
+					}
+					if (!isCurrent()) return;
+					dispatch({
+						type: "derivativesReady",
+						derivatives: [],
+						previewCounts: page.previewCounts,
+					});
+					if (
+						page.previewCounts.wallReady >= page.totalCount &&
+						hostedSweepPending.current.size === 0
+					)
+						return;
+					deferredIds.push(
+						...page.items
+							.filter(
+								(asset) =>
+									asset.wallThumbnail === null &&
+									!hostedSweepPending.current.has(asset.id) &&
+									!hostedSweepFailed.current.has(asset.id) &&
+									(derivativeRetryAttempts.current.get(asset.id) ?? 0) <= 3,
+							)
+							.map((asset) => asset.id),
+					);
+					cursor = page.nextCursor;
+					traversalComplete = cursor === null;
+				}
+
+				const capacity =
+					HOSTED_BACKGROUND_PENDING_LIMIT - hostedSweepPending.current.size;
+				const batch = deferredIds.splice(
+					0,
+					Math.min(HOSTED_BACKGROUND_REFILL_SIZE, capacity),
+				);
+				if (batch.length > 0) {
+					requestedDuringTraversal = true;
+					for (const assetId of batch) hostedSweepPending.current.add(assetId);
+					requestDerivativesRef.current(batch, "nearViewport");
+					continue;
+				}
+
+				if (!traversalComplete) continue;
+				if (hostedSweepPending.current.size > 0) {
+					await waitForProgress();
+					continue;
+				}
+				if (!requestedDuringTraversal) return;
+				requestedDuringTraversal = false;
+				traversalComplete = false;
+				cursor = null;
+				await waitForProgress();
+			}
+		})();
+
+		return () => {
+			cancelled = true;
+			wake();
+			if (hostedSweepWake.current === wake) hostedSweepWake.current = null;
+			hostedSweepPending.current.clear();
+		};
+	}, [
+		galleryScope,
+		isLive,
+		service,
+		sourceId,
+		state.direction,
+		state.orderState,
+		state.scanComplete,
+	]);
 
 	const setWallInteraction = useCallback(
 		(active: boolean) => {

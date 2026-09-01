@@ -137,11 +137,7 @@ class TestIntersectionObserver {
 }
 
 class ControlledWallService implements PhotoService {
-	readonly capabilities = {
-		chooseFolder: true,
-		folderSelection: "native" as const,
-		locateFolder: false,
-	};
+	readonly capabilities: PhotoService["capabilities"];
 	readonly queryRequests: WallQueryRequest[] = [];
 	readonly queryScopes: GalleryScope[] = [];
 	readonly watchedScopes: GalleryScope[] = [];
@@ -162,7 +158,13 @@ class ControlledWallService implements PhotoService {
 		private readonly restoredDirection: SortDirection = "oldestFirst",
 		sourceAvailability: SourceAvailability = "available",
 		private currentGalleryScope: GalleryScope = "includeSubfolders",
+		folderSelection: PhotoService["capabilities"]["folderSelection"] = "native",
 	) {
+		this.capabilities = {
+			chooseFolder: folderSelection === "native",
+			folderSelection,
+			locateFolder: false,
+		};
 		this.sourceState = {
 			settings: { appearance: "system", galleryScope: currentGalleryScope },
 			activeSource: {
@@ -570,7 +572,7 @@ describe("progressive photo wall", () => {
 		expect(refinedTile?.getBoundingClientRect().toJSON()).toEqual(before);
 	});
 
-	it("requests viewport, next rows, then remaining rows without observer callbacks", async () => {
+	it("keeps background requests bounded and refills them without observer callbacks", async () => {
 		await page.viewport(1440, 520);
 		const idleCallbacks: Array<
 			(deadline: { didTimeout: boolean; timeRemaining: () => number }) => void
@@ -590,7 +592,7 @@ describe("progressive photo wall", () => {
 		const service = new ControlledWallService();
 		const screen = await renderWall(service);
 		await expect.poll(() => service.queryRequests.length).toBe(1);
-		const assets = Array.from({ length: 24 }, (_, index) =>
+		const assets = Array.from({ length: 260 }, (_, index) =>
 			asset(`pass-${index}`, `Pass ${index}`, index + 1),
 		);
 		service.releaseQuery(0, pageOf(assets, "settled"));
@@ -657,9 +659,95 @@ describe("progressive photo wall", () => {
 		const idleRequests = service.derivativeRequests
 			.filter((request) => request.priority === "nearViewport")
 			.flatMap((request) => request.assetIds);
-		expect(idleRequests).toEqual(expectedNearIds.concat(expectedRemainingIds));
+		expect(idleRequests).toEqual(
+			expectedNearIds.concat(expectedRemainingIds.slice(0, 200)),
+		);
 		for (const request of service.derivativeRequests)
 			expect(request.assetIds.length).toBeLessThanOrEqual(50);
+
+		const nextWaitingId = expectedRemainingIds[200];
+		const completedId = expectedRemainingIds[0];
+		expect(nextWaitingId).toBeDefined();
+		expect(completedId).toBeDefined();
+		if (!nextWaitingId || !completedId) return;
+		expect(idleRequests).not.toContain(nextWaitingId);
+		service.releaseThumbnail(completedId, `/demo-photos/${completedId}.jpg`);
+		await expect.poll(() => idleCallbacks.length).toBeGreaterThan(0);
+		while (idleCallbacks.length > 0)
+			for (const callback of idleCallbacks.splice(0))
+				callback({ didTimeout: false, timeRemaining: () => 50 });
+		await expect
+			.poll(() =>
+				service.derivativeRequests
+					.flatMap((request) => request.assetIds)
+					.includes(nextWaitingId),
+			)
+			.toBe(true);
+	});
+
+	it("requests thumbnails from unloaded hosted pages without scrolling", async () => {
+		const service = new ControlledWallService(
+			"source-a",
+			"oldestFirst",
+			"available",
+			"includeSubfolders",
+			"hosted",
+		);
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		const ready = settledFixtures.slice(0, 2);
+		const waiting = Array.from({ length: 220 }, (_, index) =>
+			asset(`hosted-later-${index}`, `Hosted later ${index}`, index + 3, {
+				dateState: "settled",
+			}),
+		);
+		service.releaseQuery(
+			0,
+			pageOf(ready, "settled", "cursor-2", [], 222, {
+				wallReady: 2,
+				screenReady: 0,
+			}),
+		);
+
+		await expect.poll(() => service.queryRequests.length).toBe(2);
+		expect(service.queryRequests[1]).toEqual({
+			cursor: null,
+			limit: 250,
+			direction: "oldestFirst",
+		});
+		service.releaseQuery(
+			1,
+			pageOf(ready, "settled", "cursor-2", [], 222, {
+				wallReady: 2,
+				screenReady: 0,
+			}),
+		);
+		await expect.poll(() => service.queryRequests.length).toBe(3);
+		expect(service.queryRequests[2]?.cursor).toBe("cursor-2");
+		service.releaseQuery(
+			2,
+			pageOf(waiting, "settled", null, [], 222, {
+				wallReady: 2,
+				screenReady: 0,
+			}),
+		);
+
+		const requestedHostedIds = () =>
+			service.derivativeRequests
+				.flatMap((request) => request.assetIds)
+				.filter((id) => id.startsWith("hosted-later-"));
+		await expect.poll(requestedHostedIds).toHaveLength(200);
+		expect(requestedHostedIds()).toEqual(
+			waiting.slice(0, 200).map(({ id }) => id),
+		);
+		for (const request of service.derivativeRequests)
+			expect(request.assetIds.length).toBeLessThanOrEqual(50);
+
+		for (const item of waiting.slice(0, 50))
+			service.releaseThumbnail(item.id, `/demo-photos/${item.id}.jpg`);
+		await expect.poll(requestedHostedIds).toHaveLength(220);
+		expect(requestedHostedIds()).toEqual(waiting.map(({ id }) => id));
+		screen.unmount();
 	});
 
 	it("defers the provisional remainder until settlement and promotes settled viewport first", async () => {
@@ -2667,14 +2755,10 @@ describe("progressive photo wall", () => {
 		await expect.poll(() => service.queryRequests.length).toBe(1);
 		service.releaseQuery(
 			0,
-			pageOf(
-				realFixtureAssets.slice(0, 4),
-				"settled",
-				"cursor-2",
-				[],
-				2_092,
-				{ wallReady: 1_033, screenReady: 149 },
-			),
+			pageOf(realFixtureAssets.slice(0, 4), "settled", "cursor-2", [], 2_092, {
+				wallReady: 1_033,
+				screenReady: 149,
+			}),
 		);
 		await expect
 			.element(screen.getByRole("status"))
@@ -2685,14 +2769,10 @@ describe("progressive photo wall", () => {
 		await expect.poll(() => service.queryRequests.length).toBe(2);
 		service.releaseQuery(
 			1,
-			pageOf(
-				settledFixtures,
-				"settled",
-				null,
-				[],
-				2_092,
-				{ wallReady: 1_033, screenReady: 149 },
-			),
+			pageOf(settledFixtures, "settled", null, [], 2_092, {
+				wallReady: 1_033,
+				screenReady: 149,
+			}),
 		);
 		await expect
 			.element(screen.getByRole("status"))

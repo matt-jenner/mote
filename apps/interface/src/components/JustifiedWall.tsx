@@ -36,6 +36,9 @@ interface ViewportRowPass {
 	nearIds: string[];
 }
 
+const BACKGROUND_REQUEST_BATCH_SIZE = 50;
+const BACKGROUND_REQUEST_WINDOW_SIZE = 200;
+
 function getViewportRowPass(
 	root: HTMLElement,
 	rows: readonly JustifiedRow[],
@@ -109,7 +112,7 @@ export function JustifiedWall({
 		const visibleIds = viewportPass.visibleIds;
 		const nearIds = viewportPass.nearIds;
 		const claimed = new Set([...visibleIds, ...nearIds]);
-		const remainingIds = rows
+		const backgroundWindowIds = rows
 			.flatMap((row) =>
 				row.items
 					.filter(
@@ -118,7 +121,8 @@ export function JustifiedWall({
 					)
 					.map((item) => item.asset.id),
 			)
-			.filter((id, index, ids) => ids.indexOf(id) === index);
+			.filter((id, index, ids) => ids.indexOf(id) === index)
+			.slice(0, BACKGROUND_REQUEST_WINDOW_SIZE);
 		const currentMissing = (ids: readonly string[]) =>
 			ids.filter((id) => missingWallIdsRef.current.has(id));
 		const visibleMissing = currentMissing(visibleIds);
@@ -130,16 +134,19 @@ export function JustifiedWall({
 		let timerHandle: number | null = null;
 		let offset = 0;
 		const scheduleRemaining = () => {
-			if (offset >= remainingIds.length) return;
+			if (offset >= backgroundWindowIds.length) return;
 			const run = () => {
 				idleHandle = null;
 				timerHandle = null;
-				const batch = remainingIds.slice(offset, offset + 50);
+				const batch = backgroundWindowIds.slice(
+					offset,
+					offset + BACKGROUND_REQUEST_BATCH_SIZE,
+				);
 				offset += batch.length;
 				const missingBatch = currentMissing(batch);
 				if (missingBatch.length > 0)
 					requestNearViewportDerivatives(missingBatch);
-				if (offset < remainingIds.length) scheduleRemaining();
+				if (offset < backgroundWindowIds.length) scheduleRemaining();
 			};
 			const requestIdle = (
 				window as Window & {
