@@ -222,6 +222,7 @@ pub struct ScanProgressDto {
     pub discovered: u64,
     pub shaped: u64,
     pub enriched: u64,
+    pub direct_total: Option<u64>,
     pub total: Option<u64>,
 }
 
@@ -271,6 +272,7 @@ mod tests {
                 discovered: 1,
                 shaped: 1,
                 enriched: 0,
+                direct_total: Some(1),
                 total: Some(1),
             },
         };

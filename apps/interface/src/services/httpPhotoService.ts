@@ -290,11 +290,18 @@ function decodeWallPage(value: unknown): WallPage {
 }
 
 function decodeProgress(value: unknown): ScanProgressDto {
-	const progress = record(value, ["discovered", "shaped", "enriched", "total"]);
+	const progress = record(value, [
+		"discovered",
+		"shaped",
+		"enriched",
+		"directTotal",
+		"total",
+	]);
 	return {
 		discovered: integerValue(progress.discovered),
 		shaped: integerValue(progress.shaped),
 		enriched: integerValue(progress.enriched),
+		directTotal: nullable(progress.directTotal, integerValue),
 		total: nullable(progress.total, integerValue),
 	};
 }

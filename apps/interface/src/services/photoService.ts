@@ -125,6 +125,7 @@ export interface ScanProgressDto {
 	discovered: number;
 	shaped: number;
 	enriched: number;
+	directTotal?: number | null;
 	total: number | null;
 }
 

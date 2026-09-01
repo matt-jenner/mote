@@ -2599,6 +2599,46 @@ describe("progressive photo wall", () => {
 		);
 	});
 
+	it("switches repeatedly between direct and recursive inventory totals during indexing", async () => {
+		const service = new ControlledWallService();
+		const progress = {
+			kind: "progress" as const,
+			selectionId: "source-a",
+			generation: 1,
+			progress: {
+				discovered: 154,
+				shaped: 154,
+				enriched: 120,
+				directTotal: 300,
+				total: 2_092,
+			},
+		};
+		service.scopeUpdateReplay = () =>
+			queueMicrotask(() => service.emit(progress));
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.emit(progress);
+		service.releaseQuery(0, pageOf([], "provisional", null, [], 154));
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("154 indexed of 2,092");
+
+		const toggle = screen.getByRole("button", { name: "Include subfolders" });
+		await toggle.click();
+		await expect.poll(() => service.queryRequests.length).toBe(2);
+		service.releaseQuery(1, pageOf([], "provisional", null, [], 154));
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("154 indexed of 300");
+
+		await toggle.click();
+		await expect.poll(() => service.queryRequests.length).toBe(3);
+		service.releaseQuery(2, pageOf([], "provisional", null, [], 154));
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("154 indexed of 2,092");
+	});
+
 	it("fences overlapping sort queries and shows newest first after resetting scroll", async () => {
 		await page.viewport(834, 1194);
 		const service = new ControlledWallService();

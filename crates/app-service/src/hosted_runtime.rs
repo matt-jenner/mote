@@ -7,6 +7,8 @@ use tokio::sync::{Notify, broadcast, watch};
 
 use crate::{GalleryEngine, GallerySelection, InteractionState, WallUpdate};
 
+const INVENTORY_TOTAL_UNKNOWN: u64 = u64::MAX;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScanLifecycle {
     Idle,
@@ -81,6 +83,8 @@ pub(crate) struct SelectionRuntime {
     pub(crate) terminal_event_id: AtomicU64,
     pub(crate) next_client_token: AtomicU64,
     pub(crate) settled: std::sync::atomic::AtomicBool,
+    direct_inventory_total: AtomicU64,
+    recursive_inventory_total: AtomicU64,
     pub(crate) source_unavailable_reported: std::sync::atomic::AtomicBool,
     pub(crate) client_demand: Mutex<HashMap<u64, ClientDemand>>,
     pub(crate) lease_wake: Arc<Notify>,
@@ -170,6 +174,8 @@ impl SelectionRuntime {
             terminal_event_id: AtomicU64::new(0),
             next_client_token: AtomicU64::new(1),
             settled: std::sync::atomic::AtomicBool::new(settled),
+            direct_inventory_total: AtomicU64::new(INVENTORY_TOTAL_UNKNOWN),
+            recursive_inventory_total: AtomicU64::new(INVENTORY_TOTAL_UNKNOWN),
             source_unavailable_reported: std::sync::atomic::AtomicBool::new(false),
             client_demand: Mutex::new(HashMap::new()),
             lease_wake: Arc::new(Notify::new()),
@@ -183,6 +189,26 @@ impl SelectionRuntime {
 
     pub(crate) fn lifecycle_receiver(&self) -> watch::Receiver<ScanLifecycle> {
         self.scan_lifecycle.subscribe()
+    }
+
+    pub(crate) fn remember_inventory_totals(&self, direct: Option<u64>, recursive: Option<u64>) {
+        if let Some(direct) = direct {
+            self.direct_inventory_total.store(direct, Ordering::Release);
+        }
+        if let Some(recursive) = recursive {
+            self.recursive_inventory_total
+                .store(recursive, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn inventory_total(&self, scope: GalleryScope) -> Option<u64> {
+        let total = match scope {
+            GalleryScope::CurrentFolder => self.direct_inventory_total.load(Ordering::Acquire),
+            GalleryScope::IncludeSubfolders => {
+                self.recursive_inventory_total.load(Ordering::Acquire)
+            }
+        };
+        (total != INVENTORY_TOTAL_UNKNOWN).then_some(total)
     }
 
     #[cfg(test)]
@@ -928,6 +954,33 @@ mod tests {
             generation,
             progress: Default::default(),
         }
+    }
+
+    #[test]
+    fn inventory_totals_remain_available_across_repeated_scope_changes() {
+        let runtime = SelectionRuntime::new(
+            selection(),
+            Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
+            false,
+        );
+        runtime.remember_inventory_totals(Some(300), Some(2_092));
+
+        assert_eq!(
+            runtime.inventory_total(GalleryScope::CurrentFolder),
+            Some(300)
+        );
+        assert_eq!(
+            runtime.inventory_total(GalleryScope::IncludeSubfolders),
+            Some(2_092)
+        );
+        assert_eq!(
+            runtime.inventory_total(GalleryScope::CurrentFolder),
+            Some(300)
+        );
+        assert_eq!(
+            runtime.inventory_total(GalleryScope::IncludeSubfolders),
+            Some(2_092)
+        );
     }
 
     #[tokio::test]

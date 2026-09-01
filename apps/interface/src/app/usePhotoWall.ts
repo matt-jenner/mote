@@ -60,6 +60,21 @@ function isWallThumbnailWarning(code: string): boolean {
 	);
 }
 
+const countFormatter = new Intl.NumberFormat();
+
+function progressForScope(
+	progress: import("../services/photoService").ScanProgressDto,
+	scope: GalleryScope,
+): import("../services/photoService").ScanProgressDto {
+	return {
+		...progress,
+		total:
+			scope === "currentFolder"
+				? (progress.directTotal ?? progress.total)
+				: progress.total,
+	};
+}
+
 function wallProgress(state: typeof initialWallState): WallProgress {
 	if (state.error)
 		return {
@@ -93,25 +108,15 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 			max: total > 0 ? total : null,
 			busy: true,
 		};
-	if (missingWall > 0)
-		return {
-			status: `Preparing previews · ${wallReady} of ${total}`,
-			value: wallReady,
-			max: total > 0 ? total : null,
-			busy: true,
-		};
-	if (state.scanComplete && missingScreen > 0)
-		return {
-			status: `Photos ready · preparing larger previews · ${screenReady} of ${total}`,
-			value: screenReady,
-			max: total > 0 ? total : null,
-			busy,
-		};
-	if (!state.scanComplete) {
+	if (
+		!state.scanComplete &&
+		state.scanProgress &&
+		state.scanProgress.total !== null
+	) {
 		const progress = state.scanProgress;
 		const suffix =
 			progress && progress.total !== null
-				? ` · ${progress.shaped} of ${progress.total}`
+				? ` · ${countFormatter.format(progress.shaped)} indexed of ${countFormatter.format(progress.total)}`
 				: "";
 		return {
 			status: `${state.items.length === 0 ? "Folder ready · " : ""}Indexing photos${suffix}`,
@@ -120,6 +125,27 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 			busy,
 		};
 	}
+	if (missingWall > 0)
+		return {
+			status: `Preparing previews · ${wallReady} of ${total}`,
+			value: wallReady,
+			max: total > 0 ? total : null,
+			busy: true,
+		};
+	if (missingScreen > 0)
+		return {
+			status: `Photos ready · preparing larger previews · ${screenReady} of ${total}`,
+			value: screenReady,
+			max: total > 0 ? total : null,
+			busy,
+		};
+	if (!state.scanComplete)
+		return {
+			status: `${state.items.length === 0 ? "Folder ready · " : ""}Indexing photos`,
+			value: null,
+			max: null,
+			busy,
+		};
 	if (known === 0 && state.pagesExhausted && !state.activeRequest)
 		return { status: "No photos found", value: null, max: null, busy: false };
 	return {
@@ -148,6 +174,11 @@ export function usePhotoWall(
 	const sourceGeneration = useRef(0);
 	const ownerRef = useRef<RequestOwner | null>(null);
 	const settlementPending = useRef<number | null>(null);
+	const latestScanProgress = useRef<{
+		sourceId: string;
+		generation: number;
+		progress: import("../services/photoService").ScanProgressDto;
+	} | null>(null);
 	const failedCursor = useRef<string | null>(null);
 	const readyWallIds = useRef(new Set<string>());
 	const derivativeRequests = useRef(new Map<string, DerivativeRequestRecord>());
@@ -313,12 +344,28 @@ export function usePhotoWall(
 			wallInteractionActive.current = false;
 			void service.setWallInteraction(false);
 		}
+		const retainedProgress =
+			latestScanProgress.current?.sourceId === expectedSourceId
+				? latestScanProgress.current
+				: null;
+		if (retainedProgress === null) latestScanProgress.current = null;
 		dispatch({
 			type: "resetSource",
 			sourceGeneration: generation,
 			selectionId: expectedSourceId ?? undefined,
 		});
 		if (!expectedSourceId) return;
+		if (retainedProgress) {
+			dispatch({
+				type: "progress",
+				selectionId: expectedSourceId,
+				generation: retainedProgress.generation,
+				progress: progressForScope(
+					retainedProgress.progress,
+					expectedGalleryScope,
+				),
+			});
+		}
 		const stop = service.watchWallUpdates((update: WallUpdate) => {
 			if (galleryScopeRef.current !== expectedGalleryScope) return;
 			if (!isLive(generation, expectedSourceId)) return;
@@ -338,10 +385,28 @@ export function usePhotoWall(
 				return;
 			switch (update.kind) {
 				case "catalogBatch":
-					dispatch({ type: "catalogBatch", ...update });
+					latestScanProgress.current = {
+						sourceId: expectedSourceId,
+						generation: update.generation,
+						progress: update.progress,
+					};
+					dispatch({
+						type: "catalogBatch",
+						...update,
+						progress: progressForScope(update.progress, expectedGalleryScope),
+					});
 					break;
 				case "progress":
-					dispatch({ type: "progress", ...update });
+					latestScanProgress.current = {
+						sourceId: expectedSourceId,
+						generation: update.generation,
+						progress: update.progress,
+					};
+					dispatch({
+						type: "progress",
+						...update,
+						progress: progressForScope(update.progress, expectedGalleryScope),
+					});
 					break;
 				case "derivativesReady":
 					for (const derivative of update.derivatives) {

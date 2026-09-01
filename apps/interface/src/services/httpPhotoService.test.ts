@@ -629,7 +629,13 @@ describe("HTTP PhotoService", () => {
 				kind: "progress",
 				selectionId: "selection-a",
 				generation: 1,
-				progress: { discovered: 1, shaped: 1, enriched: 0, total: 1 },
+				progress: {
+					discovered: 1,
+					shaped: 1,
+					enriched: 0,
+					directTotal: 1,
+					total: 1,
+				},
 				nativePath: "/photos/private",
 			},
 			"2",
@@ -661,7 +667,13 @@ describe("HTTP PhotoService", () => {
 			kind: "progress",
 			selectionId: "selection-a",
 			generation: 1,
-			progress: { discovered: 1, shaped: 1, enriched: 0, total: 1 },
+			progress: {
+				discovered: 1,
+				shaped: 1,
+				enriched: 0,
+				directTotal: 1,
+				total: 1,
+			},
 		};
 		const reconnect = async (expected: string) => {
 			streams.at(-1)?.fail();
@@ -728,7 +740,13 @@ describe("HTTP PhotoService", () => {
 			kind: "progress",
 			selectionId: "selection-a",
 			generation: 1,
-			progress: { discovered: 1, shaped: 1, enriched: 0, total: 1 },
+			progress: {
+				discovered: 1,
+				shaped: 1,
+				enriched: 0,
+				directTotal: 1,
+				total: 1,
+			},
 		};
 		const stopFirst = service.watchWallUpdates(() => undefined);
 		streams[0]?.emit(selectionAProgress, "7");
@@ -772,7 +790,13 @@ describe("HTTP PhotoService", () => {
 			kind: "progress",
 			selectionId: "selection-a",
 			generation: 1,
-			progress: { discovered: 0, shaped: 0, enriched: 0, total: 0 },
+			progress: {
+				discovered: 0,
+				shaped: 0,
+				enriched: 0,
+				directTotal: 0,
+				total: 0,
+			},
 		};
 
 		streams[0]?.emit(progress, "00");
@@ -811,7 +835,13 @@ describe("HTTP PhotoService", () => {
 			kind: "progress",
 			selectionId: "selection-a",
 			generation: 1,
-			progress: { discovered: 1, shaped: 1, enriched: 0, total: 1 },
+			progress: {
+				discovered: 1,
+				shaped: 1,
+				enriched: 0,
+				directTotal: 1,
+				total: 1,
+			},
 		};
 
 		streams[0]?.emit(progress, "10");
@@ -910,7 +940,13 @@ describe("HTTP PhotoService", () => {
 				assets: [representativeAsset],
 				orderState: "settled",
 				generation: 2,
-				progress: { discovered: 1, shaped: 1, enriched: 1, total: 1 },
+				progress: {
+					discovered: 1,
+					shaped: 1,
+					enriched: 1,
+					directTotal: 1,
+					total: 1,
+				},
 			},
 			"2",
 		);
@@ -935,7 +971,13 @@ describe("HTTP PhotoService", () => {
 				assets: [representativeAsset],
 				orderState: "settled",
 				generation: 2,
-				progress: { discovered: 1, shaped: 1, enriched: 1, total: 1 },
+				progress: {
+					discovered: 1,
+					shaped: 1,
+					enriched: 1,
+					directTotal: 1,
+					total: 1,
+				},
 			},
 		]);
 		expect(calls[2]).toContain("/api/v1/selections/selection-a/wall?");
@@ -985,7 +1027,13 @@ describe("HTTP PhotoService", () => {
 				kind: "progress",
 				selectionId: "selection-a",
 				generation: 1,
-				progress: { discovered: 1, shaped: 1, enriched: 0, total: 1 },
+				progress: {
+					discovered: 1,
+					shaped: 1,
+					enriched: 0,
+					directTotal: 1,
+					total: 1,
+				},
 			},
 			"6",
 		);

@@ -10,11 +10,17 @@ use photo_metadata::{
 };
 use tokio::sync::{Mutex, mpsc, watch};
 
-use crate::discover::{DiscoveredAsset, discover_asset};
+use crate::discover::{DiscoveredAsset, SidecarLookup, discover_asset_with_sidecar};
 use crate::{IndexError, IndexEvent, ScanProgress, ScanStage, ScanSummary};
 use crate::{IndexScheduler, SchedulerConfig};
 
 const INVENTORY_TOTAL_UNKNOWN: u64 = u64::MAX;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PhotoInventory {
+    direct: u64,
+    recursive: u64,
+}
 
 pub trait MetadataReader: Send + Sync + 'static {
     fn read(
@@ -161,21 +167,25 @@ impl<R: MetadataReader> Indexer<R> {
             let summary = Arc::new(Mutex::new(ScanSummary::default()));
             let progress = Arc::new((AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)));
             let inventory_total = Arc::new(AtomicU64::new(INVENTORY_TOTAL_UNKNOWN));
+            let direct_inventory_total = Arc::new(AtomicU64::new(INVENTORY_TOTAL_UNKNOWN));
             let inventory_publisher = tokio::spawn({
                 let events = events_tx.clone();
                 let progress = progress.clone();
                 let inventory_total = inventory_total.clone();
+                let direct_inventory_total = direct_inventory_total.clone();
                 async move {
                     match inventory.await {
-                        Ok(Ok(Some(total))) => {
-                            inventory_total.store(total, Ordering::Release);
+                        Ok(Ok(Some(inventory))) => {
+                            inventory_total.store(inventory.recursive, Ordering::Release);
+                            direct_inventory_total.store(inventory.direct, Ordering::Release);
                             let _ = events
                                 .send(IndexEvent::Progress(ScanProgress {
                                     stage: ScanStage::Discovering,
                                     discovered: progress.0.load(Ordering::Relaxed),
                                     shaped: progress.1.load(Ordering::Relaxed),
                                     enriched: progress.2.load(Ordering::Relaxed),
-                                    total: Some(total),
+                                    direct_total: Some(inventory.direct),
+                                    total: Some(inventory.recursive),
                                 }))
                                 .await;
                         }
@@ -201,6 +211,7 @@ impl<R: MetadataReader> Indexer<R> {
                 let summary = summary.clone();
                 let progress = progress.clone();
                 let inventory_total = inventory_total.clone();
+                let direct_inventory_total = direct_inventory_total.clone();
                 let scheduler = scheduler.clone();
                 workers.push(tokio::spawn(async move {
                     loop {
@@ -227,6 +238,9 @@ impl<R: MetadataReader> Indexer<R> {
                                         discovered,
                                         shaped: progress.1.load(Ordering::Relaxed),
                                         enriched: progress.2.load(Ordering::Relaxed),
+                                        direct_total: known_inventory_total(
+                                            &direct_inventory_total,
+                                        ),
                                         total: known_inventory_total(&inventory_total),
                                     }))
                                     .await;
@@ -275,6 +289,9 @@ impl<R: MetadataReader> Indexer<R> {
                                                 discovered: progress.0.load(Ordering::Relaxed),
                                                 shaped,
                                                 enriched: progress.2.load(Ordering::Relaxed),
+                                                direct_total: known_inventory_total(
+                                                    &direct_inventory_total,
+                                                ),
                                                 total: known_inventory_total(&inventory_total),
                                             }))
                                             .await;
@@ -308,6 +325,9 @@ impl<R: MetadataReader> Indexer<R> {
                                                 discovered: progress.0.load(Ordering::Relaxed),
                                                 shaped,
                                                 enriched: progress.2.load(Ordering::Relaxed),
+                                                direct_total: known_inventory_total(
+                                                    &direct_inventory_total,
+                                                ),
                                                 total: known_inventory_total(&inventory_total),
                                             }))
                                             .await;
@@ -332,6 +352,7 @@ impl<R: MetadataReader> Indexer<R> {
                 let summary = summary.clone();
                 let progress = progress.clone();
                 let inventory_total = inventory_total.clone();
+                let direct_inventory_total = direct_inventory_total.clone();
                 let scheduler = scheduler.clone();
                 workers.push(tokio::spawn(async move {
                     loop {
@@ -410,6 +431,9 @@ impl<R: MetadataReader> Indexer<R> {
                                                 discovered: progress.0.load(Ordering::Relaxed),
                                                 shaped: progress.1.load(Ordering::Relaxed),
                                                 enriched,
+                                                direct_total: known_inventory_total(
+                                                    &direct_inventory_total,
+                                                ),
                                                 total: known_inventory_total(&inventory_total),
                                             }))
                                             .await;
@@ -448,13 +472,21 @@ impl<R: MetadataReader> Indexer<R> {
                 Err(error) => return Err(IndexError::TaskJoin(error.to_string())),
             }
             let _ = inventory_publisher.await;
+            if !summary.cancelled {
+                validate_completed_inventory(
+                    progress.0.load(Ordering::Relaxed),
+                    known_inventory(&direct_inventory_total, &inventory_total),
+                )?;
+            }
+            let discovered = progress.0.load(Ordering::Relaxed);
             let _ = events_tx
                 .send(IndexEvent::Progress(ScanProgress {
                     stage: ScanStage::Completed,
-                    discovered: progress.0.load(Ordering::Relaxed),
+                    discovered,
                     shaped: progress.1.load(Ordering::Relaxed),
                     enriched: progress.2.load(Ordering::Relaxed),
-                    total: Some(progress.0.load(Ordering::Relaxed)),
+                    direct_total: known_inventory_total(&direct_inventory_total),
+                    total: known_inventory_total(&inventory_total).or(Some(discovered)),
                 }))
                 .await;
             let _ = events_tx.send(IndexEvent::Completed(summary)).await;
@@ -475,11 +507,34 @@ fn known_inventory_total(total: &AtomicU64) -> Option<u64> {
     }
 }
 
+fn known_inventory(direct: &AtomicU64, recursive: &AtomicU64) -> Option<PhotoInventory> {
+    Some(PhotoInventory {
+        direct: known_inventory_total(direct)?,
+        recursive: known_inventory_total(recursive)?,
+    })
+}
+
+fn validate_completed_inventory(
+    discovered: u64,
+    inventory: Option<PhotoInventory>,
+) -> Result<(), IndexError> {
+    if let Some(inventory) = inventory
+        && discovered != inventory.recursive
+    {
+        return Err(IndexError::InventoryMismatch {
+            expected: inventory.recursive,
+            discovered,
+        });
+    }
+    Ok(())
+}
+
 fn count_photo_inventory(
     root: &Path,
     cancel: &watch::Receiver<bool>,
-) -> Result<Option<u64>, IndexError> {
-    let mut total = 0_u64;
+) -> Result<Option<PhotoInventory>, IndexError> {
+    let mut direct = 0_u64;
+    let mut recursive = 0_u64;
     for entry in walkdir::WalkDir::new(root).follow_links(false) {
         if *cancel.borrow() {
             return Ok(None);
@@ -489,10 +544,13 @@ fn count_photo_inventory(
             continue;
         }
         if MediaKind::from_path(entry.path()).is_some_and(|kind| kind != MediaKind::Video) {
-            total = total.saturating_add(1);
+            recursive = recursive.saturating_add(1);
+            if entry.depth() == 1 {
+                direct = direct.saturating_add(1);
+            }
         }
     }
-    Ok(Some(total))
+    Ok(Some(PhotoInventory { direct, recursive }))
 }
 
 async fn admit_enrichment(cancel: &watch::Receiver<bool>, scheduler: &IndexScheduler) -> bool {
@@ -540,6 +598,7 @@ fn discover_all(
         .map(|entry| entry.file_name())
         .collect::<Vec<_>>();
     let structure = FolderStructureSnapshot::new(children);
+    let mut sidecars = SidecarLookup::default();
     for entry in walkdir::WalkDir::new(root).follow_links(false) {
         if *cancel.borrow() {
             break;
@@ -548,7 +607,10 @@ fn discover_all(
         if !entry.file_type().is_file() {
             continue;
         }
-        let Some(mut asset) = discover_asset(library_root, entry.path(), library_id)? else {
+        let sidecar = sidecars.find(entry.path())?;
+        let Some(mut asset) =
+            discover_asset_with_sidecar(library_root, entry.path(), library_id, sidecar)?
+        else {
             continue;
         };
         asset.asset.folder_group_id = folder_group_id;
@@ -579,7 +641,28 @@ fn discover_all(
 
 #[cfg(test)]
 mod tests {
-    use crate::{IndexScheduler, InteractionMode, SchedulerConfig};
+    use super::{PhotoInventory, validate_completed_inventory};
+    use crate::{IndexError, IndexScheduler, InteractionMode, SchedulerConfig};
+
+    #[test]
+    fn completion_rejects_a_partial_discovery_against_the_inventory() {
+        let error = validate_completed_inventory(
+            154,
+            Some(PhotoInventory {
+                direct: 2_092,
+                recursive: 2_092,
+            }),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            IndexError::InventoryMismatch {
+                expected: 2_092,
+                discovered: 154
+            }
+        ));
+    }
 
     #[tokio::test]
     async fn admission_decision_respects_active_limit() {

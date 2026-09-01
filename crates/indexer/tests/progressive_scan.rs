@@ -359,6 +359,37 @@ async fn inventory_total_arrives_while_image_reads_are_paused() {
 }
 
 #[tokio::test]
+async fn inventory_reports_direct_and_recursive_photo_totals_in_one_pass() {
+    let fixture = tempfile::tempdir().unwrap();
+    write_png(&fixture.path().join("direct-a.jpg"), [1, 2, 3]);
+    write_png(&fixture.path().join("direct-b.jpg"), [4, 5, 6]);
+    write_png(&fixture.path().join("nested/child-a.jpg"), [7, 8, 9]);
+    write_png(&fixture.path().join("nested/child-b.jpg"), [10, 11, 12]);
+    write_png(
+        &fixture.path().join("nested/deeper/child-c.jpg"),
+        [13, 14, 15],
+    );
+    std::fs::write(fixture.path().join("nested/clip.mp4"), b"not a video").unwrap();
+
+    let indexer = Indexer::new(NoopMetadataReader, empty_policy_engine());
+    let mut scan = indexer.start(ScanRequest::new(fixture.path())).unwrap();
+    let totals = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(IndexEvent::Progress(progress)) = scan.events.recv().await
+                && progress.total.is_some()
+            {
+                break (progress.direct_total, progress.total);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    scan.join().await.unwrap();
+
+    assert_eq!(totals, (Some(2), Some(5)));
+}
+
+#[tokio::test]
 async fn video_discovery_is_indexed_but_not_counted_in_photo_progress() {
     let fixture = tempfile::tempdir().unwrap();
     write_png(&fixture.path().join("a.jpg"), [255, 0, 0]);
@@ -390,6 +421,7 @@ async fn video_discovery_is_indexed_but_not_counted_in_photo_progress() {
             discovered: 2,
             shaped: 2,
             enriched: 2,
+            direct_total: Some(2),
             total: Some(2),
         })
     );

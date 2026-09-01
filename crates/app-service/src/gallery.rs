@@ -1129,6 +1129,7 @@ impl GalleryEngine {
         if !(1..=250).contains(&request.limit) {
             return Err(AppServiceError::InvalidLimit);
         }
+        let inventory_total = self.runtime(selection).inventory_total(scope);
         let state = self
             .state
             .lock()
@@ -1159,10 +1160,11 @@ impl GalleryEngine {
             cursor,
             request.limit,
         )?;
-        let total_count = state
+        let catalog_total_count = state
             .libraries
             .catalog()
             .wall_photo_count_scoped(selection.group_id, scope)?;
+        let total_count = inventory_total.unwrap_or(catalog_total_count);
         let items = crate::service::wall_assets_with_derivatives(
             state.libraries.catalog(),
             &page.items,
@@ -3165,6 +3167,9 @@ impl GalleryEngine {
                 }
             })
             .next_back();
+        if let Some(progress) = progress {
+            runtime.remember_inventory_totals(progress.direct_total, progress.total);
+        }
         let shaped = events
             .iter()
             .filter_map(|e| match e {

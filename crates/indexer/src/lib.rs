@@ -41,4 +41,6 @@ pub enum IndexError {
     TaskJoin(String),
     #[error("scan cancellation channel is closed")]
     CancellationClosed,
+    #[error("scan inventory expected {expected} photos but discovered {discovered}")]
+    InventoryMismatch { expected: u64, discovered: u64 },
 }

@@ -108,6 +108,7 @@ export function createInMemoryPhotoService(
 		discovered: fixtures.length,
 		shaped: fixtures.length,
 		enriched,
+		directTotal: fixtures.length,
 		total: fixtures.length,
 	});
 	const derivativeReferences = (): DerivativeReference[] =>
