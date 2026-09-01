@@ -2370,6 +2370,139 @@ async fn hosted_membership_removal_at_publication_leaves_no_catalog_link_or_even
 
 #[cfg(debug_assertions)]
 #[tokio::test]
+async fn visible_hosted_thumbnail_starts_while_four_near_viewport_encodes_are_running() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir_all(&source).unwrap();
+    for folder_index in 0..4 {
+        let folder = source.join(format!("folder-{folder_index}"));
+        std::fs::create_dir_all(&folder).unwrap();
+        image::ImageBuffer::from_pixel(512, 384, image::Rgb([folder_index as u8, 180_u8, 80_u8]))
+            .save(folder.join("background.jpg"))
+            .unwrap();
+        if folder_index == 0 {
+            image::ImageBuffer::from_pixel(512, 384, image::Rgb([220_u8, 80_u8, 40_u8]))
+                .save(folder.join("visible.jpg"))
+                .unwrap();
+        }
+    }
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config, source).unwrap();
+    let mut selections = Vec::new();
+    let mut pages = Vec::new();
+    for folder_index in 0..4 {
+        let folder = format!("folder-{folder_index}");
+        let summary = engine.select_relative(Path::new(&folder)).await.unwrap();
+        let selection = engine.resolve_selection(&summary.id).unwrap();
+        engine.ensure_running(&selection).await.unwrap();
+        let expected = if folder_index == 0 { 2 } else { 1 };
+        let page = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let page = engine
+                    .query_wall(
+                        &selection,
+                        photo_app_service::GalleryScope::CurrentFolder,
+                        photo_app_service::WallQueryRequest::oldest_first(),
+                    )
+                    .await
+                    .unwrap();
+                if page.items.len() == expected {
+                    break page;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hosted folder assets did not become queryable");
+        selections.push(selection);
+        pages.push(page);
+    }
+    engine.set_hosted_derivative_admission_cap_for_test(4);
+
+    let mut entered = Vec::new();
+    let mut releases = Vec::new();
+    for _ in 0..5 {
+        let gate_entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let gate_release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        engine
+            .install_hosted_encode_test_gate(gate_entered.clone(), gate_release.clone())
+            .await;
+        entered.push(gate_entered);
+        releases.push(gate_release);
+    }
+
+    for index in 0..4 {
+        let background = pages[index]
+            .items
+            .iter()
+            .find(|asset| asset.display_name == "background.jpg")
+            .unwrap()
+            .id
+            .clone();
+        engine
+            .admit_derivatives(
+                &selections[index],
+                photo_app_service::GalleryScope::CurrentFolder,
+                photo_app_service::DerivativeRequest {
+                    asset_ids: vec![background],
+                    priority: photo_app_service::DerivativePriority::NearViewport,
+                    kind: photo_app_service::DerivativeClass::WallThumbnail,
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered[index].notified())
+            .await
+            .expect("near-viewport encode did not occupy its hosted worker");
+    }
+    assert_eq!(engine.hosted_derivative_active_count_for_test(), 4);
+
+    let visible = pages[0]
+        .items
+        .iter()
+        .find(|asset| asset.display_name == "visible.jpg")
+        .unwrap()
+        .id
+        .clone();
+    engine
+        .admit_derivatives(
+            &selections[0],
+            photo_app_service::GalleryScope::CurrentFolder,
+            photo_app_service::DerivativeRequest::visible(vec![visible]),
+        )
+        .await
+        .unwrap();
+    let visible_started =
+        tokio::time::timeout(std::time::Duration::from_millis(250), entered[4].notified())
+            .await
+            .is_ok();
+    assert_eq!(
+        engine.hosted_derivative_active_count_for_test(),
+        5,
+        "visible work did not use exactly one temporary burst slot"
+    );
+
+    for release in releases {
+        release.store(true, std::sync::atomic::Ordering::Release);
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if engine.hosted_derivative_active_count_for_test() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("hosted derivative workers did not drain after release");
+    assert!(
+        visible_started,
+        "visible thumbnail waited for an already-running near-viewport encode"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
 async fn hosted_cancellation_keeps_blocking_encode_admitted_until_successor_runs() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");

@@ -59,6 +59,8 @@ fn canonicalize_for_identity(path: &Path) -> PathBuf {
 const DERIVATIVE_DECODER_VERSION: &str = "image-0.25-v1";
 const MAX_MANAGED_DERIVATIVE_BYTES: u64 = 64 * 1024 * 1024;
 const HOSTED_ASSET_DERIVATIVE_WARNING: &str = "derivative_generation_failed";
+const HOSTED_DERIVATIVE_WORKERS: usize = 4;
+const HOSTED_VISIBLE_BURST_WORKERS: usize = HOSTED_DERIVATIVE_WORKERS + 1;
 
 fn derivative_spec_for_gallery(
     asset: &photo_catalog::AssetRecord,
@@ -197,6 +199,13 @@ struct HostedDriverOwner {
     active_ticket: Arc<Mutex<Option<WorkTicket>>>,
     active_attempt: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
     active_attempt_lease: Arc<Mutex<Option<HostedAttemptLease>>>,
+    kind: HostedDriverKind,
+}
+
+#[derive(Clone, Copy)]
+enum HostedDriverKind {
+    Durable,
+    VisibleBurst,
 }
 
 struct HostedAttemptTaskOwner {
@@ -241,6 +250,7 @@ impl Drop for HostedDriverOwner {
         let generation = self.generation;
         let engine = self.engine.clone();
         let runtime = self.runtime.clone();
+        let self_kind = self.kind;
         let active_ticket = self.active_ticket.clone();
         let active_attempt = self.active_attempt.clone();
         let active_attempt_lease = self.active_attempt_lease.clone();
@@ -297,9 +307,19 @@ impl Drop for HostedDriverOwner {
                         .recover_hosted_publication_as_failure(ticket)
                         .await;
                 }
-                coordinator.release_driver_owner(generation).await;
+                match self_kind {
+                    HostedDriverKind::Durable => {
+                        coordinator.release_driver_owner(generation).await;
+                    }
+                    HostedDriverKind::VisibleBurst => {
+                        coordinator.release_visible_driver_owner(generation).await;
+                    }
+                }
                 if coordinator.pending_job_count().await > 0 {
-                    engine.start_hosted_derivative_driver(runtime).await;
+                    engine.start_hosted_derivative_driver(runtime.clone()).await;
+                }
+                if coordinator.has_queued_visible_wall_work().await {
+                    engine.start_hosted_visible_driver(runtime).await;
                 }
                 #[cfg(debug_assertions)]
                 if let Some(gate) = cancellation_gate {
@@ -687,7 +707,7 @@ impl GalleryEngine {
             cache_root,
             cache_writer,
             catalog_path,
-            derivative_admission: Arc::new(Semaphore::new(4)),
+            derivative_admission: Arc::new(Semaphore::new(HOSTED_VISIBLE_BURST_WORKERS)),
             derivative_admission_wake: Arc::new(Notify::new()),
             hosted_active: Arc::new(AtomicUsize::new(0)),
             #[cfg(debug_assertions)]
@@ -757,7 +777,7 @@ impl GalleryEngine {
             cache_root,
             cache_writer,
             catalog_path,
-            derivative_admission: Arc::new(Semaphore::new(4)),
+            derivative_admission: Arc::new(Semaphore::new(HOSTED_VISIBLE_BURST_WORKERS)),
             derivative_admission_wake: Arc::new(Notify::new()),
             hosted_active: Arc::new(AtomicUsize::new(0)),
             #[cfg(debug_assertions)]
@@ -1299,6 +1319,12 @@ impl GalleryEngine {
                 .await?;
             if queued {
                 self.start_hosted_derivative_driver(runtime.clone()).await;
+                if matches!(mode, HostedDerivativeRequestMode::AdmitOnly)
+                    && request.priority == DerivativePriority::Visible
+                    && class == DerivativeClass::WallThumbnail
+                {
+                    self.start_hosted_visible_driver(runtime.clone()).await;
+                }
             }
             if capacity_exceeded {
                 return Err(AppServiceError::DerivativeUnavailable);
@@ -1504,7 +1530,7 @@ impl GalleryEngine {
     #[doc(hidden)]
     pub fn set_hosted_derivative_admission_cap_for_test(&self, limit: usize) {
         self.hosted_admission_limit_override
-            .store(limit.clamp(1, 4), Ordering::Release);
+            .store(limit.clamp(1, HOSTED_DERIVATIVE_WORKERS), Ordering::Release);
     }
 
     #[cfg(debug_assertions)]
@@ -1523,7 +1549,14 @@ impl GalleryEngine {
     }
 
     fn try_hosted_slot(&self) -> bool {
-        let limit = self.hosted_admission_limit();
+        self.try_hosted_slot_with_limit(self.hosted_admission_limit())
+    }
+
+    fn try_hosted_visible_slot(&self) -> bool {
+        self.try_hosted_slot_with_limit(HOSTED_VISIBLE_BURST_WORKERS)
+    }
+
+    fn try_hosted_slot_with_limit(&self, limit: usize) -> bool {
         let mut active = self.hosted_active.load(Ordering::Acquire);
         loop {
             if active >= limit {
@@ -1554,7 +1587,9 @@ impl GalleryEngine {
                 return forced;
             }
         }
-        self.scheduler.available_background_permits().clamp(1, 4)
+        self.scheduler
+            .available_background_permits()
+            .clamp(1, HOSTED_DERIVATIVE_WORKERS)
     }
 
     fn hosted_scope_authorizer(&self) -> crate::derivative_coordinator::ScopeAuthorizer {
@@ -1599,6 +1634,43 @@ impl GalleryEngine {
             drop(admission);
             return None;
         };
+        Some((ticket, admission))
+    }
+
+    async fn try_admit_hosted_visible_work(
+        &self,
+        runtime: &Arc<SelectionRuntime>,
+    ) -> Option<(WorkTicket, HostedAdmission)> {
+        let _owner = self.hosted_admission_owner.lock().await;
+        let visible_priority =
+            crate::derivative_coordinator::scheduler_priority(WorkLane::VisibleWall);
+        if self
+            .scheduler
+            .highest_priority_in_family(crate::derivative_coordinator::SCHEDULER_OWNER_PREFIX)
+            .await
+            != Some(visible_priority)
+        {
+            return None;
+        }
+        let permit = self.derivative_admission.clone().try_acquire_owned().ok()?;
+        if !self.try_hosted_visible_slot() {
+            drop(permit);
+            return None;
+        }
+        let admission = HostedAdmission {
+            permit: Some(permit),
+            active: self.hosted_active.clone(),
+            wake: self.derivative_admission_wake.clone(),
+        };
+        let Some(ticket) = runtime.coordinator.next_work().await else {
+            drop(admission);
+            return None;
+        };
+        if runtime.coordinator.lane(ticket).await != WorkLane::VisibleWall {
+            runtime.coordinator.requeue(ticket).await;
+            drop(admission);
+            return None;
+        }
         Some((ticket, admission))
     }
 
@@ -1805,6 +1877,27 @@ impl GalleryEngine {
         let Some(generation) = runtime.coordinator.claim_driver_owner().await else {
             return;
         };
+        self.spawn_hosted_derivative_driver(runtime, generation, HostedDriverKind::Durable)
+            .await;
+    }
+
+    async fn start_hosted_visible_driver(&self, runtime: Arc<SelectionRuntime>) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let Some(generation) = runtime.coordinator.claim_visible_driver_owner().await else {
+            return;
+        };
+        self.spawn_hosted_derivative_driver(runtime, generation, HostedDriverKind::VisibleBurst)
+            .await;
+    }
+
+    async fn spawn_hosted_derivative_driver(
+        &self,
+        runtime: Arc<SelectionRuntime>,
+        generation: u64,
+        kind: HostedDriverKind,
+    ) {
         let engine = self.clone();
         let active_ticket = Arc::new(Mutex::new(None));
         let active_attempt = Arc::new(Mutex::new(None));
@@ -1818,15 +1911,34 @@ impl GalleryEngine {
                 active_ticket: active_ticket.clone(),
                 active_attempt: active_attempt.clone(),
                 active_attempt_lease: active_attempt_lease.clone(),
+                kind,
             };
             loop {
                 let coordinator = runtime.coordinator.clone();
                 let observed_coordinator = coordinator.change_generation();
                 let observed_scheduler = engine.scheduler.change_generation();
-                let Some((ticket, admission)) = engine.try_admit_hosted_work(&runtime).await else {
-                    if coordinator.pending_job_count().await == 0
-                        && coordinator.release_driver_owner_if_idle(generation).await
-                    {
+                let next = match kind {
+                    HostedDriverKind::Durable => engine.try_admit_hosted_work(&runtime).await,
+                    HostedDriverKind::VisibleBurst => {
+                        engine.try_admit_hosted_visible_work(&runtime).await
+                    }
+                };
+                let Some((ticket, admission)) = next else {
+                    let should_exit = match kind {
+                        HostedDriverKind::Durable => {
+                            coordinator.pending_job_count().await == 0
+                                && coordinator.release_driver_owner_if_idle(generation).await
+                        }
+                        HostedDriverKind::VisibleBurst => {
+                            if coordinator.has_queued_visible_wall_work().await {
+                                false
+                            } else {
+                                coordinator.release_visible_driver_owner(generation).await;
+                                true
+                            }
+                        }
+                    };
+                    if should_exit {
                         break;
                     }
                     let coordinator_wake = coordinator.wait_for_change_since(observed_coordinator);
@@ -1930,7 +2042,9 @@ impl GalleryEngine {
         });
         #[cfg(debug_assertions)]
         {
-            *self.hosted_driver_abort_handle.lock().await = Some(driver.abort_handle());
+            if matches!(kind, HostedDriverKind::Durable) {
+                *self.hosted_driver_abort_handle.lock().await = Some(driver.abort_handle());
+            }
         }
         #[cfg(not(debug_assertions))]
         let _ = driver;

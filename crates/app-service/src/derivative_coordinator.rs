@@ -485,6 +485,7 @@ struct CoordinatorState {
     completed_order: VecDeque<(WorkKey, u64)>,
     terminal: HashSet<WorkKey>,
     driver_owner: Option<u64>,
+    visible_driver_owner: Option<u64>,
     next_driver_generation: u64,
     collection: CollectionState,
 }
@@ -504,6 +505,7 @@ impl Default for CoordinatorState {
             completed_order: VecDeque::new(),
             terminal: HashSet::new(),
             driver_owner: None,
+            visible_driver_owner: None,
             next_driver_generation: 1,
             collection: CollectionState {
                 phase: CollectionPhase::Dormant,
@@ -2201,6 +2203,44 @@ impl DerivativeCoordinator {
         if released {
             self.notify_waiters();
         }
+    }
+
+    /// Claims the one selection-local worker that may run visible wall work
+    /// beside the durable hosted driver. This owner is separate so an
+    /// in-flight near-viewport encode cannot block a newly visible tile.
+    pub(crate) async fn claim_visible_driver_owner(&self) -> Option<u64> {
+        let mut state = self.state.lock().await;
+        if state.visible_driver_owner.is_some() {
+            return None;
+        }
+        let generation = state.next_driver_generation;
+        state.next_driver_generation = state.next_driver_generation.wrapping_add(1).max(1);
+        state.visible_driver_owner = Some(generation);
+        Some(generation)
+    }
+
+    pub(crate) async fn release_visible_driver_owner(&self, generation: u64) {
+        let released = {
+            let mut state = self.state.lock().await;
+            if state.visible_driver_owner == Some(generation) {
+                state.visible_driver_owner = None;
+                true
+            } else {
+                false
+            }
+        };
+        if released {
+            self.notify_waiters();
+        }
+    }
+
+    pub(crate) async fn has_queued_visible_wall_work(&self) -> bool {
+        self.state
+            .lock()
+            .await
+            .jobs
+            .values()
+            .any(|work| work.status == JobStatus::Queued && work.lane == WorkLane::VisibleWall)
     }
 
     pub(crate) async fn completed_failure(&self, key: &WorkKey) -> bool {
