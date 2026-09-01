@@ -33,6 +33,7 @@ export interface FolderListing {
 	path: string;
 	breadcrumbs: FolderBreadcrumb[];
 	children: FolderEntry[];
+	imageCount: number | null;
 }
 
 export interface FolderBrowserState {

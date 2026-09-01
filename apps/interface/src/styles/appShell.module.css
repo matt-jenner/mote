@@ -437,6 +437,18 @@
 	list-style: none;
 }
 
+.hostedFolderContents {
+	display: grid;
+	gap: var(--space-2);
+}
+
+.hostedFolderCount {
+	padding: 0 var(--space-3);
+	margin: 0;
+	color: var(--text-secondary);
+	font-size: 12px;
+}
+
 .hostedFolderList button {
 	display: grid;
 	grid-template-columns: auto minmax(0, 1fr) auto;

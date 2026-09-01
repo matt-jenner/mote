@@ -380,14 +380,20 @@ export function useViewerGestures({
 	);
 
 	const finishTouch = useCallback(
-		(event: React.PointerEvent<HTMLElement>, cancelled: boolean) => {
+		(
+			event: React.PointerEvent<HTMLElement>,
+			cancelled: boolean,
+			clearOrphanCancellation: boolean,
+		) => {
 			if (ignoredTouchPointers.current.delete(event.pointerId)) return;
 			const gesture = touchGesture.current;
 			if (!gesture || !touchPoints.current.has(event.pointerId)) {
 				if (gesture) return;
 				if (cancelled) {
-					clearPendingTap();
-					lastTap.current = null;
+					if (clearOrphanCancellation) {
+						clearPendingTap();
+						lastTap.current = null;
+					}
 					return;
 				}
 				// Preserve compatibility with host integrations that emit a synthetic
@@ -471,9 +477,13 @@ export function useViewerGestures({
 	);
 
 	const finish = useCallback(
-		(event: React.PointerEvent<HTMLElement>, cancelled: boolean) => {
+		(
+			event: React.PointerEvent<HTMLElement>,
+			cancelled: boolean,
+			clearOrphanCancellation = false,
+		) => {
 			if (event.pointerType === "touch") {
-				finishTouch(event, cancelled);
+				finishTouch(event, cancelled, clearOrphanCancellation);
 				return;
 			}
 			finishMouse(event);
@@ -485,7 +495,7 @@ export function useViewerGestures({
 		onPointerDown,
 		onPointerMove,
 		onPointerUp: (event) => finish(event, false),
-		onPointerCancel: (event) => finish(event, true),
+		onPointerCancel: (event) => finish(event, true, true),
 		onLostPointerCapture: (event) => finish(event, true),
 	};
 }

@@ -451,7 +451,8 @@ function seriousViolations(result: axe.AxeResults) {
 
 const originalIntersectionObserver = window.IntersectionObserver;
 const originalRequestIdleCallback = window.requestIdleCallback;
-beforeEach(() => {
+beforeEach(async () => {
+	await page.viewport(1280, 800);
 	TestIntersectionObserver.instances = [];
 	Object.defineProperty(window, "IntersectionObserver", {
 		configurable: true,
@@ -1007,32 +1008,29 @@ describe("progressive photo wall", () => {
 		expect(wall.querySelector("[data-asset-id='recursive']")).toBeNull();
 	});
 
-	it("keeps gallery controls inside a phone-width header", async () => {
+	it("uses a compact view-options menu in a phone-width header", async () => {
 		await page.viewport(390, 844);
 		const service = new ControlledWallService();
 		const screen = await renderWall(service);
 		await expect.poll(() => service.queryRequests.length).toBe(1);
 		service.releaseQuery(0, pageOf([]));
 
-		for (const name of [
-			"Include subfolders",
-			"Oldest first",
-			"Newest first",
-			"Appearance",
-		]) {
-			const bounds = screen
-				.getByRole("button", { name })
-				.element()
-				.getBoundingClientRect();
-			expect(
-				bounds.left,
-				`${name} starts outside the viewport`,
-			).toBeGreaterThanOrEqual(0);
-			expect(
-				bounds.right,
-				`${name} ends outside the viewport`,
-			).toBeLessThanOrEqual(390);
-		}
+		const toolbar = document.querySelector("header");
+		expect(toolbar?.getBoundingClientRect().height).toBeLessThanOrEqual(64);
+		const options = screen.getByRole("button", { name: "View options" });
+		await expect.element(options).toBeVisible();
+		await options.click();
+		await expect
+			.element(screen.getByRole("dialog", { name: "View options" }))
+			.toBeVisible();
+
+		await screen.getByRole("button", { name: "Newest first" }).click();
+
+		await expect.poll(() => service.queryRequests.length).toBe(2);
+		expect(service.queryRequests[1]?.direction).toBe("newestFirst");
+		expect(
+			screen.getByRole("dialog", { name: "View options" }).query(),
+		).toBeNull();
 	});
 
 	it("retries a rejected visible thumbnail request and reports the retry", async () => {

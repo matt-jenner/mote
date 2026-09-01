@@ -319,31 +319,40 @@ export function HostedFolderBrowser({
 						</p>
 					) : null}
 					{listing ? (
-						listing.children.length > 0 ? (
-							<ul aria-label="Folders" className={styles.hostedFolderList}>
-								{listing.children.map((child) => (
-									<li key={child.path}>
-										<button
-											disabled={busy}
-											onClick={() => void loadPath(child.path)}
-											type="button"
-										>
-											<Folder aria-hidden="true" size={20} strokeWidth={1.5} />
-											<span>{child.name}</span>
-											<ChevronRight
-												aria-hidden="true"
-												size={17}
-												strokeWidth={1.7}
-											/>
-										</button>
-									</li>
-								))}
-							</ul>
-						) : (
-							<p className={styles.hostedFolderStatus}>
-								No folders inside this folder.
+						<div className={styles.hostedFolderContents}>
+							<p className={styles.hostedFolderCount}>
+								{listing.imageCount === null
+									? "Photo count unavailable"
+									: `${listing.imageCount} ${listing.imageCount === 1 ? "photo" : "photos"} in this folder`}
 							</p>
-						)
+							{listing.children.length > 0 ? (
+								<ul aria-label="Folders" className={styles.hostedFolderList}>
+									{listing.children.map((child) => (
+										<li key={child.path}>
+											<button
+												disabled={busy}
+												onClick={() => void loadPath(child.path)}
+												type="button"
+											>
+												<Folder
+													aria-hidden="true"
+													size={20}
+													strokeWidth={1.5}
+												/>
+												<span>{child.name}</span>
+												<ChevronRight
+													aria-hidden="true"
+													size={17}
+													strokeWidth={1.7}
+												/>
+											</button>
+										</li>
+									))}
+								</ul>
+							) : (
+								<p className={styles.hostedFolderStatus}>No subfolders</p>
+							)}
+						</div>
 					) : null}
 				</div>
 

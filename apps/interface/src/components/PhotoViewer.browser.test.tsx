@@ -2604,6 +2604,68 @@ describe("immersive photo viewer checkpoint", () => {
 		expect(close.getBoundingClientRect().height).toBeGreaterThanOrEqual(44);
 	});
 
+	it("fits the whole photo and keeps the filmstrip at the mobile viewport edge", async () => {
+		await page.viewport(390, 844);
+		const { view, tile } = await openAsset("Coast");
+		await tile.click();
+		await expect
+			.element(view.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		const overlay = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		const frame = view.getByTestId("viewer-frame").element();
+		const image = overlay.querySelector<HTMLElement>(
+			"[data-viewer-layer='wallThumbnail']",
+		);
+		const filmstrip = view
+			.getByRole("group", { name: "Photo filmstrip" })
+			.element();
+		const assertFitted = (minimumViewportFill: number) => {
+			const overlayBounds = overlay.getBoundingClientRect();
+			const frameBounds = frame.getBoundingClientRect();
+			const filmstripBounds = filmstrip.getBoundingClientRect();
+			const usableHeight = filmstripBounds.top - overlayBounds.top;
+			expect(frameBounds.width / frameBounds.height).toBeCloseTo(1.5, 2);
+			expect(frameBounds.left).toBeGreaterThanOrEqual(overlayBounds.left);
+			expect(frameBounds.right).toBeLessThanOrEqual(overlayBounds.right);
+			expect(frameBounds.top).toBeGreaterThanOrEqual(overlayBounds.top);
+			expect(frameBounds.bottom).toBeLessThanOrEqual(filmstripBounds.top);
+			expect(
+				Math.max(
+					frameBounds.width / overlayBounds.width,
+					frameBounds.height / usableHeight,
+				),
+			).toBeGreaterThanOrEqual(minimumViewportFill);
+		};
+		expect(image && getComputedStyle(image).objectFit).toBe("contain");
+		assertFitted(0.94);
+
+		await page.viewport(844, 390);
+		window.dispatchEvent(new Event("orientationchange"));
+		await expect.poll(() => overlay.getBoundingClientRect().width).toBe(844);
+		assertFitted(0.94);
+
+		const previous = view
+			.getByRole("button", { name: "Previous photo" })
+			.element();
+		const next = view.getByRole("button", { name: "Next photo" }).element();
+		const filmstripBounds = filmstrip.getBoundingClientRect();
+		const overlayBounds = overlay.getBoundingClientRect();
+		expect(filmstripBounds.bottom).toBeCloseTo(overlayBounds.bottom, 0);
+		const overlaps = (button: Element) => {
+			const bounds = button.getBoundingClientRect();
+			return (
+				bounds.left < filmstripBounds.right &&
+				bounds.right > filmstripBounds.left &&
+				bounds.top < filmstripBounds.bottom &&
+				bounds.bottom > filmstripBounds.top
+			);
+		};
+		expect(overlaps(previous)).toBe(false);
+		expect(overlaps(next)).toBe(false);
+	});
+
 	it("keeps the information drawer close target inside rotated safe areas", async () => {
 		const root = document.documentElement;
 		const previousSafeAreas = [
@@ -2815,6 +2877,7 @@ describe("immersive photo viewer checkpoint", () => {
 	});
 
 	it("navigates with a horizontal touch swipe and toggles chrome on a tap", async () => {
+		await page.viewport(390, 844);
 		const { view, tile } = await openAsset("Coast");
 		(tile.element() as HTMLButtonElement).click();
 		await expect
@@ -2834,8 +2897,8 @@ describe("immersive photo viewer checkpoint", () => {
 					pointerType: "touch",
 				}),
 			);
-		dispatchTouch("pointerdown", 620, 400);
-		dispatchTouch("pointerup", 540, 410);
+		dispatchTouch("pointerdown", 300, 400);
+		dispatchTouch("pointerup", 80, 410);
 		await expect
 			.element(view.getByTestId("viewer-stage"))
 			.toHaveAttribute("data-current-asset", "photo-0");
@@ -2843,8 +2906,8 @@ describe("immersive photo viewer checkpoint", () => {
 			"[data-viewer-controls]",
 		);
 		const before = controls?.getAttribute("aria-hidden");
-		dispatchTouch("pointerdown", 620, 400);
-		dispatchTouch("pointerup", 620, 400);
+		dispatchTouch("pointerdown", 200, 400);
+		dispatchTouch("pointerup", 200, 400);
 		await expect
 			.poll(() => controls?.getAttribute("aria-hidden"))
 			.not.toBe(before);
@@ -2865,7 +2928,7 @@ describe("immersive photo viewer checkpoint", () => {
 		await expect.element(stage).toHaveAttribute("data-viewer-mode", "zoomed");
 		await view.getByRole("button", { name: "Reset zoom" }).click();
 		await expect.element(stage).toHaveAttribute("data-viewer-mode", "fit");
-		expect(getComputedStyle(stage).touchAction).toBe("pan-y");
+		expect(getComputedStyle(stage).touchAction).toBe("none");
 		const dispatch = (
 			type: string,
 			pointerId: number,
@@ -3661,6 +3724,42 @@ describe("immersive photo viewer checkpoint", () => {
 			expect(seriousViolations(await axe.run(document))).toEqual([]);
 		} finally {
 			Element.prototype.scrollIntoView = originalScrollIntoView;
+			restoreViewport();
+		}
+	});
+
+	it("remeasures when mobile Safari publishes rotated dimensions late", async () => {
+		await page.viewport(390, 844);
+		const restoreViewport = installVisualViewportDouble(390, 844);
+		try {
+			const { view, tile } = await openAsset("Coast");
+			await tile.click();
+			const overlay = view
+				.getByRole("dialog", { name: "Photo viewer" })
+				.element();
+			const initialRevision = Number(overlay.dataset.viewportRevision);
+
+			window.dispatchEvent(new Event("orientationchange"));
+			await new Promise<void>((resolve) =>
+				requestAnimationFrame(() => resolve()),
+			);
+			expect(Number(overlay.dataset.viewportRevision)).toBe(initialRevision);
+
+			const viewport = window.visualViewport as VisualViewport & {
+				setSize: (width: number, height: number) => void;
+			};
+			viewport.setSize(844, 390);
+
+			await expect
+				.poll(() => overlay.style.getPropertyValue("--viewer-viewport-width"))
+				.toBe("844px");
+			expect(overlay.style.getPropertyValue("--viewer-viewport-height")).toBe(
+				"390px",
+			);
+			expect(Number(overlay.dataset.viewportRevision)).toBe(
+				initialRevision + 1,
+			);
+		} finally {
 			restoreViewport();
 		}
 	});

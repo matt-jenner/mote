@@ -88,6 +88,7 @@ function hostedFolderService(): PhotoService {
 			path: "",
 			breadcrumbs: [],
 			children: [{ name: "Trips", path: "Trips" }],
+			imageCount: 0,
 		}),
 	};
 }
@@ -133,11 +134,13 @@ function hostedGalleryService(): {
 			path: "",
 			breadcrumbs: [],
 			children: [{ name: "Trips", path: "Trips" }],
+			imageCount: 0,
 		},
 		Trips: {
 			path: "Trips",
 			breadcrumbs: [{ name: "Trips", path: "Trips" }],
 			children: [{ name: "Iceland", path: "Trips/Iceland" }],
+			imageCount: 0,
 		},
 		"Trips/Iceland": {
 			path: "Trips/Iceland",
@@ -146,6 +149,7 @@ function hostedGalleryService(): {
 				{ name: "Iceland", path: "Trips/Iceland" },
 			],
 			children: [{ name: "Processed", path: "Trips/Iceland/Processed" }],
+			imageCount: 1,
 		},
 	};
 	const service: PhotoService = {

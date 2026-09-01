@@ -53,7 +53,7 @@
 		max(44px, var(--safe-area-bottom, 0px))
 		max(44px, var(--safe-area-left, 0px));
 	background: #08090b;
-	touch-action: pan-y;
+	touch-action: none;
 }
 
 .viewerStage[data-viewer-mode="zoomed"] {
@@ -517,6 +517,29 @@
 	.viewerFilmstripItem {
 		width: 56px;
 		height: 44px;
+	}
+}
+
+@media (max-width: 639px), (orientation: landscape) and (max-height: 500px) {
+	.viewerStage {
+		padding: max(8px, var(--safe-area-top, 0px))
+			max(8px, var(--safe-area-right, 0px))
+			max(8px, var(--safe-area-bottom, 0px))
+			max(8px, var(--safe-area-left, 0px));
+	}
+
+	.viewerOverlay[data-filmstrip-visible="true"] .viewerStage {
+		padding-bottom: calc(72px + var(--safe-area-bottom, 0px));
+	}
+
+	.viewerFilmstrip {
+		bottom: var(--safe-area-bottom, 0px);
+		padding: 8px max(8px, var(--safe-area-right, 0px)) 8px
+			max(8px, var(--safe-area-left, 0px));
+	}
+
+	.viewerFilmstripTrack {
+		padding: 4px 0 0;
 	}
 }
 

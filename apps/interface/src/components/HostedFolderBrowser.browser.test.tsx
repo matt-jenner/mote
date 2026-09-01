@@ -34,6 +34,7 @@ const rootListing: FolderListing = {
 	path: "",
 	breadcrumbs: [],
 	children: [{ name: "Trips", path: "Trips" }],
+	imageCount: 0,
 };
 
 function folderService(overrides: Partial<PhotoService> = {}): PhotoService {
@@ -141,6 +142,35 @@ describe("hosted folder browser", () => {
 		expect(bounds.height).toBeLessThanOrEqual(1024 * 0.7 + 1);
 		expect(bounds.left).toBeCloseTo((1440 - bounds.width) / 2, 0);
 		expect(bounds.top).toBeCloseTo((1024 - bounds.height) / 2, 0);
+	});
+
+	it("shows the direct image count when a folder has no child folders", async () => {
+		const service = folderService({
+			listFolders: async (path) =>
+				path === "Trips"
+					? {
+							path,
+							breadcrumbs: [{ name: "Trips", path }],
+							children: [],
+							imageCount: 27,
+						}
+					: structuredClone(rootListing),
+		});
+		const screen = await render(
+			<HostedFolderBrowser
+				initialBreadcrumbs={[]}
+				onClose={() => undefined}
+				onSelected={() => undefined}
+				service={service}
+			/>,
+		);
+
+		await screen.getByRole("button", { name: "Trips" }).click();
+
+		await expect
+			.element(screen.getByText("27 photos in this folder"))
+			.toBeVisible();
+		await expect.element(screen.getByText("No subfolders")).toBeVisible();
 	});
 
 	it("uses a safe-area bounded full-height sheet on a phone", async () => {
@@ -256,6 +286,7 @@ describe("hosted folder browser", () => {
 			path: "Trips",
 			breadcrumbs: [{ name: "Trips", path: "Trips" }],
 			children: [{ name: "Iceland", path: "Trips/Iceland" }],
+			imageCount: 0,
 		});
 		await expect
 			.element(screen.getByRole("button", { name: "Iceland" }))
@@ -276,6 +307,7 @@ describe("hosted folder browser", () => {
 							{ name: "Iceland", path },
 						],
 						children: [],
+						imageCount: 0,
 					};
 				}
 				throw new Error(`Unexpected recovery path: ${path}`);
@@ -370,12 +402,14 @@ describe("hosted folder browser", () => {
 							{ name: "Current", path },
 						],
 						children: [],
+						imageCount: 0,
 					};
 				}
 				return {
 					path,
 					breadcrumbs: [{ name: "Parent", path }],
 					children: [],
+					imageCount: 0,
 				};
 			},
 		});

@@ -149,11 +149,21 @@ function decodeFolderEntry(value: unknown): FolderEntry {
 }
 
 function decodeFolderListing(value: unknown): FolderListing {
-	const listing = record(value, ["path", "breadcrumbs", "children"]);
+	const listing = record(value, [
+		"path",
+		"breadcrumbs",
+		"children",
+		"imageCount",
+	]);
+	const imageCount =
+		listing.imageCount === undefined ? null : integerValue(listing.imageCount);
+	if (imageCount !== null && imageCount < 0)
+		throw new DecodeError("expected non-negative integer");
 	return {
 		path: stringValue(listing.path),
 		breadcrumbs: arrayValue(listing.breadcrumbs, decodeBreadcrumb),
 		children: arrayValue(listing.children, decodeFolderEntry),
+		imageCount,
 	};
 }
 
@@ -762,7 +772,7 @@ export function createHttpPhotoService(
 		},
 		listFolders(path: string) {
 			return requestJson(
-				`/api/v1/folders?path=${encodeURIComponent(path)}`,
+				`/api/v1/folders?path=${encodeURIComponent(path)}&includeImageCount=true`,
 				decodeFolderListing,
 			);
 		},

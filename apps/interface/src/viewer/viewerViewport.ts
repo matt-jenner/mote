@@ -48,6 +48,7 @@ export function useViewerViewport(): ViewerViewportState {
 		revision: 0,
 	}));
 	const frame = useRef<number | null>(null);
+	const orientationFollowUp = useRef<number | null>(null);
 	const latest = useRef(state);
 	latest.current = state;
 
@@ -74,24 +75,38 @@ export function useViewerViewport(): ViewerViewportState {
 		}
 	}, [measure]);
 
+	const scheduleOrientation = useCallback(() => {
+		schedule();
+		if (orientationFollowUp.current !== null)
+			window.clearTimeout(orientationFollowUp.current);
+		orientationFollowUp.current = window.setTimeout(() => {
+			orientationFollowUp.current = null;
+			schedule();
+		}, 150);
+	}, [schedule]);
+
 	useEffect(() => {
 		const visual = window.visualViewport;
 		visual?.addEventListener("resize", schedule);
 		visual?.addEventListener("scroll", schedule);
 		window.addEventListener("resize", schedule);
-		window.addEventListener("orientationchange", schedule);
+		window.addEventListener("orientationchange", scheduleOrientation);
 		return () => {
 			visual?.removeEventListener("resize", schedule);
 			visual?.removeEventListener("scroll", schedule);
 			window.removeEventListener("resize", schedule);
-			window.removeEventListener("orientationchange", schedule);
+			window.removeEventListener("orientationchange", scheduleOrientation);
 			if (frame.current !== null) {
 				window.cancelAnimationFrame?.(frame.current);
 				window.clearTimeout(frame.current);
 				frame.current = null;
 			}
+			if (orientationFollowUp.current !== null) {
+				window.clearTimeout(orientationFollowUp.current);
+				orientationFollowUp.current = null;
+			}
 		};
-	}, [schedule]);
+	}, [schedule, scheduleOrientation]);
 
 	return state;
 }

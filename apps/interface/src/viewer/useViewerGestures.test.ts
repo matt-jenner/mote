@@ -391,6 +391,26 @@ nodeDescribe("useViewerGestures mouse panning", () => {
 });
 
 nodeDescribe("useViewerGestures touch arbitration", () => {
+	it("keeps a completed tap when release is followed by lost pointer capture", () => {
+		const { gestures, stats } = mountTouchGestures("fit");
+		const stage = new GestureElement();
+		vi.useFakeTimers();
+		try {
+			gestures.onPointerDown(
+				touchPointerEvent(stage, "pointerdown", 1, 100, 100),
+			);
+			gestures.onPointerUp(touchPointerEvent(stage, "pointerup", 1, 100, 100));
+			gestures.onLostPointerCapture(
+				touchPointerEvent(stage, "lostpointercapture", 1, 100, 100),
+			);
+
+			vi.advanceTimersByTime(280);
+			expect(stats.taps).toBe(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("tombstones an excluded touch through an orphan release", () => {
 		const { gestures, stats } = mountTouchGestures("fit");
 		const stage = new GestureElement();

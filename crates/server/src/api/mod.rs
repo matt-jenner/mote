@@ -13,6 +13,7 @@ use axum::extract::{RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::AppState;
 use crate::folders::FolderError;
@@ -112,6 +113,7 @@ pub(crate) async fn folders(
 ) -> Result<impl IntoResponse, ApiError> {
     guard_query_shape(raw_query.as_deref())?;
     let path = parse_folder_path(raw_query.as_deref())?;
+    let include_image_count = parse_image_count(raw_query.as_deref())?;
     let root = state.folder_root.as_ref().ok_or_else(|| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -119,7 +121,23 @@ pub(crate) async fn folders(
             "The photo source is unavailable.",
         )
     })?;
-    let listing = root.list(&path);
+    let root = Arc::clone(root);
+    let request_path = path.clone();
+    let listing = tokio::task::spawn_blocking(move || {
+        if include_image_count {
+            root.list_with_image_count(&request_path)
+        } else {
+            root.list(&request_path)
+        }
+    })
+    .await
+    .map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internalError",
+            "The folder could not be listed.",
+        )
+    })?;
     if path.is_empty() {
         match &listing {
             Ok(_) => state.record_source_root_listing(true).await,
@@ -155,6 +173,28 @@ fn parse_folder_path(query: Option<&str>) -> Result<String, ApiError> {
         return Err(invalid_folder_path());
     }
     Ok(path)
+}
+
+fn parse_image_count(query: Option<&str>) -> Result<bool, ApiError> {
+    let mut requested = None;
+    for pair in query.unwrap_or_default().split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if percent_decode(key)? != "includeImageCount" {
+            continue;
+        }
+        if requested.is_some() {
+            return Err(invalid_request());
+        }
+        requested = Some(match percent_decode(value)?.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => return Err(invalid_request()),
+        });
+    }
+    Ok(requested.unwrap_or(false))
 }
 
 pub(crate) fn percent_decode(value: &str) -> Result<String, ApiError> {

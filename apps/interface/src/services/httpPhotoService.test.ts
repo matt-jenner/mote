@@ -323,6 +323,7 @@ describe("HTTP PhotoService", () => {
 						path: "Trips & Tours/Iceland",
 						breadcrumbs: selectionSummary.breadcrumbs,
 						children: [],
+						imageCount: 27,
 					});
 				if (url.includes("/wall?")) return json(emptyWallPage);
 				if (url.endsWith("/derivatives") || url.endsWith("/interaction"))
@@ -348,7 +349,8 @@ describe("HTTP PhotoService", () => {
 			},
 		});
 		expect(service.initialSortDirection()).toBe("newestFirst");
-		await service.listFolders("Trips & Tours/Iceland");
+		const folder = await service.listFolders("Trips & Tours/Iceland");
+		expect(folder.imageCount).toBe(27);
 		await service.queryWall({
 			cursor: "cursor/value",
 			limit: 100,
@@ -362,7 +364,7 @@ describe("HTTP PhotoService", () => {
 		await service.setWallInteraction(false);
 
 		expect(calls[2]?.url).toBe(
-			"/api/v1/folders?path=Trips%20%26%20Tours%2FIceland",
+			"/api/v1/folders?path=Trips%20%26%20Tours%2FIceland&includeImageCount=true",
 		);
 		expect(calls[3]?.url).toBe(
 			"/api/v1/selections/selection-a/wall?scope=currentFolder&direction=newestFirst&limit=100&cursor=cursor%2Fvalue",
@@ -392,6 +394,22 @@ describe("HTTP PhotoService", () => {
 				key: "cache/key",
 			}),
 		).toBe("/api/v1/derivatives/cache%2Fkey");
+	});
+
+	it("tolerates a legacy folder response without an image count", async () => {
+		const service = createHttpPhotoService({
+			localStorage: savedPreferences(),
+			sessionStorage: new MemoryStorage(),
+			fetch: vi.fn(async () =>
+				json({ path: "Trips", breadcrumbs: [], children: [] }),
+			),
+			eventSourceFactory: () => new FakeEventSource("unused"),
+			randomUuid: () => "client-a",
+		});
+
+		await expect(service.listFolders("Trips")).resolves.toMatchObject({
+			imageCount: null,
+		});
 	});
 
 	it("stores a selected ID and structured breadcrumbs atomically", async () => {
@@ -532,6 +550,22 @@ describe("HTTP PhotoService", () => {
 					children: [],
 					nativePath: "/photos",
 				}),
+			act: (service: ReturnType<typeof createHttpPhotoService>) =>
+				service.listFolders(""),
+		},
+		{
+			name: "negative folder image count",
+			localStorage: savedPreferences(),
+			fetch: async () =>
+				json({ path: "", breadcrumbs: [], children: [], imageCount: -1 }),
+			act: (service: ReturnType<typeof createHttpPhotoService>) =>
+				service.listFolders(""),
+		},
+		{
+			name: "fractional folder image count",
+			localStorage: savedPreferences(),
+			fetch: async () =>
+				json({ path: "", breadcrumbs: [], children: [], imageCount: 1.5 }),
 			act: (service: ReturnType<typeof createHttpPhotoService>) =>
 				service.listFolders(""),
 		},

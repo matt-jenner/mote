@@ -150,6 +150,26 @@ fn folder_listing_is_case_insensitive_before_bytewise_ordering() {
     );
 }
 
+#[test]
+fn folder_listing_counts_supported_still_images_without_recursing() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    let trips = source.join("Trips");
+    let nested = trips.join("Nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    for name in ["one.jpg", "two.PNG", "three.CR3"] {
+        std::fs::write(trips.join(name), b"image").unwrap();
+    }
+    std::fs::write(trips.join("clip.mp4"), b"video").unwrap();
+    std::fs::write(trips.join("notes.txt"), b"notes").unwrap();
+    std::fs::write(nested.join("nested.jpg"), b"nested image").unwrap();
+    let root = ContainedFolderRoot::new(source).unwrap();
+
+    let listing = root.list_with_image_count("Trips").unwrap();
+
+    assert_eq!(listing.image_count, Some(3));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn folder_listing_uses_original_name_as_case_insensitive_tie_breaker() {
@@ -249,7 +269,23 @@ async fn folder_api_returns_bootstrap_and_rejects_oversized_or_repeated_paths() 
     assert_eq!(value["path"], "Trips");
     assert_eq!(value["children"][0]["name"], "Iceland");
     assert_eq!(value["children"][0]["path"], "Trips/Iceland");
+    assert!(value.get("imageCount").is_none());
     assert!(!value.to_string().contains("photos"));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/folders?path=&includeImageCount=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(value["imageCount"], 1);
 
     let oversized = format!("/api/v1/folders?path={}", "x".repeat(4097));
     let response = app

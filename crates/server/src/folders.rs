@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use photo_domain::MediaKind;
 use serde::Serialize;
 
 pub use photo_app_service::FolderBreadcrumb;
@@ -11,6 +12,8 @@ pub struct FolderListing {
     pub path: String,
     pub breadcrumbs: Vec<FolderBreadcrumb>,
     pub children: Vec<FolderEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_count: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -76,16 +79,52 @@ impl ContainedFolderRoot {
     }
 
     pub fn list(&self, relative: &str) -> Result<FolderListing, FolderError> {
+        self.list_internal(relative, false)
+    }
+
+    pub fn list_with_image_count(&self, relative: &str) -> Result<FolderListing, FolderError> {
+        self.list_internal(relative, true)
+    }
+
+    fn list_internal(
+        &self,
+        relative: &str,
+        include_image_count: bool,
+    ) -> Result<FolderListing, FolderError> {
         let directory = self.resolve_path(relative)?;
         let mut entries = Vec::new();
+        let mut image_count = 0;
         let read_dir = fs::read_dir(&directory).map_err(map_read_error)?;
         for entry in read_dir {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(_) => continue,
             };
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(_) => continue,
+            };
+            if kind.is_file() {
+                if include_image_count
+                    && MediaKind::from_path(&entry.path())
+                        .is_some_and(|kind| kind != MediaKind::Video)
+                {
+                    image_count += 1;
+                }
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             let child_relative = join_relative(relative, &name);
+            if kind.is_dir() {
+                entries.push(FolderEntry {
+                    name,
+                    path: child_relative,
+                });
+                continue;
+            }
+            if !kind.is_symlink() {
+                continue;
+            }
             let child = match self.resolve_path(&child_relative) {
                 Ok(child) => child,
                 Err(FolderError::OutsideRoot) => continue,
@@ -111,6 +150,7 @@ impl ContainedFolderRoot {
             path: relative.to_owned(),
             breadcrumbs: breadcrumbs(relative),
             children: entries,
+            image_count: include_image_count.then_some(image_count),
         })
     }
 

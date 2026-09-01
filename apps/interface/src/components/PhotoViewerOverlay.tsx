@@ -517,6 +517,7 @@ export function PhotoViewerOverlay({
 			aria-label="Photo viewer"
 			aria-modal="true"
 			className={styles.viewerOverlay}
+			data-filmstrip-visible={filmstripVisible}
 			data-viewport-revision={viewport.revision}
 			style={
 				{
