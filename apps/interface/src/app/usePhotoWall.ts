@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
 import type {
 	DerivativePriority,
 	GalleryScope,
+	ScanProgressDto,
 	SortDirection,
 	WallUpdate,
 } from "../services/photoService";
@@ -62,10 +63,43 @@ function isWallThumbnailWarning(code: string): boolean {
 
 const countFormatter = new Intl.NumberFormat();
 
+interface RetainedScanProgress {
+	sourceId: string;
+	generation: number;
+	progress: ScanProgressDto;
+}
+
+function rememberScanProgress(
+	current: RetainedScanProgress | null,
+	sourceId: string,
+	generation: number,
+	incoming: ScanProgressDto,
+): RetainedScanProgress {
+	if (
+		current === null ||
+		current.sourceId !== sourceId ||
+		generation > current.generation
+	) {
+		return { sourceId, generation, progress: incoming };
+	}
+	if (generation < current.generation) return current;
+	return {
+		sourceId,
+		generation,
+		progress: {
+			discovered: Math.max(current.progress.discovered, incoming.discovered),
+			shaped: Math.max(current.progress.shaped, incoming.shaped),
+			enriched: Math.max(current.progress.enriched, incoming.enriched),
+			directTotal: incoming.directTotal ?? current.progress.directTotal,
+			total: incoming.total ?? current.progress.total,
+		},
+	};
+}
+
 function progressForScope(
-	progress: import("../services/photoService").ScanProgressDto,
+	progress: ScanProgressDto,
 	scope: GalleryScope,
-): import("../services/photoService").ScanProgressDto {
+): ScanProgressDto {
 	return {
 		...progress,
 		total:
@@ -174,11 +208,7 @@ export function usePhotoWall(
 	const sourceGeneration = useRef(0);
 	const ownerRef = useRef<RequestOwner | null>(null);
 	const settlementPending = useRef<number | null>(null);
-	const latestScanProgress = useRef<{
-		sourceId: string;
-		generation: number;
-		progress: import("../services/photoService").ScanProgressDto;
-	} | null>(null);
+	const latestScanProgress = useRef<RetainedScanProgress | null>(null);
 	const failedCursor = useRef<string | null>(null);
 	const readyWallIds = useRef(new Set<string>());
 	const derivativeRequests = useRef(new Map<string, DerivativeRequestRecord>());
@@ -384,30 +414,36 @@ export function usePhotoWall(
 			)
 				return;
 			switch (update.kind) {
-				case "catalogBatch":
-					latestScanProgress.current = {
-						sourceId: expectedSourceId,
-						generation: update.generation,
-						progress: update.progress,
-					};
+				case "catalogBatch": {
+					const retained = rememberScanProgress(
+						latestScanProgress.current,
+						expectedSourceId,
+						update.generation,
+						update.progress,
+					);
+					latestScanProgress.current = retained;
 					dispatch({
 						type: "catalogBatch",
 						...update,
-						progress: progressForScope(update.progress, expectedGalleryScope),
+						progress: progressForScope(retained.progress, expectedGalleryScope),
 					});
 					break;
-				case "progress":
-					latestScanProgress.current = {
-						sourceId: expectedSourceId,
-						generation: update.generation,
-						progress: update.progress,
-					};
+				}
+				case "progress": {
+					const retained = rememberScanProgress(
+						latestScanProgress.current,
+						expectedSourceId,
+						update.generation,
+						update.progress,
+					);
+					latestScanProgress.current = retained;
 					dispatch({
 						type: "progress",
 						...update,
-						progress: progressForScope(update.progress, expectedGalleryScope),
+						progress: progressForScope(retained.progress, expectedGalleryScope),
 					});
 					break;
+				}
 				case "derivativesReady":
 					for (const derivative of update.derivatives) {
 						if (derivative.kind === "wallThumbnail") {

@@ -2613,8 +2613,6 @@ describe("progressive photo wall", () => {
 				total: 2_092,
 			},
 		};
-		service.scopeUpdateReplay = () =>
-			queueMicrotask(() => service.emit(progress));
 		const screen = await renderWall(service);
 		await expect.poll(() => service.queryRequests.length).toBe(1);
 		service.emit(progress);
@@ -2622,6 +2620,24 @@ describe("progressive photo wall", () => {
 		await expect
 			.element(screen.getByRole("status"))
 			.toHaveTextContent("154 indexed of 2,092");
+		service.emit({
+			kind: "catalogBatch",
+			selectionId: "source-a",
+			assets: [],
+			orderState: "provisional",
+			generation: 1,
+			progress: {
+				discovered: 0,
+				shaped: 0,
+				enriched: 0,
+				directTotal: null,
+				total: null,
+			},
+		});
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(screen.getByRole("status").element()).toHaveTextContent(
+			"154 indexed of 2,092",
+		);
 
 		const toggle = screen.getByRole("button", { name: "Include subfolders" });
 		await toggle.click();
