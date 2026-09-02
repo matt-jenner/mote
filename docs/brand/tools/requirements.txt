@@ -1,0 +1,4 @@
+fonttools[woff]>=4.59,<5
+Pillow>=11,<13
+reportlab>=4.4,<5
+pypdf>=6,<7
