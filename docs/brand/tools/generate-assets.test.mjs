@@ -151,3 +151,29 @@ test("font package preserves names, both variation axes, and the OFL", async () 
   const license = await fs.readFile(path.join(root, "fonts/OFL.txt"), "utf8");
   assert.match(license, /SIL OPEN FONT LICENSE Version 1\.1/);
 });
+
+test("print and preview exports have the approved formats and dimensions", async () => {
+  const required = [
+    "print/mote-lockup-light.svg",
+    "print/mote-lockup-dark.svg",
+    "print/mote-lockup-light-3000.png",
+    "print/mote-lockup-dark-3000.png",
+    "print/mote-brand-sheet-a4.pdf",
+    "previews/mote-asset-contact-sheet.png",
+    "previews/mote-small-size-check.png",
+  ];
+  for (const relative of required) await fs.access(path.join(root, relative));
+
+  for (const relative of [
+    "print/mote-lockup-light-3000.png",
+    "print/mote-lockup-dark-3000.png",
+  ]) {
+    const metadata = await sharp(path.join(root, relative)).metadata();
+    assert.equal(metadata.width, 3000);
+    assert.equal(metadata.hasAlpha, true);
+  }
+  const contact = await sharp(path.join(root, "previews/mote-asset-contact-sheet.png")).metadata();
+  assert.deepEqual([contact.width, contact.height], [2400, 1600]);
+  const small = await sharp(path.join(root, "previews/mote-small-size-check.png")).metadata();
+  assert.deepEqual([small.width, small.height], [1800, 600]);
+});

@@ -9,15 +9,24 @@ import { openSync } from "fontkit";
 import pngToIco from "png-to-ico";
 import sharp from "sharp";
 import { BRAND, PATHS, PLATFORM_SIZES, expectedOutputs } from "./config.mjs";
-import { exportSvgSources, symbolSvg } from "./svg.mjs";
+import { exportSvgSources, horizontalLockupSvg, symbolSvg } from "./svg.mjs";
 
 const execFileAsync = promisify(execFile);
-const generatedDirectories = ["source", "svg", "fonts", "icons"];
+const generatedDirectories = ["source", "svg", "fonts", "icons", "print", "previews"];
 
 async function renderPng(svg, size, output) {
   await fs.mkdir(path.dirname(output), { recursive: true });
   await sharp(Buffer.from(svg))
     .resize(size, size)
+    .png({ compressionLevel: 9 })
+    .withMetadata({ icc: "srgb" })
+    .toFile(output);
+}
+
+async function renderWidthPng(svg, width, output) {
+  await fs.mkdir(path.dirname(output), { recursive: true });
+  await sharp(Buffer.from(svg))
+    .resize({ width })
     .png({ compressionLevel: 9 })
     .withMetadata({ icc: "srgb" })
     .toFile(output);
@@ -226,6 +235,129 @@ async function generateWeb(stage) {
   );
 }
 
+function svgDataUri(svg) {
+  return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
+}
+
+async function generateContactSheet(stage, lightLockup, darkLockup) {
+  const lightSymbol = symbolSvg({ mode: "light", tile: true });
+  const maskable = symbolSvg({ mode: "light", tile: true, maskable: true });
+  const monoDark = symbolSvg({ mode: "light", monochrome: true });
+  const monoLight = symbolSvg({ mode: "dark", monochrome: true });
+  const sheet = `<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1600" viewBox="0 0 2400 1600">
+    <rect width="2400" height="1600" fill="${BRAND.colors.white}"/>
+    <style>text{font-family:Arial,sans-serif;fill:${BRAND.colors.graphite}}.label{font-size:28px;font-weight:700;letter-spacing:3px}.small{font-size:24px}</style>
+    <rect x="96" y="84" width="48" height="8" rx="4" fill="${BRAND.colors.green}"/>
+    <text x="166" y="103" class="label">MOTE ASSET CONTACT SHEET</text>
+    <text x="96" y="166" class="small">Light, dark, application, maskable and monochrome assets</text>
+    <rect x="96" y="220" width="1060" height="360" rx="28" fill="#FFFFFF" stroke="${BRAND.colors.grey}"/>
+    <text x="140" y="274" class="label">LIGHT</text>
+    <image x="140" y="310" width="950" height="220" preserveAspectRatio="xMinYMid meet" href="${svgDataUri(lightLockup)}"/>
+    <rect x="1244" y="220" width="1060" height="360" rx="28" fill="${BRAND.colors.graphite}"/>
+    <text x="1288" y="274" class="label" fill="${BRAND.colors.white}" style="fill:${BRAND.colors.white}">DARK</text>
+    <image x="1288" y="310" width="950" height="220" preserveAspectRatio="xMinYMid meet" href="${svgDataUri(darkLockup)}"/>
+    <text x="96" y="660" class="label">APPLICATION AND SERVICE ICONS</text>
+    <rect x="96" y="704" width="500" height="500" rx="34" fill="#FFFFFF" stroke="${BRAND.colors.grey}"/>
+    <image x="146" y="754" width="400" height="400" href="${svgDataUri(lightSymbol)}"/>
+    <text x="96" y="1248" class="small">Desktop / standard PWA</text>
+    <rect x="682" y="704" width="500" height="500" rx="34" fill="#FFFFFF" stroke="${BRAND.colors.grey}"/>
+    <image x="732" y="754" width="400" height="400" href="${svgDataUri(maskable)}"/>
+    <text x="682" y="1248" class="small">Maskable PWA safe zone</text>
+    <rect x="1268" y="704" width="500" height="500" rx="34" fill="#FFFFFF" stroke="${BRAND.colors.grey}"/>
+    <image x="1318" y="754" width="400" height="400" href="${svgDataUri(monoDark)}"/>
+    <text x="1268" y="1248" class="small">Monochrome / light surface</text>
+    <rect x="1854" y="704" width="450" height="500" rx="34" fill="${BRAND.colors.graphite}"/>
+    <image x="1879" y="754" width="400" height="400" href="${svgDataUri(monoLight)}"/>
+    <text x="1854" y="1248" class="small">Monochrome / dark surface</text>
+    <text x="96" y="1340" class="label">APPROVED PALETTE</text>
+    ${[
+      [BRAND.colors.green, "#45A06B"],
+      [BRAND.colors.graphite, "#171A1F"],
+      [BRAND.colors.white, "#F7F8FA"],
+      [BRAND.colors.grey, "#B9C1C9"],
+    ]
+      .map(
+        ([colour, label], index) =>
+          `<rect x="${96 + index * 576}" y="1380" width="510" height="92" rx="20" fill="${colour}" stroke="${BRAND.colors.grey}"/><text x="${116 + index * 576}" y="1530" class="small">${label}</text>`,
+      )
+      .join("")}
+  </svg>`;
+  await fs.mkdir(path.join(stage, "previews"), { recursive: true });
+  await sharp(Buffer.from(sheet))
+    .png({ compressionLevel: 9 })
+    .withMetadata({ icc: "srgb" })
+    .toFile(path.join(stage, "previews/mote-asset-contact-sheet.png"));
+}
+
+async function generateSmallSizeSheet(stage) {
+  const width = 1800;
+  const height = 600;
+  const base = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">
+    <rect width="${width}" height="${height}" fill="${BRAND.colors.white}"/>
+    <style>text{font-family:Arial,sans-serif;fill:${BRAND.colors.graphite}}.label{font-size:28px;font-weight:700;letter-spacing:3px}.size{font-size:26px;font-weight:700}.note{font-size:20px}</style>
+    <rect x="70" y="70" width="48" height="8" rx="4" fill="${BRAND.colors.green}"/>
+    <text x="140" y="90" class="label">SMALL-SIZE OPTICAL CHECK</text>
+    <text x="70" y="138" class="note">Nearest-neighbour enlargement with the original pixel asset below</text>
+    ${[16, 24, 32, 48, 64]
+      .map((size, index) => {
+        const x = 70 + index * 342;
+        return `<rect x="${x}" y="174" width="272" height="346" rx="26" fill="#FFFFFF" stroke="${BRAND.colors.grey}"/><text x="${x + 106}" y="490" class="size">${size}px</text>`;
+      })
+      .join("")}
+  </svg>`);
+  const composites = [];
+  for (const [index, size] of [16, 24, 32, 48, 64].entries()) {
+    const source = path.join(stage, `icons/windows/png/mote-${size}.png`);
+    const enlarged = await sharp(source)
+      .resize(200, 200, { kernel: "nearest" })
+      .png()
+      .toBuffer();
+    composites.push({ input: enlarged, left: 106 + index * 342, top: 214 });
+    composites.push({ input: source, left: 206 + index * 342 - Math.floor(size / 2), top: 530 });
+  }
+  await sharp(base)
+    .composite(composites)
+    .png({ compressionLevel: 9 })
+    .withMetadata({ icc: "srgb" })
+    .toFile(path.join(stage, "previews/mote-small-size-check.png"));
+}
+
+async function generatePrintAndPreviews(stage) {
+  const print = path.join(stage, "print");
+  const previews = path.join(stage, "previews");
+  await fs.mkdir(print, { recursive: true });
+  await fs.mkdir(previews, { recursive: true });
+  const light = await horizontalLockupSvg({ mode: "light" });
+  const dark = await horizontalLockupSvg({ mode: "dark" });
+  await writeText(path.join(print, "mote-lockup-light.svg"), light);
+  await writeText(path.join(print, "mote-lockup-dark.svg"), dark);
+  const lightPng = path.join(print, "mote-lockup-light-3000.png");
+  const darkPng = path.join(print, "mote-lockup-dark-3000.png");
+  await renderWidthPng(light, 3000, lightPng);
+  await renderWidthPng(dark, 3000, darkPng);
+  await generateContactSheet(stage, light, dark);
+  await generateSmallSizeSheet(stage);
+
+  const pdf = path.join(print, "mote-brand-sheet-a4.pdf");
+  await execFileAsync(process.env.BRAND_PYTHON ?? "python3", [
+    path.resolve("docs/brand/tools/generate_brand_sheet.py"),
+    lightPng,
+    darkPng,
+    pdf,
+  ]);
+  const fontCache = path.join(stage, ".fontconfig-cache");
+  await fs.mkdir(path.join(fontCache, "fontconfig"), { recursive: true });
+  const popplerEnvironment = { ...process.env, XDG_CACHE_HOME: fontCache };
+  if (process.env.BRAND_FONTCONFIG_FILE) {
+    popplerEnvironment.FONTCONFIG_FILE = process.env.BRAND_FONTCONFIG_FILE;
+  }
+  await execFileAsync(
+    process.env.BRAND_PDFTOPPM ?? "pdftoppm",
+    ["-png", "-r", "150", pdf, path.join(previews, "mote-brand-sheet-a4")],
+    { env: popplerEnvironment },
+  );
+}
+
 async function validateStage(stage) {
   for (const output of expectedOutputs()) {
     const relative = output.replace(/^docs\/brand\//, "");
@@ -308,6 +440,7 @@ export async function generateAll({ destination = PATHS.brandDir, keepStage = fa
       generateLinux(stage),
       generateWeb(stage),
     ]);
+    await generatePrintAndPreviews(stage);
     await validateStage(stage);
     await preserveManualFiles(stage, destination);
     await replaceGeneratedDirectories(stage, destination);
