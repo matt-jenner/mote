@@ -14,8 +14,19 @@ function escapeXml(value) {
 		.replaceAll(">", "&gt;");
 }
 
-function frame({ layer, x, y, width, height, radius, colour, stroke }) {
-	return `<rect data-layer="${layer}" x="${x}" y="${y}" width="${width}" height="${height}" rx="${radius}" fill="none" stroke="${colour}" stroke-width="${stroke}" stroke-linejoin="round"/>`;
+function frame({
+	layer,
+	x,
+	y,
+	width,
+	height,
+	radius,
+	colour,
+	stroke,
+	opacity = 1,
+}) {
+	const opacityAttribute = opacity === 1 ? "" : ` stroke-opacity="${opacity}"`;
+	return `<rect data-layer="${layer}" x="${x}" y="${y}" width="${width}" height="${height}" rx="${radius}" fill="none" stroke="${colour}" stroke-width="${stroke}"${opacityAttribute} stroke-linejoin="round"/>`;
 }
 
 function palette(mode, monochrome) {
@@ -35,6 +46,20 @@ function symbolArtwork({ mode, monochrome = false, small = false }) {
 	const colours = palette(mode, monochrome);
 	const stroke = small ? 112 : 96;
 	const centre = small ? 108 : 84;
+	const middleOutline =
+		mode === "light" && !monochrome
+			? frame({
+					layer: "middle-outline",
+					x: 302,
+					y: 274,
+					width: 414,
+					height: 420,
+					radius: 42,
+					colour: BRAND.colors.grey,
+					stroke: stroke + 12,
+					opacity: 0.65,
+				})
+			: "";
 	return [
 		frame({
 			layer: "rear",
@@ -46,6 +71,7 @@ function symbolArtwork({ mode, monochrome = false, small = false }) {
 			colour: colours.rear,
 			stroke,
 		}),
+		middleOutline,
 		frame({
 			layer: "middle",
 			x: 302,

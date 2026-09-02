@@ -19,6 +19,18 @@ test("dark symbol reverses the rear frame and retains Mote green", () => {
 	assert.match(svg, /data-layer="front"[^>]+stroke="#45A06B"/i);
 });
 
+test("light symbol gives the cool-white frame a mineral-grey edge", () => {
+	const svg = symbolSvg({ mode: "light", tile: false, size: 1024 });
+	assert.match(
+		svg,
+		/data-layer="middle-outline"[^>]+stroke="#B9C1C9"[^>]+stroke-opacity="0\.65"/i,
+	);
+	assert.ok(
+		svg.indexOf('data-layer="middle-outline"') <
+			svg.indexOf('data-layer="middle"'),
+	);
+});
+
 test("maskable app icon keeps essential artwork inside the safe zone", () => {
 	const svg = symbolSvg({
 		mode: "light",

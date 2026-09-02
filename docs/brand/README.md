@@ -40,7 +40,7 @@ The wordmark and lockup SVGs contain vector outlines. They do not depend on a lo
 
 ## Light mode and dark mode
 
-On light surfaces, use files ending in `-light`. These use graphite text and a graphite rear frame.
+On light surfaces, use files ending in `-light`. These use graphite text and a graphite rear frame. A narrow mineral-grey edge keeps the cool-white middle frame intact on white paper and screens.
 
 On dark surfaces, use files ending in `-dark`. These reverse the wordmark and rear frame to cool white. Mote green stays `#45A06B` in both appearances.
 

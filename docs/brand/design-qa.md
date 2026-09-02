@@ -52,6 +52,8 @@ No P3 typography decisions remain for this test page. The selected width is 96%.
 
 The contact sheet confirms that the graphite wordmark reads on the light surface and the cool-white wordmark reads on graphite. Green remains `#45A06B` in both modes. Full-colour desktop and PWA icons keep the same frame geometry and graphite tile.
 
+The cool-white middle frame uses a narrow mineral-grey under-stroke in the light variant. This keeps its complete edge visible on white and cool-white print surfaces without changing the frame fill or the dark variant.
+
 The small-size sheet was inspected at 16, 24, 32, 48, and 64 px. The 16 px and 24 px sources use the heavier optical treatment. The green foreground, white middle frame, dark frame area, and central green square remain identifiable at each size.
 
 Automated package checks confirmed:
