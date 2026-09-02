@@ -7,6 +7,7 @@ from pypdf import PdfReader
 def validate(pdf: Path) -> None:
     reader = PdfReader(pdf)
     assert len(reader.pages) == 1
+    assert reader.metadata.creation_date.isoformat() == "2000-01-01T00:00:00+00:00"
     page = reader.pages[0]
     width = float(page.mediabox.width)
     height = float(page.mediabox.height)

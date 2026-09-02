@@ -39,7 +39,7 @@ def build(light_lockup: Path, dark_lockup: Path, output: Path) -> None:
 
     output.parent.mkdir(parents=True, exist_ok=True)
     width, height = A4
-    page = canvas.Canvas(str(output), pagesize=A4, pageCompression=1)
+    page = canvas.Canvas(str(output), pagesize=A4, pageCompression=1, invariant=1)
     page.setTitle("Mote brand sheet")
     page.setAuthor("Mote")
     page.setSubject("Mote logo, palette, typography, and usage guidance")

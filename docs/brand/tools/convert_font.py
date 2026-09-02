@@ -5,7 +5,7 @@ from fontTools.ttLib import TTFont
 
 
 def convert(source: Path, destination: Path) -> None:
-    font = TTFont(source)
+    font = TTFont(source, recalcTimestamp=False)
     font.flavor = "woff2"
     destination.parent.mkdir(parents=True, exist_ok=True)
     font.save(destination)
