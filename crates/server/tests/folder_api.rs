@@ -373,9 +373,6 @@ async fn invalid_folder_queries_are_rejected_before_filesystem_access() {
 
 #[tokio::test]
 async fn mounted_root_missing_file_and_unreadable_fail_as_source_unavailable() {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");
     std::fs::create_dir(&source).unwrap();
@@ -426,17 +423,18 @@ async fn mounted_root_missing_file_and_unreadable_fail_as_source_unavailable() {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(value["code"], "sourceUnavailable");
 
-    let source = temp.path().join("unreadable-source");
-    std::fs::create_dir(&source).unwrap();
-    let state = AppState::new_with_source_root(
-        Catalog::open_in_memory().unwrap(),
-        temp.path().join("cache-unreadable"),
-        source.clone(),
-    )
-    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+
+        let source = temp.path().join("unreadable-source");
+        std::fs::create_dir(&source).unwrap();
+        let state = AppState::new_with_source_root(
+            Catalog::open_in_memory().unwrap(),
+            temp.path().join("cache-unreadable"),
+            source.clone(),
+        )
+        .unwrap();
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o000)).unwrap();
         // Privileged runners can still enumerate this directory. In that
         // environment there is no unreadable case to assert, so restore and
@@ -445,25 +443,23 @@ async fn mounted_root_missing_file_and_unreadable_fail_as_source_unavailable() {
             std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
             return;
         }
+        let app = build_router(state, StaticWebRoot::open(web_root(&temp)).unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/folders?path=")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let value: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(value["code"], "sourceUnavailable");
     }
-    #[cfg(not(unix))]
-    return;
-    let app = build_router(state, StaticWebRoot::open(web_root(&temp)).unwrap());
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/folders?path=")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    #[cfg(unix)]
-    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let value: serde_json::Value =
-        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(value["code"], "sourceUnavailable");
 }
 
 #[test]

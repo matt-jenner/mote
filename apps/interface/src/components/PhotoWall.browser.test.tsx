@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import axe from "axe-core";
 import { useState } from "react";
+import { flushSync } from "react-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { page } from "vitest/browser";
 import { render } from "vitest-browser-react";
@@ -1445,12 +1446,14 @@ describe("progressive photo wall", () => {
 			expect(
 				screen.getByRole("button", { name: "Open Coast", exact: true }).query(),
 			).toBeNull();
-			image.element().dispatchEvent(
-				new TransitionEvent("transitionend", {
-					bubbles: true,
-					propertyName: "opacity",
-				}),
-			);
+			flushSync(() => {
+				image.element().dispatchEvent(
+					new TransitionEvent("transitionend", {
+						bubbles: true,
+						propertyName: "opacity",
+					}),
+				);
+			});
 			await expect
 				.element(
 					screen.getByRole("button", { name: "Open Coast", exact: true }),
@@ -1919,12 +1922,14 @@ describe("progressive photo wall", () => {
 					.query(),
 			).toBeNull();
 
-			image.element().dispatchEvent(
-				new TransitionEvent("transitionend", {
-					bubbles: true,
-					propertyName: "opacity",
-				}),
-			);
+			flushSync(() => {
+				image.element().dispatchEvent(
+					new TransitionEvent("transitionend", {
+						bubbles: true,
+						propertyName: "opacity",
+					}),
+				);
+			});
 			await expect
 				.element(
 					screen.getByRole("button", { name: "Open Photo A", exact: true }),
@@ -1989,12 +1994,14 @@ describe("progressive photo wall", () => {
 					.getByRole("button", { name: "Open Photo A", exact: true })
 					.query(),
 			).toBeNull();
-			imageElement.dispatchEvent(
-				new TransitionEvent("transitionend", {
-					bubbles: true,
-					propertyName: "opacity",
-				}),
-			);
+			flushSync(() => {
+				imageElement.dispatchEvent(
+					new TransitionEvent("transitionend", {
+						bubbles: true,
+						propertyName: "opacity",
+					}),
+				);
+			});
 			await expect
 				.element(
 					screen.getByRole("button", { name: "Open Photo A", exact: true }),
@@ -2084,12 +2091,14 @@ describe("progressive photo wall", () => {
 				.toContain("paint-new=1");
 			expect(imageElement).toBe(image.element());
 			expect(getComputedStyle(imageElement).opacity).toBe("0");
-			imageElement.dispatchEvent(
-				new TransitionEvent("transitionend", {
-					bubbles: true,
-					propertyName: "opacity",
-				}),
-			);
+			flushSync(() => {
+				imageElement.dispatchEvent(
+					new TransitionEvent("transitionend", {
+						bubbles: true,
+						propertyName: "opacity",
+					}),
+				);
+			});
 			expect(
 				screen
 					.getByRole("button", { name: "Open Photo A", exact: true })
@@ -2099,12 +2108,14 @@ describe("progressive photo wall", () => {
 			newComplete = true;
 			newDecode.resolve();
 			await expect.poll(() => getComputedStyle(imageElement).opacity).toBe("1");
-			imageElement.dispatchEvent(
-				new TransitionEvent("transitionend", {
-					bubbles: true,
-					propertyName: "opacity",
-				}),
-			);
+			flushSync(() => {
+				imageElement.dispatchEvent(
+					new TransitionEvent("transitionend", {
+						bubbles: true,
+						propertyName: "opacity",
+					}),
+				);
+			});
 			await expect
 				.element(
 					screen.getByRole("button", { name: "Open Photo A", exact: true }),
