@@ -1638,6 +1638,48 @@ describe("progressive photo wall", () => {
 		}
 	});
 
+	it("marks a stale uncached page offline when source loss arrives afterward", async () => {
+		await page.viewport(1280, 800);
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(
+			0,
+			pageOf([asset("stale-offline", "Stale offline", 1)], "settled"),
+		);
+		await expect
+			.poll(() => document.querySelector('[data-asset-id="stale-offline"]'))
+			.not.toBeNull();
+
+		service.emit({
+			kind: "sourceUnavailable",
+			selectionId: "source-a",
+			sourceId: "source-a",
+		});
+
+		await expect.element(screen.getByText("File unavailable")).toBeVisible();
+		expect(
+			screen
+				.getByRole("button", { name: "Open Stale offline", exact: true })
+				.query(),
+		).toBeNull();
+
+		await screen.getByRole("button", { name: "Newest first" }).click();
+		await expect.poll(() => service.queryRequests.length).toBe(2);
+		service.releaseQuery(
+			1,
+			pageOf([asset("stale-offline", "Stale offline", 1)], "settled"),
+		);
+
+		await expect
+			.poll(() => screen.getByText("File unavailable").query())
+			.toBeNull();
+		expect(
+			screen.getByText("Some previews need attention.").query(),
+		).toBeNull();
+		screen.unmount();
+	});
+
 	it("shows an uncached offline child after broadening the restored scope", async () => {
 		await page.viewport(1280, 800);
 		const service = new ControlledWallService(

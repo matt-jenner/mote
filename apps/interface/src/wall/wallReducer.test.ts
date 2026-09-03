@@ -427,6 +427,134 @@ describe("wallReducer", () => {
 		expect(errored.activeRequest).toBeNull();
 	});
 
+	it("keeps a loaded wall and marks its assets offline after source loss", () => {
+		const cached = {
+			...wallAsset("cached", 1),
+			wallThumbnail: thumbnail("cached"),
+			screenPreview: {
+				assetId: "cached",
+				kind: "screenPreview" as const,
+				key: "cached-screen",
+			},
+		};
+		const uncached = wallAsset("uncached", 1);
+
+		const offline = reduce(loadedState([cached, uncached]), {
+			type: "sourceUnavailable",
+			sourceGeneration: 1,
+		});
+
+		expect(offline.error).toBeNull();
+		expect(offline.items).toEqual(
+			[cached, uncached].map((item) => ({
+				...item,
+				availability: "rootOffline",
+				warning: { code: "sourceUnavailable", retryable: true },
+			})),
+		);
+		expect(offline.items[0]?.wallThumbnail).toEqual(thumbnail("cached"));
+		expect(offline.items[0]?.screenPreview?.key).toBe("cached-screen");
+	});
+
+	it("clears a synthetic source warning when an authoritative update recovers", () => {
+		const available = wallAsset("recovered", 1);
+		const offline = reduce(loadedState([available]), {
+			type: "sourceUnavailable",
+			sourceGeneration: 1,
+		});
+		const requested = reduce(offline, {
+			type: "pageRequestStarted",
+			requestId: "recovery-page",
+			requestCursor: null,
+			requestEpoch: offline.scrollEpoch,
+			sourceGeneration: 1,
+		});
+		const recovered = reduce(requested, {
+			type: "pageLoaded",
+			assets: [available],
+			orderState: "settled",
+			nextCursor: null,
+			requestCursor: null,
+			requestEpoch: requested.scrollEpoch,
+			requestId: "recovery-page",
+			sourceGeneration: 1,
+		});
+
+		expect(recovered.items[0]?.availability).toBe("available");
+		expect(recovered.items[0]?.warning).toBeNull();
+		expect(recovered.assetWarnings).not.toHaveProperty("recovered");
+	});
+
+	it("clears only synthetic source warnings when metadata settles", () => {
+		const recovered = wallAsset("metadata-recovered", 1);
+		const warning = { code: "metadataWarning", retryable: false };
+		const warned = { ...wallAsset("metadata-warned", 1), warning };
+		const offline = reduce(loadedState([recovered, warned]), {
+			type: "sourceUnavailable",
+			sourceGeneration: 1,
+		});
+		const requested = reduce(offline, {
+			type: "pageRequestStarted",
+			requestId: "metadata-recovery",
+			requestCursor: null,
+			requestEpoch: offline.scrollEpoch,
+			sourceGeneration: 1,
+		});
+		const settled = reduce(requested, {
+			type: "metadataSettled",
+			assets: [recovered, warned],
+			nextCursor: null,
+			requestEpoch: requested.scrollEpoch,
+			requestCursor: null,
+			requestId: "metadata-recovery",
+			sourceGeneration: 1,
+			generation: 2,
+		});
+
+		expect(settled.items[0]?.warning).toBeNull();
+		expect(settled.assetWarnings).not.toHaveProperty("metadata-recovered");
+		expect(settled.items[1]?.warning).toEqual(warning);
+		expect(settled.assetWarnings["metadata-warned"]).toEqual(warning);
+	});
+
+	it("keeps a synthetic source warning through a catalog replay", () => {
+		const available = wallAsset("replayed-offline", 1);
+		const offline = reduce(loadedState([available]), {
+			type: "sourceUnavailable",
+			sourceGeneration: 1,
+		});
+		const replayed = reduce(offline, {
+			type: "catalogBatch",
+			selectionId: "selection-a",
+			orderState: "settled",
+			assets: [available],
+		});
+
+		expect(replayed.items[0]?.availability).toBe("rootOffline");
+		expect(replayed.items[0]?.warning).toEqual({
+			code: "sourceUnavailable",
+			retryable: true,
+		});
+		expect(replayed.assetWarnings["replayed-offline"]).toEqual({
+			code: "sourceUnavailable",
+			retryable: true,
+		});
+	});
+
+	it("ignores source loss from an earlier source generation", () => {
+		const reset = reduce(loadedState([wallAsset("old", 1)]), {
+			type: "resetSource",
+			sourceGeneration: 2,
+			selectionId: "selection-b",
+		});
+		const stale = reduce(reset, {
+			type: "sourceUnavailable",
+			sourceGeneration: 1,
+		});
+
+		expect(stale).toBe(reset);
+	});
+
 	it("marks source unavailability terminal without inventing page exhaustion", () => {
 		const source = reduce(initialWallState, {
 			type: "resetSource",

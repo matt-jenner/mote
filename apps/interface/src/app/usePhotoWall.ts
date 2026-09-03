@@ -549,9 +549,8 @@ export function usePhotoWall(
 					break;
 				case "sourceUnavailable":
 					dispatch({
-						type: "wallError",
+						type: "sourceUnavailable",
 						sourceGeneration: generation,
-						error: "Source unavailable. Try again.",
 					});
 					break;
 				case "warning":

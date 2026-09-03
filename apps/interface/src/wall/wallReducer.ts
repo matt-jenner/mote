@@ -96,6 +96,7 @@ export type WallAction =
 			error: string;
 			sourceGeneration?: number;
 	  }
+	| { type: "sourceUnavailable"; sourceGeneration?: number }
 	| { type: "resetSource"; sourceGeneration: number; selectionId?: string }
 	| { type: "retryStarted" }
 	| {
@@ -390,6 +391,25 @@ interface RememberedWarningsResult {
 	changed: boolean;
 }
 
+function clearRecoveredSourceWarnings(
+	current: Record<string, NonNullable<WallAsset["warning"]>>,
+	incoming: readonly WallAsset[],
+): Record<string, NonNullable<WallAsset["warning"]>> {
+	let next = current;
+	for (const asset of incoming) {
+		if (
+			asset.availability !== "available" ||
+			asset.warning !== null ||
+			current[asset.id]?.code !== "sourceUnavailable"
+		) {
+			continue;
+		}
+		if (next === current) next = { ...current };
+		delete next[asset.id];
+	}
+	return next;
+}
+
 function rememberWarnings(
 	current: Record<string, NonNullable<WallAsset["warning"]>>,
 	currentTombstones: Record<string, string>,
@@ -618,8 +638,12 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				return state;
 			const firstPage = action.requestCursor === null;
 			const settledPage = action.orderState === "settled";
-			const remembered = rememberWarnings(
+			const recoveredWarnings = clearRecoveredSourceWarnings(
 				state.assetWarnings,
+				action.assets,
+			);
+			const remembered = rememberWarnings(
+				recoveredWarnings,
 				state.warningTombstones,
 				action.assets,
 				requestToken(state.activeRequest),
@@ -688,9 +712,10 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 					settledPage && state.settledGeneration === null
 						? 1
 						: state.settledGeneration,
-				assetWarnings: remembered.changed
-					? remembered.warnings
-					: state.assetWarnings,
+				assetWarnings:
+					remembered.changed || recoveredWarnings !== state.assetWarnings
+						? remembered.warnings
+						: state.assetWarnings,
 				warningTombstones: remembered.tombstones,
 				sourceWarnings: rememberedSource.warnings,
 				sourceWarningTombstones: rememberedSource.tombstones,
@@ -716,6 +741,33 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 		case "wallError":
 			if (!matchesSource(state, action.sourceGeneration)) return state;
 			return { ...state, scanComplete: true, error: action.error };
+		case "sourceUnavailable": {
+			if (!matchesSource(state, action.sourceGeneration)) return state;
+			if (state.items.length === 0) {
+				return {
+					...state,
+					scanComplete: true,
+					error: "Source unavailable. Try again.",
+				};
+			}
+			const warning = { code: "sourceUnavailable", retryable: true };
+			const assetWarnings = { ...state.assetWarnings };
+			const items = state.items.map((asset) => {
+				assetWarnings[asset.id] = warning;
+				return {
+					...asset,
+					availability: "rootOffline" as const,
+					warning,
+				};
+			});
+			return {
+				...state,
+				items,
+				assetWarnings,
+				scanComplete: true,
+				error: null,
+			};
+		}
 		case "derivativesReady": {
 			if (action.derivatives.length === 0 || state.items.length === 0)
 				return action.previewCounts
@@ -788,8 +840,12 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				generation <= state.settledGeneration
 			)
 				return { ...state, activeRequest: null };
-			const remembered = rememberWarnings(
+			const recoveredWarnings = clearRecoveredSourceWarnings(
 				state.assetWarnings,
+				action.assets,
+			);
+			const remembered = rememberWarnings(
+				recoveredWarnings,
 				state.warningTombstones,
 				action.assets,
 				requestToken(state.activeRequest),
@@ -819,9 +875,10 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				scanComplete: true,
 				pagesExhausted: action.nextCursor === null,
 				settledGeneration: generation,
-				assetWarnings: remembered.changed
-					? remembered.warnings
-					: state.assetWarnings,
+				assetWarnings:
+					remembered.changed || recoveredWarnings !== state.assetWarnings
+						? remembered.warnings
+						: state.assetWarnings,
 				warningTombstones: remembered.tombstones,
 				sourceWarnings: rememberedSource.warnings,
 				sourceWarningTombstones: rememberedSource.tombstones,
