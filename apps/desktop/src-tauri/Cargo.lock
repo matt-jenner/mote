@@ -2538,6 +2538,7 @@ dependencies = [
 name = "photo-app-service"
 version = "0.1.0"
 dependencies = [
+ "image",
  "photo-cache",
  "photo-catalog",
  "photo-core",
@@ -2559,6 +2560,7 @@ dependencies = [
  "blake3",
  "fs2",
  "image",
+ "libc",
  "photo-catalog",
  "photo-domain",
  "photo-metadata",

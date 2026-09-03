@@ -418,6 +418,7 @@ mod tests {
                 discovered: 1,
                 shaped: 1,
                 enriched: 0,
+                direct_total: Some(1),
                 total: Some(1),
             },
         }
@@ -488,6 +489,7 @@ mod tests {
                 discovered,
                 shaped: discovered,
                 enriched: discovered,
+                direct_total: Some(20),
                 total: Some(20),
             },
         }
