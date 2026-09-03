@@ -799,6 +799,7 @@ fn add_library(catalog: &mut Catalog, root: &str, availability: Availability) {
         .unwrap();
 }
 
+#[cfg(unix)]
 async fn request_json(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
     let response = app
         .clone()
