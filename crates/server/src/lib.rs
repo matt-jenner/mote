@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use axum::Router;
 use axum::extract::{ConnectInfo, State};
 use axum::routing::{any, get};
-use photo_app_service::{AppConfig, AppServiceError, GalleryEngine};
+#[cfg(unix)]
+use photo_app_service::AppConfig;
+use photo_app_service::{AppServiceError, GalleryEngine};
 use photo_cache::{CacheReconcileReport, CacheWriter};
 use photo_catalog::Catalog;
 #[cfg(unix)]

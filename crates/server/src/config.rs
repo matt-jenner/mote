@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(unix)]
 use photo_app_service::PrevalidatedHostedSource;
-use photo_core::{LocalStateError, LocalStatePaths, PrevalidatedSourceKeys};
+#[cfg(unix)]
+use photo_core::PrevalidatedSourceKeys;
+use photo_core::{LocalStateError, LocalStatePaths};
 
 #[cfg(unix)]
 use crate::static_host::PinnedDirectory;
@@ -163,6 +165,7 @@ impl ServerConfig {
             .map_err(ConfigError::from_local_state)
     }
 
+    #[cfg(unix)]
     pub(crate) fn prepare_prevalidated_source_keys(
         &self,
         source_roots: &PrevalidatedSourceKeys,
@@ -172,6 +175,7 @@ impl ServerConfig {
             .map_err(ConfigError::from_local_state)
     }
 
+    #[cfg(unix)]
     pub(crate) fn validate_prevalidated_source_keys(
         &self,
         source_roots: &PrevalidatedSourceKeys,

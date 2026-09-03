@@ -86,7 +86,7 @@ impl StaticWebRootValidation {
         Self::capture_with_identity_hook_inner(path, || {})
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn capture_with_identity_hook<F>(path: PathBuf, after_identity_capture: F) -> io::Result<Self>
     where
         F: FnOnce(),
@@ -568,7 +568,7 @@ fn system_mount_identity(file: &std::fs::File) -> io::Result<MountIdentity> {
     parse_fdinfo_mount_id(&contents).map(MountIdentity::Linux)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn parse_fdinfo_mount_id(contents: &str) -> io::Result<u64> {
     let mut mount_id = None;
     for line in contents.lines() {
@@ -590,7 +590,7 @@ fn parse_fdinfo_mount_id(contents: &str) -> io::Result<u64> {
     mount_id.ok_or_else(invalid_fdinfo)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn invalid_fdinfo() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,

@@ -381,9 +381,7 @@
 	);
 	max-width: 100%;
 	overflow-y: auto;
-	padding: calc(20px + max(0px, var(--safe-area-top, 0px)))
-		calc(24px + max(0px, var(--safe-area-right, 0px))) 24px
-		calc(24px + max(0px, var(--safe-area-left, 0px)));
+	padding: calc(20px + max(0px, var(--safe-area-top, 0px))) 24px 24px;
 	color: #f4f5f6;
 	background: rgb(19 21 25 / 96%);
 	box-shadow: -14px 0 30px rgb(0 0 0 / 24%);
@@ -501,8 +499,8 @@
 			88%,
 			calc(100% - var(--safe-area-left, 0px) - var(--safe-area-right, 0px))
 		);
-		padding-right: calc(20px + max(0px, var(--safe-area-right, 0px)));
-		padding-left: calc(20px + max(0px, var(--safe-area-left, 0px)));
+		padding-right: 20px;
+		padding-left: 20px;
 	}
 
 	.viewerOverlay:has(.viewerInfoDrawer) .viewerZoomControls {

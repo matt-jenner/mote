@@ -51,6 +51,7 @@ impl ContainedFolderRoot {
         Ok(Self { root })
     }
 
+    #[cfg(unix)]
     pub(crate) fn from_prevalidated_operational_path(root: PathBuf) -> Self {
         Self { root }
     }
