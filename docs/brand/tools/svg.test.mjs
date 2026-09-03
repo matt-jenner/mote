@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import sharp from "sharp";
 import { horizontalLockupSvg, symbolSvg, wordmarkSvg } from "./svg.mjs";
 
 function layerRect(svg, layer) {
@@ -19,6 +20,55 @@ function layerRect(svg, layer) {
 		width: numberAttribute("width"),
 		height: numberAttribute("height"),
 		stroke: numberAttribute("stroke-width", 0),
+	};
+}
+
+async function horizontalArtworkMetrics(svg) {
+	const { data, info } = await sharp(Buffer.from(svg))
+		.ensureAlpha()
+		.raw()
+		.toBuffer({ resolveWithObject: true });
+	const activeColumns = [];
+	for (let x = 0; x < info.width; x += 1) {
+		for (let y = 0; y < info.height; y += 1) {
+			if (data[(y * info.width + x) * info.channels + 3] > 8) {
+				activeColumns.push(x);
+				break;
+			}
+		}
+	}
+	const gaps = [];
+	for (let index = 1; index < activeColumns.length; index += 1) {
+		const width = activeColumns[index] - activeColumns[index - 1] - 1;
+		if (width > 0) {
+			gaps.push({
+				left: activeColumns[index - 1],
+				right: activeColumns[index],
+				width,
+			});
+		}
+	}
+	const separation = gaps.sort((a, b) => b.width - a.width)[0];
+	assert.ok(separation, "symbol and wordmark have a visible separation");
+
+	function bounds(fromX, toX) {
+		let minY = info.height;
+		let maxY = -1;
+		for (let y = 0; y < info.height; y += 1) {
+			for (let x = fromX; x <= toX; x += 1) {
+				if (data[(y * info.width + x) * info.channels + 3] > 8) {
+					minY = Math.min(minY, y);
+					maxY = Math.max(maxY, y);
+				}
+			}
+		}
+		return { centreY: (minY + maxY) / 2 };
+	}
+
+	return {
+		gap: separation.width,
+		symbol: bounds(0, separation.left),
+		wordmark: bounds(separation.right, info.width - 1),
 	};
 }
 
@@ -136,6 +186,23 @@ test("portable wordmarks and lockups use outlines instead of live text", async (
 		assert.match(svg, /<path\b/);
 		assert.doesNotMatch(svg, /<text\b/i);
 	}
+});
+
+test("horizontal lockup uses the approved 88-unit visible gap", async () => {
+	const metrics = await horizontalArtworkMetrics(
+		await horizontalLockupSvg({ mode: "light" }),
+	);
+	assert.ok(metrics.gap >= 86 && metrics.gap <= 89, metrics);
+});
+
+test("horizontal lockup optically aligns the symbol and wordmark centres", async () => {
+	const metrics = await horizontalArtworkMetrics(
+		await horizontalLockupSvg({ mode: "light" }),
+	);
+	assert.ok(
+		Math.abs(metrics.symbol.centreY - metrics.wordmark.centreY) <= 1,
+		metrics,
+	);
 });
 
 test("monochrome symbol keeps all layers in one requested colour", () => {

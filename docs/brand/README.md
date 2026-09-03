@@ -51,6 +51,7 @@ Use the graphite monochrome symbol on a light surface and the white monochrome s
 - Keep both frames, their offsets, and the green foreground unchanged.
 - Keep the rear frame open at the top-right and the foreground frame open at the bottom-left.
 - Keep the centre dot inside the shared open area without touching either frame.
+- In horizontal lockups, keep the visible symbol and wordmark centres aligned with an 88-unit optical gap.
 - Do not add the wordmark or other text inside an application icon.
 - Leave clear space equal to at least one centre-square width around the symbol or horizontal lockup.
 - Do not place the graphite wordmark on graphite, or the white wordmark on white.

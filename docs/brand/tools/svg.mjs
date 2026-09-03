@@ -163,17 +163,18 @@ export async function wordmarkSvg({ mode = "light" } = {}) {
 
 export async function horizontalLockupSvg({ mode = "light" } = {}) {
 	const symbolSize = 620;
-	const gap = 88;
+	const symbolY = 46;
+	const wordmarkX = 561;
 	const wordmark = wordmarkGroup({
 		mode,
-		x: symbolSize + gap,
+		x: wordmarkX,
 		baseline: 511,
 		scale: 0.46,
 	});
-	const width = symbolSize + gap + wordmark.width + 48;
+	const width = wordmarkX + wordmark.width + 48;
 	const artwork = symbolArtwork({ mode, monochrome: false, small: false });
 	return `<svg xmlns="${XMLNS}" viewBox="0 0 ${width} ${symbolSize}" role="img" aria-label="${escapeXml(BRAND.name)}">
-  <g data-layer="symbol" transform="scale(${symbolSize / 1024})">${artwork}</g>
+  <g data-layer="symbol" transform="translate(0 ${symbolY}) scale(${symbolSize / 1024})">${artwork}</g>
   ${wordmark.markup}
 </svg>`;
 }
