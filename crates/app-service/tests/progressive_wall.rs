@@ -2596,12 +2596,12 @@ async fn stale_screen_preview_is_discarded_after_post_encode_invalidation() {
         .expect("screen preview should reach the post-encode boundary");
 
     service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    service
         .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
         .await
         .unwrap();
-    service
-        .set_interaction(photo_app_service::InteractionState::Active)
-        .await;
     post_encode_release.notify_waiters();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
