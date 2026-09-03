@@ -50,11 +50,11 @@ No P3 typography decisions remain for this test page. The selected width is 96%.
 - Print reference: `docs/brand/print/mote-brand-sheet-a4.pdf`.
 - Rendered print evidence: `docs/brand/previews/mote-brand-sheet-a4-1.png`.
 
-The contact sheet confirms that the graphite wordmark reads on the light surface and the cool-white wordmark reads on graphite. Green remains `#45A06B` in both modes. Full-colour desktop and PWA icons keep the same frame geometry and graphite tile.
+The contact sheet confirms that the graphite wordmark reads on the light surface and the cool-white wordmark reads on graphite. Green remains `#45A06B` in both modes. Full-colour desktop and PWA icons use a cool-white rear frame and green foreground frame on the same graphite tile.
 
-The cool-white middle frame uses a narrow mineral-grey under-stroke in the light variant. This keeps its complete edge visible on white and cool-white print surfaces without changing the frame fill or the dark variant.
+The approved symbol contains two equal `416 x 416` frames: a graphite or cool-white rear frame and a green foreground frame. The rear frame opens at its exposed top-right corner and the foreground frame opens at its exposed bottom-left corner. These crop-line endings break the continuous interlocking-square silhouette. The combined painted bounds remain centred on both axes of the master canvas. The centre dot sits wholly inside the shared open area and remains clear of both strokes at normal and small-icon weights.
 
-The small-size sheet was inspected at 16, 24, 32, 48, and 64 px. The 16 px and 24 px sources use the heavier optical treatment. The green foreground, white middle frame, dark frame area, and central green square remain identifiable at each size.
+The small-size sheet was inspected at 16, 24, 32, 48, and 64 px. The 16 px and 24 px sources use heavier strokes and wider crop-corner openings. The green foreground, rear frame, central green square, and open-corner treatment remain identifiable at each size.
 
 Automated package checks confirmed:
 

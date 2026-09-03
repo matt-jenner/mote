@@ -1,6 +1,6 @@
 # Mote brand assets
 
-Mote uses a stack of photo frames, Fredoka, and a single green highlight. The identity is built around clean, efficient simplicity.
+Mote uses a pair of equal overlapping photo frames with opposing crop corners, Fredoka, and a single green highlight. The identity is built around clean, efficient simplicity.
 
 ![Mote asset contact sheet](previews/mote-asset-contact-sheet.png)
 
@@ -40,19 +40,21 @@ The wordmark and lockup SVGs contain vector outlines. They do not depend on a lo
 
 ## Light mode and dark mode
 
-On light surfaces, use files ending in `-light`. These use graphite text and a graphite rear frame. A narrow mineral-grey edge keeps the cool-white middle frame intact on white paper and screens.
+On light surfaces, use files ending in `-light`. These use graphite text and a graphite rear frame behind the green foreground frame.
 
 On dark surfaces, use files ending in `-dark`. These reverse the wordmark and rear frame to cool white. Mote green stays `#45A06B` in both appearances.
 
-Use the graphite monochrome symbol on a light surface and the white monochrome symbol on a dark surface. The full-colour application icon keeps its graphite tile across macOS, Windows, Linux, and the PWA so it remains recognisable between platforms.
+Use the graphite monochrome symbol on a light surface and the white monochrome symbol on a dark surface. The full-colour application icon keeps its graphite tile, cool-white rear frame, and green foreground frame across macOS, Windows, Linux, and the PWA so it remains recognisable between platforms.
 
 ## Logo rules
 
-- Keep the frame order, offsets, and green foreground unchanged.
+- Keep both frames, their offsets, and the green foreground unchanged.
+- Keep the rear frame open at the top-right and the foreground frame open at the bottom-left.
+- Keep the centre dot inside the shared open area without touching either frame.
 - Do not add the wordmark or other text inside an application icon.
 - Leave clear space equal to at least one centre-square width around the symbol or horizontal lockup.
 - Do not place the graphite wordmark on graphite, or the white wordmark on white.
-- Do not remove a frame at small sizes. The 16 px and 24 px exports use a slightly heavier optical master instead.
+- Keep both frames and their crop openings at small sizes. The 16 px and 24 px exports use a slightly heavier optical master with wider corner openings.
 - Use the outlined SVG wordmark for portable documents.
 
 Minimum sizes are 16 px for the standalone screen symbol and 6 mm for print. Use a horizontal lockup at 120 px or wider when the wordmark must remain readable.

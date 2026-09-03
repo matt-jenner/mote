@@ -23,20 +23,28 @@ function frame({
 	radius,
 	colour,
 	stroke,
-	opacity = 1,
+	cropCorner,
+	cropCut,
 }) {
-	const opacityAttribute = opacity === 1 ? "" : ` stroke-opacity="${opacity}"`;
-	return `<rect data-layer="${layer}" x="${x}" y="${y}" width="${width}" height="${height}" rx="${radius}" fill="none" stroke="${colour}" stroke-width="${stroke}"${opacityAttribute} stroke-linejoin="round"/>`;
+	if (cropCorner) {
+		const right = x + width;
+		const bottom = y + height;
+		const pathData =
+			cropCorner === "top-right"
+				? `M ${right} ${y + cropCut} V ${bottom - radius} Q ${right} ${bottom} ${right - radius} ${bottom} H ${x + radius} Q ${x} ${bottom} ${x} ${bottom - radius} V ${y + radius} Q ${x} ${y} ${x + radius} ${y} H ${right - cropCut}`
+				: `M ${x} ${bottom - cropCut} V ${y + radius} Q ${x} ${y} ${x + radius} ${y} H ${right - radius} Q ${right} ${y} ${right} ${y + radius} V ${bottom - radius} Q ${right} ${bottom} ${right - radius} ${bottom} H ${x + cropCut}`;
+		return `<path data-layer="${layer}" data-crop-corner="${cropCorner}" data-x="${x}" data-y="${y}" data-width="${width}" data-height="${height}" d="${pathData}" fill="none" stroke="${colour}" stroke-width="${stroke}" stroke-linecap="round" stroke-linejoin="round"/>`;
+	}
+	return `<rect data-layer="${layer}" x="${x}" y="${y}" width="${width}" height="${height}" rx="${radius}" fill="none" stroke="${colour}" stroke-width="${stroke}" stroke-linejoin="round"/>`;
 }
 
 function palette(mode, monochrome) {
 	if (monochrome) {
 		const colour = mode === "dark" ? BRAND.colors.white : BRAND.colors.graphite;
-		return { rear: colour, middle: colour, front: colour, centre: colour };
+		return { rear: colour, front: colour, centre: colour };
 	}
 	return {
 		rear: mode === "dark" ? BRAND.colors.white : BRAND.colors.graphite,
-		middle: BRAND.colors.white,
 		front: BRAND.colors.green,
 		centre: BRAND.colors.green,
 	};
@@ -46,51 +54,31 @@ function symbolArtwork({ mode, monochrome = false, small = false }) {
 	const colours = palette(mode, monochrome);
 	const stroke = small ? 112 : 96;
 	const centre = small ? 108 : 84;
-	const middleOutline =
-		mode === "light" && !monochrome
-			? frame({
-					layer: "middle-outline",
-					x: 302,
-					y: 274,
-					width: 414,
-					height: 420,
-					radius: 42,
-					colour: BRAND.colors.grey,
-					stroke: stroke + 12,
-					opacity: 0.65,
-				})
-			: "";
+	const cropCut = small ? 144 : 128;
 	return [
 		frame({
 			layer: "rear",
-			x: 390,
-			y: 162,
-			width: 356,
-			height: 500,
+			x: 368,
+			y: 240,
+			width: 416,
+			height: 416,
 			radius: 42,
 			colour: colours.rear,
 			stroke,
-		}),
-		middleOutline,
-		frame({
-			layer: "middle",
-			x: 302,
-			y: 274,
-			width: 414,
-			height: 420,
-			radius: 42,
-			colour: colours.middle,
-			stroke,
+			cropCorner: "top-right",
+			cropCut,
 		}),
 		frame({
 			layer: "front",
-			x: 184,
-			y: 356,
-			width: 442,
-			height: 442,
+			x: 240,
+			y: 368,
+			width: 416,
+			height: 416,
 			radius: 42,
 			colour: colours.front,
 			stroke,
+			cropCorner: "bottom-left",
+			cropCut,
 		}),
 		`<rect data-layer="centre" x="${512 - centre / 2}" y="${512 - centre / 2}" width="${centre}" height="${centre}" rx="12" fill="${colours.centre}"/>`,
 	].join("");
@@ -116,9 +104,10 @@ export function symbolSvg({
 		? '<rect data-safe-zone="205 205 614 614" x="205" y="205" width="614" height="614" fill="none"/>'
 		: "";
 	const bounds = maskable ? ' data-artwork-bounds="205 205 614 614"' : "";
+	const artworkMode = tile && !monochrome ? "dark" : mode;
 	return `<svg xmlns="${XMLNS}" viewBox="0 0 1024 1024" width="${size}" height="${size}" role="img" aria-label="Mote symbol">
   ${tileMarkup}
-  <g${bounds} transform="translate(${offset} ${offset}) scale(${scale})">${symbolArtwork({ mode, monochrome, small })}</g>
+  <g${bounds} transform="translate(${offset} ${offset}) scale(${scale})">${symbolArtwork({ mode: artworkMode, monochrome, small })}</g>
   ${safeZone}
 </svg>`;
 }

@@ -27,24 +27,23 @@ The master wordmark must be converted to vector outlines so it renders consisten
 
 ### Core symbol
 
-The symbol uses three offset rectangular photo frames and a small central square. The frames overlap to suggest a compact stack of photographs without adding a literal camera, mountain, or aperture glyph.
+The symbol uses two equal `416 x 416` photo frames and a small central square. The frames overlap with a 128-unit diagonal offset to suggest a compact pair of photographs without adding a literal camera, mountain, or aperture glyph. The rear frame opens at its exposed top-right corner and the foreground frame opens at its exposed bottom-left corner, producing rounded crop-line endings instead of two continuous interlocking loops. Their combined painted bounds are centred on the master canvas. The central square sits inside the shared open area without touching either frame stroke, including at the heavier small-icon stroke weight.
 
 The master uses a `1024 x 1024` coordinate system. It has enough internal spacing to remain distinct at 16 pixels. Corners and stroke endings follow the rounded Fredoka letterforms.
 
 The full-colour symbol has these layers:
 
 1. A rear graphite frame, offset toward the upper right.
-2. A cool-white middle frame, offset toward the upper centre.
-3. A green foreground frame, offset toward the lower left.
-4. A small green central square.
+2. A green foreground frame, offset toward the lower left.
+3. A small green central square.
 
-The small-size master keeps the same geometry. At 16 and 24 pixels, it increases the frame stroke and central square by one optical pixel. No layer may be removed.
+The small-size master keeps the same geometry. At 16 and 24 pixels, it increases the frame stroke and central square by one optical pixel and widens the crop-corner openings. No layer may be removed.
 
 ### Light and dark variants
 
 Light-background assets use graphite text and a graphite rear frame. Dark-background assets use cool-white text and a cool-white rear frame. The green foreground remains `#45A06B` in both modes. Mineral grey is used only for secondary outlines and neutral samples.
 
-Full-colour app icons keep a graphite tile in both modes so the application remains recognisable across launchers. Appearance-specific sources may lift the dark tile to `#22272D` or use a cool-white tile, but the mark geometry and green foreground remain unchanged.
+Full-colour app icons keep a graphite tile with a cool-white rear frame and green foreground frame so both frames remain visible across launchers. Appearance-specific sources may lift the dark tile to `#22272D`, but the mark geometry and frame colours remain unchanged.
 
 Monochrome exports use solid graphite for light surfaces and solid white for dark surfaces. They must retain transparent backgrounds unless the target format requires an opaque canvas.
 
@@ -171,7 +170,8 @@ The PDF uses vector artwork where possible and embeds the required font informat
 It also records these usage rules:
 
 - Do not recolour the green foreground.
-- Do not change the order or offset of the frames.
+- Do not change the order or offset of the two frames.
+- Do not close or swap the two opposing crop corners.
 - Do not add text inside an app icon.
 - Do not use the dark wordmark on graphite or the light wordmark on white.
 - Preserve the clear space defined by the central-square width.
