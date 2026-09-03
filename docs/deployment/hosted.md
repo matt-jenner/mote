@@ -231,10 +231,16 @@ Keep a current catalogue backup before an upgrade. Never delete the host data di
 
 ## Acceptance smoke test
 
-`scripts/hosted-smoke.sh` builds `localhost/photo-viewer:dev`, creates only resources prefixed `photo-viewer-smoke-`, and runs the complete browser restart and offline lifecycle:
+`scripts/hosted-smoke.sh` builds `localhost/photo-viewer:dev`, creates only resources prefixed `photo-viewer-smoke-`, and runs the complete browser restart and offline lifecycle with Podman by default:
 
 ```bash
 ./scripts/hosted-smoke.sh
 ```
 
-The script needs Podman, curl, Node.js, npm, and the Playwright Chromium headless shell. It bind-mounts test-only directories below `./runtime`, confirms the catalogue and cache files appear there, and removes only its exact container, network, host test directories, and temporary browser state.
+Run the same smoke test with Docker by selecting it as the container engine:
+
+```bash
+CONTAINER_ENGINE=docker ./scripts/hosted-smoke.sh
+```
+
+The script needs the selected container engine, curl, Node.js, npm, and the Playwright Chromium headless shell. It verifies that the image defaults to UID and GID 10001, then runs the test container as the host user so its temporary bind mounts remain writable under standard rootful Docker and rootless or machine-hosted Podman. Docker daemons using rootless mode or `userns-remap` are rejected because their user-namespace mapping cannot safely use these host-owned test directories. The script bind-mounts test-only directories below `./runtime`, confirms the catalogue and cache files appear there, and removes only its exact container, network, host test directories, and temporary browser state.

@@ -2,6 +2,10 @@
 set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+container_engine=${CONTAINER_ENGINE:-podman}
+container_engine_name=${container_engine##*/}
+runtime_uid=$(id -u)
+runtime_gid=$(id -g)
 run_id="photo-viewer-smoke-$(date +%s)-$$"
 container_name="${run_id}-app"
 network_name="${run_id}-network"
@@ -25,14 +29,14 @@ cleanup() {
 	trap - HUP INT TERM
 	if [ "$exit_status" -ne 0 ]; then
 		printf '%s\n' "hosted smoke failed; container log follows" >&2
-		podman logs "$container_name" >&2 2>/dev/null || true
+		"$container_engine" logs "$container_name" >&2 2>/dev/null || true
 	fi
 	if [ -d "$source_dir" ]; then
 		chmod u+rwx "$source_dir" >/dev/null 2>&1 || true
 		find "$source_dir" -type d -exec chmod u+rwx {} \; >/dev/null 2>&1 || true
 	fi
-	podman rm --force "$container_name" >/dev/null 2>&1 || true
-	podman network rm "$network_name" >/dev/null 2>&1 || true
+	"$container_engine" rm --force "$container_name" >/dev/null 2>&1 || true
+	"$container_engine" network rm "$network_name" >/dev/null 2>&1 || true
 	case "$temporary_root" in
 		"${TMPDIR:-/tmp}"/photo-viewer-smoke-*) rm -rf -- "$temporary_root" ;;
 		*) printf '%s\n' "refusing to remove unexpected path: $temporary_root" >&2 ;;
@@ -107,20 +111,26 @@ wait_for_health() {
 		sleep 1
 	done
 	printf '%s\n' "health check did not pass within 60 seconds" >&2
-	podman logs "$container_name" >&2 || true
+	"$container_engine" logs "$container_name" >&2 || true
 	return 1
 }
 
 start_container() {
 	host_port=${1:-}
+	set --
+	case "$container_engine_name" in
+		podman | podman-remote) set -- --userns=keep-id ;;
+	esac
 	if [ -n "$host_port" ]; then
 		publish="127.0.0.1:${host_port}:8080"
 	else
 		publish="127.0.0.1::8080"
 	fi
-	podman run --detach \
+	"$container_engine" run --detach \
+		"$@" \
 		--name "$container_name" \
 		--network "$network_name" \
+		--user "${runtime_uid}:${runtime_gid}" \
 		--read-only \
 		--security-opt no-new-privileges \
 		--publish "$publish" \
@@ -132,7 +142,7 @@ start_container() {
 		--volume "${data_dir}:/var/lib/photo-viewer:Z" \
 		--volume "${cache_dir}:/var/cache/photo-viewer:Z" \
 		localhost/photo-viewer:dev >/dev/null
-	port_mapping=$(podman port "$container_name" 8080/tcp | sed -n '1p')
+	port_mapping=$("$container_engine" port "$container_name" 8080/tcp | sed -n '1p')
 	case "$port_mapping" in
 		127.0.0.1:*) ;;
 		*) printf '%s\n' "unexpected loopback mapping: $port_mapping" >&2; exit 1 ;;
@@ -141,6 +151,28 @@ start_container() {
 	base_url="http://127.0.0.1:${mapped_port}"
 	wait_for_health "$base_url"
 	printf '%s\n' "$mapped_port"
+}
+
+assert_supported_engine() {
+	if [ "$container_engine_name" = docker ]; then
+		security_options=$("$container_engine" info --format '{{json .SecurityOptions}}')
+		case "$security_options" in
+			*rootless* | *name=userns*)
+				printf '%s\n' "Docker user-namespace remapping is not supported by this bind-mount smoke test" >&2
+				exit 1
+				;;
+		esac
+	fi
+}
+
+assert_image_runtime_user() {
+	configured_user=$("$container_engine" image inspect \
+		--format '{{.Config.User}}' localhost/photo-viewer:dev)
+	if [ "$configured_user" != "10001:10001" ]; then
+		printf '%s\n' "unexpected image runtime user: $configured_user" >&2
+		exit 1
+	fi
+	printf '%s\n' "image defaults to runtime user $configured_user"
 }
 
 run_browser_phase() {
@@ -181,9 +213,10 @@ wait_for_degraded_health() {
 	return 1
 }
 
-command -v podman >/dev/null 2>&1 || { printf '%s\n' "podman is required" >&2; exit 1; }
+command -v "$container_engine" >/dev/null 2>&1 || { printf '%s\n' "$container_engine is required" >&2; exit 1; }
 command -v curl >/dev/null 2>&1 || { printf '%s\n' "curl is required" >&2; exit 1; }
 command -v node >/dev/null 2>&1 || { printf '%s\n' "node is required" >&2; exit 1; }
+assert_supported_engine
 
 mkdir -p \
 	"$source_dir/A/child" \
@@ -214,10 +247,11 @@ metadata_manifest "$baseline_metadata"
 hash_manifest "$baseline_hashes"
 
 cd "$project_dir"
-printf '%s\n' "building localhost/photo-viewer:dev"
-podman build --tag localhost/photo-viewer:dev --file Containerfile .
+printf '%s\n' "building localhost/photo-viewer:dev with $container_engine"
+"$container_engine" build --tag localhost/photo-viewer:dev --file Containerfile .
+assert_image_runtime_user
 
-podman network create "$network_name" >/dev/null
+"$container_engine" network create "$network_name" >/dev/null
 
 mapped_port=$(start_container)
 base_url="http://127.0.0.1:${mapped_port}"
@@ -227,8 +261,8 @@ run_browser_phase beforeRestart
 assert_external_storage
 assert_source_unchanged "two-browser browse, scan, sort, scope, and viewer phase"
 
-podman stop --time 10 "$container_name" >/dev/null
-podman rm "$container_name" >/dev/null
+"$container_engine" stop -t 10 "$container_name" >/dev/null
+"$container_engine" rm "$container_name" >/dev/null
 mapped_port=$(start_container "$mapped_port")
 base_url="http://127.0.0.1:${mapped_port}"
 assert_source_unchanged "retained-volume restart"

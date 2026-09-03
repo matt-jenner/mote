@@ -565,7 +565,7 @@ fn system_mount_identity(file: &std::fs::File) -> io::Result<MountIdentity> {
             "descriptor mount metadata exceeded its fixed bound",
         ));
     }
-    parse_fdinfo_mount_id(&contents).map(|id| MountIdentity::Linux(id))
+    parse_fdinfo_mount_id(&contents).map(MountIdentity::Linux)
 }
 
 #[cfg(any(target_os = "linux", test))]

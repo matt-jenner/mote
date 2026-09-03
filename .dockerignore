@@ -11,6 +11,7 @@ apps/interface/dist
 apps/interface/.vite
 apps/interface/tsconfig.tsbuildinfo
 coverage
+runtime
 *.log
 *.sqlite
 *.sqlite-*
