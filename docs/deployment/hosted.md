@@ -20,13 +20,35 @@ docker build -t photo-viewer:dev -f Containerfile .
 
 The image starts `photo-server` as `10001:10001`. It contains no source photos, catalogue, or generated derivatives.
 
-## Run with Podman or Docker
+## Required host storage
 
-Create retained volumes once, then mount the photo source read-only:
+The SQLite catalogue and generated image cache must use host bind mounts. Podman named volumes live inside the Podman VM on macOS, so they do not meet this requirement and can silently consume the VM disk.
+
+Choose two separate host directories and expose their absolute paths as `PHOTO_VIEWER_DATA_PATH` and `PHOTO_VIEWER_CACHE_PATH`. The Compose file refuses to start if either variable is missing or empty. Do not put these directories below the photo source.
+
+For a local test from the repository root, `./runtime/data` and `./runtime/cache` are suitable:
 
 ```bash
-podman volume create photo-viewer-data
-podman volume create photo-viewer-cache
+mkdir -p ./runtime/data ./runtime/cache
+export PHOTO_VIEWER_DATA_PATH="$PWD/runtime/data"
+export PHOTO_VIEWER_CACHE_PATH="$PWD/runtime/cache"
+```
+
+The container runs as UID and GID 10001 and needs read, write, and directory traversal permission on both directories. On a rootless Linux Podman host, set ownership in Podman's user namespace:
+
+```bash
+podman unshare chown -R 10001:10001 \
+  "$PHOTO_VIEWER_DATA_PATH" \
+  "$PHOTO_VIEWER_CACHE_PATH"
+```
+
+For rootful Podman or Docker on Linux, use `sudo chown -R 10001:10001` instead. Podman on macOS shares bind-mounted host directories through its VM. For disposable `./runtime` testing only, `chmod 0777 ./runtime/data ./runtime/cache` is a simple fallback if the container reports unwritable storage.
+
+## Run with Podman or Docker
+
+Mount the photo source read-only and bind both required storage paths:
+
+```bash
 podman run -d --name photo-viewer \
   -p 127.0.0.1:8080:8080 \
   -e PHOTO_VIEWER_DATA_DIR=/var/lib/photo-viewer \
@@ -34,16 +56,14 @@ podman run -d --name photo-viewer \
   -e PHOTO_VIEWER_SOURCE_ROOT=/photos \
   -e PHOTO_VIEWER_BIND=0.0.0.0:8080 \
   -v /srv/photos:/photos:ro,Z \
-  -v photo-viewer-data:/var/lib/photo-viewer:U \
-  -v photo-viewer-cache:/var/cache/photo-viewer:U \
+  -v "$PHOTO_VIEWER_DATA_PATH:/var/lib/photo-viewer:Z" \
+  -v "$PHOTO_VIEWER_CACHE_PATH:/var/cache/photo-viewer:Z" \
   localhost/photo-viewer:dev
 ```
 
-On a host without SELinux, omit `,Z`. The Docker form uses the same arguments with `docker`, omits `:U`, and relies on Docker's named-volume ownership initialization:
+On a host without SELinux, omit `,Z`. Docker uses the same host paths:
 
 ```bash
-docker volume create photo-viewer-data
-docker volume create photo-viewer-cache
 docker run -d --name photo-viewer \
   -p 127.0.0.1:8080:8080 \
   -e PHOTO_VIEWER_DATA_DIR=/var/lib/photo-viewer \
@@ -51,28 +71,37 @@ docker run -d --name photo-viewer \
   -e PHOTO_VIEWER_SOURCE_ROOT=/photos \
   -e PHOTO_VIEWER_BIND=0.0.0.0:8080 \
   -v /srv/photos:/photos:ro \
-  -v photo-viewer-data:/var/lib/photo-viewer \
-  -v photo-viewer-cache:/var/cache/photo-viewer \
+  -v "$PHOTO_VIEWER_DATA_PATH:/var/lib/photo-viewer" \
+  -v "$PHOTO_VIEWER_CACHE_PATH:/var/cache/photo-viewer" \
   photo-viewer:dev
 ```
 
-The `/photos` mount must remain read-only. Do not put `/var/lib/photo-viewer` or `/var/cache/photo-viewer` below the source tree. For bind-mounted data or cache directories, grant UID 10001 read, write, and directory traversal permission before starting the container. Named volumes avoid host-path permission drift.
+The `/photos` mount must remain read-only.
 
 ## Compose
 
-`deploy/compose.yaml` binds the service to loopback, mounts `${PHOTO_PATH:-/srv/photos}` read-only, and retains the catalogue and derivative cache in named volumes:
+`deploy/compose.yaml` binds the service to loopback, mounts `${PHOTO_PATH:-/srv/photos}` read-only, and bind-mounts the two required host storage directories. Its `Z` mount option gives each directory a private SELinux label on enforcing Linux hosts; Compose implementations on hosts without SELinux accept the same file.
+
+Keep all three host paths in an environment file so every Compose command uses the same source and storage. For the local test directories above, create this ignored test file from the repository root:
 
 ```bash
-PHOTO_PATH=/mnt/archive/photos podman compose -f deploy/compose.yaml up -d --build
+cat > ./runtime/compose.env <<EOF
+PHOTO_PATH="/mnt/archive/photos"
+PHOTO_VIEWER_DATA_PATH="$PWD/runtime/data"
+PHOTO_VIEWER_CACHE_PATH="$PWD/runtime/cache"
+EOF
+podman compose --env-file ./runtime/compose.env \
+  -f deploy/compose.yaml up -d --build
 ```
 
 Docker Compose uses the same file:
 
 ```bash
-PHOTO_PATH=/mnt/archive/photos docker compose -f deploy/compose.yaml up -d --build
+docker compose --env-file ./runtime/compose.env \
+  -f deploy/compose.yaml up -d --build
 ```
 
-The Compose project owns `photo-viewer-data` and `photo-viewer-cache`. `compose down` keeps them. Do not add `--volumes` during routine restarts or upgrades.
+For a permanent installation, keep the environment file in a protected host configuration directory rather than below `./runtime`. Use absolute paths in it, as shown above, so Compose provider differences cannot resolve a relative path below `deploy/`. `compose down` does not remove bind-mounted host data.
 
 ## Health and logs
 
@@ -98,39 +127,107 @@ The server never uses `Host`, `X-Forwarded-Host`, or `X-Forwarded-Proto` to cons
 
 ## Backup and restore
 
-The catalogue is `/var/lib/photo-viewer/catalog.sqlite`. Stop the service before copying it so the SQLite file and its sidecars form one consistent backup:
+The catalogue is `$PHOTO_VIEWER_DATA_PATH/catalog.sqlite` on the host. Before any filesystem operation, require the variable explicitly so an unset path cannot become the host root. Stop the service before copying the data directory so the SQLite file and its sidecars form one consistent backup.
+
+For a container created by the direct `podman run` command above, use this rootless Linux backup:
 
 ```bash
-podman stop photo-viewer
-podman run --rm \
-  -v photo-viewer-data:/data:ro \
-  -v "$PWD/backups:/backup" \
-  docker.io/library/debian:bookworm-slim \
-  cp /data/catalog.sqlite /backup/catalog.sqlite
-podman start photo-viewer
+(
+  set -eu
+  : "${PHOTO_VIEWER_DATA_PATH:?export the absolute host data path first}"
+  backup_root="$PWD/backups"
+  backup_dir="$backup_root/photo-viewer-data-$(date -u +%Y%m%dT%H%M%SZ)"
+  stopped=false
+  restart_after_failure() {
+    exit_status=$?
+    trap - EXIT
+    if [ "$stopped" = true ]; then podman start photo-viewer || true; fi
+    exit "$exit_status"
+  }
+  trap restart_after_failure EXIT
+  mkdir -p "$backup_root"
+  mkdir "$backup_dir"
+  podman stop photo-viewer
+  stopped=true
+  podman unshare cp -a "$PHOTO_VIEWER_DATA_PATH/." "$backup_dir/"
+  podman start photo-viewer
+  stopped=false
+  printf 'catalogue backup: %s\n' "$backup_dir"
+)
 ```
 
-Use `docker` instead of `podman` for Docker-managed volumes. Protect the backup like the photo catalogue it describes. To restore, stop the service and copy the file into a fresh data volume owned by UID and GID 10001.
+For a Compose deployment, load the same trusted environment file used to create the service and address the service through Compose:
 
-The cache volume contains rebuildable JPEG derivatives. Backing it up reduces regeneration work but is optional. If it is lost or cleared, keep the data volume and source mount. The server reconciles missing cache rows at startup and regenerates derivatives when a wall or viewer requests them.
+```bash
+(
+  set -eu
+  compose_env="./runtime/compose.env"
+  set -a
+  . "$compose_env"
+  set +a
+  : "${PHOTO_VIEWER_DATA_PATH:?compose environment must set the data path}"
+  backup_root="$PWD/backups"
+  backup_dir="$backup_root/photo-viewer-data-$(date -u +%Y%m%dT%H%M%SZ)"
+  stopped=false
+  restart_after_failure() {
+    exit_status=$?
+    trap - EXIT
+    if [ "$stopped" = true ]; then
+      podman compose --env-file "$compose_env" \
+        -f deploy/compose.yaml start photo-viewer || true
+    fi
+    exit "$exit_status"
+  }
+  trap restart_after_failure EXIT
+  mkdir -p "$backup_root"
+  mkdir "$backup_dir"
+  podman compose --env-file "$compose_env" \
+    -f deploy/compose.yaml stop photo-viewer
+  stopped=true
+  podman unshare cp -a "$PHOTO_VIEWER_DATA_PATH/." "$backup_dir/"
+  podman compose --env-file "$compose_env" \
+    -f deploy/compose.yaml start photo-viewer
+  stopped=false
+  printf 'catalogue backup: %s\n' "$backup_dir"
+)
+```
+
+Replace `./runtime/compose.env` with the permanent environment-file path used by your installation. On Podman for macOS, or Docker where your host account owns the directory, use `cp -R "$PHOTO_VIEWER_DATA_PATH/." "$backup_dir/"` after the same variable guard. A rootful Linux deployment can use `sudo cp -a`. Protect the backup like the photo catalogue it describes. To restore, stop the service with the matching direct-run or Compose command, require and verify `PHOTO_VIEWER_DATA_PATH` again, copy the saved directory contents into it, restore UID and GID 10001 access, and then start the service through the same route.
+
+`PHOTO_VIEWER_CACHE_PATH` contains rebuildable JPEG derivatives. Backing it up reduces regeneration work but is optional. If it is lost or cleared, keep the data directory and source mount. The server reconciles missing cache rows at startup and regenerates derivatives when a wall or viewer requests them.
+
+### Migrating existing Podman named volumes
+
+If an earlier deployment used `photo-viewer-data` and `photo-viewer-cache` named volumes, stop the service and copy both volumes into the new host directories before starting this version. Compose often prefixes volume names with its project name, so identify the exact names first with `podman volume ls`. Keep the old volumes until the new deployment reports healthy and the gallery has been checked.
 
 ## Restart and upgrade
 
-A normal restart keeps both volumes:
+A normal restart keeps both host storage directories. For the direct-run container:
 
 ```bash
 podman restart photo-viewer
 ```
 
-For an upgrade, build or pull the new image, stop and remove only the container, then recreate it with the same source mount and named volumes. With Compose:
+For Compose:
 
 ```bash
-podman compose -f deploy/compose.yaml build --pull
-podman compose -f deploy/compose.yaml up -d
+podman compose --env-file ./runtime/compose.env \
+  -f deploy/compose.yaml restart photo-viewer
+```
+
+For an upgrade, build or pull the new image, stop and remove only the container, then recreate it with the same source mount and host storage paths. With Compose:
+
+```bash
+podman compose --env-file ./runtime/compose.env \
+  -f deploy/compose.yaml build --pull
+podman compose --env-file ./runtime/compose.env \
+  -f deploy/compose.yaml up -d
 curl --fail --silent --show-error http://127.0.0.1:8080/healthz
 ```
 
-Keep a current catalogue backup before an upgrade. Never delete the data volume as part of image replacement. Cached wall and viewer derivatives remain usable across process restarts and temporary source outages.
+Replace `./runtime/compose.env` with the permanent environment-file path used by your installation.
+
+Keep a current catalogue backup before an upgrade. Never delete the host data directory as part of image replacement. Cached wall and viewer derivatives remain usable across process restarts and temporary source outages.
 
 ## Acceptance smoke test
 
@@ -140,4 +237,4 @@ Keep a current catalogue backup before an upgrade. Never delete the data volume 
 ./scripts/hosted-smoke.sh
 ```
 
-The script needs Podman, curl, Node.js, npm, and the Playwright Chromium headless shell. It never prunes Podman and removes only its exact container, network, volumes, and temporary browser state.
+The script needs Podman, curl, Node.js, npm, and the Playwright Chromium headless shell. It bind-mounts test-only directories below `./runtime`, confirms the catalogue and cache files appear there, and removes only its exact container, network, host test directories, and temporary browser state.

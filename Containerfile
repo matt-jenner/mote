@@ -4,6 +4,8 @@ COPY package.json package-lock.json ./
 COPY apps/interface/package.json apps/interface/package.json
 COPY apps/desktop/package.json apps/desktop/package.json
 RUN npm ci
+COPY docs/brand/fonts docs/brand/fonts
+COPY docs/brand/svg docs/brand/svg
 COPY apps/interface apps/interface
 RUN npm run web:build
 

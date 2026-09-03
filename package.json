@@ -9,12 +9,13 @@
 		"npm": ">=11.16.0"
 	},
 	"scripts": {
-		"check": "biome check apps",
-		"check:write": "biome check --write apps",
+		"check": "biome check apps tests/deployment",
+		"check:write": "biome check --write apps tests/deployment",
 		"brand:generate": "node docs/brand/tools/generate-assets.mjs",
 		"brand:test": "node --test docs/brand/tools/*.test.mjs",
 		"desktop:dev": "npm exec --workspace @photo-viewer/desktop -- tauri dev",
 		"desktop:build": "npm exec --workspace @photo-viewer/desktop -- tauri build",
+		"test:deployment": "node --test tests/deployment/*.test.mjs",
 		"typecheck": "npm run typecheck --workspace @photo-viewer/interface",
 		"test": "npm run test --workspace @photo-viewer/interface",
 		"test:browser": "npm run test:browser --workspace @photo-viewer/interface",
@@ -30,6 +31,7 @@
 		"fast-xml-parser": "5.11.1",
 		"fontkit": "2.0.4",
 		"png-to-ico": "3.0.2",
-		"sharp": "0.35.4"
+		"sharp": "0.35.4",
+		"yaml": "^2.8.2"
 	}
 }

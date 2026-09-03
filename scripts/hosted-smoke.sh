@@ -5,33 +5,41 @@ project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 run_id="photo-viewer-smoke-$(date +%s)-$$"
 container_name="${run_id}-app"
 network_name="${run_id}-network"
-data_volume="${run_id}-data"
-cache_volume="${run_id}-cache"
 temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/${run_id}.XXXXXX")
+runtime_root="${project_dir}/runtime/${run_id}"
 source_dir="${temporary_root}/photos"
 state_dir="${temporary_root}/browser-state"
+data_dir="${runtime_root}/data"
+cache_dir="${runtime_root}/cache"
 baseline_metadata="${temporary_root}/source-metadata.before"
 baseline_hashes="${temporary_root}/source-hashes.before"
 source_mode=0555
 cleanup_started=false
 
 cleanup() {
+	exit_status=$?
 	if [ "$cleanup_started" = true ]; then
 		return
 	fi
 	cleanup_started=true
 	trap - HUP INT TERM
+	if [ "$exit_status" -ne 0 ]; then
+		printf '%s\n' "hosted smoke failed; container log follows" >&2
+		podman logs "$container_name" >&2 2>/dev/null || true
+	fi
 	if [ -d "$source_dir" ]; then
 		chmod u+rwx "$source_dir" >/dev/null 2>&1 || true
 		find "$source_dir" -type d -exec chmod u+rwx {} \; >/dev/null 2>&1 || true
 	fi
 	podman rm --force "$container_name" >/dev/null 2>&1 || true
 	podman network rm "$network_name" >/dev/null 2>&1 || true
-	podman volume rm "$data_volume" >/dev/null 2>&1 || true
-	podman volume rm "$cache_volume" >/dev/null 2>&1 || true
 	case "$temporary_root" in
 		"${TMPDIR:-/tmp}"/photo-viewer-smoke-*) rm -rf -- "$temporary_root" ;;
 		*) printf '%s\n' "refusing to remove unexpected path: $temporary_root" >&2 ;;
+	esac
+	case "$runtime_root" in
+		"${project_dir}"/runtime/photo-viewer-smoke-*) rm -rf -- "$runtime_root" ;;
+		*) printf '%s\n' "refusing to remove unexpected path: $runtime_root" >&2 ;;
 	esac
 }
 trap cleanup EXIT
@@ -76,6 +84,18 @@ assert_source_unchanged() {
 	printf '%s\n' "source manifests unchanged after $label"
 }
 
+assert_external_storage() {
+	if [ ! -f "${data_dir}/catalog.sqlite" ]; then
+		printf '%s\n' "catalogue was not written to host path: $data_dir" >&2
+		exit 1
+	fi
+	if ! find "$cache_dir" -type f -name '*.jpg' -print -quit | grep -q .; then
+		printf '%s\n' "JPEG derivative cache was not written to host path: $cache_dir" >&2
+		exit 1
+	fi
+	printf '%s\n' "catalogue and derivative cache are present under $runtime_root"
+}
+
 wait_for_health() {
 	base_url=$1
 	attempt=0
@@ -109,8 +129,8 @@ start_container() {
 		--env PHOTO_VIEWER_SOURCE_ROOT=/photos \
 		--env PHOTO_VIEWER_BIND=0.0.0.0:8080 \
 		--volume "${source_dir}:/photos:ro,Z" \
-		--volume "${data_volume}:/var/lib/photo-viewer:U" \
-		--volume "${cache_volume}:/var/cache/photo-viewer:U" \
+		--volume "${data_dir}:/var/lib/photo-viewer:Z" \
+		--volume "${cache_dir}:/var/cache/photo-viewer:Z" \
 		localhost/photo-viewer:dev >/dev/null
 	port_mapping=$(podman port "$container_name" 8080/tcp | sed -n '1p')
 	case "$port_mapping" in
@@ -169,7 +189,10 @@ mkdir -p \
 	"$source_dir/A/child" \
 	"$source_dir/B" \
 	"$source_dir/Nested/Album/grandchild" \
-	"$state_dir"
+	"$state_dir" \
+	"$data_dir" \
+	"$cache_dir"
+chmod 0777 "$data_dir" "$cache_dir"
 cp "$project_dir/apps/interface/public/demo-photos/mountain.jpg" "$source_dir/A/a-01.jpg"
 cp "$project_dir/apps/interface/public/demo-photos/coast.jpg" "$source_dir/A/a-02.jpg"
 cp "$project_dir/apps/interface/public/demo-photos/forest.jpg" "$source_dir/A/child/a-child-uncached.jpg"
@@ -195,14 +218,13 @@ printf '%s\n' "building localhost/photo-viewer:dev"
 podman build --tag localhost/photo-viewer:dev --file Containerfile .
 
 podman network create "$network_name" >/dev/null
-podman volume create "$data_volume" >/dev/null
-podman volume create "$cache_volume" >/dev/null
 
 mapped_port=$(start_container)
 base_url="http://127.0.0.1:${mapped_port}"
 printf '%s\n' "hosted service: $base_url"
 assert_source_unchanged "initial startup"
 run_browser_phase beforeRestart
+assert_external_storage
 assert_source_unchanged "two-browser browse, scan, sort, scope, and viewer phase"
 
 podman stop --time 10 "$container_name" >/dev/null
@@ -229,4 +251,4 @@ probe_rejected "file-as-folder" "/api/v1/folders?path=A%2Fa-01.jpg"
 probe_rejected "symlink escape" "/api/v1/folders?path=Escape"
 assert_source_unchanged "traversal and limit probes"
 
-printf '%s\n' "hosted smoke passed: nested folder selection, scoped browsing, independent browsers, restart restoration, stable ETags, offline cache, request rejection, unchanged source"
+printf '%s\n' "hosted smoke passed: host-mounted catalogue and cache, nested folder selection, scoped browsing, independent browsers, restart restoration, stable ETags, offline cache, request rejection, unchanged source"

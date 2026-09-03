@@ -33,6 +33,9 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run test:browser
+      - run: npm run test:deployment
+        env:
+          CONTAINER_ENGINE: docker
       - run: npm run --workspace @photo-viewer/interface build
 
   macos-app:
