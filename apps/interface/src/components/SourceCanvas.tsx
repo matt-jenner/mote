@@ -50,10 +50,11 @@ export function SourceCanvas({
 				) : (
 					<>
 						<h1 className={styles.canvasTitle}>
-							Your photos, in one quiet place
+							A simple space for your photos.
 						</h1>
 						<p className={styles.canvasCopy}>
-							Choose a folder to start this photo library.
+							Open a folder to browse your photos without importing or
+							reorganising them.
 						</p>
 						<button
 							className={styles.primaryButton}
@@ -61,7 +62,7 @@ export function SourceCanvas({
 							onClick={onChooseFolder}
 							type="button"
 						>
-							Choose Folder
+							Choose folder
 						</button>
 					</>
 				)}

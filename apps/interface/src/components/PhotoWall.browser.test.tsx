@@ -1344,19 +1344,16 @@ describe("progressive photo wall", () => {
 		const screen = await renderWall(service);
 		await expect.poll(() => service.queryRequests.length).toBe(1);
 		service.releaseQuery(0, pageOf(settledFixtures, "settled"));
-		await expect.element(screen.getByRole("img").first()).toBeVisible();
 		const wall = screen.getByRole("region", { name: "Photos" });
+		const firstPhoto = wall.getByRole("img").first();
+		await expect.element(firstPhoto).toBeVisible();
 		wall.element().scrollTop = 500;
 		await screen.getByRole("button", { name: "Newest first" }).click();
 		await expect.poll(() => service.queryRequests.length).toBe(2);
 		expect(wall.element().getAttribute("aria-busy")).toBe("true");
-		expect(screen.getByRole("img").first().element().getAttribute("alt")).toBe(
-			"Interior",
-		);
+		expect(firstPhoto.element().getAttribute("alt")).toBe("Interior");
 		service.releaseQuery(1, pageOf([...settledFixtures].reverse(), "settled"));
-		await expect
-			.element(screen.getByRole("img").first())
-			.toHaveAttribute("alt", "Interior");
+		await expect.element(firstPhoto).toHaveAttribute("alt", "Interior");
 		expect(wall.element().scrollTop).toBe(0);
 	});
 
@@ -2908,7 +2905,9 @@ describe("progressive photo wall", () => {
 		await expect.poll(() => wall.element().scrollTop).toBe(0);
 		service.releaseQuery(0, pageOf(settledFixtures, "settled"));
 		await expect
-			.element(screen.getByRole("img").first())
+			.element(
+				screen.getByRole("region", { name: "Photos" }).getByRole("img").first(),
+			)
 			.toHaveAttribute("alt", "Interior");
 	});
 
@@ -2939,7 +2938,9 @@ describe("progressive photo wall", () => {
 		const wall = screen.getByRole("region", { name: "Photos" });
 		expect(wall.element().querySelectorAll("img").length).toBe(6);
 		await expect
-			.element(screen.getByRole("img").first())
+			.element(
+				screen.getByRole("region", { name: "Photos" }).getByRole("img").first(),
+			)
 			.toHaveAttribute("alt", "Interior");
 		service.releaseQuery(
 			2,
@@ -2960,7 +2961,9 @@ describe("progressive photo wall", () => {
 			.element(screen.getByRole("status"))
 			.toHaveTextContent("Photos ready · preparing larger previews · 0 of 6");
 		await expect
-			.element(screen.getByRole("img").first())
+			.element(
+				screen.getByRole("region", { name: "Photos" }).getByRole("img").first(),
+			)
 			.toHaveAttribute("alt", "Interior");
 	});
 
@@ -2988,7 +2991,9 @@ describe("progressive photo wall", () => {
 		});
 		service.releaseQuery(2, pageOf([...settledFixtures].reverse(), "settled"));
 		await expect
-			.element(screen.getByRole("img").first())
+			.element(
+				screen.getByRole("region", { name: "Photos" }).getByRole("img").first(),
+			)
 			.toHaveAttribute("alt", "Interior");
 	});
 
@@ -3437,7 +3442,9 @@ describe("progressive photo wall", () => {
 		await expect.poll(() => service.queryRequests.length).toBe(2);
 		service.releaseQuery(1, pageOf([...settledFixtures].reverse(), "settled"));
 		await expect
-			.element(screen.getByRole("img").first())
+			.element(
+				screen.getByRole("region", { name: "Photos" }).getByRole("img").first(),
+			)
 			.toHaveAttribute("alt", "Interior");
 
 		service.emit({ kind: "resyncRequired", selectionId: "source-a" });
@@ -3448,7 +3455,9 @@ describe("progressive photo wall", () => {
 		});
 		service.releaseQuery(2, pageOf([...settledFixtures].reverse(), "settled"));
 		await expect
-			.element(screen.getByRole("img").first())
+			.element(
+				screen.getByRole("region", { name: "Photos" }).getByRole("img").first(),
+			)
 			.toHaveAttribute("alt", "Interior");
 	});
 

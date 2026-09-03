@@ -219,6 +219,70 @@ describe("open and return shell", () => {
 		await expect.element(screen.getByText("Folder ready")).toBeVisible();
 	});
 
+	it("presents the approved Mote identity in the empty library", async () => {
+		const screen = await renderApp();
+
+		await expect
+			.element(screen.getByRole("img", { name: "Mote" }))
+			.toBeVisible();
+		const heading = screen.getByRole("heading", {
+			name: "A simple space for your photos.",
+		});
+		await expect.element(heading).toBeVisible();
+		await expect
+			.element(
+				screen.getByText(
+					"Open a folder to browse your photos without importing or reorganising them.",
+				),
+			)
+			.toBeVisible();
+		await expect
+			.element(screen.getByRole("button", { name: "Choose folder" }))
+			.toBeVisible();
+		expect(getComputedStyle(heading.element()).fontFamily).toContain("Fredoka");
+		expect(heading.element().getBoundingClientRect().height).toBeLessThan(60);
+	});
+
+	it("keeps keyboard focus and selected rail hover visibly contrasted", async () => {
+		const screen = await renderApp();
+		const focusSwatch = document.createElement("span");
+		focusSwatch.style.color = "var(--focus-ring)";
+		document.body.append(focusSwatch);
+		const focusRing = getComputedStyle(focusSwatch).color;
+		focusSwatch.remove();
+		expect(
+			contrastRatio(
+				focusRing,
+				getComputedStyle(screen.getByRole("main").element()).backgroundColor,
+			),
+		).toBeGreaterThanOrEqual(3);
+		expect(
+			contrastRatio(
+				focusRing,
+				getComputedStyle(
+					screen.getByRole("navigation", { name: "Sources" }).element(),
+				).backgroundColor,
+			),
+		).toBeGreaterThanOrEqual(3);
+		const focusRule = Array.from(document.styleSheets)
+			.flatMap((styleSheet) => Array.from(styleSheet.cssRules))
+			.find(
+				(rule) =>
+					rule instanceof CSSStyleRule &&
+					rule.selectorText.includes("button:focus-visible"),
+			) as CSSStyleRule | undefined;
+		expect(focusRule?.style.outline).toBe("3px solid var(--focus-ring)");
+
+		const folders = screen.getByRole("button", {
+			name: "Folders",
+			exact: true,
+		});
+		await folders.hover();
+		const hoveredStyle = getComputedStyle(folders.element());
+		expect(hoveredStyle.backgroundColor).toBe("rgba(255, 255, 255, 0.12)");
+		expect(hoveredStyle.color).toBe("rgb(247, 248, 250)");
+	});
+
 	it("opens the contained folder browser instead of the native picker in hosted mode", async () => {
 		const screen = await renderApp(hostedFolderService());
 		await screen.getByRole("button", { name: "Folders", exact: true }).click();
@@ -361,7 +425,7 @@ describe("open and return shell", () => {
 		const primary = screen.getByRole("button", { name: "Choose Folder" });
 		await expect
 			.poll(() => getComputedStyle(primary.element()).backgroundColor)
-			.toBe("rgb(108, 158, 219)");
+			.toBe("rgb(52, 125, 82)");
 		const primaryStyle = getComputedStyle(primary.element());
 		expect(
 			contrastRatio(primaryStyle.color, primaryStyle.backgroundColor),
@@ -399,6 +463,10 @@ describe("open and return shell", () => {
 		});
 		expect(document.activeElement).toBe(close.element());
 		expect((workspace.element() as HTMLElement).inert).toBe(true);
+		await close.hover();
+		expect(getComputedStyle(close.element()).backgroundColor).toBe(
+			"rgba(255, 255, 255, 0.12)",
+		);
 
 		await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
 		expect(document.activeElement).toBe(folders.element());

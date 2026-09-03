@@ -1,3 +1,13 @@
+@font-face {
+	font-family: "Fredoka";
+	src: url("../../../../docs/brand/fonts/Fredoka-Variable.woff2")
+		format("woff2-variations");
+	font-style: normal;
+	font-weight: 300 700;
+	font-stretch: 75% 125%;
+	font-display: swap;
+}
+
 * {
 	box-sizing: border-box;
 }
@@ -39,8 +49,8 @@ button {
 
 button:focus-visible,
 input:focus-visible {
-	outline: 2px solid var(--focus-ring);
-	outline-offset: 2px;
+	outline: 3px solid var(--focus-ring);
+	outline-offset: 3px;
 }
 
 @media (max-width: 639px) {

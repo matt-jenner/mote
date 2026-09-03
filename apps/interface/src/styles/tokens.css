@@ -1,62 +1,72 @@
 :root,
 :root[data-theme="system"],
 :root[data-theme="light"] {
-	--canvas: #f4f3ef;
+	--canvas: #f7f8fa;
 	--canvas-elevated: #ffffff;
-	--rail: #ebe9e3;
-	--text-primary: #171816;
-	--text-secondary: #686a66;
-	--separator: #d7d5cf;
-	--selection: #dce6f2;
-	--focus-ring: #245f99;
-	--progress-accent: #326aa3;
+	--rail: #171a1f;
+	--text-primary: #171a1f;
+	--text-secondary: #66707a;
+	--separator: #dfe3e7;
+	--selection: #e5f1e9;
+	--focus-ring: #347d52;
+	--progress-accent: #45a06b;
+	--primary-control: #347d52;
 	--primary-control-text: #ffffff;
 	--control: #ffffff;
-	--control-hover: #e3e1db;
-	--unavailable: #858780;
-	--overlay-scrim: rgb(16 18 16 / 42%);
-	--overlay-shadow: 0 24px 72px rgb(20 22 20 / 24%);
+	--control-hover: #edf1f3;
+	--unavailable: #87919a;
+	--overlay-scrim: rgb(23 26 31 / 48%);
+	--overlay-shadow: 0 24px 72px rgb(23 26 31 / 24%);
 }
 
 :root[data-theme="dark"] {
-	--canvas: #1a1b1b;
-	--canvas-elevated: #242625;
-	--rail: #121313;
-	--text-primary: #f0f0eb;
-	--text-secondary: #a5a7a1;
-	--separator: #343735;
-	--selection: #283a4f;
-	--focus-ring: #7fb5f0;
-	--progress-accent: #6c9edb;
-	--primary-control-text: #121313;
-	--control: #2a2c2b;
-	--control-hover: #363937;
-	--unavailable: #777b76;
+	--canvas: #171a1f;
+	--canvas-elevated: #22262c;
+	--rail: #101216;
+	--text-primary: #f7f8fa;
+	--text-secondary: #b9c1c9;
+	--separator: #353b42;
+	--selection: #263c31;
+	--focus-ring: #6fc28f;
+	--progress-accent: #45a06b;
+	--primary-control: #347d52;
+	--primary-control-text: #ffffff;
+	--control: #292e35;
+	--control-hover: #323840;
+	--unavailable: #7e8790;
 	--overlay-scrim: rgb(0 0 0 / 62%);
 	--overlay-shadow: 0 24px 72px rgb(0 0 0 / 44%);
 }
 
 @media (prefers-color-scheme: dark) {
 	:root[data-theme="system"] {
-		--canvas: #1a1b1b;
-		--canvas-elevated: #242625;
-		--rail: #121313;
-		--text-primary: #f0f0eb;
-		--text-secondary: #a5a7a1;
-		--separator: #343735;
-		--selection: #283a4f;
-		--focus-ring: #7fb5f0;
-		--progress-accent: #6c9edb;
-		--primary-control-text: #121313;
-		--control: #2a2c2b;
-		--control-hover: #363937;
-		--unavailable: #777b76;
+		--canvas: #171a1f;
+		--canvas-elevated: #22262c;
+		--rail: #101216;
+		--text-primary: #f7f8fa;
+		--text-secondary: #b9c1c9;
+		--separator: #353b42;
+		--selection: #263c31;
+		--focus-ring: #6fc28f;
+		--progress-accent: #45a06b;
+		--primary-control: #347d52;
+		--primary-control-text: #ffffff;
+		--control: #292e35;
+		--control-hover: #323840;
+		--unavailable: #7e8790;
 		--overlay-scrim: rgb(0 0 0 / 62%);
 		--overlay-shadow: 0 24px 72px rgb(0 0 0 / 44%);
 	}
 }
 
 :root {
+	--mote-green: #45a06b;
+	--mote-green-dark: #347d52;
+	--mote-graphite: #171a1f;
+	--mote-white: #f7f8fa;
+	--mote-grey: #b9c1c9;
+	--font-brand:
+		"Fredoka", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 	--space-1: 4px;
 	--space-2: 8px;
 	--space-3: 12px;

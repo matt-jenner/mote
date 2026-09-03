@@ -1,5 +1,6 @@
 import { FolderOpen } from "lucide-react";
 import type { Ref } from "react";
+import moteWordmark from "../../../../docs/brand/svg/mote-wordmark-light.svg";
 import type { PhotoServiceCapabilities } from "../services/photoService";
 import styles from "../styles/appShell.module.css";
 
@@ -28,6 +29,10 @@ export function NavigationRail({
 			className={`${styles.rail} ${className}`}
 			inert={inert}
 		>
+			<div aria-label="Mote" className={styles.railBrand} role="img">
+				<img alt="" src={moteWordmark} />
+			</div>
+			<span className={styles.railSectionLabel}>Library</span>
 			<button
 				aria-controls={
 					folderSelection === "hosted" ? "hosted-folder-browser" : undefined

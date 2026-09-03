@@ -250,9 +250,9 @@ export function AppShell() {
 						<Menu aria-hidden="true" size={20} strokeWidth={1.7} />
 					</button>
 					<div className={styles.titleGroup}>
-						<span className={styles.eyebrow}>Photo Viewer</span>
+						<span className={styles.eyebrow}>Library</span>
 						<span className={styles.sourceTitle}>
-							{source?.displayName ?? "Library"}
+							{source?.displayName ?? "All photos"}
 						</span>
 					</div>
 					{source ? (
