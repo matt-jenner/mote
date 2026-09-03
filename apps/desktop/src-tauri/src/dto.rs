@@ -22,6 +22,6 @@ impl CommandError {
     }
 
     pub const fn internal() -> Self {
-        Self::new("internal", "Photo Viewer could not complete that request.")
+        Self::new("internal", "Mote could not complete that request.")
     }
 }

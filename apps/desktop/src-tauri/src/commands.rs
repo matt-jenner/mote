@@ -151,7 +151,7 @@ fn map_service_error(error: AppServiceError) -> CommandError {
         ),
         AppServiceError::OpenRecent(AddLibraryError::OverlapsLocalState) => CommandError::new(
             "folderOverlapsLocalState",
-            "That folder overlaps Photo Viewer's local data.",
+            "That folder overlaps Mote's local data.",
         ),
         AppServiceError::InvalidLimit => {
             CommandError::new("invalidLimit", "The requested wall page is not valid.")
@@ -165,10 +165,9 @@ fn map_service_error(error: AppServiceError) -> CommandError {
         | AppServiceError::UnknownAsset => {
             CommandError::new("assetNotFound", "That photo is no longer available.")
         }
-        AppServiceError::LocalState(_) => CommandError::new(
-            "localStateUnavailable",
-            "Photo Viewer cannot open its local data.",
-        ),
+        AppServiceError::LocalState(_) => {
+            CommandError::new("localStateUnavailable", "Mote cannot open its local data.")
+        }
         _ => CommandError::internal(),
     }
 }

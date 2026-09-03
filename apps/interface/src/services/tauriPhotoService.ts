@@ -13,14 +13,14 @@ import {
 	type WallUpdate,
 } from "./photoService";
 
-const internalErrorMessage = "Photo Viewer could not complete that request.";
+const internalErrorMessage = "Mote could not complete that request.";
 
 const nativeErrorMessages: Readonly<Record<string, string>> = {
 	folderUnavailable: "The selected folder is unavailable.",
 	folderNotDirectory: "Choose a folder, not a file.",
 	folderOverlapsSource: "That folder overlaps an existing source.",
-	folderOverlapsLocalState: "That folder overlaps Photo Viewer's local data.",
-	localStateUnavailable: "Photo Viewer cannot open its local data.",
+	folderOverlapsLocalState: "That folder overlaps Mote's local data.",
+	localStateUnavailable: "Mote cannot open its local data.",
 	invalidLimit: "The requested wall page is not valid.",
 	assetNotFound: "That photo is no longer available.",
 	derivativeUnavailable: "Some requested previews could not be generated.",

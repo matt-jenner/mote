@@ -76,5 +76,5 @@ pub fn run() {
             commands::unwatch_wall_updates
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Photo Viewer");
+        .expect("error while running Mote");
 }

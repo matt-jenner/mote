@@ -67,7 +67,7 @@ interface ActiveWatch {
 	resyncDelivered: boolean;
 }
 
-const internalErrorMessage = "Photo Viewer could not complete that request.";
+const internalErrorMessage = "Mote could not complete that request.";
 const retryStartMs = 250;
 const retryMaximumMs = 5_000;
 const interactionRefreshMs = 10_000;

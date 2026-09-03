@@ -1,4 +1,4 @@
-# Photo Viewer
+# Mote
 
 This repository implements the catalog foundation and the second macOS desktop checkpoint for a cross-platform photo viewer. It indexes local folders and mounted network shares into a local SQLite catalog, normalizes useful metadata, tracks offline sources without discarding their records, schedules progressive background work, and manages local derivative-cache accounting.
 
@@ -143,7 +143,7 @@ To create an unsigned macOS application bundle:
 npm run desktop:build -- --bundles app
 ```
 
-The bundle is written to `apps/desktop/src-tauri/target/release/bundle/macos/Photo Viewer.app`. Because it is unsigned, macOS may require you to approve it through the normal local-app security flow before first launch.
+The bundle is written to `apps/desktop/src-tauri/target/release/bundle/macos/Mote.app`. Because it is unsigned, macOS may require you to approve it through the normal local-app security flow before first launch.
 
 ## Start the health service
 

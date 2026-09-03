@@ -10,7 +10,7 @@ use photo_server::{AppState, ServerConfig, StaticWebRoot, build_router};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-const INDEX: &str = r#"<!doctype html><title>Photo Viewer</title><script type="module" src="/assets/app-immutable.js"></script>"#;
+const INDEX: &str = r#"<!doctype html><title>Mote</title><script type="module" src="/assets/app-immutable.js"></script>"#;
 const JAVASCRIPT: &str = "globalThis.photoViewer = true;";
 const BROTLI_JAVASCRIPT: &[u8] = b"precompressed-javascript";
 const BROTLI_INDEX: &[u8] = b"precompressed-index";

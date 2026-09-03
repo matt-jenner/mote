@@ -602,7 +602,7 @@ describe("HTTP PhotoService", () => {
 			await expect(act(service)).rejects.toEqual(
 				expect.objectContaining({
 					code: "internal",
-					message: "Photo Viewer could not complete that request.",
+					message: "Mote could not complete that request.",
 				}),
 			);
 		},

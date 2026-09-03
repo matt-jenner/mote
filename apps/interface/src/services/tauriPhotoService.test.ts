@@ -205,7 +205,7 @@ describe("Tauri PhotoService", () => {
 			expect(error).toBeInstanceOf(PhotoServiceError);
 			expect(error).toMatchObject({
 				code: "internal",
-				message: "Photo Viewer could not complete that request.",
+				message: "Mote could not complete that request.",
 			});
 			expect((error as Error).message).not.toContain("/Users/private");
 		}
