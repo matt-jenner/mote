@@ -6,6 +6,20 @@ Run the native app with the [macOS desktop development workflow](#run-the-macos-
 
 Source media is read-only. Production code never writes, renames, or deletes files under a configured photo root. SQLite state and generated derivatives stay in explicit local data and cache directories; do not place either directory inside a photo source.
 
+## Mote brand assets
+
+The approved Mote identity, fonts, logos, application icons, PWA assets, and print files live in [`docs/brand/`](docs/brand/). Start with the [brand asset and usage guide](docs/brand/README.md).
+
+Common downloads:
+
+- [Horizontal logo for light backgrounds](docs/brand/svg/mote-lockup-horizontal-light.svg)
+- [Horizontal logo for dark backgrounds](docs/brand/svg/mote-lockup-horizontal-dark.svg)
+- [macOS application icon](docs/brand/icons/macos/Mote.icns)
+- [Windows application icon](docs/brand/icons/windows/Mote.ico)
+- [Linux application icons](docs/brand/icons/linux/hicolor/)
+- [Hosted web and PWA icons](docs/brand/icons/web/)
+- [Printable brand sheet](docs/brand/print/mote-brand-sheet-a4.pdf)
+
 ## Requirements
 
 - Rust 1.97.1 installed through [rustup](https://rustup.rs/)

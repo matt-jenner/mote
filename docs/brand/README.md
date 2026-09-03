@@ -25,6 +25,89 @@ Mote uses a pair of equal overlapping photo frames with opposing crop corners, F
 
 The desktop packages all use the same symbol. Their differences are limited to required file formats, sizes, canvas padding, and small-size optical correction.
 
+## Where the brand lives
+
+| What | Location | Notes |
+| --- | --- | --- |
+| Brand colours, name, tagline, and wordmark axes | [`tools/config.mjs`](tools/config.mjs) | Source of truth for generated assets |
+| Symbol, wordmark, and lockup geometry | [`tools/svg.mjs`](tools/svg.mjs) | Source of truth for vector artwork |
+| Ready-to-use logos | [`svg/`](svg/) | Outlined SVGs for light and dark backgrounds |
+| Font files and licence | [`fonts/`](fonts/) | TTF, WOFF2, SIL OFL, checksums, and CSS settings |
+| Desktop application icons | [`icons/macos/`](icons/macos/), [`icons/windows/`](icons/windows/), [`icons/linux/`](icons/linux/) | Platform packages built from the same symbol |
+| Hosted web and PWA icons | [`icons/web/`](icons/web/) | Favicons, touch icon, manifest icons, maskable icons, and monochrome service mark |
+| Print and documentation files | [`print/`](print/) | SVG and 3000 px lockups plus the A4 reference PDF |
+| Review images | [`previews/`](previews/) | Contact sheet, PDF render, and small-size checks |
+| Product UI theme tokens | [`../../apps/interface/src/styles/tokens.css`](../../apps/interface/src/styles/tokens.css) | Application colours, spacing, controls, and appearance modes |
+
+The brand configuration and application theme are separate on purpose. Changing a value in `tools/config.mjs` updates generated brand files after regeneration. It does not rewrite `apps/interface/src/styles/tokens.css` or change the running application.
+
+## Using the assets
+
+### Logos in the interface
+
+Use the outlined SVG exports when the exact Mote logo is required. Copy the files your build needs into its public asset directory. Do not recreate the wordmark with live text.
+
+For a site that follows the operating-system appearance:
+
+```html
+<picture>
+  <source
+    media="(prefers-color-scheme: dark)"
+    srcset="/brand/mote-lockup-horizontal-dark.svg"
+  >
+  <img
+    src="/brand/mote-lockup-horizontal-light.svg"
+    alt="Mote"
+    width="312"
+    height="124"
+  >
+</picture>
+```
+
+If the application has its own light, dark, or system setting, select the matching file from application state instead of relying on `prefers-color-scheme`.
+
+Use [`mote-symbol-light.svg`](svg/mote-symbol-light.svg) or [`mote-symbol-dark.svg`](svg/mote-symbol-dark.svg) when there is no room for the wordmark. Use [`mote-symbol-monochrome-dark.svg`](svg/mote-symbol-monochrome-dark.svg) on light one-colour surfaces and [`mote-symbol-monochrome-light.svg`](svg/mote-symbol-monochrome-light.svg) on dark one-colour surfaces.
+
+### Colour and type in product styles
+
+The canonical brand values are:
+
+```css
+:root {
+  --mote-green: #45a06b;
+  --mote-graphite: #171a1f;
+  --mote-white: #f7f8fa;
+  --mote-grey: #b9c1c9;
+}
+```
+
+Use Mote green for brand emphasis, selection, progress, and focus accents where it meets the contrast requirement for the surrounding UI. Keep normal body text in the application's existing text tokens.
+
+Load Fredoka from [`fonts/Fredoka-Variable.woff2`](fonts/Fredoka-Variable.woff2) when editable brand text is needed:
+
+```css
+@font-face {
+  font-family: "Fredoka";
+  src: url("/fonts/Fredoka-Variable.woff2") format("woff2-variations");
+  font-style: normal;
+  font-weight: 300 700;
+  font-stretch: 75% 125%;
+  font-display: swap;
+}
+
+.mote-brand-text {
+  font-family: "Fredoka", sans-serif;
+  font-variation-settings: "wght" 400, "wdth" 96;
+  letter-spacing: -0.035em;
+}
+```
+
+The [font notes](fonts/README.md) record the exact axes, checksums, source, and licence terms. Ship [`fonts/OFL.txt`](fonts/OFL.txt) whenever either font binary is redistributed.
+
+### Documentation and print
+
+Use the scalable [`mote-lockup-light.svg`](print/mote-lockup-light.svg) or [`mote-lockup-dark.svg`](print/mote-lockup-dark.svg) for documents. The corresponding [`light`](print/mote-lockup-light-3000.png) and [`dark`](print/mote-lockup-dark-3000.png) 3000 px PNG files suit tools that do not import SVG cleanly. The [`A4 brand sheet`](print/mote-brand-sheet-a4.pdf) is the compact printable reference.
+
 ## Identity
 
 | Role | Value |
