@@ -2,11 +2,12 @@ import react from "@vitejs/plugin-react";
 import { playwright } from "@vitest/browser-playwright";
 import { defineConfig } from "vitest/config";
 
+const browserOptimizeDeps = {
+	include: ["@tauri-apps/api/core", "lucide-react", "react-dom/client"],
+};
+
 export default defineConfig({
 	plugins: [react()],
-	optimizeDeps: {
-		include: ["lucide-react"],
-	},
 	test: {
 		projects: [
 			{
@@ -18,6 +19,7 @@ export default defineConfig({
 			},
 			{
 				plugins: [react()],
+				optimizeDeps: browserOptimizeDeps,
 				test: {
 					name: "browser",
 					include: ["src/**/*.browser.test.tsx"],
@@ -33,6 +35,7 @@ export default defineConfig({
 			},
 			{
 				plugins: [react()],
+				optimizeDeps: browserOptimizeDeps,
 				test: {
 					name: "browser-motion",
 					include: ["src/**/*.motion.test.tsx"],
@@ -48,6 +51,7 @@ export default defineConfig({
 			},
 			{
 				plugins: [react()],
+				optimizeDeps: browserOptimizeDeps,
 				test: {
 					name: "browser-contrast",
 					include: ["src/**/*.contrast.test.tsx"],

@@ -29,7 +29,7 @@ pub struct CacheReconcileReport {
 #[derive(Clone)]
 pub struct CacheWriter {
     root: PathBuf,
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(all(any(test, debug_assertions), unix))]
     path_race_test_hook: TestHook,
     #[cfg(any(test, debug_assertions))]
     replace_failure_test_hook: std::sync::Arc<AtomicBool>,
@@ -56,7 +56,7 @@ impl CacheWriter {
         std::fs::create_dir_all(root)?;
         Ok(Self {
             root: root.canonicalize()?,
-            #[cfg(any(test, debug_assertions))]
+            #[cfg(all(any(test, debug_assertions), unix))]
             path_race_test_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, debug_assertions))]
             replace_failure_test_hook: std::sync::Arc::new(AtomicBool::new(false)),
@@ -71,7 +71,7 @@ impl CacheWriter {
     /// component is opened or unlinked.  This narrow seam is only available
     /// in test/debug builds so Unix/macOS race behavior can be exercised
     /// deterministically without weakening normal path handling.
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(all(any(test, debug_assertions), unix))]
     #[doc(hidden)]
     pub fn install_path_race_test_hook(&self, hook: std::sync::Arc<dyn Fn() + Send + Sync>) {
         *self
@@ -80,7 +80,7 @@ impl CacheWriter {
             .expect("cache path race hook poisoned") = Some(hook);
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(all(any(test, debug_assertions), unix))]
     fn run_path_race_test_hook(&self) {
         let hook = self
             .path_race_test_hook
@@ -636,7 +636,7 @@ impl CacheWriter {
             if !file.metadata()?.is_file() || !descriptor_is_contained(&file, &self.root) {
                 return Err(CacheError::PathEscape);
             }
-            return Ok(file);
+            Ok(file)
         }
     }
 
@@ -654,18 +654,18 @@ impl CacheWriter {
         {
             self.remove_checked_unix(relative_path)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            #[cfg(windows)]
-            {
-                return self.remove_checked_windows(relative_path);
-            }
+            self.remove_checked_windows(relative_path)
+        }
+        #[cfg(all(not(unix), not(windows)))]
+        {
             let path = self.resolve_checked(relative_path)?;
-            return match std::fs::remove_file(path) {
+            match std::fs::remove_file(path) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(error.into()),
-            };
+            }
         }
     }
 
@@ -845,7 +845,7 @@ impl CacheWriter {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(all(not(unix), not(windows)))]
     fn create_safe_directories(&self, parent: &Path) -> Result<(), CacheError> {
         let relative = parent
             .strip_prefix(&self.root)
@@ -891,7 +891,7 @@ impl CacheWriter {
 
         let mut guards = Vec::new();
         let mut current = self.root.clone();
-        let mut open_directory = |path: &Path| -> Result<File, CacheError> {
+        let open_directory = |path: &Path| -> Result<File, CacheError> {
             let metadata = match std::fs::symlink_metadata(path) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1048,7 +1048,7 @@ fn descriptor_is_contained(file: &File, root: &Path) -> bool {
     let mut buffer = vec![0_u16; 32_768];
     let length = unsafe {
         GetFinalPathNameByHandleW(
-            file.as_raw_handle() as *mut std::ffi::c_void,
+            file.as_raw_handle(),
             buffer.as_mut_ptr(),
             u32::try_from(buffer.len()).unwrap_or(u32::MAX),
             0,
