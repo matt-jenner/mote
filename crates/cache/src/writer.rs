@@ -1110,13 +1110,20 @@ fn rename_file_by_handle_windows(
         fn GetLastError() -> u32;
     }
     const FILE_RENAME_INFO_CLASS: u32 = 3;
-    let wide = file_name.encode_wide().collect::<Vec<_>>();
+    let mut wide = file_name.encode_wide().collect::<Vec<_>>();
     let name_bytes = wide
         .len()
         .checked_mul(std::mem::size_of::<u16>())
         .ok_or_else(|| std::io::Error::other("replacement name is too long"))?;
+    // FileNameLength excludes the terminator, but Windows still expects the
+    // variable-length FILE_RENAME_INFO buffer to contain it.
+    wide.push(0);
+    let name_storage_bytes = wide
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| std::io::Error::other("replacement name is too long"))?;
     let info_size = std::mem::offset_of!(FileRenameInfo, file_name)
-        .checked_add(name_bytes)
+        .checked_add(name_storage_bytes)
         .ok_or_else(|| std::io::Error::other("replacement metadata is too large"))?;
     let words = info_size.div_ceil(std::mem::size_of::<usize>());
     let mut storage = vec![0_usize; words];
