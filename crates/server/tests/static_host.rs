@@ -6,7 +6,9 @@ use axum::http::header::{
 use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use photo_catalog::Catalog;
-use photo_server::{AppState, ServerConfig, StaticWebRoot, build_router};
+#[cfg(unix)]
+use photo_server::ServerConfig;
+use photo_server::{AppState, StaticWebRoot, build_router};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
