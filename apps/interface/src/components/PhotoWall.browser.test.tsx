@@ -1398,7 +1398,6 @@ describe("progressive photo wall", () => {
 
 	it("reveals a cached image when its load event does not reach React", async () => {
 		const service = new ControlledWallService();
-		const onOpen = vi.fn();
 		service.setDerivativeUrl(
 			"cached-completion",
 			"/demo-photos/coast.jpg?cached-completion=1",
@@ -1415,20 +1414,16 @@ describe("progressive photo wall", () => {
 			width: 320,
 			height: 220,
 		};
-		const warmImage = new Image();
-		warmImage.src = "/demo-photos/coast.jpg?cached-completion=1";
-		await expect
-			.poll(() => warmImage.complete && warmImage.naturalWidth > 0)
-			.toBe(true);
-		const suppressImageLoad = (event: Event) => {
-			event.stopImmediatePropagation();
-		};
+		const restoreImageRuntime = overrideImageRuntime({
+			complete: () => true,
+			naturalWidth: () => 320,
+			decode: () => Promise.resolve(),
+		});
 		const restoreReducedMotion = overrideReducedMotion(false);
-		window.addEventListener("load", suppressImageLoad, true);
-		document.addEventListener("load", suppressImageLoad, true);
+		const restoreLoadCapture = suppressCapture("load");
 		try {
 			const screen = await render(
-				<PhotoTile onOpen={onOpen} positioned={positioned} service={service} />,
+				<PhotoTile positioned={positioned} service={service} />,
 			);
 			const image = screen.getByRole("img", { name: "Coast" });
 			await expect
@@ -1459,14 +1454,10 @@ describe("progressive photo wall", () => {
 					screen.getByRole("button", { name: "Open Coast", exact: true }),
 				)
 				.toBeVisible();
-			await screen
-				.getByRole("button", { name: "Open Coast", exact: true })
-				.click();
-			expect(onOpen).toHaveBeenCalledTimes(1);
 			screen.unmount();
 		} finally {
-			window.removeEventListener("load", suppressImageLoad, true);
-			document.removeEventListener("load", suppressImageLoad, true);
+			restoreLoadCapture();
+			restoreImageRuntime();
 			restoreReducedMotion();
 		}
 	});

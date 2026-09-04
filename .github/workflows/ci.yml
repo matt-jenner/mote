@@ -16,7 +16,10 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace --all-features
+      - if: runner.os != 'Windows'
+        run: cargo test --workspace --all-features
+      - if: runner.os == 'Windows'
+        run: cargo test --workspace --all-features -- --test-threads=1
       - run: cargo test -p catalog-bench --test benchmark_smoke
 
   interface:

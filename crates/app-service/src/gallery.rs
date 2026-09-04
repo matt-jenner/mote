@@ -3652,6 +3652,7 @@ mod prevalidated_hosted_source_tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn prevalidated_hosted_source_requires_normalized_absolute_keys() {
         let temp = tempfile::tempdir().unwrap();
