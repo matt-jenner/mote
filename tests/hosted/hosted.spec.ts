@@ -458,22 +458,20 @@ test(`hosted lifecycle phase: ${phase}`, async ({ browser, baseURL }) => {
 		try {
 			const pageA = await contextA.newPage();
 			const pageB = await contextB.newPage();
-			const [a, b] = await Promise.all([
-				configureBrowser(pageA, {
+			const a = await configureBrowser(pageA, {
 					folder: "A",
 					appearance: "dark",
 					scope: "currentFolder",
 					sort: "oldestFirst",
 					firstFilename: "a-01.jpg",
-				}),
-				configureBrowser(pageB, {
+				});
+			const b = await configureBrowser(pageB, {
 					folder: "B",
 					appearance: "light",
 					scope: "includeSubfolders",
 					sort: "newestFirst",
 					firstFilename: "b-01.jpg",
-				}),
-			]);
+				});
 			await assertChildStartsUncached(pageA, a.selectionId);
 			expect(a.selectionId).not.toBe(b.selectionId);
 			expect(a.clientId).not.toBe(b.clientId);

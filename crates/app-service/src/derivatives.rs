@@ -4797,7 +4797,11 @@ mod tests {
         };
         let (left_result, right_result) = tokio::join!(make_commit(left), make_commit(right));
         let outcomes = [left_result.unwrap(), right_result.unwrap()];
-        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "screen-preview commit outcomes: {outcomes:#?}"
+        );
         assert_eq!(outcomes.iter().filter(|result| result.is_err()).count(), 1);
         assert!(outcomes.iter().any(|result| {
             matches!(

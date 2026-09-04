@@ -19,6 +19,8 @@ jobs:
       - if: runner.os != 'Windows'
         run: cargo test --workspace --all-features
       - if: runner.os == 'Windows'
+        run: cargo test -p photo-cache --all-features -- --test-threads=1
+      - if: runner.os == 'Windows'
         run: cargo test --workspace --all-features -- --test-threads=1
       - run: cargo test -p catalog-bench --test benchmark_smoke
 
