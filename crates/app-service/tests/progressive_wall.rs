@@ -850,7 +850,7 @@ async fn wall_cursor_is_rejected_after_switching_folder_groups() {
     ));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn unavailable_reopen_retains_cached_wall_and_emits_source_unavailable() {
     let fixture = ProgressiveFixture::new(12);
     let (reader, release) = BlockingReader::new();
@@ -873,12 +873,12 @@ async fn unavailable_reopen_retains_cached_wall_and_emits_source_unavailable() {
     let reopened =
         AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
             .unwrap();
+    let mut updates = reopened.subscribe_wall_updates();
     let cached = reopened
         .query_wall(query(SortDirection::NewestFirst))
         .await
         .unwrap();
     assert_eq!(cached.items.len(), 12);
-    let mut updates = reopened.subscribe_wall_updates();
     recv_until(&mut updates, |event| {
         matches!(event, WallUpdate::SourceUnavailable { .. })
     })
@@ -898,7 +898,7 @@ async fn unavailable_reopen_retains_cached_wall_and_emits_source_unavailable() {
     std::fs::rename(unavailable, &fixture.source).unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn unavailable_selected_child_marks_only_its_group_offline() {
     let fixture = ProgressiveFixture::new(4);
     let child = fixture.source.join("child");
