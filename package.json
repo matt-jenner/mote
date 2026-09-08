@@ -17,6 +17,7 @@
 		"desktop:build": "npm exec --workspace @photo-viewer/desktop -- tauri build",
 		"test:deployment": "node --test tests/deployment/*.test.mjs",
 		"test:flatpak": "node --test tests/packaging/*.test.mjs",
+		"flatpak": "bash scripts/flatpak.sh",
 		"typecheck": "npm run typecheck --workspace @photo-viewer/interface",
 		"test": "npm run test --workspace @photo-viewer/interface",
 		"test:browser": "npm run test:browser --workspace @photo-viewer/interface",
