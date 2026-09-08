@@ -12,7 +12,9 @@
 
 ## Global Constraints
 
-- The application ID is exactly `io.github.matt_jenner.mote` on every desktop platform.
+- Flatpak/Flathub uses `io.github.matt_jenner.mote`; Tauri/macOS uses
+  `io.github.matt-jenner.mote`. Flathub demangles the former to GitHub owner
+  `matt-jenner`, while Tauri rejects underscores.
 - No migration from `app.photoviewer.desktop` data or cache paths is included.
 - The installed Linux executable is `mote`.
 - The runtime and SDK are `org.gnome.Platform//49` and `org.gnome.Sdk//49`.
@@ -35,7 +37,8 @@
 
 **Interfaces:**
 - Consumes: Tauri's `identifier` configuration and existing profile documentation
-- Produces: permanent application ID `io.github.matt_jenner.mote` for every later packaging task
+- Produces: the permanent Tauri/macOS ID `io.github.matt-jenner.mote`; later
+  Flatpak packaging continues to use `io.github.matt_jenner.mote`.
 
 - [ ] **Step 1: Add a failing application-ID test**
 
@@ -56,8 +59,8 @@ const tauriConfig = JSON.parse(
 Add this test after the existing icon tests:
 
 ```js
-test("Tauri uses the permanent Mote application identifier", () => {
-	assert.equal(tauriConfig.identifier, "io.github.matt_jenner.mote");
+test("Tauri uses the hyphenated Mote application identifier", () => {
+	assert.equal(tauriConfig.identifier, "io.github.matt-jenner.mote");
 });
 ```
 
@@ -66,7 +69,7 @@ test("Tauri uses the permanent Mote application identifier", () => {
 Run:
 
 ```bash
-npm run brand:test -- --test-name-pattern="permanent Mote application identifier"
+npm run brand:test -- --test-name-pattern="hyphenated Mote application identifier"
 ```
 
 Expected: FAIL because the actual value is `app.photoviewer.desktop`.
@@ -76,16 +79,16 @@ Expected: FAIL because the actual value is `app.photoviewer.desktop`.
 In `apps/desktop/src-tauri/tauri.conf.json`, set:
 
 ```json
-"identifier": "io.github.matt_jenner.mote"
+"identifier": "io.github.matt-jenner.mote"
 ```
 
 In the macOS development section of `README.md`, replace the identifier and paths with:
 
 ```markdown
-per-user macOS paths below the `io.github.matt_jenner.mote` Tauri identifier:
+per-user macOS paths below the `io.github.matt-jenner.mote` Tauri identifier:
 
-- `~/Library/Application Support/io.github.matt_jenner.mote/profiles/<profile>/catalog.sqlite`
-- `~/Library/Caches/io.github.matt_jenner.mote/profiles/<profile>/`
+- `~/Library/Application Support/io.github.matt-jenner.mote/profiles/<profile>/catalog.sqlite`
+- `~/Library/Caches/io.github.matt-jenner.mote/profiles/<profile>/`
 ```
 
 - [ ] **Step 4: Run identity and desktop tests**
@@ -117,7 +120,7 @@ git commit -m "build: adopt permanent Mote application id"
 - Modify: `package.json`
 
 **Interfaces:**
-- Consumes: permanent application ID from Task 1 and approved Linux icon assets
+- Consumes: the Flatpak application ID and approved Linux icon assets
 - Produces: freedesktop launcher and AppStream component metadata installed by Task 3
 
 - [ ] **Step 1: Add failing metadata contract tests**

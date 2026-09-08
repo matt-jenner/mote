@@ -20,15 +20,16 @@ the application does not receive blanket access to the host filesystem.
 
 ## Application identity
 
-Change the desktop application identifier from `app.photoviewer.desktop` to
-`io.github.matt_jenner.mote` on every desktop platform. The Flatpak manifest,
-desktop entry, AppStream metadata, icons, and Tauri configuration use this exact
-identifier.
+Use `io.github.matt_jenner.mote` as the Flatpak/Flathub application ID. The
+Flatpak manifest, desktop entry, AppStream metadata, and Linux icons use this
+exact identifier. Flathub demangles the underscore to the GitHub owner
+`matt-jenner`. Use `io.github.matt-jenner.mote` as Tauri's desktop/macOS
+identifier because Tauri rejects underscores.
 
 No migration from the old application-data paths is included. There are no
 development profiles that need preserving, and Mote has not shipped a signed
-public desktop release under the old identifier. Documentation and tests that
-name the old paths are updated to the new identifier.
+public desktop release under either new identifier. Documentation and tests that
+name the old paths are updated to the appropriate platform identifier.
 
 The installed Linux executable is named `mote`.
 
@@ -53,7 +54,7 @@ interface, Tauri shell, shared Rust crates, brand assets, and metadata.
 
 The build installs the release binary directly into `/app/bin/mote`, along with
 the desktop entry, AppStream metadata, and existing Mote icons under names that
-match the application identifier.
+match the Flatpak application ID.
 
 Only x86-64 is an acceptance target for this phase. The manifest and packaging
 scripts must not embed x86-64 paths or assumptions that would prevent a later
@@ -138,8 +139,9 @@ and automatic updates are outside this phase.
 
 Automated repository tests verify:
 
-- the identifier matches in the Tauri config, Flatpak manifest, desktop entry,
-  AppStream metadata, and installed icon names
+- Tauri config uses `io.github.matt-jenner.mote`, while the Flatpak manifest,
+  desktop entry, AppStream metadata, and installed icon names use
+  `io.github.matt_jenner.mote`
 - the manifest contains no blanket filesystem, network, or source-write
   permission
 - the manifest uses the specified runtime and SDK extensions

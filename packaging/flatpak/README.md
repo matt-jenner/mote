@@ -1,8 +1,10 @@
 # Mote Flatpak
 
-Mote is built from locked source inside GNOME SDK 49. The installed app uses the
-ID `io.github.matt_jenner.mote` and receives photo-folder access only through the
-desktop file chooser portal.
+Mote is built from locked source inside GNOME SDK 49. The installed Flatpak app
+uses the ID `io.github.matt_jenner.mote` and receives photo-folder access only
+through the desktop file chooser portal. Flatpak uses the underscore because
+Flathub demangles it to the GitHub owner `matt-jenner`; Tauri rejects
+underscores, so its macOS identifier is `io.github.matt-jenner.mote`.
 
 ## Host setup
 

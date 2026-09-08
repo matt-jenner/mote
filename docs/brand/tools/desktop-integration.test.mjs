@@ -33,6 +33,6 @@ test("Tauri ships the approved Mote ICNS icon", () => {
 	);
 });
 
-test("Tauri uses the permanent Mote application identifier", () => {
-	assert.equal(tauriConfig.identifier, "io.github.matt_jenner.mote");
+test("Tauri uses the hyphenated Mote application identifier", () => {
+	assert.equal(tauriConfig.identifier, "io.github.matt-jenner.mote");
 });

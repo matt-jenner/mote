@@ -38,6 +38,14 @@ test("Flatpak guide covers both local distributions and defers CI", () => {
 	}
 });
 
+test("Flatpak guide distinguishes its ID from Tauri's macOS identifier", () => {
+	const guide = read("README.md");
+	assert.match(guide, /io\.github\.matt_jenner\.mote/);
+	assert.match(guide, /io\.github\.matt-jenner\.mote/);
+	assert.match(guide, /Flathub.*demangle.*matt-jenner/is);
+	assert.match(guide, /Tauri.*reject.*underscore/is);
+});
+
 test("desktop entry launches Mote with the permanent application ID", () => {
 	const desktop = read(`${APP_ID}.desktop`);
 	for (const line of [
