@@ -28,6 +28,8 @@ test("Flatpak guide covers both local distributions and defers CI", () => {
 		"io.github.matt_jenner.mote",
 		"GitHub Actions is deferred",
 		"portal",
+		"x86-64 is the current acceptance architecture",
+		"ARM builds and Flathub publication are deferred",
 	]) {
 		assert.ok(
 			guide.toLowerCase().includes(text.toLowerCase()),
