@@ -18,6 +18,24 @@ function sha256(filename) {
 	return createHash("sha256").update(fs.readFileSync(filename)).digest("hex");
 }
 
+test("Flatpak guide covers both local distributions and defers CI", () => {
+	const guide = read("README.md");
+	for (const text of [
+		"Omarchy or Arch Linux",
+		"Fedora",
+		"npm run flatpak -- package",
+		"npm run flatpak -- install",
+		"io.github.matt_jenner.mote",
+		"GitHub Actions is deferred",
+		"portal",
+	]) {
+		assert.ok(
+			guide.toLowerCase().includes(text.toLowerCase()),
+			`missing guide text: ${text}`,
+		);
+	}
+});
+
 test("desktop entry launches Mote with the permanent application ID", () => {
 	const desktop = read(`${APP_ID}.desktop`);
 	for (const line of [

@@ -154,6 +154,13 @@ npm run desktop:build -- --bundles app
 
 The bundle is written to `apps/desktop/src-tauri/target/release/bundle/macos/Mote.app`. Because it is unsigned, macOS may require you to approve it through the normal local-app security flow before first launch.
 
+## Build and run the Linux Flatpak
+
+Mote's distribution-independent Linux package is built from source with
+`flatpak-builder` and uses portal-only folder access. Follow the
+[Flatpak build and installation guide](packaging/flatpak/README.md) to create a
+local `.flatpak` bundle, install it on this workstation, or copy it to Fedora.
+
 ## Start the health service
 
 The service requires explicit local directories and binds to loopback port 8080 by default:
