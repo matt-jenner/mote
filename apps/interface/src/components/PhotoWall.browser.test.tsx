@@ -3307,6 +3307,7 @@ describe("progressive photo wall", () => {
 	it("does not announce an empty result until scan completion and all pages are exhausted", async () => {
 		const service = new ControlledWallService();
 		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
 		service.releaseQuery(0, pageOf([]));
 		await expect
 			.element(screen.getByRole("status"))
@@ -3343,6 +3344,7 @@ describe("progressive photo wall", () => {
 	it("reports interaction quieting, retry, and source swaps without stale assets", async () => {
 		const service = new ControlledWallService();
 		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
 		service.rejectQuery(0);
 		await expect
 			.element(screen.getByRole("button", { name: "Retry" }))
@@ -3409,10 +3411,14 @@ describe("progressive photo wall", () => {
 		try {
 			const service = new ControlledWallService();
 			const screen = await renderWall(service);
-			queued.splice(0).forEach((callback) => {
-				callback();
-			});
-			await expect.poll(() => service.queryRequests.length).toBe(1);
+			await expect
+				.poll(() => {
+					queued.splice(0).forEach((callback) => {
+						callback();
+					});
+					return service.queryRequests.length;
+				})
+				.toBe(1);
 			service.emit({
 				kind: "metadataSettled",
 				selectionId: "source-a",

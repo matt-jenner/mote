@@ -43,12 +43,21 @@ CI runs these checks, plus the 10,000-asset benchmark smoke test, on Ubuntu, mac
 
 ## Install and verify the interface
 
-Install the locked Node dependencies and Playwright's WebKit browser:
+Install the locked Node dependencies and Playwright's browser for the current
+platform. Browser tests use WebKit on macOS and Chromium elsewhere:
 
 ```bash
 npm ci
-npm exec playwright install webkit
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  npm exec playwright install webkit
+else
+  npm exec playwright install chromium
+fi
 ```
+
+On Arch Linux, the browser tests use the system Chromium at
+`/usr/bin/chromium` when it is installed. Set `MOTE_CHROMIUM_PATH` to use a
+different system Chromium executable.
 
 Run the interface checks:
 
