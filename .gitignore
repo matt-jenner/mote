@@ -6,3 +6,6 @@ apps/interface/dist/
 apps/interface/.vite/
 apps/interface/tsconfig.tsbuildinfo
 runtime/
+.flatpak-builder/
+build/flatpak/
+dist/flatpak/

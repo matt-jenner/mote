@@ -1,0 +1,56 @@
+id: io.github.matt_jenner.mote
+runtime: org.gnome.Platform
+runtime-version: "49"
+sdk: org.gnome.Sdk
+command: mote
+default-branch: stable
+
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.node24
+  - org.freedesktop.Sdk.Extension.rust-stable
+
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --share=ipc
+
+modules:
+  - name: mote
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/node24/bin:/usr/lib/sdk/rust-stable/bin
+      env:
+        HOME: /run/build/mote
+        CARGO_HOME: /run/build/mote/cargo-home
+        CARGO_NET_OFFLINE: "true"
+        XDG_CACHE_HOME: /run/build/mote/flatpak-node/cache
+        npm_config_cache: /run/build/mote/flatpak-node/npm-cache
+        npm_config_nodedir: /usr/lib/sdk/node24
+        npm_config_offline: "true"
+    build-commands:
+      - install -Dm0644 cargo/config .cargo/config.toml
+      - npm ci --offline
+      - npm run desktop:build -- --no-bundle --ci
+      - install -Dm0755 apps/desktop/src-tauri/target/release/photo-viewer-desktop /app/bin/mote
+      - install -Dm0644 packaging/flatpak/io.github.matt_jenner.mote.desktop /app/share/applications/io.github.matt_jenner.mote.desktop
+      - install -Dm0644 packaging/flatpak/io.github.matt_jenner.mote.metainfo.xml /app/share/metainfo/io.github.matt_jenner.mote.metainfo.xml
+      - |
+        for size in 16x16 24x24 32x32 48x48 64x64 128x128 256x256 512x512; do
+          install -Dm0644 "docs/brand/icons/linux/hicolor/${size}/apps/mote.png" "/app/share/icons/hicolor/${size}/apps/io.github.matt_jenner.mote.png"
+        done
+      - install -Dm0644 docs/brand/icons/linux/hicolor/scalable/apps/mote.svg /app/share/icons/hicolor/scalable/apps/io.github.matt_jenner.mote.svg
+      - install -Dm0644 docs/brand/icons/linux/hicolor/scalable/apps/mote-symbolic.svg /app/share/icons/hicolor/scalable/apps/io.github.matt_jenner.mote-symbolic.svg
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - .flatpak-builder
+          - .git
+          - node_modules
+          - target
+          - apps/desktop/src-tauri/target
+          - apps/interface/dist
+          - dist
+      - generated/cargo-sources.json
+      - generated/node-sources.json

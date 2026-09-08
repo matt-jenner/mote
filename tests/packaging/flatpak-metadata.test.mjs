@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { XMLParser } from "fast-xml-parser";
+import { parse } from "yaml";
 
 const APP_ID = "io.github.matt_jenner.mote";
 const root = path.resolve(import.meta.dirname, "../..");
@@ -75,5 +76,71 @@ test("approved Linux icons cover Flatpak desktop integration", () => {
 				"docs/brand/icons/linux/hicolor/scalable/apps/mote-symbolic.svg",
 			),
 		),
+	);
+});
+
+test("manifest pins the approved runtime and build SDKs", () => {
+	const manifest = parse(read(`${APP_ID}.yml`));
+	assert.equal(manifest.id, APP_ID);
+	assert.equal(manifest.runtime, "org.gnome.Platform");
+	assert.equal(manifest["runtime-version"], "49");
+	assert.equal(manifest.sdk, "org.gnome.Sdk");
+	assert.equal(manifest.command, "mote");
+	assert.equal(manifest["default-branch"], "stable");
+	assert.deepEqual(manifest["sdk-extensions"], [
+		"org.freedesktop.Sdk.Extension.node24",
+		"org.freedesktop.Sdk.Extension.rust-stable",
+	]);
+});
+
+test("manifest grants display acceleration without host file or network access", () => {
+	const manifest = parse(read(`${APP_ID}.yml`));
+	assert.deepEqual(manifest["finish-args"], [
+		"--socket=wayland",
+		"--socket=fallback-x11",
+		"--device=dri",
+		"--share=ipc",
+	]);
+	const serialized = JSON.stringify(manifest["finish-args"]);
+	assert.doesNotMatch(
+		serialized,
+		/--filesystem|--share=network|--socket=session-bus|--socket=system-bus/,
+	);
+});
+
+test("manifest builds npm and Cargo offline and installs matching metadata", () => {
+	const manifest = parse(read(`${APP_ID}.yml`));
+	const module = manifest.modules.find(({ name }) => name === "mote");
+	assert.equal(module.buildsystem, "simple");
+	assert.equal(module["build-options"].env.CARGO_NET_OFFLINE, "true");
+	assert.equal(module["build-options"].env.npm_config_offline, "true");
+	assert.match(module["build-options"]["append-path"], /node24/);
+	assert.match(module["build-options"]["append-path"], /rust-stable/);
+	const commands = module["build-commands"].join("\n");
+	assert.match(commands, /npm ci --offline/);
+	assert.match(commands, /desktop:build -- --no-bundle --ci/);
+	assert.match(commands, /target\/release\/photo-viewer-desktop/);
+	assert.ok(commands.includes(`${APP_ID}.desktop`));
+	assert.ok(commands.includes(`${APP_ID}.metainfo.xml`));
+	assert.match(
+		commands,
+		/for size in 16x16 24x24 32x32 48x48 64x64 128x128 256x256 512x512/,
+	);
+	assert.ok(
+		commands.includes(`/app/share/icons/hicolor/\${size}/apps/${APP_ID}.png`),
+	);
+	assert.ok(
+		commands.includes(`/app/share/icons/hicolor/scalable/apps/${APP_ID}.svg`),
+	);
+	assert.ok(
+		commands.includes(
+			`/app/share/icons/hicolor/scalable/apps/${APP_ID}-symbolic.svg`,
+		),
+	);
+	assert.ok(
+		module.sources.some((source) => source === "generated/cargo-sources.json"),
+	);
+	assert.ok(
+		module.sources.some((source) => source === "generated/node-sources.json"),
 	);
 });
