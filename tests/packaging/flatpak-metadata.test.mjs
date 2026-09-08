@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -11,6 +12,10 @@ const packaging = path.join(root, "packaging/flatpak");
 
 function read(filename) {
 	return fs.readFileSync(path.join(packaging, filename), "utf8");
+}
+
+function sha256(filename) {
+	return createHash("sha256").update(fs.readFileSync(filename)).digest("hex");
 }
 
 test("desktop entry launches Mote with the permanent application ID", () => {
@@ -143,4 +148,31 @@ test("manifest builds npm and Cargo offline and installs matching metadata", () 
 	assert.ok(
 		module.sources.some((source) => source === "generated/node-sources.json"),
 	);
+});
+
+test("generated Flatpak sources are nonempty and match both lockfiles", () => {
+	const generated = path.join(packaging, "generated");
+	const sourceLock = JSON.parse(
+		fs.readFileSync(path.join(generated, "source-lock.json"), "utf8"),
+	);
+	assert.equal(
+		sourceLock.lockfiles["package-lock.json"],
+		sha256(path.join(root, "package-lock.json")),
+	);
+	assert.equal(
+		sourceLock.lockfiles["apps/desktop/src-tauri/Cargo.lock"],
+		sha256(path.join(root, "apps/desktop/src-tauri/Cargo.lock")),
+	);
+	assert.match(
+		sourceLock.generator.repository,
+		/^https:\/\/github\.com\/flatpak\/flatpak-builder-tools(?:\.git)?$/,
+	);
+	assert.match(sourceLock.generator.commit, /^[0-9a-f]{40}$/);
+	for (const filename of ["node-sources.json", "cargo-sources.json"]) {
+		const sources = JSON.parse(
+			fs.readFileSync(path.join(generated, filename), "utf8"),
+		);
+		assert.ok(Array.isArray(sources));
+		assert.ok(sources.length > 0);
+	}
 });

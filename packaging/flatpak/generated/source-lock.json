@@ -1,0 +1,10 @@
+{
+  "generator": {
+    "repository": "https://github.com/flatpak/flatpak-builder-tools.git",
+    "commit": "1fc32195e3e60fe5c97f0af646dec7a99df5962b"
+  },
+  "lockfiles": {
+    "package-lock.json": "8e974ed6ca3ed440bb35adb3178f0f08233aa48fb748e93a74f267a05fc3cd68",
+    "apps/desktop/src-tauri/Cargo.lock": "c23e5e86206ee9be32d09e05aa7dcde99e5754fe43504d1931344f8d0f6dc8ff"
+  }
+}
