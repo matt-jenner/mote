@@ -39,7 +39,8 @@ flatpak_arch() {
 }
 
 app_version() {
-  node -p "require('$repository_root/apps/desktop/src-tauri/tauri.conf.json').version"
+  node -p 'require(process.argv[1]).version' \
+    "$repository_root/apps/desktop/src-tauri/tauri.conf.json"
 }
 
 bundle_path() {
@@ -63,7 +64,10 @@ check_requirements() {
   flatpak-builder --show-manifest "$manifest" >/dev/null
   desktop-file-validate "$repository_root/packaging/flatpak/$app_id.desktop"
   appstreamcli validate --no-net "$repository_root/packaging/flatpak/$app_id.metainfo.xml"
-  npm run test:flatpak
+  (
+    cd -- "$repository_root"
+    npm run test:flatpak
+  )
 }
 
 build() {
@@ -85,7 +89,7 @@ bundle() {
 
 install_bundle() {
   require_command flatpak
-  flatpak install --user --noninteractive -y "$(bundle_path)"
+  flatpak install --user --noninteractive --or-update -y "$(bundle_path)"
 }
 
 case "${1:-help}" in

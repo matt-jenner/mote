@@ -36,3 +36,22 @@ test("Flatpak helper is valid Bash and never escalates privileges", () => {
 	);
 	assert.match(source, /--show-permissions/);
 });
+
+test("Flatpak helper preserves the application and bundle naming contract", () => {
+	const source = fs.readFileSync(script, "utf8");
+	assert.match(source, /app_id="io\.github\.matt_jenner\.mote"/);
+	assert.match(source, /Mote-%s-%s\.flatpak/);
+	assert.match(source, /MOTE_FLATPAK_ARCH/);
+	assert.match(source, /require\(process\.argv\[1\]\)\.version/);
+});
+
+test("Flatpak helper updates the current user's installed bundle", () => {
+	const source = fs.readFileSync(script, "utf8");
+	assert.match(source, /flatpak install --user --noninteractive --or-update/);
+});
+
+test("Flatpak validation runs from the repository root", () => {
+	const source = fs.readFileSync(script, "utf8");
+	assert.match(source, /cd -- "\$repository_root"/);
+	assert.match(source, /npm run test:flatpak/);
+});
