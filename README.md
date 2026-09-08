@@ -84,10 +84,10 @@ PHOTO_VIEWER_PROFILE=clean-demo npm run desktop:dev
 ```
 
 A named profile isolates the local SQLite catalog and generated derivatives in
-per-user macOS paths below the `app.photoviewer.desktop` Tauri identifier:
+per-user macOS paths below the `io.github.matt_jenner.mote` Tauri identifier:
 
-- `~/Library/Application Support/app.photoviewer.desktop/profiles/<profile>/catalog.sqlite`
-- `~/Library/Caches/app.photoviewer.desktop/profiles/<profile>/`
+- `~/Library/Application Support/io.github.matt_jenner.mote/profiles/<profile>/catalog.sqlite`
+- `~/Library/Caches/io.github.matt_jenner.mote/profiles/<profile>/`
 
 For the progressive wall demonstration, use a fresh profile and choose the
 checked-in `apps/interface/public/demo-photos` folder in the native picker:
