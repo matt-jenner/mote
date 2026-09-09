@@ -88,8 +88,12 @@ npm run test:flatpak
 
 Commit both generated JSON files and `source-lock.json` with the lockfile change.
 
-## CI status
+## Tagged releases
 
-GitHub Actions is deferred for this phase. The checked-in manifest, sources,
-tests, and non-interactive helper are intended to be called unchanged from a
-later Ubuntu runner.
+Publishing a GitHub Release whose tag exactly matches `v` plus the version in
+`apps/desktop/src-tauri/tauri.conf.json` runs
+`.github/workflows/release-flatpak.yml`. The workflow validates the tag before
+installing the Flatpak runtimes, builds the bundle with the same non-interactive
+helper used locally, and attaches the `.flatpak` to the existing GitHub Release.
+It has no manual trigger, so ordinary pushes and draft releases do not consume a
+Flatpak build.

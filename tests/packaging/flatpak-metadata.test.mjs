@@ -18,7 +18,7 @@ function sha256(filename) {
 	return createHash("sha256").update(fs.readFileSync(filename)).digest("hex");
 }
 
-test("Flatpak guide covers both local distributions and defers CI", () => {
+test("Flatpak guide covers local distributions and tagged releases", () => {
 	const guide = read("README.md");
 	for (const text of [
 		"Omarchy or Arch Linux",
@@ -26,7 +26,9 @@ test("Flatpak guide covers both local distributions and defers CI", () => {
 		"npm run flatpak -- package",
 		"npm run flatpak -- install",
 		"io.github.matt_jenner.mote",
-		"GitHub Actions is deferred",
+		"release-flatpak.yml",
+		"publishing a GitHub Release",
+		"attaches the `.flatpak`",
 		"portal",
 		"x86-64 is the current acceptance architecture",
 		"ARM builds and Flathub publication are deferred",
