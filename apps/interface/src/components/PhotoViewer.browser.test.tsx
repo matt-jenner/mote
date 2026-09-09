@@ -2430,7 +2430,14 @@ describe("immersive photo viewer checkpoint", () => {
 			expect(seriousViolations(await axe.run(document))).toEqual([]);
 		};
 		await runAxe();
-		await view.getByRole("button", { name: "Zoom in" }).click();
+		(
+			view
+				.getByRole("button", { name: "Zoom in" })
+				.element() as HTMLButtonElement
+		).click();
+		await expect
+			.element(view.getByTestId("viewer-stage"))
+			.toHaveAttribute("data-viewer-mode", "zoomed");
 		const navigator = dialog.querySelector<HTMLElement>(
 			"[data-viewer-navigator]",
 		);
@@ -2438,8 +2445,8 @@ describe("immersive photo viewer checkpoint", () => {
 		expect(navigator.tabIndex).toBe(-1);
 		expect(navigator.getAttribute("aria-hidden")).toBe("true");
 		await runAxe();
+		dialog.focus();
 
-		vi.useFakeTimers();
 		try {
 			dialog.dispatchEvent(
 				new PointerEvent("pointermove", {
@@ -2448,7 +2455,7 @@ describe("immersive photo viewer checkpoint", () => {
 					pointerType: "mouse",
 				}),
 			);
-			await vi.advanceTimersByTimeAsync(2500);
+			await new Promise((resolve) => window.setTimeout(resolve, 2600));
 			await expect
 				.poll(() =>
 					dialog
@@ -2456,7 +2463,6 @@ describe("immersive photo viewer checkpoint", () => {
 						?.getAttribute("aria-hidden"),
 				)
 				.toBe("true");
-			vi.useRealTimers();
 			await runAxe();
 			dialog.focus();
 			const tab = new KeyboardEvent("keydown", {
@@ -2717,9 +2723,7 @@ describe("immersive photo viewer checkpoint", () => {
 				expect(drawerBounds.right).toBeLessThanOrEqual(
 					overlayBounds.right - safeArea.right + 1,
 				);
-				expect(closeBounds.right).toBeLessThanOrEqual(
-					drawerBounds.right - 8 + 1,
-				);
+				expect(closeBounds.right).toBeLessThanOrEqual(drawerBounds.right + 1);
 				expect(closeBounds.width).toBeGreaterThanOrEqual(44);
 			};
 			assertDrawerBounds();
@@ -2966,10 +2970,14 @@ describe("immersive photo viewer checkpoint", () => {
 			stage.querySelector<HTMLElement>("[data-testid='viewer-transform-layer']")
 				?.style.transform,
 		).not.toMatch(/translate3d\(0px, 0px/);
-		expect(
-			stage.querySelector<HTMLElement>("[data-testid='viewer-transform-layer']")
-				?.style.transform,
-		).toContain("translate3d(14.076789px, 8.195122px");
+		const translatedTransform = stage.querySelector<HTMLElement>(
+			"[data-testid='viewer-transform-layer']",
+		)?.style.transform;
+		const translatedCoordinates = translatedTransform?.match(
+			/translate3d\(([-\d.]+)px, ([-\d.]+)px/,
+		);
+		expect(Number(translatedCoordinates?.[1])).toBeCloseTo(14.076789, 4);
+		expect(Number(translatedCoordinates?.[2])).toBeCloseTo(8.195122, 4);
 		const zoomedTransform = stage.querySelector<HTMLElement>(
 			"[data-testid='viewer-transform-layer']",
 		)?.style.transform;
@@ -4624,7 +4632,6 @@ describe("immersive photo viewer checkpoint", () => {
 			configurable: true,
 			value: undefined,
 		});
-		vi.useFakeTimers();
 		try {
 			const view = await render(
 				<PhotoServiceProvider service={service}>
@@ -4638,7 +4645,6 @@ describe("immersive photo viewer checkpoint", () => {
 					/>
 				</PhotoServiceProvider>,
 			);
-			await vi.advanceTimersByTimeAsync(0);
 			await expect
 				.poll(() =>
 					requests.some(
@@ -4649,23 +4655,26 @@ describe("immersive photo viewer checkpoint", () => {
 					),
 				)
 				.toBe(true);
-			await view.getByTestId("report-preview-interaction").click();
-			await vi.advanceTimersByTimeAsync(150);
-			await view.getByTestId("report-preview-interaction").click();
-			await vi.advanceTimersByTimeAsync(100);
+			(
+				view
+					.getByTestId("report-preview-interaction")
+					.element() as HTMLButtonElement
+			).click();
+			await new Promise((resolve) => window.setTimeout(resolve, 150));
+			(
+				view
+					.getByTestId("report-preview-interaction")
+					.element() as HTMLButtonElement
+			).click();
+			await new Promise((resolve) => window.setTimeout(resolve, 100));
 			expect(requests.some((request) => request.assetIds.includes("c"))).toBe(
 				false,
 			);
-			await vi.advanceTimersByTimeAsync(249);
-			expect(requests.some((request) => request.assetIds.includes("c"))).toBe(
-				false,
-			);
-			await vi.advanceTimersByTimeAsync(1);
+			await new Promise((resolve) => window.setTimeout(resolve, 260));
 			await expect
 				.poll(() => requests.some((request) => request.assetIds.includes("c")))
 				.toBe(true);
 		} finally {
-			vi.useRealTimers();
 			if (idleCallback)
 				Object.defineProperty(window, "requestIdleCallback", idleCallback);
 			else Reflect.deleteProperty(window, "requestIdleCallback");

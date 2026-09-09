@@ -43,12 +43,21 @@ CI runs these checks, plus the 10,000-asset benchmark smoke test, on Ubuntu, mac
 
 ## Install and verify the interface
 
-Install the locked Node dependencies and Playwright's WebKit browser:
+Install the locked Node dependencies and Playwright's browser for the current
+platform. Browser tests use WebKit on macOS and Chromium elsewhere:
 
 ```bash
 npm ci
-npm exec playwright install webkit
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  npm exec playwright install webkit
+else
+  npm exec playwright install chromium
+fi
 ```
+
+On Arch Linux, the browser tests use the system Chromium at
+`/usr/bin/chromium` when it is installed. Set `MOTE_CHROMIUM_PATH` to use a
+different system Chromium executable.
 
 Run the interface checks:
 
@@ -75,10 +84,10 @@ PHOTO_VIEWER_PROFILE=clean-demo npm run desktop:dev
 ```
 
 A named profile isolates the local SQLite catalog and generated derivatives in
-per-user macOS paths below the `app.photoviewer.desktop` Tauri identifier:
+per-user macOS paths below the `io.github.matt-jenner.mote` Tauri identifier:
 
-- `~/Library/Application Support/app.photoviewer.desktop/profiles/<profile>/catalog.sqlite`
-- `~/Library/Caches/app.photoviewer.desktop/profiles/<profile>/`
+- `~/Library/Application Support/io.github.matt-jenner.mote/profiles/<profile>/catalog.sqlite`
+- `~/Library/Caches/io.github.matt-jenner.mote/profiles/<profile>/`
 
 For the progressive wall demonstration, use a fresh profile and choose the
 checked-in `apps/interface/public/demo-photos` folder in the native picker:
@@ -144,6 +153,13 @@ npm run desktop:build -- --bundles app
 ```
 
 The bundle is written to `apps/desktop/src-tauri/target/release/bundle/macos/Mote.app`. Because it is unsigned, macOS may require you to approve it through the normal local-app security flow before first launch.
+
+## Build and run the Linux Flatpak
+
+Mote's distribution-independent Linux package is built from source with
+`flatpak-builder` and uses portal-only folder access. Follow the
+[Flatpak build and installation guide](packaging/flatpak/README.md) to create a
+local `.flatpak` bundle, install it on this workstation, or copy it to Fedora.
 
 ## Start the health service
 

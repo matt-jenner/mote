@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.matt_jenner.mote</id>
+  <name>Mote</name>
+  <summary>A simple space for your photos</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <developer id="io.github.matt_jenner.mote">
+    <name>Mote contributors</name>
+  </developer>
+  <description>
+    <p>Mote indexes local folders and mounted photo shares into a private catalogue, then presents a fast photo wall and immersive viewer.</p>
+    <p>Photo sources are read-only. Mote stores its catalogue and generated previews separately from the selected source folders.</p>
+  </description>
+  <launchable type="desktop-id">io.github.matt_jenner.mote.desktop</launchable>
+  <url type="homepage">https://github.com/matt-jenner/mote</url>
+  <content_rating type="oars-1.1" />
+  <recommends>
+    <display_length compare="ge">360</display_length>
+  </recommends>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+  <releases>
+    <release version="0.1.0" date="2026-09-08">
+      <description>
+        <p>Initial private Linux test package.</p>
+      </description>
+    </release>
+  </releases>
+</component>

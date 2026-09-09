@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Mote
+Comment=A simple space for your photos
+Exec=mote
+Icon=io.github.matt_jenner.mote
+Terminal=false
+Categories=Graphics;Photography;
+StartupNotify=true

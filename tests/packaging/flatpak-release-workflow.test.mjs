@@ -1,0 +1,82 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import test from "node:test";
+import { parse } from "yaml";
+
+const root = path.resolve(import.meta.dirname, "../..");
+const workflowPath = path.join(root, ".github/workflows/release-flatpak.yml");
+const githubTokenExpression = ["$", "{{ github.token }}"].join("");
+const releaseTagExpression = ["$", "{{ github.event.release.tag_name }}"].join(
+	"",
+);
+
+function workflow() {
+	return parse(fs.readFileSync(workflowPath, "utf8"));
+}
+
+function buildJob() {
+	return workflow().jobs["build-flatpak"];
+}
+
+test("Flatpak release builds run only when a GitHub Release is published", () => {
+	const releaseWorkflow = workflow();
+
+	assert.deepEqual(releaseWorkflow.on, {
+		release: { types: ["published"] },
+	});
+	assert.equal(buildJob()["timeout-minutes"], 90);
+});
+
+test("the release tag is checked before installing runtimes or building", () => {
+	const steps = buildJob().steps;
+	const validateIndex = steps.findIndex(
+		(step) => step.name === "Validate release tag",
+	);
+	const dependenciesIndex = steps.findIndex(
+		(step) => step.name === "Install Flatpak dependencies",
+	);
+	const buildIndex = steps.findIndex((step) => step.name === "Build Flatpak");
+
+	assert.ok(validateIndex >= 0);
+	assert.ok(validateIndex < dependenciesIndex);
+	assert.ok(dependenciesIndex < buildIndex);
+	assert.match(steps[validateIndex].run, /tauri\.conf\.json/);
+	assert.match(steps[validateIndex].run, /expected_tag="v\$\{app_version\}"/);
+	assert.equal(steps[validateIndex].env.RELEASE_TAG, releaseTagExpression);
+});
+
+test("the existing packaging command builds with the locked Flatpak SDKs", () => {
+	const steps = buildJob().steps;
+	const install = steps.find(
+		(step) => step.name === "Install Flatpak dependencies",
+	).run;
+	const build = steps.find((step) => step.name === "Build Flatpak").run;
+
+	assert.match(install, /flatpak-builder/);
+	for (const runtime of [
+		"org.gnome.Platform//49",
+		"org.gnome.Sdk//49",
+		"org.freedesktop.Sdk.Extension.node24//25.08",
+		"org.freedesktop.Sdk.Extension.rust-stable//25.08",
+	]) {
+		assert.match(install, new RegExp(runtime));
+	}
+	assert.equal(build, "npm run flatpak -- package");
+});
+
+test("the bundle is attached to its existing GitHub Release", () => {
+	const releaseWorkflow = workflow();
+	const upload = buildJob().steps.find(
+		(step) => step.name === "Upload Flatpak to release",
+	);
+
+	assert.equal(releaseWorkflow.permissions.contents, "write");
+	assert.match(
+		upload.run,
+		/gh release upload "\$RELEASE_TAG" dist\/flatpak\/\*\.flatpak/,
+	);
+	assert.doesNotMatch(upload.run, /--clobber/);
+	assert.equal(upload.env.GH_TOKEN, githubTokenExpression);
+	assert.equal(upload.env.RELEASE_TAG, releaseTagExpression);
+});
