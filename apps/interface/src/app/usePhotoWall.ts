@@ -154,7 +154,7 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 		state.activeRequest !== null || missingWall > 0 || state.sortPending;
 	if (
 		Object.keys(state.sourceWarnings).length > 0 ||
-		Object.keys(state.assetWarnings).length > 0
+		state.items.some((item) => item.warning !== null)
 	)
 		return {
 			status: "Some previews need attention",

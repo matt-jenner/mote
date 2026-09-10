@@ -3650,6 +3650,45 @@ describe("progressive photo wall", () => {
 		expect(service.queryRequests).toHaveLength(1);
 	});
 
+	it("does not surface retained warnings for assets outside the wall", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(0, pageOf(settledFixtures, "settled"));
+		await expect
+			.poll(() => screen.getByRole("button", { name: "Open Coast" }).query())
+			.not.toBeNull();
+
+		service.emit({
+			kind: "warning",
+			selectionId: "source-a",
+			sourceId: "source-a",
+			assetId: "filtered-dng",
+			warning: { code: "derivativeUnavailable", retryable: false },
+		});
+		service.emit({
+			kind: "warning",
+			selectionId: "source-a",
+			sourceId: "source-a",
+			assetId: "coast",
+			warning: { code: "derivativeUnavailable", retryable: true },
+		});
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("Some previews need attention");
+
+		service.emit({
+			kind: "warningCleared",
+			selectionId: "source-a",
+			sourceId: "source-a",
+			assetId: "coast",
+			code: "derivativeUnavailable",
+		});
+		await expect
+			.element(screen.getByRole("status"))
+			.not.toHaveTextContent("Some previews need attention");
+	});
+
 	it("keeps a later unrelated asset warning after a stale derivative page", async () => {
 		const service = new ControlledWallService();
 		const screen = await renderWall(service);

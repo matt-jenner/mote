@@ -20,6 +20,8 @@ Design: [approved specification](../specs/2026-09-10-saved-folder-sidebar-design
 - Wall and viewer queries include the decoder-supported JPEG, PNG, TIFF and
   WebP formats. RAW/DNG, HEIF and AVIF files, plus supported files with a
   terminal thumbnail decode failure, are omitted from both sequences.
+- The wall status ignores retained warnings for filtered assets while still
+  reporting warnings attached to visible items.
 - Option 3 sidebar geometry, labelled narrow-screen drawer, keyboard menus,
   rename focus, sticky folder header and menus that open upwards near the bottom.
 
@@ -39,7 +41,7 @@ related pieces from the plan's illustrative file breakdown.
 | `npm run check` | Passed |
 | `npm run typecheck` | Passed |
 | `npm test` | 191 passed in 20 files |
-| Vitest browser, motion and contrast projects | 190 passed in 6 files |
+| Vitest browser, motion and contrast projects | 191 passed in 6 files |
 | Final sidebar browser suite after adding long-list regression | 18 passed; includes one additional test |
 | Interface production build and hosted build | Passed |
 | Hosted Playwright before restart | 3 passed |
