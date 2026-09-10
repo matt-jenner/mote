@@ -984,6 +984,19 @@ async fn unavailable_selected_child_marks_only_its_group_offline() {
         };
         assert_eq!(checked.access[&entry.folder_id].state, expected);
     }
+    let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    let active = catalog.load_app_state().unwrap().active_selection.unwrap();
+    let active_group = catalog
+        .folder_group_for_path(active.library_id, &active.relative_folder)
+        .unwrap()
+        .unwrap();
+    let recovery = catalog
+        .folder_group_recovery_state(active.library_id, active_group)
+        .unwrap();
+    assert!(
+        recovery.requested > recovery.reconciled,
+        "an unavailable saved-folder check must persist its pending recovery"
+    );
     assert_eq!(
         service
             .query_wall(query(SortDirection::NewestFirst))

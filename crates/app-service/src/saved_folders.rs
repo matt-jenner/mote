@@ -108,6 +108,8 @@ impl AppService {
 
     async fn check_saved_folder(&self, entry: &str) -> Result<AccessReply, AppServiceError> {
         let (group, target) = self.saved_target(entry)?;
+        let library = target.key.library_id;
+        let root_selection = target.key.relative.as_bytes().is_empty();
         let reply = self.folder_access.check_with_root(target).await;
         let access = FolderAccess::from_reply(group.as_uuid().to_string(), &reply);
         let mut state = self.state()?;
@@ -117,6 +119,22 @@ impl AppService {
             .find_saved_folder(id(entry)?)?
             .is_some()
         {
+            if matches!(
+                &reply,
+                AccessReply::Complete {
+                    outcome,
+                    ..
+                } if !matches!(outcome, FolderProbeOutcome::Available(_))
+            ) {
+                if root_selection {
+                    state.libraries.catalog_mut().mark_root_offline(library)?;
+                } else {
+                    state
+                        .libraries
+                        .catalog_mut()
+                        .mark_group_offline(library, group)?;
+                }
+            }
             let old = state.folder_status.get(&access.folder_id);
             if old.is_none_or(|old| old.generation <= access.generation) {
                 state.folder_revision += 1;
