@@ -17,6 +17,9 @@ Design: [approved specification](../specs/2026-09-10-saved-folder-sidebar-design
   restoring removed entries or superseded views.
 - Unavailable rows, manual rechecks, cached-image warning badges, and empty
   startup when the previous folder cannot be accessed.
+- Wall and viewer queries include the decoder-supported JPEG, PNG, TIFF and
+  WebP formats. RAW/DNG, HEIF and AVIF files, plus supported files with a
+  terminal thumbnail decode failure, are omitted from both sequences.
 - Option 3 sidebar geometry, labelled narrow-screen drawer, keyboard menus,
   rename focus, sticky folder header and menus that open upwards near the bottom.
 
@@ -36,7 +39,7 @@ related pieces from the plan's illustrative file breakdown.
 | `npm run check` | Passed |
 | `npm run typecheck` | Passed |
 | `npm test` | 191 passed in 20 files |
-| Vitest browser, motion and contrast projects | 188 passed in 6 files |
+| Vitest browser, motion and contrast projects | 190 passed in 6 files |
 | Final sidebar browser suite after adding long-list regression | 18 passed; includes one additional test |
 | Interface production build and hosted build | Passed |
 | Hosted Playwright before restart | 3 passed |
@@ -75,5 +78,5 @@ the unavailable shortcut; its menu offered Remove only. Removing it kept the
 remaining shortcut and moved focus there. Browser tests also cover viewer
 navigation, warning hit targets, uncached placeholders and accessibility.
 
-This validation ran on macOS. Desktop command integration compiled; packaged
-native apps and Windows/Linux desktop UI were not launched.
+This validation ran on macOS. The release `Mote.app` bundle was built and
+launched; Windows and Linux desktop UI were not launched.

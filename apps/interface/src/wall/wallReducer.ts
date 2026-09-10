@@ -913,6 +913,41 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 					sourceWarningTombstones,
 				};
 			}
+			if (
+				action.warning.code === "wallThumbnailUnavailable" &&
+				!action.warning.retryable
+			) {
+				const removed = state.items.find(
+					(asset) => asset.id === action.assetId,
+				);
+				if (!removed) return state;
+				const assetWarnings = { ...state.assetWarnings };
+				delete assetWarnings[action.assetId];
+				return {
+					...state,
+					items: state.items.filter((asset) => asset.id !== action.assetId),
+					totalCount:
+						state.totalCount === null
+							? null
+							: Math.max(0, state.totalCount - 1),
+					previewCounts:
+						state.previewCounts === null
+							? null
+							: {
+									wallReady: Math.max(
+										0,
+										state.previewCounts.wallReady -
+											(removed.wallThumbnail === null ? 0 : 1),
+									),
+									screenReady: Math.max(
+										0,
+										state.previewCounts.screenReady -
+											(removed.screenPreview === null ? 0 : 1),
+									),
+								},
+					assetWarnings,
+				};
+			}
 			const assetWarnings = {
 				...state.assetWarnings,
 				[action.assetId]: action.warning,

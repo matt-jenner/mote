@@ -2,9 +2,11 @@ use std::path::Path;
 
 use photo_catalog::{
     AssetMetadataUpdate, AssetShapeUpdate, Catalog, CatalogError, CatalogIndexRecord, NewAsset,
-    NewFolderGroup, NewLibrary, ShapeStatus, WallCursorKey, WallOrder,
+    NewFolderGroup, NewLibrary, ShapeStatus, TerminalDerivativeFailure, WallCursorKey, WallOrder,
 };
-use photo_domain::{AssetId, FolderGroupId, GalleryScope, MediaKind, RelativePathKey};
+use photo_domain::{
+    AssetId, Availability, FolderGroupId, GalleryScope, MediaKind, RelativePathKey,
+};
 use rusqlite::Connection;
 
 fn id_key(id: photo_domain::AssetId) -> [u8; 16] {
@@ -173,6 +175,121 @@ fn wall_pages_skip_videos_before_limit_and_cursor_calculation() {
         .unwrap();
     assert_eq!(display_paths(&second.items), ["b.jpg"]);
     assert!(second.next.is_some());
+}
+
+#[test]
+fn wall_pages_include_only_formats_the_derivative_decoder_supports() {
+    let fixture = WallFixture::with_assets([
+        asset("photo.jpg", MediaKind::Jpeg, 1),
+        asset("photo.png", MediaKind::Png, 2),
+        asset("photo.tiff", MediaKind::Tiff, 3),
+        asset("photo.webp", MediaKind::Webp, 4),
+        asset("photo.heic", MediaKind::Heif, 5),
+        asset("photo.avif", MediaKind::Avif, 6),
+        asset("photo.dng", MediaKind::Raw, 7),
+        asset("clip.mp4", MediaKind::Video, 8),
+    ]);
+
+    let page = fixture
+        .catalog
+        .wall_page(fixture.group, WallOrder::Provisional, None, 20)
+        .unwrap();
+
+    assert_eq!(
+        display_paths(&page.items),
+        ["photo.jpg", "photo.png", "photo.tiff", "photo.webp"]
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .wall_photo_count_scoped(fixture.group, GalleryScope::IncludeSubfolders)
+            .unwrap(),
+        4
+    );
+}
+
+#[test]
+fn wall_pages_and_counts_skip_terminal_thumbnail_failures() {
+    let mut fixture = WallFixture::with_assets([
+        asset("loadable.jpg", MediaKind::Jpeg, 1),
+        asset("broken.jpg", MediaKind::Jpeg, 2),
+        asset("screen-only.jpg", MediaKind::Jpeg, 3),
+        asset("cached-offline.jpg", MediaKind::Jpeg, 4),
+    ]);
+    let broken = fixture
+        .catalog
+        .find_asset(AssetId::for_path(
+            fixture.library,
+            &RelativePathKey::from_relative_path(Path::new("broken.jpg")).unwrap(),
+        ))
+        .unwrap()
+        .unwrap();
+    let screen_only = fixture
+        .catalog
+        .find_asset(AssetId::for_path(
+            fixture.library,
+            &RelativePathKey::from_relative_path(Path::new("screen-only.jpg")).unwrap(),
+        ))
+        .unwrap()
+        .unwrap();
+    let cached_offline = fixture
+        .catalog
+        .find_asset(AssetId::for_path(
+            fixture.library,
+            &RelativePathKey::from_relative_path(Path::new("cached-offline.jpg")).unwrap(),
+        ))
+        .unwrap()
+        .unwrap();
+    fixture
+        .catalog
+        .record_terminal_derivative_failure(&TerminalDerivativeFailure {
+            asset_id: broken.id,
+            kind: "wall_thumbnail".into(),
+            cache_key: "broken-wall".into(),
+            availability: Availability::Available,
+            failure_code: "derivative_generation_terminal".into(),
+            occurred_at: 1,
+        })
+        .unwrap();
+    fixture
+        .catalog
+        .record_terminal_derivative_failure(&TerminalDerivativeFailure {
+            asset_id: cached_offline.id,
+            kind: "wall_thumbnail".into(),
+            cache_key: "cached-offline".into(),
+            availability: Availability::Missing,
+            failure_code: "derivative_generation_terminal".into(),
+            occurred_at: 1,
+        })
+        .unwrap();
+    fixture
+        .catalog
+        .record_terminal_derivative_failure(&TerminalDerivativeFailure {
+            asset_id: screen_only.id,
+            kind: "screen_preview".into(),
+            cache_key: "screen-only".into(),
+            availability: Availability::Available,
+            failure_code: "derivative_generation_terminal".into(),
+            occurred_at: 1,
+        })
+        .unwrap();
+
+    let page = fixture
+        .catalog
+        .wall_page(fixture.group, WallOrder::Provisional, None, 10)
+        .unwrap();
+
+    assert_eq!(
+        display_paths(&page.items),
+        ["loadable.jpg", "screen-only.jpg", "cached-offline.jpg"]
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .wall_photo_count_scoped(fixture.group, GalleryScope::IncludeSubfolders)
+            .unwrap(),
+        3
+    );
 }
 
 #[test]

@@ -3627,6 +3627,29 @@ describe("progressive photo wall", () => {
 			.toBeVisible();
 	});
 
+	it("removes an asset after its wall thumbnail becomes permanently unavailable", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(0, pageOf(settledFixtures, "settled"));
+		await expect
+			.poll(() => screen.getByRole("button", { name: "Open Coast" }).query())
+			.not.toBeNull();
+
+		service.emit({
+			kind: "warning",
+			selectionId: "source-a",
+			sourceId: "source-a",
+			assetId: "coast",
+			warning: { code: "wallThumbnailUnavailable", retryable: false },
+		});
+
+		await expect
+			.poll(() => screen.getByRole("button", { name: "Open Coast" }).query())
+			.toBeNull();
+		expect(service.queryRequests).toHaveLength(1);
+	});
+
 	it("keeps a later unrelated asset warning after a stale derivative page", async () => {
 		const service = new ControlledWallService();
 		const screen = await renderWall(service);

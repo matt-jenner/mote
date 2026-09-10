@@ -13,9 +13,12 @@ use photo_app_service::{
     WallQueryRequest, WallShapeState, WallUpdate, WallWarningState,
 };
 use photo_cache::CacheBudget;
-use photo_catalog::{Catalog, CatalogWarningRecord, NewDerivative, NewFolderGroup};
+use photo_catalog::{
+    Catalog, CatalogWarningRecord, NewDerivative, NewFolderGroup, TerminalDerivativeFailure,
+};
 use photo_domain::{
-    Appearance, AssetId, DerivativeId, FolderGroupId, GalleryScope, LibraryId, RelativePathKey,
+    Appearance, AssetId, Availability, DerivativeId, FolderGroupId, GalleryScope, LibraryId,
+    RelativePathKey,
 };
 use photo_metadata::{MetadataBundle, MetadataCandidate, MetadataReadWarning, MetadataSource};
 
@@ -457,6 +460,46 @@ fn query(direction: SortDirection) -> WallQueryRequest {
         limit: 50,
         direction,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settled_wall_total_excludes_terminal_thumbnail_failures() {
+    let fixture = ProgressiveFixture::new(1);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+
+    let initial = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    let asset_id = AssetId::from_uuid(uuid::Uuid::parse_str(&initial.items[0].id).unwrap());
+    Catalog::open(&fixture.config.catalog_path())
+        .unwrap()
+        .record_terminal_derivative_failure(&TerminalDerivativeFailure {
+            asset_id,
+            kind: "wall_thumbnail".to_owned(),
+            cache_key: "terminal-test-key".to_owned(),
+            availability: Availability::Available,
+            failure_code: "derivative_generation_terminal".to_owned(),
+            occurred_at: 1,
+        })
+        .unwrap();
+
+    let filtered = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    assert!(filtered.items.is_empty());
+    assert_eq!(filtered.total_count, 0);
 }
 
 #[test]
@@ -1771,12 +1814,8 @@ async fn derivative_failure_records_and_publishes_a_terminal_asset_warning() {
         .query_wall(query(SortDirection::OldestFirst))
         .await
         .unwrap();
-    assert!(
-        page.items[0]
-            .warning
-            .as_ref()
-            .is_some_and(|warning| !warning.retryable && warning.code == "derivativeUnavailable")
-    );
+    assert!(page.items.is_empty());
+    assert_eq!(page.total_count, 0);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         photo_catalog::Catalog::open(&fixture.config.catalog_path())
@@ -4166,8 +4205,9 @@ async fn terminal_photo_failures_and_videos_do_not_starve_healthy_previews() {
             .iter()
             .map(|asset| asset.display_name.as_str())
             .collect::<Vec<_>>(),
-        ["a.jpg", "b.jpg", "corrupt.jpg", "offline.jpg"]
+        ["a.jpg", "b.jpg"]
     );
+    assert_eq!(wall.total_count, 2);
     assert!(
         wall.items
             .iter()
@@ -4215,7 +4255,7 @@ async fn terminal_wall_failure_persists_a_nonretryable_warning() {
                 retryable: false,
             },
             ..
-        } if code == "derivativeUnavailable"
+        } if code == "wallThumbnailUnavailable"
     ));
 }
 

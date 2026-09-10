@@ -98,7 +98,13 @@ impl Catalog {
         let mut sql = String::from(
             "SELECT COUNT(*) \
              FROM assets JOIN folder_group_assets fga ON fga.asset_id = assets.id \
-             WHERE fga.folder_group_id = ?1 AND media_kind <> 'video'",
+             WHERE fga.folder_group_id = ?1 \
+               AND media_kind IN ('jpeg','png','tiff','webp') \
+               AND NOT EXISTS (SELECT 1 FROM derivative_failures \
+                               WHERE derivative_failures.asset_id = assets.id \
+                                 AND derivative_failures.kind = 'wall_thumbnail' \
+                                 AND derivative_failures.availability = 'available' \
+                                 AND derivative_failures.availability = assets.availability)",
         );
         if scope == GalleryScope::CurrentFolder {
             sql.push_str(
@@ -157,7 +163,12 @@ impl Catalog {
                     (SELECT code FROM warnings WHERE warnings.asset_id = assets.id ORDER BY CASE code WHEN 'derivative_generation_failed' THEN 0 ELSE 1 END, occurred_at DESC, id DESC LIMIT 1) \
              FROM assets JOIN folder_group_assets fga ON fga.asset_id = assets.id \
              WHERE fga.folder_group_id = ?1 AND assets.id = ?2 \
-               AND media_kind <> 'video' \
+               AND media_kind IN ('jpeg','png','tiff','webp') \
+               AND NOT EXISTS (SELECT 1 FROM derivative_failures \
+                               WHERE derivative_failures.asset_id = assets.id \
+                                 AND derivative_failures.kind = 'wall_thumbnail' \
+                                 AND derivative_failures.availability = 'available' \
+                                 AND derivative_failures.availability = assets.availability) \
                AND shape_status IN ('ready','fallback') AND width IS NOT NULL AND height IS NOT NULL",
         );
         if scope == GalleryScope::CurrentFolder {
@@ -216,7 +227,13 @@ impl Catalog {
                     EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id), \
                     (SELECT code FROM warnings WHERE warnings.asset_id = assets.id ORDER BY CASE code WHEN 'derivative_generation_failed' THEN 0 ELSE 1 END, occurred_at DESC, id DESC LIMIT 1) \
              FROM assets JOIN folder_group_assets fga ON fga.asset_id = assets.id \
-             WHERE fga.folder_group_id = ?1 AND media_kind <> 'video' \
+             WHERE fga.folder_group_id = ?1 \
+               AND media_kind IN ('jpeg','png','tiff','webp') \
+               AND NOT EXISTS (SELECT 1 FROM derivative_failures \
+                               WHERE derivative_failures.asset_id = assets.id \
+                                 AND derivative_failures.kind = 'wall_thumbnail' \
+                                 AND derivative_failures.availability = 'available' \
+                                 AND derivative_failures.availability = assets.availability) \
                AND shape_status IN ('ready','fallback') AND width IS NOT NULL AND height IS NOT NULL",
         );
         if scope == GalleryScope::CurrentFolder {

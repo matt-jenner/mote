@@ -2535,7 +2535,16 @@ impl AppService {
                     source_id: selection.library_id.as_uuid().hyphenated().to_string(),
                     asset_id: Some(asset_id.as_uuid().hyphenated().to_string()),
                     warning: crate::WallWarningState {
-                        code: "derivativeUnavailable".to_owned(),
+                        code: match (class, asset.availability) {
+                            (DerivativeClass::WallThumbnail, Availability::Available) => {
+                                "wallThumbnailUnavailable"
+                            }
+                            (DerivativeClass::ScreenPreview, Availability::Available) => {
+                                "screenPreviewUnavailable"
+                            }
+                            _ => "derivativeUnavailable",
+                        }
+                        .to_owned(),
                         retryable: false,
                     },
                 });
