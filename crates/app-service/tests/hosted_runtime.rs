@@ -82,6 +82,49 @@ fn write_jpeg(path: &Path) {
 }
 
 #[tokio::test]
+async fn settled_wall_total_excludes_inventory_formats_the_wall_cannot_decode() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    write_jpeg(&source.join("photo.jpg"));
+    std::fs::write(source.join("photo.dng"), b"raw fixture").unwrap();
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let engine = GalleryEngine::open(config, source).unwrap();
+    let summary = engine.select_relative(Path::new(".")).await.unwrap();
+    let selection = engine.resolve_selection(&summary.id).unwrap();
+    let mut events = engine.subscribe(
+        &selection,
+        "count-client".to_owned(),
+        GalleryScope::CurrentFolder,
+        None,
+    );
+    engine.ensure_running(&selection).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().update,
+                WallUpdate::MetadataSettled { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("scan did not settle");
+
+    let page = engine
+        .query_wall(
+            &selection,
+            GalleryScope::CurrentFolder,
+            photo_app_service::WallQueryRequest::oldest_first(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.total_count, 1);
+}
+
+#[tokio::test]
 async fn an_old_subscription_drop_cannot_remove_a_reconnected_client_demand() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("photos");

@@ -22,6 +22,10 @@ Design: [approved specification](../specs/2026-09-10-saved-folder-sidebar-design
   terminal thumbnail decode failure, are omitted from both sequences.
 - The wall status ignores retained warnings for filtered assets while still
   reporting warnings attached to visible items.
+- Long folder labels shrink within the sidebar, render a trailing ellipsis and
+  preserve the fixed menu-button hit target.
+- Settled progress uses the filtered wall total, so unsupported formats do not
+  leave a fully generated folder looking unfinished.
 - Option 3 sidebar geometry, labelled narrow-screen drawer, keyboard menus,
   rename focus, sticky folder header and menus that open upwards near the bottom.
 
@@ -36,12 +40,12 @@ related pieces from the plan's illustrative file breakdown.
 | --- | --- |
 | `cargo fmt --all --check` | Passed |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | Passed |
-| `cargo test --workspace --all-features --quiet` | 519 passed |
+| `cargo test --workspace --all-features --quiet` | 520 passed |
 | Desktop `cargo fmt -- --check` and `cargo check` | Passed |
 | `npm run check` | Passed |
 | `npm run typecheck` | Passed |
 | `npm test` | 191 passed in 20 files |
-| Vitest browser, motion and contrast projects | 191 passed in 6 files |
+| Vitest browser, motion and contrast projects | 192 passed in 6 files |
 | Final sidebar browser suite after adding long-list regression | 18 passed; includes one additional test |
 | Interface production build and hosted build | Passed |
 | Hosted Playwright before restart | 3 passed |

@@ -1238,7 +1238,11 @@ impl GalleryEngine {
             .libraries
             .catalog()
             .wall_preview_counts_scoped(selection.group_id, scope)?;
-        let total_count = inventory_total.unwrap_or(catalog_total_count);
+        let total_count = if settled {
+            catalog_total_count
+        } else {
+            inventory_total.unwrap_or(catalog_total_count)
+        };
         let items = crate::service::wall_assets_with_derivatives(
             state.libraries.catalog(),
             &page.items,

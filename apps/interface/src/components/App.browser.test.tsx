@@ -615,6 +615,64 @@ it("renames a saved entry and removing it clears the active folder", async () =>
 	expect(service.getSavedFolders().entries).toEqual([]);
 });
 
+it("truncates a long saved-folder label without displacing its menu", async () => {
+	await page.viewport(1200, 800);
+	const longLabel =
+		"A very long folder label that must stay inside the navigation sidebar";
+	const snapshot = {
+		...emptySavedFolders(),
+		entries: [
+			{
+				id: "saved-long",
+				folderId: "folder-long",
+				name: "Original",
+				displayPath: "/Photos/Original",
+				customLabel: longLabel,
+			},
+		],
+		access: {
+			"folder-long": {
+				folderId: "folder-long",
+				state: "available" as const,
+				generation: 1,
+				retryAfterMs: 0,
+			},
+		},
+	};
+	await render(
+		<div style={{ display: "grid", height: 400, width: 288 }}>
+			<NavigationRail
+				savedFolders={snapshot}
+				onChooseFolder={() => {}}
+				chooseFolderAvailable
+				folderSelection="native"
+			/>
+		</div>,
+	);
+
+	const folderButton = page
+		.getByRole("button", { name: longLabel, exact: true })
+		.element();
+	const label = folderButton.querySelector<HTMLElement>("span");
+	const menuButton = page
+		.getByRole("button", { name: `Options for ${longLabel}` })
+		.element();
+	const row = folderButton.closest("li");
+	const rail = page.getByRole("navigation", { name: "Sources" }).element();
+	if (!label || !row) throw new Error("Saved folder row was not rendered");
+
+	const labelStyle = getComputedStyle(label);
+	expect(label.scrollWidth).toBeGreaterThan(label.clientWidth);
+	expect(labelStyle.textOverflow).toBe("ellipsis");
+	expect(labelStyle.whiteSpace).toBe("nowrap");
+	expect(folderButton.getBoundingClientRect().right).toBeLessThanOrEqual(
+		menuButton.getBoundingClientRect().left,
+	);
+	expect(row.getBoundingClientRect().right).toBeLessThanOrEqual(
+		rail.getBoundingClientRect().right,
+	);
+});
+
 it("keeps the folder header and last-row menu visible in a long sidebar", async () => {
 	await page.viewport(1200, 800);
 	const entries = Array.from({ length: 20 }, (_, i) => ({

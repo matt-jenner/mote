@@ -743,6 +743,8 @@
 }
 .savedFolders {
 	flex-shrink: 0;
+	min-width: 0;
+	width: 100%;
 	list-style: none;
 	padding: 0;
 	margin: 0;
@@ -753,6 +755,8 @@
 	position: relative;
 	display: flex;
 	align-items: center;
+	min-width: 0;
+	max-width: 100%;
 	min-height: 52px;
 	color: var(--mote-grey);
 	border-left: 3px solid transparent;
@@ -784,6 +788,8 @@
 	flex-shrink: 0;
 }
 .savedFolderButton > span:not(.visuallyHidden) {
+	flex: 1 1 auto;
+	min-width: 0;
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
