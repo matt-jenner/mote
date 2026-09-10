@@ -154,6 +154,35 @@ describe("wallReducer", () => {
 		});
 	});
 
+	it("uses the filtered total when an empty wall settles", () => {
+		const progressing = reduce(activeState(), {
+			type: "progress",
+			selectionId: "selection-a",
+			generation: 3,
+			progress: { discovered: 29, shaped: 0, enriched: 0, total: 29 },
+		});
+		const requested = reduce(progressing, {
+			type: "pageRequestStarted",
+			requestId: "settled-empty",
+			requestCursor: null,
+			requestEpoch: progressing.scrollEpoch,
+		});
+		const settled = reduce(requested, {
+			type: "pageLoaded",
+			assets: [],
+			totalCount: 0,
+			previewCounts: { wallReady: 0, screenReady: 0 },
+			orderState: "settled",
+			nextCursor: null,
+			requestCursor: null,
+			requestEpoch: requested.scrollEpoch,
+			requestId: "settled-empty",
+		});
+
+		expect(settled.scanComplete).toBe(true);
+		expect(settled.totalCount).toBe(0);
+	});
+
 	it("does not regress a live preview count when an older wall page arrives", () => {
 		const initial = {
 			...activeState(),

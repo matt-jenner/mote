@@ -681,10 +681,11 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 					: merged.items;
 			const items = reuseSequence(state.items, sorted);
 			const pagesExhausted = action.nextCursor === null;
-			const totalCount =
-				state.scanProgress?.total ??
-				action.totalCount ??
-				Math.max(state.totalCount ?? 0, merged.items.length);
+			const totalCount = settledPage
+				? (action.totalCount ?? merged.items.length)
+				: (state.scanProgress?.total ??
+					action.totalCount ??
+					Math.max(state.totalCount ?? 0, merged.items.length));
 			const previewCounts = pagePreviewCounts(state, action.previewCounts);
 			if (
 				!merged.changed &&

@@ -44,7 +44,7 @@ related pieces from the plan's illustrative file breakdown.
 | Desktop `cargo fmt -- --check` and `cargo check` | Passed |
 | `npm run check` | Passed |
 | `npm run typecheck` | Passed |
-| `npm test` | 191 passed in 20 files |
+| `npm test` | 192 passed in 20 files |
 | Vitest browser, motion and contrast projects | 192 passed in 6 files |
 | Final sidebar browser suite after adding long-list regression | 18 passed; includes one additional test |
 | Interface production build and hosted build | Passed |
