@@ -64,7 +64,7 @@ fn selecting_a_child_folder_restores_its_basename_after_reopen() {
         state.active_source.as_ref().unwrap().display_name,
         "Iceland 2025"
     );
-    let json = serde_json::to_string(&state).unwrap();
+    let json = serde_json::to_string(&state.active_source).unwrap();
     assert!(!json.contains("Private Library Root"));
     assert!(!json.contains(&temp.path().to_string_lossy().to_string()));
 }
@@ -92,7 +92,7 @@ fn default_profile_reconciliation_preserves_named_profile_partials() {
 }
 
 #[test]
-fn bootstrap_does_not_expose_a_native_source_path() {
+fn source_summary_stays_path_free_and_desktop_shortcut_has_a_tooltip_path() {
     let temp = tempfile::tempdir().unwrap();
     let photos = temp.path().join("Private Folder Name");
     std::fs::create_dir(&photos).unwrap();
@@ -100,8 +100,12 @@ fn bootstrap_does_not_expose_a_native_source_path() {
     let service = AppService::open(config).unwrap();
     let state = service.open_recent(&photos).unwrap();
 
-    let json = serde_json::to_string(&state).unwrap();
+    let json = serde_json::to_string(&state.active_source).unwrap();
     assert!(json.contains("Private Folder Name"));
+    assert_eq!(
+        state.saved_folders.entries[0].display_path,
+        photos.canonicalize().unwrap().to_string_lossy()
+    );
     assert!(!json.contains(&temp.path().to_string_lossy().to_string()));
 }
 

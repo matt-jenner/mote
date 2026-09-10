@@ -239,6 +239,7 @@ pub struct ScanProgressDto {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BootstrapState {
+    pub saved_folders: SavedFolderSnapshot,
     pub settings: SettingsState,
     pub active_source: Option<SourceSummary>,
 }
@@ -365,4 +366,71 @@ mod tests {
         assert_eq!(value["rating"], 4);
         assert!(!value.to_string().contains("/photos/"));
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedFolder {
+    pub id: String,
+    pub folder_id: String,
+    pub name: String,
+    pub display_path: String,
+    pub custom_label: Option<String>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FolderAccessState {
+    Unknown,
+    Checking,
+    Available,
+    Missing,
+    Unreadable,
+    RootOffline,
+    Unverified,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderAccess {
+    pub folder_id: String,
+    pub state: FolderAccessState,
+    pub generation: u64,
+    pub retry_after_ms: u64,
+}
+impl FolderAccess {
+    pub fn from_reply(folder_id: String, reply: &crate::AccessReply) -> Self {
+        use crate::{AccessReply, FolderProbeOutcome};
+        let (state, retry_after_ms) = match reply {
+            AccessReply::Checking { .. } => (FolderAccessState::Checking, 1000),
+            AccessReply::Complete {
+                outcome,
+                retry_after_ms,
+                ..
+            } => (
+                match outcome {
+                    FolderProbeOutcome::Available(_) => FolderAccessState::Available,
+                    FolderProbeOutcome::Missing => FolderAccessState::Missing,
+                    FolderProbeOutcome::Unreadable => FolderAccessState::Unreadable,
+                    FolderProbeOutcome::RootOffline => FolderAccessState::RootOffline,
+                    _ => FolderAccessState::Unverified,
+                },
+                *retry_after_ms,
+            ),
+        };
+        Self {
+            folder_id,
+            state,
+            generation: reply.generation(),
+            retry_after_ms,
+        }
+    }
+}
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedFolderSnapshot {
+    pub revision: u64,
+    pub entries: Vec<SavedFolder>,
+    pub access: std::collections::HashMap<String, FolderAccess>,
+    pub active_entry_id: Option<String>,
+    pub has_opened_folder: bool,
+    pub persistence_error: Option<String>,
 }

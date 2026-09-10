@@ -43,6 +43,7 @@ pub(crate) struct EventsParams {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BootstrapResponse {
+    pub root_id: Option<String>,
     pub capabilities: Capabilities,
     pub source_available: bool,
 }

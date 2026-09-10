@@ -27,14 +27,7 @@ pub(crate) async fn create_selection(
             "That folder path is not valid.",
         )
     })?;
-    let root = state.folder_root.as_ref().ok_or_else(|| {
-        super::ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "sourceUnavailable",
-            "The photo source is unavailable.",
-        )
-    })?;
-    root.resolve(&request.path)
+    crate::folders::validate_relative(&request.path)
         .map_err(|error| map_folder_error(error, request.path.is_empty()))?;
     let engine = state.gallery.as_ref().ok_or_else(|| {
         super::ApiError::new(
@@ -43,10 +36,37 @@ pub(crate) async fn create_selection(
             "The photo source is unavailable.",
         )
     })?;
-    let summary = engine
-        .select_relative(FsPath::new(&request.path))
+    let reply = engine
+        .check_relative(FsPath::new(&request.path))
         .await
         .map_err(map_service_error)?;
+    let summary = match reply {
+        photo_app_service::AccessReply::Complete {
+            outcome: photo_app_service::FolderProbeOutcome::Available(proof),
+            ..
+        } => engine.select_validated(&proof).map_err(map_service_error)?,
+        photo_app_service::AccessReply::Complete { outcome, .. } => {
+            return Err(match outcome {
+                photo_app_service::FolderProbeOutcome::Invalid => {
+                    map_folder_error(FolderError::InvalidPath, false)
+                }
+                photo_app_service::FolderProbeOutcome::Unreadable => {
+                    map_folder_error(FolderError::Unreadable, request.path.is_empty())
+                }
+                photo_app_service::FolderProbeOutcome::RootOffline => {
+                    map_folder_error(FolderError::Unavailable, true)
+                }
+                _ => map_folder_error(FolderError::Unavailable, request.path.is_empty()),
+            });
+        }
+        photo_app_service::AccessReply::Checking { .. } => {
+            return Err(super::ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "folderUnavailable",
+                "That folder is unavailable.",
+            ));
+        }
+    };
     let selection = engine
         .resolve_selection(&summary.id)
         .map_err(map_service_error)?;
@@ -243,4 +263,26 @@ fn map_folder_error(error: FolderError, mounted_root: bool) -> super::ApiError {
             "That folder cannot be read.",
         ),
     }
+}
+
+pub(crate) async fn folder_access(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<impl IntoResponse, super::ApiError> {
+    require_no_query(query.as_deref())?;
+    validate_ascii_identifier(&id, 128)?;
+    let engine = gallery(&state)?;
+    let selection = engine.resolve_selection(&id).map_err(map_service_error)?;
+    let summary = engine
+        .selection_summary(&selection)
+        .map_err(map_service_error)?;
+    let reply = engine
+        .check_relative(FsPath::new(&summary.path))
+        .await
+        .map_err(map_service_error)?;
+    Ok(Json(photo_app_service::FolderAccess::from_reply(
+        summary.folder_id,
+        &reply,
+    )))
 }

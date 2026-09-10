@@ -12,8 +12,14 @@ use crate::protocol::forward_wall_updates_for_service;
 use crate::state::{DesktopState, WallSubscriptionId};
 
 #[tauri::command]
-pub fn get_bootstrap_state(state: State<'_, DesktopState>) -> Result<BootstrapState, CommandError> {
-    state.service.bootstrap().map_err(map_service_error)
+pub async fn get_bootstrap_state(
+    state: State<'_, DesktopState>,
+) -> Result<BootstrapState, CommandError> {
+    state
+        .service
+        .checked_bootstrap()
+        .await
+        .map_err(map_service_error)
 }
 
 #[tauri::command]
@@ -29,11 +35,17 @@ pub async fn choose_folder(
         tracing::error!(%error, "native dialog returned an unusable path");
         CommandError::internal()
     })?;
-    let state = state
-        .service
-        .open_recent(&path)
-        .map_err(map_service_error)?;
-    Ok(ChooseFolderResult::Selected { state })
+    Ok(
+        match state
+            .service
+            .open_folder(path)
+            .await
+            .map_err(map_service_error)?
+        {
+            Some(state) => ChooseFolderResult::Selected { state },
+            None => ChooseFolderResult::Cancelled,
+        },
+    )
 }
 
 #[tauri::command]
@@ -200,4 +212,62 @@ mod tests {
             "Some requested previews could not be generated."
         );
     }
+}
+
+#[tauri::command]
+pub fn rename_saved_folder(
+    id: String,
+    label: Option<String>,
+    state: State<'_, DesktopState>,
+) -> Result<BootstrapState, CommandError> {
+    state
+        .service
+        .rename_saved_folder(&id, label.as_deref())
+        .map_err(map_service_error)
+}
+#[tauri::command]
+pub fn remove_saved_folder(
+    id: String,
+    state: State<'_, DesktopState>,
+) -> Result<BootstrapState, CommandError> {
+    state
+        .service
+        .remove_saved_folder(&id)
+        .map_err(map_service_error)
+}
+#[tauri::command]
+pub fn clear_active_folder(state: State<'_, DesktopState>) -> Result<BootstrapState, CommandError> {
+    state
+        .service
+        .clear_active_folder()
+        .map_err(map_service_error)
+}
+#[tauri::command]
+pub async fn activate_saved_folder(
+    id: String,
+    state: State<'_, DesktopState>,
+) -> Result<ChooseFolderResult, CommandError> {
+    Ok(
+        match state
+            .service
+            .activate_saved_folder(&id)
+            .await
+            .map_err(map_service_error)?
+        {
+            Some(state) => ChooseFolderResult::Selected { state },
+            None => ChooseFolderResult::Cancelled,
+        },
+    )
+}
+#[tauri::command]
+pub async fn check_saved_folders(
+    ids: Vec<String>,
+    state: State<'_, DesktopState>,
+) -> Result<BootstrapState, CommandError> {
+    state
+        .service
+        .check_saved_folders(&ids)
+        .await
+        .map_err(map_service_error)?;
+    state.service.bootstrap().map_err(map_service_error)
 }

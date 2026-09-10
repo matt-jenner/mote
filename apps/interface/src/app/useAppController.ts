@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
+import { folderLabel, sourceIsUnavailable } from "../folders/savedFolders";
 import type {
 	Appearance,
 	BootstrapState,
@@ -22,6 +23,7 @@ export function useAppController() {
 	const bootstrap = useQuery({
 		queryKey: bootstrapKey,
 		queryFn: () => service.getBootstrapState(),
+		refetchOnWindowFocus: false,
 	});
 
 	useEffect(() => {
@@ -46,6 +48,61 @@ export function useAppController() {
 		},
 	});
 
+	useEffect(
+		() =>
+			service.watchSavedFolders((savedFolders) => {
+				queryClient.setQueryData<BootstrapState>(bootstrapKey, (previous) => {
+					if (!previous) return previous;
+					let activeSource = previous.activeSource;
+					if (savedFolders.activeEntryId === null) activeSource = null;
+					const entry = savedFolders.entries.find(
+						(e) => e.id === savedFolders.activeEntryId,
+					);
+					if (
+						entry &&
+						activeSource &&
+						savedFolders.activeEntryId === previous.savedFolders.activeEntryId
+					) {
+						const access = savedFolders.access[entry.folderId]?.state;
+						activeSource = {
+							...activeSource,
+							displayName: folderLabel(entry),
+							availability:
+								access && sourceIsUnavailable(access)
+									? access === "unverified"
+										? "rootOffline"
+										: (access as "missing" | "unreadable" | "rootOffline")
+									: access === "available"
+										? "available"
+										: activeSource.availability,
+						};
+					}
+					return { ...previous, activeSource, savedFolders };
+				});
+			}),
+		[service, queryClient],
+	);
+	const entryIds =
+		bootstrap.data?.savedFolders.entries.map((e) => e.id).join(",") ?? "";
+	useEffect(() => {
+		const check = () => {
+			if (document.visibilityState !== "hidden")
+				void service
+					.checkSavedFolders(entryIds ? entryIds.split(",") : [])
+					.catch(() => {});
+		};
+		check();
+		window.addEventListener("focus", check);
+		document.addEventListener("visibilitychange", check);
+		return () => {
+			window.removeEventListener("focus", check);
+			document.removeEventListener("visibilitychange", check);
+		};
+	}, [service, entryIds]);
+	const accept = (state: BootstrapState) => {
+		queryClient.setQueryData<BootstrapState>(bootstrapKey, state);
+	};
+
 	return {
 		state: bootstrap.data,
 		loading: bootstrap.isPending,
@@ -53,6 +110,17 @@ export function useAppController() {
 			bootstrap.error ?? folder.error ?? appearance.error ?? galleryScope.error,
 		capabilities: service.capabilities,
 		chooseFolder: folder.mutate,
+		activateSavedFolder: async (id: string) => {
+			const result = await service.activateSavedFolder(id);
+			acceptFolderSelection(result);
+			return result.kind === "selected";
+		},
+		renameSavedFolder: async (id: string, label: string) => {
+			accept(await service.renameSavedFolder(id, label));
+		},
+		removeSavedFolder: async (id: string) => {
+			accept(await service.removeSavedFolder(id));
+		},
 		acceptFolderSelection,
 		updateAppearance: appearance.mutate,
 		updateGalleryScope: galleryScope.mutate,

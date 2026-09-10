@@ -11,6 +11,12 @@ import {
 import { usePhotoService } from "../app/PhotoServiceContext";
 import { useAppController } from "../app/useAppController";
 import { usePhotoWall } from "../app/usePhotoWall";
+import { SourceUnavailableContext } from "../folders/SourceAvailabilityContext";
+import {
+	activeFolderAccess,
+	emptySavedFolders,
+	sourceIsUnavailable,
+} from "../folders/savedFolders";
 import type { PhotoService } from "../services/photoService";
 import styles from "../styles/appShell.module.css";
 import { initialViewerState, viewerReducer } from "../viewer/viewerReducer";
@@ -50,6 +56,17 @@ export function AppShell() {
 	const galleryScope =
 		controller.state?.settings.galleryScope ?? "includeSubfolders";
 	const wall = usePhotoWall(source?.selectionId ?? null, galleryScope);
+	const activeAccess = activeFolderAccess(
+		controller.state?.savedFolders ?? emptySavedFolders(),
+	);
+	const folderUnavailable =
+		activeAccess === "available"
+			? false
+			: sourceIsUnavailable(activeAccess) ||
+				(source !== null && source.availability !== "available") ||
+				wall.state.items.some(
+					(asset) => asset.warning?.code === "sourceUnavailable",
+				);
 	const appearance = controller.state?.settings.appearance ?? "system";
 	const chooseFolder = () => {
 		if (controller.capabilities.folderSelection === "native") {
@@ -74,7 +91,7 @@ export function AppShell() {
 			const asset = wall.state.items.find((item) => item.id === assetId);
 			if (
 				!asset ||
-				(asset.availability !== "available" &&
+				((folderUnavailable || asset.availability !== "available") &&
 					!asset.wallThumbnail &&
 					!asset.screenPreview)
 			)
@@ -88,7 +105,7 @@ export function AppShell() {
 				},
 			});
 		},
-		[wall.state.items],
+		[wall.state.items, folderUnavailable],
 	);
 	const handleCloseViewer = useCallback(() => {
 		const anchor = viewer.returnAnchor;
@@ -187,7 +204,7 @@ export function AppShell() {
 	}, [folderBrowserOpen]);
 
 	useEffect(() => {
-		const phoneViewport = window.matchMedia("(max-width: 639px)");
+		const phoneViewport = window.matchMedia("(max-width: 899px)");
 		const closeDrawerAbovePhoneWidth = (event: MediaQueryListEvent) => {
 			if (!event.matches) setDrawerOpen(false);
 		};
@@ -224,143 +241,178 @@ export function AppShell() {
 	};
 
 	return (
-		<div className={styles.appShell}>
-			<NavigationRail
-				chooseFolderAvailable={controller.capabilities.chooseFolder}
-				className={styles.permanentRail}
-				folderBrowserOpen={folderBrowserOpen}
-				folderButtonRef={permanentFolderTriggerRef}
-				folderSelection={controller.capabilities.folderSelection}
-				inert={drawerOpen || viewer.open || folderBrowserOpen}
-				onChooseFolder={chooseFolder}
-			/>
-			<section
-				aria-label="Photo workspace"
-				className={styles.workspace}
-				inert={drawerOpen || viewer.open || folderBrowserOpen}
-			>
-				<header className={styles.toolbar}>
-					<button
-						aria-label="Open sources"
-						className={`${styles.iconButton} ${styles.drawerTrigger}`}
-						onClick={() => setDrawerOpen(true)}
-						ref={drawerTriggerRef}
-						type="button"
-					>
-						<Menu aria-hidden="true" size={20} strokeWidth={1.7} />
-					</button>
-					<div className={styles.titleGroup}>
-						<span className={styles.eyebrow}>Library</span>
-						<span className={styles.sourceTitle}>
-							{source?.displayName ?? "All photos"}
-						</span>
-					</div>
-					{source ? (
-						<WallToolbar
-							direction={wall.state.direction}
-							galleryScope={galleryScope}
-							onGalleryScopeChange={controller.updateGalleryScope}
-							onDirectionChange={wall.setDirection}
-							onRetry={wall.retry}
-							progress={wall.progress}
-							status={wall.status}
-							retryable={Boolean(wall.state.error)}
+		<SourceUnavailableContext value={folderUnavailable}>
+			<div className={styles.appShell}>
+				<NavigationRail
+					savedFolders={controller.state?.savedFolders}
+					onActivate={async (id) => {
+						if (await controller.activateSavedFolder(id)) setDrawerOpen(false);
+					}}
+					onRename={controller.renameSavedFolder}
+					onRemove={controller.removeSavedFolder}
+					chooseFolderAvailable={controller.capabilities.chooseFolder}
+					className={styles.permanentRail}
+					folderBrowserOpen={folderBrowserOpen}
+					folderButtonRef={permanentFolderTriggerRef}
+					folderSelection={controller.capabilities.folderSelection}
+					inert={drawerOpen || viewer.open || folderBrowserOpen}
+					onChooseFolder={chooseFolder}
+				/>
+				<section
+					aria-label="Photo workspace"
+					className={styles.workspace}
+					inert={drawerOpen || viewer.open || folderBrowserOpen}
+				>
+					<header className={styles.toolbar}>
+						<button
+							aria-label="Open sources"
+							className={`${styles.iconButton} ${styles.drawerTrigger}`}
+							onClick={() => setDrawerOpen(true)}
+							ref={drawerTriggerRef}
+							type="button"
+						>
+							<Menu aria-hidden="true" size={20} strokeWidth={1.7} />
+						</button>
+						<div className={styles.titleGroup}>
+							<span className={styles.eyebrow}>Library</span>
+							<span className={styles.sourceTitle}>
+								{source?.displayName ?? "All photos"}
+							</span>
+						</div>
+						{source ? (
+							<WallToolbar
+								direction={wall.state.direction}
+								galleryScope={galleryScope}
+								onGalleryScopeChange={controller.updateGalleryScope}
+								onDirectionChange={wall.setDirection}
+								onRetry={wall.retry}
+								progress={folderUnavailable ? undefined : wall.progress}
+								status={
+									folderUnavailable
+										? "Source unavailable. Showing cached images."
+										: wall.status
+								}
+								retryable={Boolean(wall.state.error)}
+							/>
+						) : null}
+						<AppearanceMenu
+							onChange={controller.updateAppearance}
+							value={appearance}
 						/>
+					</header>
+					{controller.error ? (
+						<div className={styles.errorBanner} role="alert">
+							{controller.error instanceof Error
+								? controller.error.message
+								: "Something went wrong"}
+						</div>
 					) : null}
-					<AppearanceMenu
-						onChange={controller.updateAppearance}
-						value={appearance}
+					{controller.loading ? (
+						<main aria-busy="true" className={styles.canvas} />
+					) : (
+						<SourceCanvas
+							hasOpenedFolder={controller.state?.savedFolders.hasOpenedFolder}
+							chooseFolderAvailable={controller.capabilities.chooseFolder}
+							onChooseFolder={chooseFolder}
+							source={source}
+							wall={wall}
+							regionRef={wallRegionRef}
+							onOpen={handleOpenViewer}
+							highlightedAssetId={highlightedAssetId}
+						/>
+					)}
+				</section>
+				{viewer.open ? (
+					<PhotoViewerOverlay
+						assets={wall.state.items.filter(
+							(asset) =>
+								(!folderUnavailable && asset.availability === "available") ||
+								asset.wallThumbnail ||
+								asset.screenPreview ||
+								asset.id === viewer.currentAssetId,
+						)}
+						onClose={handleCloseViewer}
+						onSetInfoOpen={(open) =>
+							dispatchViewer({ type: "setInfoOpen", open })
+						}
+						onShowControls={() => dispatchViewer({ type: "showControls" })}
+						onHideControls={() => dispatchViewer({ type: "hideControls" })}
+						onToggleTouchControls={() =>
+							dispatchViewer({ type: "toggleTouchControls" })
+						}
+						service={service}
+						state={viewer}
+						onLoadMore={wall.loadMore}
+						onRequestNearViewportDerivatives={
+							wall.requestNearViewportDerivatives
+						}
+						onSetWallInteraction={wall.setWallInteraction}
+						onSelectAsset={handleSelectViewerAsset}
+						loading={wall.loading}
+						nextCursor={wall.state.cursor}
 					/>
-				</header>
-				{controller.error ? (
-					<div className={styles.errorBanner} role="alert">
-						{controller.error instanceof Error
-							? controller.error.message
-							: "Something went wrong"}
+				) : null}
+				{folderBrowserBreadcrumbs ? (
+					<HostedFolderBrowser
+						initialBreadcrumbs={folderBrowserBreadcrumbs}
+						onClose={closeFolderBrowser}
+						onSelected={(result) => {
+							controller.acceptFolderSelection(result);
+							closeFolderBrowser();
+						}}
+						service={service}
+					/>
+				) : null}
+				{drawerOpen ? (
+					<div className={styles.drawerBackdrop}>
+						<button
+							type="button"
+							aria-label="Dismiss sources drawer"
+							tabIndex={-1}
+							className={styles.drawerDismiss}
+							onClick={() => setDrawerOpen(false)}
+						/>
+						<section
+							aria-label="Sources drawer"
+							aria-modal="true"
+							className={styles.drawer}
+							onKeyDown={handleDrawerKeyDown}
+							ref={drawerRef}
+							role="dialog"
+						>
+							<div className={styles.drawerHeader}>
+								<span>Sources</span>
+								<button
+									aria-label="Close sources"
+									className={styles.iconButton}
+									onClick={() => setDrawerOpen(false)}
+									ref={drawerCloseRef}
+									type="button"
+								>
+									<X aria-hidden="true" size={20} strokeWidth={1.7} />
+								</button>
+							</div>
+							<NavigationRail
+								savedFolders={controller.state?.savedFolders}
+								onActivate={async (id) => {
+									if (await controller.activateSavedFolder(id))
+										setDrawerOpen(false);
+								}}
+								onRename={controller.renameSavedFolder}
+								onRemove={controller.removeSavedFolder}
+								chooseFolderAvailable={controller.capabilities.chooseFolder}
+								className={styles.drawerNavigation}
+								folderBrowserOpen={folderBrowserOpen}
+								folderSelection={controller.capabilities.folderSelection}
+								onChooseFolder={() => {
+									chooseFolder();
+									setDrawerOpen(false);
+								}}
+							/>
+						</section>
 					</div>
 				) : null}
-				{controller.loading ? (
-					<main aria-busy="true" className={styles.canvas} />
-				) : (
-					<SourceCanvas
-						chooseFolderAvailable={controller.capabilities.chooseFolder}
-						onChooseFolder={chooseFolder}
-						source={source}
-						wall={wall}
-						regionRef={wallRegionRef}
-						onOpen={handleOpenViewer}
-						highlightedAssetId={highlightedAssetId}
-					/>
-				)}
-			</section>
-			{viewer.open ? (
-				<PhotoViewerOverlay
-					assets={wall.state.items}
-					onClose={handleCloseViewer}
-					onSetInfoOpen={(open) =>
-						dispatchViewer({ type: "setInfoOpen", open })
-					}
-					onShowControls={() => dispatchViewer({ type: "showControls" })}
-					onHideControls={() => dispatchViewer({ type: "hideControls" })}
-					onToggleTouchControls={() =>
-						dispatchViewer({ type: "toggleTouchControls" })
-					}
-					service={service}
-					state={viewer}
-					onLoadMore={wall.loadMore}
-					onRequestNearViewportDerivatives={wall.requestNearViewportDerivatives}
-					onSetWallInteraction={wall.setWallInteraction}
-					onSelectAsset={handleSelectViewerAsset}
-					loading={wall.loading}
-					nextCursor={wall.state.cursor}
-				/>
-			) : null}
-			{folderBrowserBreadcrumbs ? (
-				<HostedFolderBrowser
-					initialBreadcrumbs={folderBrowserBreadcrumbs}
-					onClose={closeFolderBrowser}
-					onSelected={(result) => {
-						controller.acceptFolderSelection(result);
-						closeFolderBrowser();
-					}}
-					service={service}
-				/>
-			) : null}
-			{drawerOpen ? (
-				<div className={styles.drawerBackdrop}>
-					<section
-						aria-label="Sources drawer"
-						aria-modal="true"
-						className={styles.drawer}
-						onKeyDown={handleDrawerKeyDown}
-						ref={drawerRef}
-						role="dialog"
-					>
-						<div className={styles.drawerHeader}>
-							<span>Sources</span>
-							<button
-								aria-label="Close sources"
-								className={styles.iconButton}
-								onClick={() => setDrawerOpen(false)}
-								ref={drawerCloseRef}
-								type="button"
-							>
-								<X aria-hidden="true" size={20} strokeWidth={1.7} />
-							</button>
-						</div>
-						<NavigationRail
-							chooseFolderAvailable={controller.capabilities.chooseFolder}
-							className={styles.drawerNavigation}
-							folderBrowserOpen={folderBrowserOpen}
-							folderSelection={controller.capabilities.folderSelection}
-							onChooseFolder={() => {
-								chooseFolder();
-								setDrawerOpen(false);
-							}}
-						/>
-					</section>
-				</div>
-			) : null}
-		</div>
+			</div>
+		</SourceUnavailableContext>
 	);
 }

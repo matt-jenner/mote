@@ -1,3 +1,5 @@
+import type { SavedFolderSnapshot } from "../folders/savedFolders";
+
 export type Appearance = "system" | "light" | "dark";
 export type GalleryScope = "currentFolder" | "includeSubfolders";
 export type SourceAvailability =
@@ -44,6 +46,7 @@ export interface FolderBrowserState {
 export interface BootstrapState {
 	settings: SettingsState;
 	activeSource: SourceSummary | null;
+	savedFolders: SavedFolderSnapshot;
 }
 
 export type ChooseFolderResult =
@@ -188,6 +191,15 @@ export type WallUpdate = WallUpdateBase | ResyncRequiredUpdate;
 
 export interface PhotoService {
 	readonly capabilities: PhotoServiceCapabilities;
+	getSavedFolders(): SavedFolderSnapshot;
+	watchSavedFolders(
+		listener: (snapshot: SavedFolderSnapshot) => void,
+	): () => void;
+	renameSavedFolder(id: string, label: string): Promise<BootstrapState>;
+	removeSavedFolder(id: string): Promise<BootstrapState>;
+	activateSavedFolder(id: string): Promise<ChooseFolderResult>;
+	clearActiveFolder(): Promise<BootstrapState>;
+	checkSavedFolders(ids: readonly string[]): Promise<SavedFolderSnapshot>;
 	getBootstrapState(): Promise<BootstrapState>;
 	chooseFolder(): Promise<ChooseFolderResult>;
 	updateAppearance(appearance: Appearance): Promise<BootstrapState>;

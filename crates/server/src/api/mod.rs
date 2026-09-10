@@ -6,7 +6,7 @@ mod types;
 
 pub(crate) use derivative::{derivative, request_derivatives};
 pub(crate) use events::events;
-pub(crate) use gallery::{create_selection, interaction, selection_summary, wall};
+pub(crate) use gallery::{create_selection, folder_access, interaction, selection_summary, wall};
 
 use axum::Json;
 use axum::extract::{RawQuery, State};
@@ -94,11 +94,23 @@ pub(crate) fn validate_decoded_identifier(value: &str, max: usize) -> Result<(),
 }
 
 pub(crate) async fn bootstrap(State(state): State<AppState>) -> impl IntoResponse {
-    let source_available = state
-        .folder_root
-        .as_ref()
-        .is_some_and(|root| root.is_available());
+    let source_available = if let Some(engine) = &state.gallery {
+        matches!(
+            engine.check_relative(std::path::Path::new("")).await,
+            Ok(photo_app_service::AccessReply::Complete {
+                outcome: photo_app_service::FolderProbeOutcome::Available(_),
+                ..
+            })
+        )
+    } else if let Some(root) = state.folder_root.clone() {
+        tokio::task::spawn_blocking(move || root.is_available())
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
     Json(BootstrapResponse {
+        root_id: state.gallery.as_ref().and_then(|engine| engine.root_id()),
         capabilities: Capabilities {
             folder_browser: state.folder_root.is_some(),
             video: false,

@@ -1,4 +1,9 @@
 import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import {
+	imageSourceUnavailable,
+	SourceWarningBadge,
+	useSourceUnavailable,
+} from "../folders/SourceAvailabilityContext";
 import type { PhotoService, WallAsset } from "../services/photoService";
 import styles from "../styles/photoViewer.module.css";
 import {
@@ -39,6 +44,7 @@ export function ViewerFilmstrip({
 	viewportWidth = 0,
 	viewportRevision = 0,
 }: ViewerFilmstripProps) {
+	const sourceUnavailable = useSourceUnavailable();
 	const capacity = viewerFilmstripCapacity(viewportWidth);
 	const windowRange = useMemo(
 		() => viewerFilmstripWindow(assets, currentIndex, (capacity - 1) / 2),
@@ -103,6 +109,11 @@ export function ViewerFilmstrip({
 							aria-current={isCurrent ? "true" : undefined}
 							aria-label={asset.displayName}
 							className={styles.viewerFilmstripItem}
+							disabled={
+								imageSourceUnavailable(sourceUnavailable, asset) &&
+								!asset.wallThumbnail &&
+								!asset.screenPreview
+							}
 							onClick={() => {
 								pendingSelectionAssetId.current = isCurrent ? null : asset.id;
 								onSelectAsset(asset.id);
@@ -110,6 +121,9 @@ export function ViewerFilmstrip({
 							ref={isCurrent ? currentButtonRef : undefined}
 							type="button"
 						>
+							{imageSourceUnavailable(sourceUnavailable, asset) ? (
+								<SourceWarningBadge />
+							) : null}
 							{url ? (
 								<img
 									alt=""

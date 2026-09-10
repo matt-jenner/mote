@@ -67,6 +67,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap_state,
             commands::choose_folder,
+            commands::rename_saved_folder,
+            commands::remove_saved_folder,
+            commands::clear_active_folder,
+            commands::activate_saved_folder,
+            commands::check_saved_folders,
             commands::update_appearance,
             commands::update_gallery_scope,
             commands::query_wall,

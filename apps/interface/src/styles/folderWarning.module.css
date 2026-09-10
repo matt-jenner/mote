@@ -1,0 +1,14 @@
+.badge {
+	position: absolute;
+	top: 8px;
+	right: 8px;
+	z-index: 3;
+	display: grid;
+	place-items: center;
+	width: 24px;
+	height: 24px;
+	color: #f3c46a;
+	background: rgb(20 21 22 / 82%);
+	border-radius: 5px;
+	pointer-events: none;
+}

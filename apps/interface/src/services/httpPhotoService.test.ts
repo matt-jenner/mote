@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { emptySavedFolders } from "../folders/savedFolders";
 import {
 	hostedClientStorageKey,
 	hostedPreferencesStorageKey,
@@ -342,6 +343,7 @@ describe("HTTP PhotoService", () => {
 		});
 
 		await expect(service.getBootstrapState()).resolves.toEqual({
+			savedFolders: emptySavedFolders(),
 			settings: { appearance: "dark", galleryScope: "currentFolder" },
 			activeSource: {
 				id: "source-a",
@@ -477,6 +479,7 @@ describe("HTTP PhotoService", () => {
 		});
 
 		await expect(service.getBootstrapState()).resolves.toEqual({
+			savedFolders: emptySavedFolders(),
 			settings: { appearance: "light", galleryScope: "currentFolder" },
 			activeSource: null,
 		});
@@ -1164,4 +1167,175 @@ describe("HTTP PhotoService", () => {
 		await vi.advanceTimersByTimeAsync(20_000);
 		expect(activeCalls()).toBe(afterDispose);
 	});
+});
+
+it("migrates the legacy hosted selection into the root-scoped folder list", async () => {
+	const local = savedPreferences({ selectionId: "selection-a" });
+	const service = createHttpPhotoService({
+		localStorage: local,
+		sessionStorage: new MemoryStorage(),
+		fetch: async (input) => {
+			const url = String(input);
+			if (url.endsWith("bootstrap"))
+				return json({ ...bootstrapResponse, rootId: "source-a" });
+			if (url.endsWith("/access"))
+				return json({
+					folderId: "a",
+					state: "available",
+					generation: 1,
+					retryAfterMs: 5000,
+				});
+			return json(selectionSummary);
+		},
+	});
+	const state = await service.getBootstrapState();
+	expect(state.savedFolders.entries).toHaveLength(1);
+	expect(state.activeSource?.displayName).toBe("Iceland");
+	service.dispose();
+});
+
+it("keeps a newer selection when an earlier startup restoration finishes late", async () => {
+	const local = new MemoryStorage();
+	const session = new MemoryStorage();
+	const { createBrowserSavedFolders } = await import(
+		"../folders/browserSavedFolders"
+	);
+	const folders = createBrowserSavedFolders(local, session, "source-a");
+	const one = folders.save({
+		folderId: "a",
+		name: "Iceland",
+		displayPath: "Trips/Iceland",
+	});
+	folders.select(one.id);
+	folders.markMigrated();
+	let release!: (response: Response) => void;
+	let started!: () => void;
+	const checking = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	const service = createHttpPhotoService({
+		localStorage: local,
+		sessionStorage: session,
+		fetch: async (input) => {
+			const url = String(input);
+			if (url.endsWith("bootstrap"))
+				return json({ ...bootstrapResponse, rootId: "source-a" });
+			if (url.endsWith("/access")) {
+				started();
+				return new Promise<Response>((resolve) => {
+					release = resolve;
+				});
+			}
+			return json({
+				...secondSelectionSummary,
+				sourceId: "source-a",
+				availability: "available",
+			});
+		},
+	});
+	const restoring = service.getBootstrapState();
+	await checking;
+	await service.selectFolder("Trips/Alps");
+	release(
+		json({
+			folderId: "a",
+			state: "available",
+			generation: 1,
+			retryAfterMs: 5000,
+		}),
+	);
+	const state = await restoring;
+	expect(state.activeSource?.displayName).toBe("Alps");
+	expect(service.getSavedFolders().activeEntryId).not.toBeNull();
+	service.dispose();
+});
+
+it("does not recreate an entry removed in another tab during its selection POST", async () => {
+	const local = new MemoryStorage();
+	const session = new MemoryStorage();
+	const { createBrowserSavedFolders } = await import(
+		"../folders/browserSavedFolders"
+	);
+	const folders = createBrowserSavedFolders(local, session, "source-a");
+	const one = folders.save({
+		folderId: "a",
+		name: "Iceland",
+		displayPath: "Trips/Iceland",
+	});
+	folders.select(null);
+	folders.markMigrated();
+	let release!: (response: Response) => void;
+	let started!: () => void;
+	const posting = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	const service = createHttpPhotoService({
+		localStorage: local,
+		sessionStorage: session,
+		fetch: async (input) => {
+			const url = String(input);
+			if (url.endsWith("bootstrap"))
+				return json({ ...bootstrapResponse, rootId: "source-a" });
+			if (url.endsWith("/access"))
+				return json({
+					folderId: "a",
+					state: "available",
+					generation: 1,
+					retryAfterMs: 5000,
+				});
+			started();
+			return new Promise<Response>((resolve) => {
+				release = resolve;
+			});
+		},
+	});
+	await service.getBootstrapState();
+	const opening = service.activateSavedFolder(one.id);
+	await posting;
+	createBrowserSavedFolders(local, new MemoryStorage(), "source-a").remove(
+		one.id,
+	);
+	release(json(selectionSummary));
+	expect((await opening).kind).toBe("cancelled");
+	expect(service.getSavedFolders().entries).toEqual([]);
+	service.dispose();
+});
+
+it("keeps legacy preferences retryable when migration lookup fails transiently", async () => {
+	const local = savedPreferences({ selectionId: "selection-a" });
+	const service = createHttpPhotoService({
+		localStorage: local,
+		sessionStorage: new MemoryStorage(),
+		fetch: async (input) => {
+			if (String(input).endsWith("bootstrap"))
+				return json({ ...bootstrapResponse, rootId: "source-a" });
+			throw Error("offline");
+		},
+	});
+	await expect(service.getBootstrapState()).rejects.toBeInstanceOf(
+		PhotoServiceError,
+	);
+	expect(
+		JSON.parse(local.getItem(hostedPreferencesStorageKey) ?? "{}").selectionId,
+	).toBe("selection-a");
+	expect(local.getItem("mote.folders.v1.source-a.migrated")).not.toBe("1");
+	service.dispose();
+});
+
+it("does not save a response from a changed hosted root into the previous root", async () => {
+	const service = createHttpPhotoService({
+		localStorage: new MemoryStorage(),
+		sessionStorage: new MemoryStorage(),
+		fetch: async (input) => {
+			if (String(input).endsWith("bootstrap"))
+				return json({ ...bootstrapResponse, rootId: "source-a" });
+			return json({ ...selectionSummary, sourceId: "changed-root" });
+		},
+	});
+	await service.getBootstrapState();
+	await expect(service.selectFolder("Trips/Iceland")).rejects.toBeInstanceOf(
+		PhotoServiceError,
+	);
+	expect(service.getSavedFolders().entries).toEqual([]);
+	service.dispose();
 });

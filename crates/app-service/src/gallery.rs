@@ -414,6 +414,8 @@ impl GallerySelection {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SelectionSummary {
+    pub folder_id: String,
+    pub path: String,
     pub id: String,
     pub source_id: String,
     pub display_name: String,
@@ -442,6 +444,7 @@ pub struct GalleryEngine {
     pub(crate) runtimes: Arc<Mutex<HashMap<FolderGroupId, Weak<SelectionRuntime>>>>,
     pub(crate) metadata_reader: ReaderAdapter,
     hosted_library_id: Option<LibraryId>,
+    folder_access: crate::FolderAccessCoordinator,
     pub(crate) shared_coordinator:
         Option<Arc<crate::derivative_coordinator::DerivativeCoordinator>>,
     pub(crate) cache_root: PathBuf,
@@ -693,6 +696,8 @@ impl GalleryEngine {
         Ok(Self {
             state: Arc::new(Mutex::new(ServiceState {
                 libraries,
+                folder_status: HashMap::new(),
+                folder_revision: 0,
                 active_scan: None,
                 protected_group: None,
                 selection_epoch: 0,
@@ -703,6 +708,7 @@ impl GalleryEngine {
             runtimes: Arc::new(Mutex::new(HashMap::new())),
             metadata_reader: ReaderAdapter::new(reader),
             hosted_library_id: Some(hosted_library_id),
+            folder_access: crate::FolderAccessCoordinator::default(),
             shared_coordinator: None,
             cache_root,
             cache_writer,
@@ -773,6 +779,7 @@ impl GalleryEngine {
             runtimes: Arc::new(Mutex::new(HashMap::new())),
             metadata_reader,
             hosted_library_id: None,
+            folder_access: crate::FolderAccessCoordinator::default(),
             shared_coordinator: Some(shared_coordinator),
             cache_root,
             cache_writer,
@@ -828,10 +835,14 @@ impl GalleryEngine {
         }
     }
 
-    pub async fn select_relative(
+    pub fn root_id(&self) -> Option<String> {
+        self.hosted_library_id.map(|id| id.as_uuid().to_string())
+    }
+
+    pub async fn check_relative(
         &self,
         relative: &Path,
-    ) -> Result<SelectionSummary, AppServiceError> {
+    ) -> Result<crate::AccessReply, AppServiceError> {
         if relative.is_absolute()
             || relative.components().any(|c| {
                 matches!(
@@ -840,71 +851,91 @@ impl GalleryEngine {
                 )
             })
         {
-            return Err(AppServiceError::OpenRecent(
-                photo_core::AddLibraryError::InvalidSelection,
-            ));
+            return Err(photo_core::AddLibraryError::InvalidSelection.into());
+        }
+        let target = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| AppServiceError::StatePoisoned)?;
+            let library_id = self
+                .hosted_library_id
+                .ok_or(AppServiceError::UnknownAsset)?;
+            let library = state
+                .libraries
+                .catalog()
+                .find_library(library_id)?
+                .ok_or(AppServiceError::UnknownAsset)?;
+            crate::FolderAccessTarget {
+                key: crate::FolderAccessKey {
+                    library_id,
+                    relative: RelativePathKey::from_relative_path(relative)
+                        .map_err(|_| photo_core::AddLibraryError::InvalidSelection)?,
+                },
+                root: library
+                    .canonical_root_key
+                    .to_path_buf()
+                    .map_err(|e| CatalogError::InvalidData(e.to_string()))?,
+            }
+        };
+        Ok(self.folder_access.check_with_root(target).await)
+    }
+
+    pub async fn select_relative(
+        &self,
+        relative: &Path,
+    ) -> Result<SelectionSummary, AppServiceError> {
+        let reply = self.check_relative(relative).await?;
+        match reply {
+            crate::AccessReply::Complete {
+                outcome: crate::FolderProbeOutcome::Available(proof),
+                ..
+            } => self.select_validated(&proof),
+            crate::AccessReply::Complete {
+                outcome: crate::FolderProbeOutcome::Invalid,
+                ..
+            } => Err(photo_core::AddLibraryError::InvalidSelection.into()),
+            _ => Err(photo_core::AddLibraryError::NotDirectory(relative.to_path_buf()).into()),
+        }
+    }
+
+    pub fn select_validated(
+        &self,
+        proof: &crate::ValidatedFolder,
+    ) -> Result<SelectionSummary, AppServiceError> {
+        if self.hosted_library_id != Some(proof.key().library_id) {
+            return Err(AppServiceError::UnknownAsset);
         }
         let mut state = self
             .state
             .lock()
             .map_err(|_| AppServiceError::StatePoisoned)?;
-        let hosted_library_id = self
-            .hosted_library_id
-            .ok_or(AppServiceError::UnknownAsset)?;
-        let library = state
-            .libraries
-            .catalog()
-            .find_library(hosted_library_id)?
-            .ok_or(AppServiceError::StatePoisoned)?;
-        let root = library
-            .canonical_root_key
-            .to_path_buf()
-            .map_err(|e| CatalogError::InvalidData(e.to_string()))?;
-        let selected_native = root.join(relative);
-        let selected_canonical = std::fs::canonicalize(&selected_native).map_err(|_| {
-            AppServiceError::OpenRecent(photo_core::AddLibraryError::NotDirectory(
-                selected_native.clone(),
-            ))
-        })?;
-        if !selected_canonical.starts_with(&root) || !selected_canonical.is_dir() {
-            return Err(AppServiceError::OpenRecent(
-                photo_core::AddLibraryError::InvalidSelection,
-            ));
-        }
-        let canonical_relative = selected_canonical
-            .strip_prefix(&root)
-            .unwrap_or_else(|_| Path::new("."));
-        let key = RelativePathKey::from_relative_path(canonical_relative)
-            .map_err(|_| photo_core::AddLibraryError::InvalidSelection)?;
-        let display_name = canonical_relative
-            .file_name()
-            .map(|v| v.to_string_lossy().into_owned())
-            .unwrap_or_else(|| library.display_name.clone());
         let group = state
             .libraries
             .catalog_mut()
             .upsert_folder_group(&NewFolderGroup {
                 id: FolderGroupId::new(),
-                library_id: hosted_library_id,
-                relative_path: key,
-                display_path: relative.to_string_lossy().into_owned(),
+                library_id: proof.key().library_id,
+                relative_path: proof.key().relative.clone(),
+                display_path: proof
+                    .key()
+                    .relative
+                    .to_path_buf()
+                    .map_err(|e| CatalogError::InvalidData(e.to_string()))?
+                    .to_string_lossy()
+                    .into_owned(),
                 last_viewed_at: Some(crate::service::unix_timestamp()),
             })?;
         let selection = GallerySelection {
-            id: format!("selection-{}", group.as_uuid().hyphenated()),
-            library_id: hosted_library_id,
+            id: format!("selection-{}", group.as_uuid()),
+            library_id: proof.key().library_id,
             group_id: group,
-            relative_folder: state
-                .libraries
-                .catalog()
-                .folder_group(group)?
-                .ok_or(AppServiceError::StatePoisoned)?
-                .relative_path,
+            relative_folder: proof.key().relative.clone(),
             epoch: 0,
         };
         drop(state);
         self.selection_summary(&selection).map(|mut summary| {
-            summary.display_name = display_name;
+            summary.availability = SourceAvailability::Available;
             summary
         })
     }
@@ -1011,6 +1042,8 @@ impl GalleryEngine {
             });
         }
         Ok(SelectionSummary {
+            folder_id: group.id.as_uuid().to_string(),
+            path: relative.to_string_lossy().into_owned(),
             id: selection.id.clone(),
             source_id: group.library_id.as_uuid().hyphenated().to_string(),
             display_name: relative

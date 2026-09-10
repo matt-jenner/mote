@@ -117,7 +117,12 @@ function decodePreferences(value: unknown): HostedBrowserPreferences {
 }
 
 function readStoredPreferences(storage: Storage): HostedBrowserPreferences {
-	const stored = storage.getItem(hostedPreferencesStorageKey);
+	let stored: string | null;
+	try {
+		stored = storage.getItem(hostedPreferencesStorageKey);
+	} catch {
+		return clonePreferences(defaultPreferences);
+	}
 	if (stored === null) return clonePreferences(defaultPreferences);
 	try {
 		return decodePreferences(JSON.parse(stored));
@@ -148,15 +153,24 @@ export function createBrowserPreferences(
 						? cloneBreadcrumbs(preferences.breadcrumbs)
 						: cloneBreadcrumbs(values.breadcrumbs),
 			};
-			options.localStorage.setItem(
-				hostedPreferencesStorageKey,
-				JSON.stringify(preferences),
-			);
+			try {
+				options.localStorage.setItem(
+					hostedPreferencesStorageKey,
+					JSON.stringify(preferences),
+				);
+			} catch {
+				/* Keep preferences usable for this tab. */
+			}
 			return clonePreferences(preferences);
 		},
 		clientId() {
 			if (clientId !== null) return clientId;
-			const stored = options.sessionStorage.getItem(hostedClientStorageKey);
+			let stored: string | null = null;
+			try {
+				stored = options.sessionStorage.getItem(hostedClientStorageKey);
+			} catch {
+				/* Use an in-memory client. */
+			}
 			if (validClientId(stored)) {
 				clientId = stored;
 				return clientId;
@@ -166,7 +180,11 @@ export function createBrowserPreferences(
 				throw new Error("The client ID factory returned an invalid value.");
 			}
 			clientId = generated;
-			options.sessionStorage.setItem(hostedClientStorageKey, clientId);
+			try {
+				options.sessionStorage.setItem(hostedClientStorageKey, clientId);
+			} catch {
+				/* Keep the generated client in memory. */
+			}
 			return clientId;
 		},
 	};

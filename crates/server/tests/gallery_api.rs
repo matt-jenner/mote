@@ -646,3 +646,53 @@ async fn route_rejects_a_cursor_over_2048_bytes_before_lookup() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json_body(response).await["code"], "invalidRequest");
 }
+
+#[tokio::test]
+async fn saved_folder_access_is_shared_and_exposes_only_relative_identity() {
+    let (temp, router) = app();
+    let selected = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/selections")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"path":"Trips"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.status(), StatusCode::CREATED);
+    let selected = json_body(selected).await;
+    assert_eq!(selected["path"], "Trips");
+    let id = selected["id"].as_str().unwrap();
+    let request = || {
+        Request::builder()
+            .uri(format!("/api/v1/selections/{id}/access"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (a, b) = tokio::join!(
+        router.clone().oneshot(request()),
+        router.clone().oneshot(request())
+    );
+    let a = json_body(a.unwrap()).await;
+    let b = json_body(b.unwrap()).await;
+    assert_eq!(a["state"], "available");
+    assert_eq!(a["generation"], b["generation"]);
+    assert_eq!(a["folderId"], selected["folderId"]);
+    assert!(!a.to_string().contains(temp.path().to_str().unwrap()));
+    let bootstrap = json_body(
+        router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/bootstrap")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(bootstrap["rootId"], selected["sourceId"]);
+}

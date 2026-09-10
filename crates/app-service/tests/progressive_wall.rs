@@ -851,7 +851,7 @@ async fn wall_cursor_is_rejected_after_switching_folder_groups() {
 }
 
 #[tokio::test]
-async fn unavailable_reopen_retains_cached_wall_and_emits_source_unavailable() {
+async fn unavailable_reopen_clears_the_view_and_preserves_the_cached_catalog() {
     let fixture = ProgressiveFixture::new(12);
     let (reader, release) = BlockingReader::new();
     let service = fixture.service(reader);
@@ -873,28 +873,25 @@ async fn unavailable_reopen_retains_cached_wall_and_emits_source_unavailable() {
     let reopened =
         AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
             .unwrap();
-    let mut updates = reopened.subscribe_wall_updates();
-    let cached = reopened
-        .query_wall(query(SortDirection::NewestFirst))
-        .await
-        .unwrap();
-    assert_eq!(cached.items.len(), 12);
-    recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::SourceUnavailable { .. })
-    })
-    .await;
-    let unavailable_page = reopened
-        .query_wall(query(SortDirection::NewestFirst))
-        .await
-        .unwrap();
-    assert_eq!(unavailable_page.items.len(), 12);
-    assert!(unavailable_page.items.iter().all(|asset| {
-        asset.availability == SourceAvailability::RootOffline
-            && asset
-                .warning
-                .as_ref()
-                .is_some_and(|warning| warning.retryable)
-    }));
+    let bootstrap = reopened.checked_bootstrap().await.unwrap();
+    assert!(bootstrap.active_source.is_none());
+    assert_eq!(bootstrap.saved_folders.entries.len(), 1);
+    assert!(bootstrap.saved_folders.active_entry_id.is_none());
+    assert!(
+        reopened
+            .query_wall(query(SortDirection::NewestFirst))
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    let library = catalog.list_libraries().unwrap().remove(0);
+    assert_eq!(
+        catalog.assets(library.id).unwrap().len(),
+        12,
+        "clearing the view must preserve the cached catalog"
+    );
     std::fs::rename(unavailable, &fixture.source).unwrap();
 }
 
@@ -922,57 +919,36 @@ async fn unavailable_selected_child_marks_only_its_group_offline() {
         matches!(event, WallUpdate::MetadataSettled { .. })
     })
     .await;
-    drop(service);
-
+    let before = service.bootstrap().unwrap();
     let unavailable = fixture.source.join("child-offline");
     std::fs::rename(&child, &unavailable).unwrap();
-    let reopened =
-        AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
-            .unwrap();
-    let mut updates = reopened.subscribe_wall_updates();
-    recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::SourceUnavailable { .. })
-    })
-    .await;
-
-    let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
-    let selection = catalog.load_app_state().unwrap().active_selection.unwrap();
-    let child_group = catalog
-        .folder_group_for_path(selection.library_id, &selection.relative_folder)
-        .unwrap()
-        .unwrap();
-    let root_group = catalog
-        .folder_group_for_path(
-            selection.library_id,
-            &photo_domain::RelativePathKey::from_relative_path(Path::new("")).unwrap(),
-        )
-        .unwrap()
-        .unwrap();
-    let assets = catalog.assets(selection.library_id).unwrap();
-    assert!(
-        assets
-            .iter()
-            .any(|asset| asset.folder_group_id == Some(child_group))
-    );
-    assert!(
-        assets
-            .iter()
-            .filter(|asset| asset.folder_group_id == Some(child_group))
-            .all(|asset| asset.availability == photo_domain::Availability::RootOffline)
-    );
-    assert!(
-        assets
-            .iter()
-            .filter(|asset| asset.folder_group_id == Some(root_group))
-            .all(|asset| asset.availability == photo_domain::Availability::Available)
-    );
+    let ids: Vec<_> = before
+        .saved_folders
+        .entries
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect();
+    let checked = service.check_saved_folders(&ids).await.unwrap();
     assert_eq!(
-        catalog
-            .find_library(selection.library_id)
+        checked.active_entry_id,
+        before.saved_folders.active_entry_id
+    );
+    for entry in &checked.entries {
+        let expected = if entry.name == "child" {
+            photo_app_service::FolderAccessState::Missing
+        } else {
+            photo_app_service::FolderAccessState::Available
+        };
+        assert_eq!(checked.access[&entry.folder_id].state, expected);
+    }
+    assert_eq!(
+        service
+            .query_wall(query(SortDirection::NewestFirst))
+            .await
             .unwrap()
-            .unwrap()
-            .availability,
-        photo_domain::Availability::Available
+            .items
+            .len(),
+        1
     );
     std::fs::rename(unavailable, child).unwrap();
 }
@@ -2662,6 +2638,15 @@ async fn invalidation_before_commit_admission_has_no_side_effects() {
             .install_derivative_completion_test_hook(completed.clone())
             .await;
 
+        // Keep automatic prefetch from satisfying the encode gate before the
+        // explicit request below has registered its completion waiter.
+        let collection_release = Arc::new(tokio::sync::Notify::new());
+        service
+            .install_collection_enqueue_test_gate(
+                Arc::new(tokio::sync::Notify::new()),
+                collection_release.clone(),
+            )
+            .await;
         service
             .set_interaction(photo_app_service::InteractionState::Idle)
             .await;
@@ -2688,7 +2673,14 @@ async fn invalidation_before_commit_admission_has_no_side_effects() {
             .await
             .unwrap();
         post_encode_release.notify_waiters();
-        assert!(background.await.unwrap().is_err());
+        collection_release.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), background)
+                .await
+                .expect("the invalidated request should resolve")
+                .unwrap()
+                .is_err()
+        );
         tokio::time::timeout(Duration::from_secs(5), completed.notified())
             .await
             .expect("stale worker should finish after admission is rejected");

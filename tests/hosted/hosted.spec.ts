@@ -149,11 +149,13 @@ async function seedPreferences(
 
 async function chooseFolder(page: Page, folder: "A" | "B") {
 	await page.goto("/", { waitUntil: "domcontentloaded" });
-	const folders = page.getByRole("button", { name: "Folders", exact: true });
+	const folders = page.getByRole("button", { name: "Add folder", exact: true });
 	await expect(folders).toBeEnabled();
 	await folders.click();
 	const dialog = page.getByRole("dialog", { name: "Choose a folder" });
 	await expect(dialog).toBeVisible();
+	const back = dialog.getByRole("button", { name: "Back", exact: true });
+	while (await back.isEnabled()) await back.click();
 	await dialog.getByRole("button", { name: folder, exact: true }).click();
 	await dialog
 		.getByRole("button", { name: "Open this folder", exact: true })
@@ -459,19 +461,19 @@ test(`hosted lifecycle phase: ${phase}`, async ({ browser, baseURL }) => {
 			const pageA = await contextA.newPage();
 			const pageB = await contextB.newPage();
 			const a = await configureBrowser(pageA, {
-					folder: "A",
-					appearance: "dark",
-					scope: "currentFolder",
-					sort: "oldestFirst",
-					firstFilename: "a-01.jpg",
-				});
+				folder: "A",
+				appearance: "dark",
+				scope: "currentFolder",
+				sort: "oldestFirst",
+				firstFilename: "a-01.jpg",
+			});
 			const b = await configureBrowser(pageB, {
-					folder: "B",
-					appearance: "light",
-					scope: "includeSubfolders",
-					sort: "newestFirst",
-					firstFilename: "b-01.jpg",
-				});
+				folder: "B",
+				appearance: "light",
+				scope: "includeSubfolders",
+				sort: "newestFirst",
+				firstFilename: "b-01.jpg",
+			});
 			await assertChildStartsUncached(pageA, a.selectionId);
 			expect(a.selectionId).not.toBe(b.selectionId);
 			expect(a.clientId).not.toBe(b.clientId);
@@ -519,6 +521,35 @@ test(`hosted lifecycle phase: ${phase}`, async ({ browser, baseURL }) => {
 				assertOfflineServerCache(pageA, record.a, baseURL ?? ""),
 				assertOfflineServerCache(pageB, record.b, baseURL ?? ""),
 			]);
+			for (const [page, saved] of [
+				[pageA, record.a],
+				[pageB, record.b],
+			] as const) {
+				await page.goto("/", { waitUntil: "domcontentloaded" });
+				await expect(
+					page.getByRole("heading", { name: "Select a folder" }),
+				).toBeVisible();
+				const entry = page.getByRole("button", {
+					name: `${saved.folder} unavailable; select to recheck`,
+					exact: true,
+				});
+				await expect(entry).toBeVisible();
+				await expect(page.locator("figure[data-asset-id]")).toHaveCount(0);
+				await entry.click();
+				await expect(
+					page.getByRole("heading", { name: "Select a folder" }),
+				).toBeVisible();
+				await page
+					.getByRole("button", { name: `Options for ${saved.folder}` })
+					.click();
+				await expect(
+					page.getByRole("menuitem", { name: "Rename" }),
+				).toHaveCount(0);
+				await expect(
+					page.getByRole("menuitem", { name: "Remove" }),
+				).toBeVisible();
+			}
+			return;
 		}
 		await Promise.all([
 			assertRestored(pageA, record.a),
@@ -544,54 +575,7 @@ test(`hosted lifecycle phase: ${phase}`, async ({ browser, baseURL }) => {
 			return;
 		}
 
-		if (phase !== "offline") {
-			throw new Error(`unknown PHOTO_VIEWER_PHASE: ${phase}`);
-		}
-		await Promise.all([
-			openViewerAndExercise(pageA, record.a.firstFilename),
-			openViewerAndExercise(pageB, record.b.firstFilename),
-		]);
-
-		await setPressed(pageA, "Include subfolders", true);
-		const child = await expect
-			.poll(async () => {
-				const response = await pageA.request.get(
-					`/api/v1/selections/${encodeURIComponent(
-						record.a.selectionId,
-					)}/wall?scope=includeSubfolders&direction=oldestFirst&limit=100`,
-				);
-				expect(response.status()).toBe(200);
-				const wall = (await response.json()) as WallResponse;
-				await response.dispose();
-				return wall.items.find(
-					(item) => item.displayName === "a-child-uncached.jpg",
-				);
-			})
-			.toBeTruthy();
-		void child;
-
-		const response = await pageA.request.get(
-			`/api/v1/selections/${encodeURIComponent(
-				record.a.selectionId,
-			)}/wall?scope=includeSubfolders&direction=oldestFirst&limit=100`,
-		);
-		expect(response.status()).toBe(200);
-		const wall = (await response.json()) as WallResponse;
-		await response.dispose();
-		const childAsset = wall.items.find(
-			(item) => item.displayName === "a-child-uncached.jpg",
-		);
-		expect(childAsset).toBeTruthy();
-		expect(childAsset?.availability).toBe("rootOffline");
-		expect(childAsset?.wallThumbnail).toBeNull();
-		expect(childAsset?.screenPreview).toBeNull();
-		const childTile = pageA.locator(
-			`figure[data-asset-id="${childAsset?.id ?? "missing"}"]`,
-		);
-		await expect(childTile.getByText("File unavailable")).toBeVisible();
-		await expect(
-			childTile.getByRole("button", { name: "Open a-child-uncached.jpg" }),
-		).toHaveCount(0);
+		throw new Error(`unknown PHOTO_VIEWER_PHASE: ${phase}`);
 	} finally {
 		await contextA.close();
 		await contextB.close();
@@ -611,7 +595,10 @@ test("mounted root allows contained child selection and scoped browsing", async 
 	try {
 		const page = await context.newPage();
 		await page.goto("/", { waitUntil: "domcontentloaded" });
-		const folders = page.getByRole("button", { name: "Folders", exact: true });
+		const folders = page.getByRole("button", {
+			name: "Add folder",
+			exact: true,
+		});
 		await expect(folders).toBeEnabled();
 		await folders.click();
 		const dialog = page.getByRole("dialog", { name: "Choose a folder" });
@@ -641,5 +628,91 @@ test("mounted root allows contained child selection and scoped browsing", async 
 		await visibleTile(page, "album-descendant.jpg");
 	} finally {
 		await context.close();
+	}
+});
+
+test("saved folders share edits across tabs but keep selections and browser profiles independent", async ({
+	browser,
+	baseURL,
+}) => {
+	test.skip(
+		phase !== "beforeRestart",
+		"Saved-folder edits run while the fixture is online",
+	);
+	const first = await newContext(browser, baseURL ?? "");
+	const other = await newContext(browser, baseURL ?? "");
+	try {
+		const a = await first.newPage();
+		const isolated = await other.newPage();
+		for (const page of [a, isolated]) {
+			await seedPreferences(page, {
+				folder: "A",
+				appearance: "dark",
+				scope: "currentFolder",
+				sort: "oldestFirst",
+				firstFilename: "a-01.jpg",
+			});
+		}
+		await chooseFolder(a, "A");
+		await a.getByRole("button", { name: "Options for A" }).click();
+		await a.getByRole("menuitem", { name: "Rename" }).click();
+		await a.getByRole("textbox", { name: "Folder label" }).fill("Album 10");
+		await a.getByRole("textbox", { name: "Folder label" }).press("Enter");
+		const b = await first.newPage();
+		await chooseFolder(b, "B");
+		await b.getByRole("button", { name: "Options for B" }).click();
+		await b.getByRole("menuitem", { name: "Rename" }).click();
+		await b.getByRole("textbox", { name: "Folder label" }).fill("Album 2");
+		await b.getByRole("textbox", { name: "Folder label" }).press("Enter");
+		await expect(a.locator("nav button[data-folder-id]")).toHaveText([
+			"Album 2",
+			"Album 10",
+		]);
+		await expect(
+			a.locator("header").getByText("Album 10", { exact: true }),
+		).toBeVisible();
+		await expect(
+			b.locator("header").getByText("Album 2", { exact: true }),
+		).toBeVisible();
+		await a.reload();
+		await expect(
+			a.locator("header").getByText("Album 10", { exact: true }),
+		).toBeVisible();
+		await expect(
+			a.getByRole("button", { name: "Album 10", exact: true }),
+		).toHaveAttribute("title", "Album 10\nA");
+		await chooseFolder(isolated, "A");
+		await expect(isolated.locator("nav button[data-folder-id]")).toHaveText([
+			"A",
+		]);
+		await a.getByRole("button", { name: "Options for Album 10" }).click();
+		await a.getByRole("menuitem", { name: "Remove" }).click();
+		await expect(
+			a.getByRole("heading", { name: "Select a folder" }),
+		).toBeVisible();
+		await expect(b.locator("nav button[data-folder-id]")).toHaveText([
+			"Album 2",
+		]);
+		await expect(
+			b.locator("header").getByText("Album 2", { exact: true }),
+		).toBeVisible();
+		await expect(
+			isolated.locator("header").getByText("A", { exact: true }),
+		).toBeVisible();
+		await a.getByRole("button", { name: "Album 2", exact: true }).click();
+		await expect(
+			a.locator("header").getByText("Album 2", { exact: true }),
+		).toBeVisible();
+		await b.getByRole("button", { name: "Options for Album 2" }).click();
+		await b.getByRole("menuitem", { name: "Remove" }).click();
+		await expect(
+			a.getByRole("heading", { name: "Select a folder" }),
+		).toBeVisible();
+		await expect(
+			b.getByRole("heading", { name: "Select a folder" }),
+		).toBeVisible();
+	} finally {
+		await first.close();
+		await other.close();
 	}
 });

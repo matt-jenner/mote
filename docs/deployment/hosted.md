@@ -2,7 +2,39 @@
 
 The hosted image serves the web interface and API on port 8080. It runs as UID and GID 10001, reads photos from `/photos`, and writes only to its data and cache mounts. Every browser URL is origin-relative. A deployment at `https://photos.docker.jenner.lan` needs no hostname or public-URL environment variable.
 
-The `/photos` mount is the highest folder the web interface can browse. Choose **Folders** in the hosted interface to list its child directories, move through nested directories, and open any contained folder as the gallery source. The browser never receives the host path and cannot navigate above the mounted root. **Include subfolders** controls whether the gallery shows only photos directly inside the selected folder or also includes its descendants.
+The `/photos` mount is the highest folder the web interface can browse. Choose **Add folder** in the hosted interface to list its child directories, move through nested directories, and open any contained folder as the gallery source. The browser never receives the host path and cannot navigate above the mounted root. **Include subfolders** controls whether the gallery shows only photos directly inside the selected folder or also includes its descendants.
+
+## Saved folders
+
+Opening a folder adds a shortcut to the left sidebar. Its menu lets you rename
+or remove the shortcut. Labels use natural alphabetical order, so Album 2
+precedes Album 10. Hovering a row shows its full label and root-relative path.
+Removing the active shortcut clears the gallery; it does not delete photos,
+catalogue records, or cached images.
+
+The hosted list lives in localStorage for each browser profile and site, under
+an opaque identity for the configured catalogue root. It survives page reloads
+and server restarts without accounts. Tabs share additions, labels and removals,
+but keep independent active folders in sessionStorage. Removing a folder clears
+any tab viewing it. Separate browser profiles have independent lists. Changing
+the configured root identity selects a separate list. If browser storage is
+blocked or full, Mote retains changes in memory and displays a persistence notice.
+
+Desktop shortcuts instead live in the app profile's SQLite catalogue and show
+native paths in their tooltips.
+
+Unavailable entries stay visible with an amber warning and a Remove-only menu.
+Selecting one requests an access check. Startup and focus also check saved
+folders. Checks for the same folder share one running operation across clients
+of the server process and reuse results for five seconds. A caller stops waiting
+after five seconds; a slow filesystem operation keeps its slot until it finishes.
+The coordinator allows four filesystem workers, 256 tracked keys and 64 waiters
+per key. No periodic availability polling runs in the browser.
+
+If an open folder becomes unavailable, cached images remain viewable with corner
+warnings. Images without cached content cannot open. Switching away or reloading
+requires a successful access check before that folder can reopen. Restoring
+access clears the folder warning while preserving independent image errors.
 
 ## Build the image
 

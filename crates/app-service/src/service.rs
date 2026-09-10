@@ -3,7 +3,7 @@ use crate::{
     SourceAvailability, SourceSummary,
 };
 use photo_cache::{CacheBudget, CacheError, CacheWriter, ProtectedGroups};
-use photo_catalog::{Catalog, CatalogError, NewFolderGroup, StoredSourceSelection};
+use photo_catalog::{Catalog, CatalogError, NewFolderGroup};
 use photo_core::{
     AddLibraryError, LibraryService, LocalStateError, RealSourceFs, SourceFs, SourceValidator,
     ValidatedSourceFolder,
@@ -21,6 +21,8 @@ use tokio::sync::Notify;
 
 pub(crate) struct ServiceState {
     pub(crate) libraries: LibraryService<RealSourceFs>,
+    pub(crate) folder_status: HashMap<String, crate::FolderAccess>,
+    pub(crate) folder_revision: u64,
     pub(crate) active_scan: Option<ScanOwner>,
     pub(crate) protected_group: Option<photo_domain::FolderGroupId>,
     pub(crate) selection_epoch: u64,
@@ -487,9 +489,10 @@ pub struct AppService {
     pub(crate) desktop_bridges: Arc<Mutex<HashMap<SelectionToken, DesktopBridgeEntry>>>,
     pub(crate) next_bridge_id: Arc<AtomicU64>,
     source_validator: Arc<dyn RecentSourceValidator>,
+    pub(crate) folder_access: crate::FolderAccessCoordinator,
     pub(crate) selection_transition: Arc<Mutex<()>>,
-    selection_request_sequence: Arc<AtomicU64>,
-    latest_validated_selection: Arc<AtomicU64>,
+    pub(crate) selection_request_sequence: Arc<AtomicU64>,
+    pub(crate) latest_validated_selection: Arc<AtomicU64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -561,6 +564,8 @@ impl AppService {
         ));
         let state = Arc::new(Mutex::new(ServiceState {
             libraries,
+            folder_status: HashMap::new(),
+            folder_revision: 0,
             active_scan: None,
             protected_group: None,
             selection_epoch: u64::from(should_reconcile),
@@ -632,6 +637,7 @@ impl AppService {
             next_bridge_id: Arc::new(AtomicU64::new(0)),
             source_validator,
             selection_transition: Arc::new(Mutex::new(())),
+            folder_access: crate::FolderAccessCoordinator::default(),
             selection_request_sequence: Arc::new(AtomicU64::new(0)),
             latest_validated_selection: Arc::new(AtomicU64::new(0)),
         };
@@ -663,7 +669,13 @@ impl AppService {
             let startup = service.clone();
             tokio::spawn(async move {
                 tokio::task::yield_now().await;
-                startup.reconcile_existing().await;
+                if startup
+                    .checked_bootstrap()
+                    .await
+                    .is_ok_and(|s| s.active_source.is_some())
+                {
+                    startup.reconcile_existing().await;
+                }
             });
         }
         Ok(service)
@@ -675,9 +687,12 @@ impl AppService {
             .map_err(|_| AppServiceError::StatePoisoned)
     }
 
-    fn bootstrap_locked(state: &ServiceState) -> Result<BootstrapState, AppServiceError> {
+    pub(crate) fn bootstrap_locked(
+        state: &ServiceState,
+    ) -> Result<BootstrapState, AppServiceError> {
         let stored = state.libraries.catalog().load_app_state()?;
-        let active_source = match stored.active_selection {
+        let saved_folders = Self::saved_folders_locked(state)?;
+        let mut active_source = match stored.active_selection {
             Some(selection) => match state
                 .libraries
                 .catalog()
@@ -723,7 +738,28 @@ impl AppService {
             },
             None => None,
         };
+        if let Some(active) = &mut active_source
+            && let Some(entry) = saved_folders
+                .entries
+                .iter()
+                .find(|e| Some(&e.id) == saved_folders.active_entry_id.as_ref())
+        {
+            active.display_name = entry
+                .custom_label
+                .clone()
+                .unwrap_or_else(|| entry.name.clone());
+            if let Some(access) = saved_folders.access.get(&entry.folder_id) {
+                active.availability = match access.state {
+                    crate::FolderAccessState::Available => SourceAvailability::Available,
+                    crate::FolderAccessState::Missing => SourceAvailability::Missing,
+                    crate::FolderAccessState::Unreadable => SourceAvailability::Unreadable,
+                    crate::FolderAccessState::RootOffline => SourceAvailability::RootOffline,
+                    _ => active.availability,
+                };
+            }
+        }
         Ok(BootstrapState {
+            saved_folders,
             settings: SettingsState {
                 appearance: stored.appearance,
                 gallery_scope: stored.gallery_scope,
@@ -796,20 +832,26 @@ impl AppService {
         if previous != Some(group) {
             self.protected_groups.protect(group)?;
         }
-        if let Err(error) =
-            state
-                .libraries
-                .catalog_mut()
-                .set_active_selection(Some(&StoredSourceSelection {
-                    library_id: selection.library_id,
-                    relative_folder: selection.relative_folder,
-                }))
+        if let Err(error) = state
+            .libraries
+            .catalog_mut()
+            .save_and_activate_folder(group)
         {
             if previous != Some(group) {
                 let _ = self.protected_groups.unprotect(group);
             }
             return Err(error.into());
         }
+        state.folder_revision += 1;
+        state.folder_status.insert(
+            group.as_uuid().to_string(),
+            crate::FolderAccess {
+                folder_id: group.as_uuid().to_string(),
+                state: crate::FolderAccessState::Available,
+                generation: 0,
+                retry_after_ms: 0,
+            },
+        );
         let cancelled_group = state.active_scan.map(|owner| owner.selection.group_id);
         state.active_scan = None;
         state.published_wall_cache_warning = None;

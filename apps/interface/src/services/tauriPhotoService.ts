@@ -1,5 +1,11 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import {
+	cloneSavedFolders,
+	emptySavedFolders,
+	type SavedFolderSnapshot,
+	sortSavedFolders,
+} from "../folders/savedFolders";
+import {
 	type Appearance,
 	type BootstrapState,
 	type ChooseFolderResult,
@@ -54,36 +60,80 @@ export function createTauriPhotoService(
 	channelFactory: ChannelFactory = (listener) => new Channel(listener),
 ): PhotoService {
 	let sortDirection: SortDirection = "oldestFirst";
+
+	let saved = emptySavedFolders();
+	let lastState: BootstrapState | null = null;
+	const listeners = new Set<(snapshot: SavedFolderSnapshot) => void>();
+	const publish = (value: SavedFolderSnapshot) => {
+		if ((value.revision ?? 0) < (saved.revision ?? 0))
+			return cloneSavedFolders(saved);
+		saved = cloneSavedFolders(value);
+		saved.entries = sortSavedFolders(saved.entries);
+		for (const listener of listeners) listener(cloneSavedFolders(saved));
+		return cloneSavedFolders(saved);
+	};
+	const accept = (state: BootstrapState) => {
+		if (
+			(state.savedFolders?.revision ?? 0) < (saved.revision ?? 0) &&
+			lastState
+		)
+			return { ...lastState, savedFolders: cloneSavedFolders(saved) };
+		publish(state.savedFolders ?? emptySavedFolders());
+		lastState = { ...state, savedFolders: cloneSavedFolders(saved) };
+		return lastState;
+	};
+	const stateCommand = async (
+		command: string,
+		args?: Record<string, unknown>,
+	) =>
+		accept(
+			await invokePhotoCommand<BootstrapState>(invokeCommand, command, args),
+		);
+	const selectCommand = async (
+		command: string,
+		args?: Record<string, unknown>,
+	): Promise<ChooseFolderResult> => {
+		const result = await invokePhotoCommand<ChooseFolderResult>(
+			invokeCommand,
+			command,
+			args,
+		);
+		if (result.kind === "selected")
+			return { kind: "selected", state: accept(result.state) };
+		return result;
+	};
 	return {
+		getSavedFolders: () => cloneSavedFolders(saved),
+		watchSavedFolders: (listener) => {
+			listeners.add(listener);
+			return () => {
+				listeners.delete(listener);
+			};
+		},
+		renameSavedFolder: (id, label) =>
+			stateCommand("rename_saved_folder", { id, label }),
+		removeSavedFolder: (id) => stateCommand("remove_saved_folder", { id }),
+		clearActiveFolder: () => stateCommand("clear_active_folder"),
+		activateSavedFolder: async (id) => {
+			const result = await selectCommand("activate_saved_folder", { id });
+			if (result.kind === "cancelled")
+				await stateCommand("check_saved_folders", { ids: [id] });
+			return result;
+		},
+		checkSavedFolders: async (ids) =>
+			(await stateCommand("check_saved_folders", { ids })).savedFolders,
+
 		capabilities: {
 			chooseFolder: true,
 			folderSelection: "native",
 			locateFolder: false,
 		},
-		getBootstrapState: () =>
-			invokePhotoCommand<BootstrapState>(
-				invokeCommand,
-				"get_bootstrap_state",
-				undefined,
-			),
-		chooseFolder: () =>
-			invokePhotoCommand<ChooseFolderResult>(
-				invokeCommand,
-				"choose_folder",
-				undefined,
-			),
+		getBootstrapState: () => stateCommand("get_bootstrap_state"),
+		chooseFolder: () => selectCommand("choose_folder"),
 		updateAppearance: (appearance: Appearance) =>
-			invokePhotoCommand<BootstrapState>(invokeCommand, "update_appearance", {
-				appearance,
-			}),
+			stateCommand("update_appearance", { appearance }),
 		updateGalleryScope: (scope: GalleryScope) =>
-			invokePhotoCommand<BootstrapState>(
-				invokeCommand,
-				"update_gallery_scope",
-				{
-					scope,
-				},
-			),
+			stateCommand("update_gallery_scope", { scope }),
 		queryWall: (request: WallQueryRequest) =>
 			invokePhotoCommand(invokeCommand, "query_wall", { request }),
 		requestDerivatives: (request: DerivativeRequest) =>
@@ -117,6 +167,22 @@ export function createTauriPhotoService(
 			};
 			const deliver = (update: WallUpdate) => {
 				if (!active) return;
+				if (update.kind === "sourceUnavailable") {
+					const entry = saved.entries.find((e) => e.id === saved.activeEntryId);
+					if (entry)
+						publish({
+							...saved,
+							access: {
+								...saved.access,
+								[entry.folderId]: {
+									folderId: entry.folderId,
+									state: "rootOffline",
+									generation: saved.access[entry.folderId]?.generation ?? 0,
+									retryAfterMs: 0,
+								},
+							},
+						});
+				}
 				try {
 					listener(update);
 				} catch {

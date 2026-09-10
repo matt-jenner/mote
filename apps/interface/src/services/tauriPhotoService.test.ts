@@ -576,3 +576,102 @@ describe("Tauri PhotoService", () => {
 		]);
 	});
 });
+
+it("ignores an older native check snapshot after a newer removal", async () => {
+	const { emptySavedFolders } = await import("../folders/savedFolders");
+	const entry = {
+		id: "saved-a",
+		folderId: "folder-a",
+		name: "A",
+		displayPath: "/A",
+		customLabel: null,
+	};
+	const old = {
+		...emptySavedFolders(),
+		entries: [entry],
+		activeEntryId: entry.id,
+		revision: 1,
+	};
+	const removed = {
+		...emptySavedFolders(),
+		hasOpenedFolder: true,
+		revision: 2,
+	};
+	let release!: (value: unknown) => void;
+	const invoke = async <T>(command: string): Promise<T> => {
+		if (command === "check_saved_folders")
+			return new Promise((resolve) => {
+				release = resolve as (value: unknown) => void;
+			});
+		return {
+			settings: { appearance: "system", galleryScope: "includeSubfolders" },
+			activeSource: null,
+			savedFolders: command === "remove_saved_folder" ? removed : old,
+		} as T;
+	};
+	const service = createTauriPhotoService(invoke);
+	await service.getBootstrapState();
+	const checking = service.checkSavedFolders([entry.id]);
+	await service.removeSavedFolder(entry.id);
+	release({
+		settings: { appearance: "system", galleryScope: "includeSubfolders" },
+		activeSource: null,
+		savedFolders: old,
+	});
+	await checking;
+	expect(service.getSavedFolders().entries).toEqual([]);
+	expect(service.getSavedFolders().activeEntryId).toBeNull();
+});
+
+it("keeps the wall cleared when a newer check overtakes the removal response", async () => {
+	const { emptySavedFolders } = await import("../folders/savedFolders");
+	const entry = {
+		id: "saved-a",
+		folderId: "folder-a",
+		name: "A",
+		displayPath: "/A",
+		customLabel: null,
+	};
+	const settings = { appearance: "system", galleryScope: "includeSubfolders" };
+	const initial = {
+		settings,
+		activeSource: { id: "A", selectionId: "selection-a", displayName: "A" },
+		savedFolders: {
+			...emptySavedFolders(),
+			entries: [entry],
+			activeEntryId: entry.id,
+			revision: 1,
+		},
+	};
+	const removed = {
+		settings,
+		activeSource: null,
+		savedFolders: {
+			...emptySavedFolders(),
+			hasOpenedFolder: true,
+			revision: 2,
+		},
+	};
+	let release!: (value: unknown) => void;
+	const invoke = async <T>(command: string): Promise<T> => {
+		if (command === "remove_saved_folder")
+			return new Promise((resolve) => {
+				release = resolve as (value: unknown) => void;
+			});
+		if (command === "check_saved_folders")
+			return {
+				...removed,
+				savedFolders: { ...removed.savedFolders, revision: 3 },
+			} as T;
+		return initial as T;
+	};
+	const service = createTauriPhotoService(invoke);
+	await service.getBootstrapState();
+	const removing = service.removeSavedFolder(entry.id);
+	await service.checkSavedFolders([]);
+	release(removed);
+	const result = await removing;
+	expect(result.activeSource).toBeNull();
+	expect(result.savedFolders.activeEntryId).toBeNull();
+	expect(result.savedFolders.revision).toBe(3);
+});

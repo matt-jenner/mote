@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { PhotoServiceProvider } from "../app/PhotoServiceContext";
+import { emptySavedFolders } from "../folders/savedFolders";
 import {
 	createInMemoryPhotoService,
 	type InMemoryPhotoService,
@@ -305,21 +306,25 @@ function previewService(
 	requestDerivatives: PhotoService["requestDerivatives"],
 ): PhotoService {
 	return {
+		...createInMemoryPhotoService(),
 		capabilities: {
 			chooseFolder: false,
 			folderSelection: "native",
 			locateFolder: false,
 		},
 		getBootstrapState: async () => ({
+			savedFolders: emptySavedFolders(),
 			settings: { appearance: "system", galleryScope: "includeSubfolders" },
 			activeSource: null,
 		}),
 		chooseFolder: async () => ({ kind: "cancelled" }),
 		updateAppearance: async (appearance) => ({
+			savedFolders: emptySavedFolders(),
 			settings: { appearance, galleryScope: "includeSubfolders" },
 			activeSource: null,
 		}),
 		updateGalleryScope: async (galleryScope) => ({
+			savedFolders: emptySavedFolders(),
 			settings: { appearance: "system", galleryScope },
 			activeSource: null,
 		}),
@@ -4819,7 +4824,7 @@ describe("immersive photo viewer checkpoint", () => {
 		const previous = view.getByRole("button", { name: "Previous photo" });
 		const next = view.getByRole("button", { name: "Next photo" });
 		const folders = view.getByRole("button", {
-			name: "Folders",
+			name: "Add folder",
 			exact: true,
 		});
 		const firstThumb = view

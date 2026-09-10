@@ -5,6 +5,11 @@ import {
 	useRef,
 	useState,
 } from "react";
+import {
+	imageSourceUnavailable,
+	SourceWarningBadge,
+	useSourceUnavailable,
+} from "../folders/SourceAvailabilityContext";
 import type {
 	DerivativeReference,
 	PhotoService,
@@ -93,6 +98,10 @@ export function ViewerStage({
 	onDoubleClick,
 	panning = false,
 }: ViewerStageProps) {
+	const sourceUnavailable = imageSourceUnavailable(
+		useSourceUnavailable(),
+		asset,
+	);
 	const measureRef = useRef<HTMLDivElement>(null);
 	const stageRef = useRef<HTMLDivElement>(null);
 	const screenImageRef = useRef<HTMLImageElement>(null);
@@ -299,8 +308,14 @@ export function ViewerStage({
 				<div
 					className={styles.viewerFrame}
 					data-testid="viewer-frame"
+					title={
+						sourceUnavailable
+							? "Source unavailable. Showing cached image."
+							: undefined
+					}
 					style={frameStyle}
 				>
+					{sourceUnavailable ? <SourceWarningBadge /> : null}
 					<div
 						className={styles.viewerTransformLayer}
 						data-testid="viewer-transform-layer"

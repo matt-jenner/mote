@@ -1,3 +1,13 @@
+import { createBrowserSavedFolders } from "../folders/browserSavedFolders";
+import {
+	cloneSavedFolders,
+	emptySavedFolders,
+	type FolderAccess,
+	folderLabel,
+	type SavedFolderSnapshot,
+	sourceIsUnavailable,
+} from "../folders/savedFolders";
+import { createSelectionIntent } from "../folders/selectionIntent";
 import {
 	type BrowserPreferences,
 	createBrowserPreferences,
@@ -51,6 +61,8 @@ export interface HttpPhotoServiceOptions {
 }
 
 interface SelectionSummary {
+	folderId: string;
+	path: string;
 	id: string;
 	sourceId: string;
 	displayName: string;
@@ -178,6 +190,8 @@ function decodeAvailability(value: unknown): SourceAvailability {
 
 function decodeSelectionSummary(value: unknown): SelectionSummary {
 	const summary = record(value, [
+		"folderId",
+		"path",
 		"id",
 		"sourceId",
 		"displayName",
@@ -186,6 +200,14 @@ function decodeSelectionSummary(value: unknown): SelectionSummary {
 	]);
 	return {
 		id: stringValue(summary.id),
+		folderId:
+			summary.folderId === undefined
+				? stringValue(summary.id).replace(/^selection-/, "")
+				: stringValue(summary.folderId),
+		path:
+			summary.path === undefined
+				? (arrayValue(summary.breadcrumbs, decodeBreadcrumb).at(-1)?.path ?? "")
+				: stringValue(summary.path),
 		sourceId: stringValue(summary.sourceId),
 		displayName: stringValue(summary.displayName),
 		breadcrumbs: arrayValue(summary.breadcrumbs, decodeBreadcrumb),
@@ -193,8 +215,12 @@ function decodeSelectionSummary(value: unknown): SelectionSummary {
 	};
 }
 
-function decodeBootstrap(value: unknown): void {
-	const bootstrap = record(value, ["capabilities", "sourceAvailable"]);
+function decodeBootstrap(value: unknown): string | null {
+	const bootstrap = record(value, [
+		"capabilities",
+		"sourceAvailable",
+		"rootId",
+	]);
 	const capabilities = record(bootstrap.capabilities, [
 		"folderBrowser",
 		"video",
@@ -202,6 +228,30 @@ function decodeBootstrap(value: unknown): void {
 	booleanValue(capabilities.folderBrowser);
 	booleanValue(capabilities.video);
 	booleanValue(bootstrap.sourceAvailable);
+	return bootstrap.rootId == null ? null : stringValue(bootstrap.rootId);
+}
+
+function decodeFolderAccess(value: unknown): FolderAccess {
+	const item = record(value, [
+		"folderId",
+		"state",
+		"generation",
+		"retryAfterMs",
+	]);
+	return {
+		folderId: stringValue(item.folderId),
+		state: enumValue(item.state, [
+			"unknown",
+			"checking",
+			"available",
+			"missing",
+			"unreadable",
+			"rootOffline",
+			"unverified",
+		]),
+		generation: integerValue(item.generation),
+		retryAfterMs: integerValue(item.retryAfterMs),
+	};
 }
 
 function decodeWarning(value: unknown): WallWarningState {
@@ -486,8 +536,27 @@ export function createHttpPhotoService(
 	let replayId: string | null = null;
 	let replayValue: bigint | null = null;
 	const watches = new Set<ActiveWatch>();
+	let folderStore: ReturnType<typeof createBrowserSavedFolders> | null = null;
+	let rootId: string | null = null;
+	const folderListeners = new Set<(value: SavedFolderSnapshot) => void>();
+	const access: Record<string, FolderAccess> = {};
+	const deadlines = new Map<string, number>();
+	const pendingChecks = new Map<string, Promise<void>>();
+	const selectionIntent = createSelectionIntent();
+	const savedSnapshot = () => ({
+		...(folderStore?.read() ?? emptySavedFolders()),
+		access: Object.fromEntries(
+			Object.entries(access).map(([id, value]) => [id, { ...value }]),
+		),
+	});
+	const publishFolders = () => {
+		const value = savedSnapshot();
+		for (const listener of folderListeners) listener(cloneSavedFolders(value));
+		return value;
+	};
 
 	const bootstrapState = (): BootstrapState => ({
+		savedFolders: savedSnapshot(),
 		settings: {
 			appearance: stored.appearance,
 			galleryScope: stored.galleryScope,
@@ -637,6 +706,24 @@ export function createHttpPhotoService(
 				deliverResync(watch);
 				return;
 			}
+			if (
+				update.kind === "sourceUnavailable" &&
+				update.selectionId === activeSource?.selectionId
+			) {
+				const entry = savedSnapshot().entries.find(
+					(e) => e.id === savedSnapshot().activeEntryId,
+				);
+				if (entry) {
+					access[entry.folderId] = {
+						folderId: entry.folderId,
+						state: "rootOffline",
+						generation: access[entry.folderId]?.generation ?? 0,
+						retryAfterMs: 0,
+					};
+					deadlines.delete(entry.folderId);
+					publishFolders();
+				}
+			}
 			watch.resyncDelivered = false;
 			try {
 				watch.listener(update);
@@ -690,14 +777,216 @@ export function createHttpPhotoService(
 		replayValue = null;
 	};
 
+	const storageChanged = (event: StorageEvent) => {
+		if (
+			!folderStore ||
+			(event.key !== null && !event.key.startsWith(folderStore.prefix))
+		)
+			return;
+		if (event.newValue === null) selectionIntent.invalidate();
+		const snapshot = folderStore.read();
+		if (activeSource && snapshot.activeEntryId === null) {
+			selectionIntent.invalidate();
+			stopSelectionResources();
+			activeSource = null;
+			stored = preferences.update({ selectionId: null });
+		} else if (activeSource) {
+			const entry = snapshot.entries.find(
+				(e) => e.id === snapshot.activeEntryId,
+			);
+			if (entry)
+				activeSource = { ...activeSource, displayName: folderLabel(entry) };
+		}
+		publishFolders();
+	};
+	globalThis.addEventListener?.("storage", storageChanged);
+
 	const service: HttpPhotoService = {
+		getSavedFolders: savedSnapshot,
+		watchSavedFolders: (listener) => {
+			folderListeners.add(listener);
+			return () => {
+				folderListeners.delete(listener);
+			};
+		},
+		async renameSavedFolder(id, label) {
+			const entry = savedSnapshot().entries.find((e) => e.id === id);
+			if (
+				!entry ||
+				sourceIsUnavailable(access[entry.folderId]?.state ?? "unknown")
+			)
+				return bootstrapState();
+			folderStore?.rename(id, label);
+			if (savedSnapshot().activeEntryId === id && activeSource)
+				activeSource = {
+					...activeSource,
+					displayName: label.trim() || entry.name,
+				};
+			publishFolders();
+			return bootstrapState();
+		},
+		async removeSavedFolder(id) {
+			const active = savedSnapshot().activeEntryId === id;
+			folderStore?.remove(id);
+			selectionIntent.invalidate();
+			if (active) {
+				stopSelectionResources();
+				activeSource = null;
+				stored = preferences.update({ selectionId: null });
+			}
+			publishFolders();
+			return bootstrapState();
+		},
+		async clearActiveFolder() {
+			selectionIntent.invalidate();
+			stopSelectionResources();
+			activeSource = null;
+			stored = preferences.update({ selectionId: null });
+			folderStore?.select(null);
+			publishFolders();
+			return bootstrapState();
+		},
+		async activateSavedFolder(id) {
+			const intent = selectionIntent.begin();
+			const entry = savedSnapshot().entries.find((e) => e.id === id);
+			if (!entry) return { kind: "cancelled" };
+			await service.checkSavedFolders([id]);
+			if (
+				!selectionIntent.isCurrent(intent) ||
+				access[entry.folderId]?.state !== "available" ||
+				!savedSnapshot().entries.some((e) => e.id === id)
+			)
+				return { kind: "cancelled" };
+			return service.selectFolder(entry.displayPath);
+		},
+		async checkSavedFolders(ids) {
+			await Promise.all(
+				ids.slice(0, 256).map(async (id) => {
+					const entry = savedSnapshot().entries.find((e) => e.id === id);
+					if (!entry) return;
+					const running = pendingChecks.get(entry.folderId);
+					if (running) return running;
+					if ((deadlines.get(entry.folderId) ?? 0) > Date.now()) return;
+					const checking = (async () => {
+						access[entry.folderId] = {
+							folderId: entry.folderId,
+							state: "checking",
+							generation: access[entry.folderId]?.generation ?? 0,
+							retryAfterMs: 0,
+						};
+						publishFolders();
+						let result: FolderAccess;
+						try {
+							result = await requestJson(
+								`/api/v1/selections/${encodeURIComponent(`selection-${entry.folderId}`)}/access`,
+								decodeFolderAccess,
+								{ signal: AbortSignal.timeout(5000) },
+							);
+							if (result.folderId !== entry.folderId) throw internalError();
+						} catch (error) {
+							result = {
+								folderId: entry.folderId,
+								state:
+									error instanceof PhotoServiceError &&
+									error.code === "notFound"
+										? "missing"
+										: "unverified",
+								generation: access[entry.folderId]?.generation ?? 0,
+								retryAfterMs: 5000,
+							};
+						}
+						if (savedSnapshot().entries.some((e) => e.id === id)) {
+							access[entry.folderId] = result;
+							deadlines.set(
+								entry.folderId,
+								Date.now() + Math.max(0, result.retryAfterMs),
+							);
+						}
+						publishFolders();
+					})();
+					pendingChecks.set(entry.folderId, checking);
+					try {
+						await checking;
+					} finally {
+						pendingChecks.delete(entry.folderId);
+					}
+				}),
+			);
+			return savedSnapshot();
+		},
 		capabilities: {
 			chooseFolder: true,
 			folderSelection: "hosted",
 			locateFolder: false,
 		},
 		async getBootstrapState() {
-			await requestJson("/api/v1/bootstrap", decodeBootstrap);
+			const bootstrapIntent = selectionIntent.begin();
+			const nextRoot = await requestJson("/api/v1/bootstrap", decodeBootstrap);
+			if (!selectionIntent.isCurrent(bootstrapIntent)) return bootstrapState();
+			if (nextRoot !== null) {
+				if (rootId !== nextRoot) {
+					stopSelectionResources();
+					activeSource = null;
+					rootId = nextRoot;
+					folderStore = createBrowserSavedFolders(
+						options.localStorage ?? globalThis.localStorage,
+						options.sessionStorage ?? globalThis.sessionStorage,
+						rootId,
+					);
+					for (const key of Object.keys(access)) delete access[key];
+					deadlines.clear();
+				}
+				if (folderStore && !folderStore.migrated()) {
+					const legacyId = stored.selectionId;
+					if (legacyId && folderStore.read().entries.length === 0) {
+						try {
+							const legacy = await requestJson(
+								`/api/v1/selections/${encodeURIComponent(legacyId)}`,
+								decodeSelectionSummary,
+							);
+							if (!selectionIntent.isCurrent(bootstrapIntent))
+								return bootstrapState();
+							if (legacy.sourceId === rootId) {
+								const entry = folderStore.save({
+									folderId: legacy.folderId,
+									name: legacy.displayName,
+									displayPath: legacy.path,
+								});
+								folderStore.select(entry.id);
+							}
+						} catch (error) {
+							if (
+								!(error instanceof PhotoServiceError) ||
+								error.code !== "notFound"
+							)
+								throw error;
+						}
+					}
+					folderStore.markMigrated();
+				}
+				if (!selectionIntent.isCurrent(bootstrapIntent))
+					return bootstrapState();
+				const snapshot = savedSnapshot();
+				const active = snapshot.entries.find(
+					(e) => e.id === snapshot.activeEntryId,
+				);
+				if (active) {
+					const restoring = service.activateSavedFolder(active.id);
+					const restoreIntent = selectionIntent.current();
+					const selected = await restoring;
+					if (
+						!selectionIntent.isCurrent(restoreIntent) &&
+						selected.kind !== "selected"
+					)
+						return bootstrapState();
+					if (selected.kind === "selected") return selected.state;
+					folderStore?.select(null);
+				}
+				activeSource = null;
+				stored = preferences.update({ selectionId: null });
+				publishFolders();
+				return bootstrapState();
+			}
 			if (stored.selectionId === null) {
 				activeSource = null;
 				return bootstrapState();
@@ -802,6 +1091,10 @@ export function createHttpPhotoService(
 			);
 		},
 		async selectFolder(path: string): Promise<ChooseFolderResult> {
+			const intent = selectionIntent.begin();
+			const expectedEntry = savedSnapshot().entries.find(
+				(e) => e.displayPath === path,
+			);
 			const summary = await requestJson(
 				"/api/v1/selections",
 				decodeSelectionSummary,
@@ -811,12 +1104,40 @@ export function createHttpPhotoService(
 					body: JSON.stringify({ path }),
 				},
 			);
+			if (
+				!selectionIntent.isCurrent(intent) ||
+				(expectedEntry &&
+					!savedSnapshot().entries.some((e) => e.id === expectedEntry.id))
+			)
+				return { kind: "cancelled" };
+			if (rootId !== null && summary.sourceId !== rootId)
+				throw new PhotoServiceError(
+					"sourceChanged",
+					"The photo source changed. Reload to choose a folder.",
+				);
 			if (stored.selectionId !== summary.id) stopSelectionResources();
 			stored = preferences.update({
 				selectionId: summary.id,
 				breadcrumbs: cloneBreadcrumbs(summary.breadcrumbs),
 			});
 			activeSource = sourceFromSummary(summary);
+			if (folderStore) {
+				activeSource.availability = "available";
+				const entry = folderStore.save({
+					folderId: summary.folderId,
+					name: summary.displayName,
+					displayPath: summary.path,
+				});
+				folderStore.select(entry.id);
+				activeSource.displayName = folderLabel(entry);
+				access[entry.folderId] = {
+					folderId: entry.folderId,
+					state: "available",
+					generation: access[entry.folderId]?.generation ?? 0,
+					retryAfterMs: 0,
+				};
+				publishFolders();
+			}
 			return { kind: "selected", state: bootstrapState() };
 		},
 		folderBrowserState() {
@@ -837,6 +1158,9 @@ export function createHttpPhotoService(
 			if (disposed) return;
 			stopSelectionResources();
 			disposed = true;
+			selectionIntent.invalidate();
+			globalThis.removeEventListener?.("storage", storageChanged);
+			folderListeners.clear();
 		},
 	};
 

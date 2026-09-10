@@ -19,6 +19,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0009_selection_membership.sql"),
     include_str!("../migrations/0010_folder_recovery.sql"),
     include_str!("../migrations/0011_preview_counts.sql"),
+    include_str!("../migrations/0012_saved_folders.sql"),
 ];
 
 pub(crate) fn migrate_with(path: &Path, migrations: &[&str]) -> Result<Connection, CatalogError> {
@@ -73,6 +74,9 @@ pub(crate) fn apply_migrations(
         if version == 8 {
             backfill_relative_parent_keys(&transaction)?;
             create_gallery_scope_indexes(&transaction)?;
+        }
+        if version == 12 {
+            crate::saved_folder_repo::migrate_saved_folders(&transaction)?;
         }
         transaction.commit()?;
     }

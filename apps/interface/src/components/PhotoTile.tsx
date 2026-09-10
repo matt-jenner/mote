@@ -1,5 +1,10 @@
 import { CircleAlert } from "lucide-react";
 import { useCallback, useLayoutEffect, useRef, useState } from "react";
+import {
+	imageSourceUnavailable,
+	SourceWarningBadge,
+	useSourceUnavailable,
+} from "../folders/SourceAvailabilityContext";
 import type { PhotoService } from "../services/photoService";
 import styles from "../styles/photoWall.module.css";
 import type { PositionedWallAsset } from "../wall/layoutJustifiedRows";
@@ -50,6 +55,10 @@ export function PhotoTile({
 	highlighted = false,
 }: PhotoTileProps) {
 	const { asset } = positioned;
+	const sourceUnavailable = imageSourceUnavailable(
+		useSourceUnavailable(),
+		asset,
+	);
 	const [phase, setPhase] = useState<TilePaintPhase>("placeholder");
 	const [previewFailed, setPreviewFailed] = useState(false);
 	const imageRef = useRef<HTMLImageElement | null>(null);
@@ -75,6 +84,7 @@ export function PhotoTile({
 	}
 	const derivativeKey = thumbnail?.key ?? "";
 	const hasThumbnail = thumbnail !== null;
+	const unavailableWithoutPreview = sourceUnavailable && !url;
 	const updatePhase = useCallback((next: TilePaintPhase) => {
 		phaseRef.current = next;
 		setPhase(next);
@@ -191,10 +201,7 @@ export function PhotoTile({
 		errorHandlerRef.current = errorHandler;
 
 		setPreviewFailed(false);
-		if (
-			(shapeState === "fallback" || asset.availability !== "available") &&
-			!url
-		) {
+		if ((shapeState === "fallback" || unavailableWithoutPreview) && !url) {
 			updatePhase("failed");
 		} else if (!url || !hasThumbnail) {
 			updatePhase("placeholder");
@@ -218,7 +225,7 @@ export function PhotoTile({
 			cancelInteractiveFrame();
 		};
 	}, [
-		asset.availability,
+		unavailableWithoutPreview,
 		asset.id,
 		derivativeKey,
 		hasThumbnail,
@@ -268,7 +275,7 @@ export function PhotoTile({
 					}}
 				/>
 			) : null}
-			{previewFailed || asset.warning ? (
+			{!sourceUnavailable && (previewFailed || asset.warning) ? (
 				<span
 					aria-label={
 						previewFailed
@@ -300,13 +307,24 @@ export function PhotoTile({
 			className={className}
 			data-asset-id={asset.id}
 			data-media-kind={asset.mediaKind}
+			title={
+				sourceUnavailable
+					? "Source unavailable. Showing cached image."
+					: undefined
+			}
 			style={style}
 			tabIndex={-1}
 		>
 			{layers}
+			{sourceUnavailable ? <SourceWarningBadge /> : null}
 			{canOpen ? (
 				<button
 					aria-label={`Open ${asset.displayName}`}
+					aria-description={
+						sourceUnavailable
+							? "Source unavailable. Showing cached image."
+							: undefined
+					}
 					className={`${styles.tileOpenOverlay} ${highlighted ? styles.tileReturnHighlight : ""}`}
 					onClick={() => onOpen(asset.id)}
 					type="button"

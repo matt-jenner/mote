@@ -2955,3 +2955,29 @@ async fn hosted_repair_failures_keep_the_catalog_link_and_repair_on_retry() {
     assert!(image::load_from_memory(&std::fs::read(&cache_path).unwrap()).is_ok());
     assert_eq!(std::fs::read(source_file).unwrap(), source_before);
 }
+
+#[tokio::test]
+async fn saved_folder_access_reuses_probes_and_returns_relative_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("photos");
+    std::fs::create_dir_all(root.join("Family")).unwrap();
+    let engine = GalleryEngine::open(
+        AppConfig::new(temp.path().join("data"), temp.path().join("cache")),
+        root.clone(),
+    )
+    .unwrap();
+    let summary = engine.select_relative(Path::new("Family")).await.unwrap();
+    assert_eq!(summary.path, "Family");
+    assert_eq!(summary.source_id, engine.root_id().unwrap());
+    let one = engine.check_relative(Path::new("Family")).await.unwrap();
+    let two = engine.check_relative(Path::new("Family")).await.unwrap();
+    assert_eq!(one.generation(), two.generation());
+    assert!(
+        !serde_json::to_string(&photo_app_service::FolderAccess::from_reply(
+            summary.folder_id,
+            &two
+        ))
+        .unwrap()
+        .contains(&root.to_string_lossy().to_string())
+    );
+}

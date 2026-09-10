@@ -6,6 +6,7 @@ import styles from "../styles/appShell.module.css";
 import { PhotoWallCanvas } from "./PhotoWallCanvas";
 
 interface SourceCanvasProps {
+	hasOpenedFolder?: boolean;
 	source: SourceSummary | null;
 	chooseFolderAvailable: boolean;
 	onChooseFolder: () => void;
@@ -16,6 +17,7 @@ interface SourceCanvasProps {
 }
 
 export function SourceCanvas({
+	hasOpenedFolder = false,
 	source,
 	chooseFolderAvailable,
 	onChooseFolder,
@@ -50,11 +52,14 @@ export function SourceCanvas({
 				) : (
 					<>
 						<h1 className={styles.canvasTitle}>
-							A simple space for your photos.
+							{hasOpenedFolder
+								? "Select a folder"
+								: "A simple space for your photos."}
 						</h1>
 						<p className={styles.canvasCopy}>
-							Open a folder to browse your photos without importing or
-							reorganising them.
+							{hasOpenedFolder
+								? "Choose a saved folder or open a new one."
+								: "Open a folder to browse your photos without importing or reorganising them."}
 						</p>
 						<button
 							className={styles.primaryButton}
@@ -62,7 +67,7 @@ export function SourceCanvas({
 							onClick={onChooseFolder}
 							type="button"
 						>
-							Choose folder
+							{hasOpenedFolder ? "Add folder" : "Choose folder"}
 						</button>
 					</>
 				)}

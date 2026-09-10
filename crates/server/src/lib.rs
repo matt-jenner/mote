@@ -306,6 +306,7 @@ pub fn build_router(state: AppState, web_root: StaticWebRoot) -> Router {
         )
         .route("/api/v1/selections/{id}", get(api::selection_summary))
         .route("/api/v1/selections/{id}/wall", get(api::wall))
+        .route("/api/v1/selections/{id}/access", get(api::folder_access))
         .route(
             "/api/v1/selections/{id}/interaction",
             axum::routing::post(api::interaction),

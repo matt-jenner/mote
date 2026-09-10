@@ -164,7 +164,7 @@ impl ContainedFolderRoot {
     }
 }
 
-fn validate_relative(relative: &str) -> Result<(), FolderError> {
+pub(crate) fn validate_relative(relative: &str) -> Result<(), FolderError> {
     if relative.contains('\0') || relative.contains('\\') || relative.starts_with('/') {
         return Err(FolderError::InvalidPath);
     }

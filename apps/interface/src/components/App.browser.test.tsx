@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { PhotoServiceProvider } from "../app/PhotoServiceContext";
+import { emptySavedFolders } from "../folders/savedFolders";
 import {
 	createInMemoryPhotoService,
 	type InMemoryPhotoService,
@@ -17,6 +18,7 @@ import type {
 import "../styles/tokens.css";
 import "../styles/global.css";
 import { AppShell } from "./AppShell";
+import { NavigationRail } from "./NavigationRail";
 
 const safeAreaProperties = [
 	"--safe-area-top",
@@ -126,6 +128,7 @@ function hostedGalleryService(): {
 	});
 	let breadcrumbs: FolderBreadcrumb[] = [];
 	let state: BootstrapState = {
+		savedFolders: emptySavedFolders(),
 		settings: { appearance: "system", galleryScope: "includeSubfolders" },
 		activeSource: null,
 	};
@@ -215,7 +218,13 @@ describe("open and return shell", () => {
 	it("opens a folder and shows its persisted display name", async () => {
 		const screen = await renderApp();
 		await screen.getByRole("button", { name: "Choose Folder" }).click();
-		await expect.element(screen.getByText("Iceland 2025")).toBeVisible();
+		await expect
+			.element(
+				screen
+					.getByRole("region", { name: "Photo workspace" })
+					.getByText("Iceland 2025"),
+			)
+			.toBeVisible();
 		await expect.element(screen.getByText("Folder ready")).toBeVisible();
 	});
 
@@ -274,18 +283,22 @@ describe("open and return shell", () => {
 		expect(focusRule?.style.outline).toBe("3px solid var(--focus-ring)");
 
 		const folders = screen.getByRole("button", {
-			name: "Folders",
+			name: "Add folder",
 			exact: true,
 		});
 		await folders.hover();
 		const hoveredStyle = getComputedStyle(folders.element());
-		expect(hoveredStyle.backgroundColor).toBe("rgba(255, 255, 255, 0.12)");
-		expect(hoveredStyle.color).toBe("rgb(247, 248, 250)");
+		expect(hoveredStyle.backgroundColor).toBe("rgba(255, 255, 255, 0.07)");
+		expect(
+			contrastRatio(hoveredStyle.color, "rgb(30, 32, 34)"),
+		).toBeGreaterThanOrEqual(4.5);
 	});
 
 	it("opens the contained folder browser instead of the native picker in hosted mode", async () => {
 		const screen = await renderApp(hostedFolderService());
-		await screen.getByRole("button", { name: "Folders", exact: true }).click();
+		await screen
+			.getByRole("button", { name: "Add folder", exact: true })
+			.click();
 
 		await expect
 			.element(screen.getByRole("dialog", { name: "Choose a folder" }))
@@ -298,7 +311,9 @@ describe("open and return shell", () => {
 	it("selects a hosted folder, restores its breadcrumbs, and opens the existing viewer", async () => {
 		const { service, memory } = hostedGalleryService();
 		const screen = await renderApp(service);
-		await screen.getByRole("button", { name: "Folders", exact: true }).click();
+		await screen
+			.getByRole("button", { name: "Add folder", exact: true })
+			.click();
 		await screen.getByRole("button", { name: "Trips" }).click();
 		await screen.getByRole("button", { name: "Iceland" }).click();
 		await screen.getByRole("button", { name: "Open this folder" }).click();
@@ -326,7 +341,9 @@ describe("open and return shell", () => {
 			.toBeVisible();
 		await screen.getByRole("button", { name: "Back to photos" }).click();
 
-		await screen.getByRole("button", { name: "Folders", exact: true }).click();
+		await screen
+			.getByRole("button", { name: "Add folder", exact: true })
+			.click();
 		await expect
 			.element(
 				screen
@@ -345,7 +362,9 @@ describe("open and return shell", () => {
 		const screen = await renderApp(hostedFolderService());
 		const sources = screen.getByRole("button", { name: "Open sources" });
 		await sources.click();
-		await screen.getByRole("button", { name: "Folders", exact: true }).click();
+		await screen
+			.getByRole("button", { name: "Add folder", exact: true })
+			.click();
 
 		const dialog = screen.getByRole("dialog", { name: "Choose a folder" });
 		await expect.element(dialog).toBeVisible();
@@ -366,7 +385,9 @@ describe("open and return shell", () => {
 		const screen = await renderApp(service);
 
 		await screen.getByRole("button", { name: "Open sources" }).click();
-		await screen.getByRole("button", { name: "Folders", exact: true }).click();
+		await screen
+			.getByRole("button", { name: "Add folder", exact: true })
+			.click();
 		await screen.getByRole("button", { name: "Trips" }).click();
 		await screen.getByRole("button", { name: "Iceland" }).click();
 		await screen.getByRole("button", { name: "Open this folder" }).click();
@@ -456,7 +477,7 @@ describe("open and return shell", () => {
 		await trigger.click();
 
 		const close = screen.getByRole("button", { name: "Close sources" });
-		const folders = screen.getByRole("button", { name: "Folders" });
+		const folders = screen.getByRole("button", { name: "Add folder" });
 		const workspace = screen.getByRole("region", {
 			name: "Photo workspace",
 			includeHidden: true,
@@ -481,7 +502,7 @@ describe("open and return shell", () => {
 		expect((workspace.element() as HTMLElement).inert).toBe(false);
 	});
 
-	it("closes the phone drawer when the viewport grows to tablet width", async () => {
+	it("closes the drawer when the viewport grows to desktop width", async () => {
 		await page.viewport(390, 844);
 		const screen = await renderApp();
 		await screen.getByRole("button", { name: "Open sources" }).click();
@@ -491,7 +512,7 @@ describe("open and return shell", () => {
 		});
 		expect((workspace.element() as HTMLElement).inert).toBe(true);
 
-		await page.viewport(834, 1194);
+		await page.viewport(1000, 1194);
 
 		await expect
 			.poll(() =>
@@ -549,7 +570,7 @@ describe("open and return shell", () => {
 			const main = screen.getByRole("main");
 			await expect.element(main).toBeVisible();
 			const bounds = main.element().getBoundingClientRect();
-			expect(bounds.top).toBe(width < 640 ? 64 : 72);
+			expect(bounds.top).toBe(width < 900 ? 64 : 72);
 			expect(bounds.bottom).toBeCloseTo(height, 0);
 			screen.unmount();
 		}
@@ -560,4 +581,88 @@ describe("open and return shell", () => {
 		const result = await axe.run(document);
 		expect(seriousViolations(result)).toEqual([]);
 	});
+});
+
+it("renames a saved entry and removing it clears the active folder", async () => {
+	await page.viewport(1200, 800);
+	const service = createInMemoryPhotoService({
+		selectedFolderName: "Iceland 2025",
+	});
+	renderApp(service);
+	await page
+		.getByRole("button", { name: "Choose folder", exact: true })
+		.click();
+	await page.getByRole("button", { name: "Options for Iceland 2025" }).click();
+	await page.getByRole("menuitem", { name: "Rename" }).click();
+	const input = page.getByRole("textbox", { name: "Folder label" });
+	await input.fill("Holiday");
+	await userEvent.keyboard("{Enter}");
+	await expect
+		.element(page.getByRole("button", { name: "Holiday", exact: true }))
+		.toBeVisible();
+	const options = page.getByRole("button", { name: "Options for Holiday" });
+	await options.click();
+	await userEvent.keyboard("{Escape}");
+	await expect.element(options).toHaveFocus();
+	await expect
+		.element(page.getByRole("button", { name: "Holiday", exact: true }))
+		.toHaveAttribute("title", "Holiday\n/Photos/Iceland 2025");
+	await options.click();
+	await page.getByRole("menuitem", { name: "Remove" }).click();
+	await expect
+		.element(page.getByRole("heading", { name: "Select a folder" }))
+		.toBeVisible();
+	expect(service.getSavedFolders().entries).toEqual([]);
+});
+
+it("keeps the folder header and last-row menu visible in a long sidebar", async () => {
+	await page.viewport(1200, 800);
+	const entries = Array.from({ length: 20 }, (_, i) => ({
+		id: `saved-${i}`,
+		folderId: `folder-${i}`,
+		name: `Album ${i + 1}`,
+		displayPath: `/Photos/Album ${i + 1}`,
+		customLabel: null,
+	}));
+	const snapshot = {
+		...emptySavedFolders(),
+		entries,
+		access: Object.fromEntries(
+			entries.map((e) => [
+				e.folderId,
+				{
+					folderId: e.folderId,
+					state: "available" as const,
+					generation: 1,
+					retryAfterMs: 0,
+				},
+			]),
+		),
+	};
+	await render(
+		<div style={{ display: "grid", height: 400, width: 288 }}>
+			<NavigationRail
+				savedFolders={snapshot}
+				onChooseFolder={() => {}}
+				chooseFolderAvailable
+				folderSelection="native"
+			/>
+		</div>,
+	);
+	const last = page.getByRole("button", { name: "Options for Album 20" });
+	await last.click();
+	const popup = page.getByRole("menu").element().getBoundingClientRect();
+	const rail = page
+		.getByRole("navigation", { name: "Sources" })
+		.element()
+		.getBoundingClientRect();
+	expect(popup.bottom).toBeLessThanOrEqual(rail.bottom);
+	expect(popup.top).toBeGreaterThanOrEqual(rail.top);
+	const add = page
+		.getByRole("button", { name: "Add folder" })
+		.element()
+		.getBoundingClientRect();
+	expect(add.top).toBeGreaterThanOrEqual(rail.top);
+	await userEvent.keyboard("{Escape}");
+	await expect.element(last).toHaveFocus();
 });

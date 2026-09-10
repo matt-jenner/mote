@@ -7,6 +7,7 @@ import { page } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { PhotoServiceProvider } from "../app/PhotoServiceContext";
 import { usePhotoWall } from "../app/usePhotoWall";
+import { emptySavedFolders } from "../folders/savedFolders";
 import type {
 	Appearance,
 	BootstrapState,
@@ -138,6 +139,13 @@ class TestIntersectionObserver {
 }
 
 class ControlledWallService implements PhotoService {
+	getSavedFolders = () => this.sourceState.savedFolders;
+	watchSavedFolders = () => () => {};
+	renameSavedFolder = async () => this.sourceState;
+	removeSavedFolder = async () => this.sourceState;
+	clearActiveFolder = async () => this.sourceState;
+	activateSavedFolder = async () => ({ kind: "cancelled" as const });
+	checkSavedFolders = async () => this.sourceState.savedFolders;
 	readonly capabilities: PhotoService["capabilities"];
 	readonly queryRequests: WallQueryRequest[] = [];
 	readonly queryScopes: GalleryScope[] = [];
@@ -167,6 +175,7 @@ class ControlledWallService implements PhotoService {
 			locateFolder: false,
 		};
 		this.sourceState = {
+			savedFolders: emptySavedFolders(),
 			settings: { appearance: "system", galleryScope: currentGalleryScope },
 			activeSource: {
 				id: sourceId,
@@ -194,6 +203,7 @@ class ControlledWallService implements PhotoService {
 	};
 	updateAppearance = async (appearance: Appearance) => ({
 		...this.sourceState,
+		savedFolders: emptySavedFolders(),
 		settings: { ...this.sourceState.settings, appearance },
 	});
 	updateGalleryScope = async (galleryScope: GalleryScope) => {
@@ -1774,7 +1784,7 @@ describe("progressive photo wall", () => {
 					document.querySelector('figure[data-asset-id="offline-child"]')
 						?.textContent,
 			)
-			.not.toContain("File unavailable");
+			.toContain("File unavailable");
 		screen.unmount();
 	});
 
@@ -1845,7 +1855,7 @@ describe("progressive photo wall", () => {
 
 		await expect
 			.element(screen.getByRole("status"))
-			.toHaveTextContent("Preparing previews · 1 of 2");
+			.toHaveTextContent("Source unavailable. Showing cached images.");
 		const figure = () =>
 			document.querySelector<HTMLElement>(
 				'figure[data-asset-id="offline-child"]',

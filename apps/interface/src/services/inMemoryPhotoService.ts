@@ -1,3 +1,11 @@
+import {
+	cloneSavedFolders,
+	emptySavedFolders,
+	folderLabel,
+	normalizeFolderLabel,
+	type SavedFolderSnapshot,
+	sortSavedFolders,
+} from "../folders/savedFolders";
 import type {
 	Appearance,
 	BootstrapState,
@@ -44,7 +52,6 @@ export interface InMemoryPhotoService extends PhotoService {
 type WallListener = (update: WallUpdate) => void;
 
 const sourceId = "memory-source";
-const selectionId = "memory-selection-1";
 const maxWallPageSize = 250;
 
 const clone = <T>(value: T): T => structuredClone(value);
@@ -71,9 +78,26 @@ export function createInMemoryPhotoService(
 	const derivativeRequests: DerivativeRequest[] = [];
 	const interactionCalls: boolean[] = [];
 	let sortDirection: SortDirection = "oldestFirst";
+	const savedListeners = new Set<(snapshot: SavedFolderSnapshot) => void>();
+	let savedSequence = 0;
+	let selectionSequence = 1;
+	let selectionId = "memory-selection-1";
+	const invalidateSelection = () => {
+		selectionId = `memory-selection-${++selectionSequence}`;
+		scanGeneration += 1;
+		scanPromise = null;
+		derivativePhasePromise = null;
+		settlementPromise = null;
+	};
 	let state: BootstrapState = {
 		settings: { appearance: "system", galleryScope: "includeSubfolders" },
 		activeSource: null,
+		savedFolders: emptySavedFolders(),
+	};
+	const publishSaved = () => {
+		state.savedFolders.entries = sortSavedFolders(state.savedFolders.entries);
+		for (const listener of savedListeners)
+			listener(cloneSavedFolders(state.savedFolders));
 	};
 	let assets: WallAsset[] = fixtures.map(
 		({
@@ -102,6 +126,7 @@ export function createInMemoryPhotoService(
 	}
 
 	const publish = (update: WallUpdate): void => {
+		if (update.selectionId !== selectionId) return;
 		for (const listener of listeners) listener(clone(update));
 	};
 	const progress = (enriched: number): ScanProgressDto => ({
@@ -119,6 +144,71 @@ export function createInMemoryPhotoService(
 		);
 
 	const service: InMemoryPhotoService = {
+		getSavedFolders: () => cloneSavedFolders(state.savedFolders),
+		watchSavedFolders(listener) {
+			savedListeners.add(listener);
+			return () => {
+				savedListeners.delete(listener);
+			};
+		},
+		async renameSavedFolder(id, label) {
+			const entry = state.savedFolders.entries.find((item) => item.id === id);
+			if (
+				!entry ||
+				state.savedFolders.access[entry.folderId]?.state !== "available"
+			)
+				throw new PhotoServiceError(
+					"folderUnavailable",
+					"That folder is unavailable.",
+				);
+			entry.customLabel = normalizeFolderLabel(label);
+			if (state.savedFolders.activeEntryId === id && state.activeSource)
+				state.activeSource.displayName = folderLabel(entry);
+			publishSaved();
+			return clone(state);
+		},
+		async removeSavedFolder(id) {
+			const entry = state.savedFolders.entries.find((item) => item.id === id);
+			state.savedFolders.entries = state.savedFolders.entries.filter(
+				(item) => item.id !== id,
+			);
+			if (entry) delete state.savedFolders.access[entry.folderId];
+			if (state.savedFolders.activeEntryId === id) {
+				invalidateSelection();
+				state.savedFolders.activeEntryId = null;
+				state.activeSource = null;
+			}
+			publishSaved();
+			return clone(state);
+		},
+		async activateSavedFolder(id) {
+			const entry = state.savedFolders.entries.find((item) => item.id === id);
+			if (
+				!entry ||
+				state.savedFolders.access[entry.folderId]?.state !== "available"
+			)
+				return { kind: "cancelled" };
+			if (state.savedFolders.activeEntryId !== id) invalidateSelection();
+			state.savedFolders.activeEntryId = id;
+			state.activeSource = {
+				id: sourceId,
+				selectionId,
+				displayName: folderLabel(entry),
+				availability: "available",
+			};
+			publishSaved();
+			return { kind: "selected", state: clone(state) };
+		},
+		async clearActiveFolder() {
+			invalidateSelection();
+			state.savedFolders.activeEntryId = null;
+			state.activeSource = null;
+			publishSaved();
+			return clone(state);
+		},
+		async checkSavedFolders() {
+			return cloneSavedFolders(state.savedFolders);
+		},
 		capabilities: {
 			chooseFolder: true,
 			folderSelection: "native",
@@ -131,15 +221,43 @@ export function createInMemoryPhotoService(
 		},
 		async chooseFolder() {
 			if (options.cancelFolderPicker) return { kind: "cancelled" };
+			const name = options.selectedFolderName ?? "Selected Folder";
+			let entry = state.savedFolders.entries.find(
+				(item) => item.folderId === name,
+			);
+			if (!entry) {
+				entry = {
+					id: `saved-${++savedSequence}`,
+					folderId: name,
+					name,
+					displayPath: `/Photos/${name}`,
+					customLabel: null,
+				};
+				state.savedFolders.entries.push(entry);
+			}
+			state.savedFolders.access[entry.folderId] = {
+				folderId: entry.folderId,
+				state: "available",
+				generation: 1,
+				retryAfterMs: 5000,
+			};
+			if (
+				state.savedFolders.activeEntryId &&
+				state.savedFolders.activeEntryId !== entry.id
+			)
+				invalidateSelection();
+			state.savedFolders.activeEntryId = entry.id;
+			state.savedFolders.hasOpenedFolder = true;
 			state = {
 				...state,
 				activeSource: {
 					id: sourceId,
 					selectionId,
-					displayName: options.selectedFolderName ?? "Selected Folder",
+					displayName: folderLabel(entry),
 					availability: "available",
 				},
 			};
+			publishSaved();
 			return { kind: "selected", state: clone(state) };
 		},
 		async updateAppearance(appearance: Appearance) {
@@ -290,6 +408,7 @@ export function createInMemoryPhotoService(
 			);
 			scanPromise = (async () => {
 				await delay(options.geometryDelayMs ?? 0);
+				if (generation !== scanGeneration) return;
 				publish({
 					kind: "catalogBatch",
 					selectionId,
@@ -301,6 +420,7 @@ export function createInMemoryPhotoService(
 				});
 				derivativePhasePromise = (async () => {
 					await delay(options.thumbnailDelayMs ?? 0);
+					if (generation !== scanGeneration) return;
 					const derivatives = derivativeReferences().filter(
 						(derivative) => derivative.kind === "wallThumbnail",
 					);
@@ -341,9 +461,11 @@ export function createInMemoryPhotoService(
 			if (settlementPromise) return settlementPromise;
 			settlementPromise = (async () => {
 				if (!scanPromise) await service.startFixtureScan();
+				const generation = scanGeneration;
 				await scanPromise;
 				if (derivativePhasePromise) await derivativePhasePromise;
 				await delay(options.metadataDelayMs ?? 0);
+				if (generation !== scanGeneration) return;
 				if (settled) return;
 				settled = true;
 				assets = assets.map((asset) => ({ ...asset, dateState: "settled" }));
@@ -357,6 +479,24 @@ export function createInMemoryPhotoService(
 			return settlementPromise;
 		},
 		emitForTest(update: WallUpdate) {
+			if (update.selectionId !== selectionId) return;
+			if (update.kind === "sourceUnavailable") {
+				const entry = state.savedFolders.entries.find(
+					(item) => item.id === state.savedFolders.activeEntryId,
+				);
+				if (entry) {
+					state.savedFolders.access[entry.folderId] = {
+						folderId: entry.folderId,
+						state: "rootOffline",
+						generation:
+							(state.savedFolders.access[entry.folderId]?.generation ?? 0) + 1,
+						retryAfterMs: 5000,
+					};
+					if (state.activeSource)
+						state.activeSource.availability = "rootOffline";
+					publishSaved();
+				}
+			}
 			if (update.kind === "warning" && update.assetId === null) {
 				sourceWarnings = [
 					...sourceWarnings.filter(
