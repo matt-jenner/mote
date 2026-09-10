@@ -2,7 +2,7 @@
 
 Date: 2026-09-10
 
-Status: approved in conversation, awaiting written-spec review
+Status: written spec approved; UX option 3 selected in conversation
 
 ## Purpose
 
@@ -48,6 +48,85 @@ catalog records, or cached derivatives.
   Selecting a folder closes the drawer after successful activation. Long
   lists scroll and long labels truncate without hiding the entry menu.
 
+## Approved visual UX
+
+The user selected the third displayed mockup, Roomy rows. The reference image
+is [the approved sidebar mockup](assets/2026-09-10-saved-folder-sidebar-approved.png).
+It depicts the active folder becoming unavailable while its cached images
+remain visible. The warning state is conditional, not the normal appearance
+of every folder or photo.
+
+The mockup guides the sidebar and warning treatment. Retain the existing
+justified photo layout, crop rules, gallery controls, Mote wordmark asset,
+fonts, and light/dark theme tokens. Generated photo arrangements and changes
+to unrelated controls in the mockup are not requirements to redesign them.
+
+### Layout and row states
+
+- On desktop widths of 900px and above, use a 288px sidebar, 24px horizontal
+  padding, and the existing Mote wordmark at its current 92px display width.
+- Place a sentence-case Folders heading and a plus icon with Add folder on
+  the same line. Keep this header visible while the list scrolls.
+- Use flat 52px rows with 15px labels, an outlined folder icon, and a separate
+  trailing ellipsis button. Keep the menu button visible as shown in the
+  selected mockup, including on touch devices. Do not nest it inside the row's
+  activation button.
+- Keep labels to one line with truncation. The tooltip reveals the complete
+  label and path. The entire usable label area activates the entry.
+- Mark the active row with the existing green left stripe and a subtle
+  background. Hover adds a restrained background, and keyboard focus uses
+  the existing focus ring. Selection and focus remain visibly distinct.
+- An unavailable row substitutes an amber warning triangle for the folder
+  icon and uses muted text. If it is still active, retain its stripe and
+  background. Keep text legible, rather than reducing the entire row's opacity.
+- During a check, substitute a small progress indicator in the icon position,
+  announce Checking folder, and keep the row label and Remove action available.
+  Cooldown clicks do not flash a false loading state. Reduced-motion settings
+  use a static checking indicator with the same accessible announcement.
+
+### Menus, rename, and empty state
+
+Open the row menu from its ellipsis button, anchored to that button and kept
+inside the viewport. Available rows offer Rename and Remove. Unavailable or
+unchecked rows offer Remove. Escape or an outside click closes the menu and
+returns focus to its trigger where it still exists.
+
+Rename replaces only the label area with a focused text input with the current
+display label selected. Keep the entry in its old position until Enter saves,
+then re-sort and return focus to that entry. Escape or blur cancels. Do not
+add a separate rename dialog. Existing keyboard and source-safety rules apply.
+
+After removal, move focus to the next entry in the previous list order, then
+the previous entry if no next entry exists, or Add folder if the list is
+empty. Removing the active entry shows Select a folder as the wall title,
+with the supporting copy Choose a saved folder or open a new one. Keep an
+Add folder button in that state so the next step is visible even when the
+drawer is closed. Preserve the existing first-run welcome when no folder
+has ever been opened.
+
+### Image warnings and responsive layout
+
+Place a small amber warning triangle on a translucent graphite background
+at the top-right of each affected thumbnail, inset 8px, with a 24px badge.
+Keep the image at normal colour and opacity. The badge must not intercept the
+image's open action. Expose its meaning through the tile's accessible
+description and a tooltip on tile hover or keyboard focus.
+
+For the active unavailable folder, use the existing wall status area for
+Source unavailable. Showing cached images. In the immersive viewer, put the
+same warning near the existing image controls without blocking the image,
+navigation, or zoom. Remove the source warning after access is verified again;
+independent per-image errors remain visible.
+
+Below 900px, use the existing menu-triggered navigation drawer for the full
+labelled list. Replace the current 640-899px icon-only rail treatment for this
+flow; indistinguishable folder icons cannot support a saved-folder list.
+Use a drawer width of min(320px, viewport width minus 48px), retain 52px rows,
+and keep interactive targets at least 44px. Trap focus in the open drawer,
+support Escape/backdrop dismissal, and restore focus to its trigger. Keep
+the drawer open during a failed selection or access check; close it after a
+successful activation.
+
 ## Unavailable folders and cached images
 
 Unavailable entries remain saved, display a warning symbol, and use muted
@@ -61,8 +140,9 @@ unavailable and activation checks again. The warning tooltip includes the
 path and a concise reason. A check shows progress without disabling removal.
 
 If a click-triggered check succeeds, open the folder only while that selection
-intent remains current. Automatic startup or focus checks update availability
-without switching the user's current folder. A failed check leaves the entry
+intent remains current. Apart from initial last-folder restoration, automatic
+startup or focus checks update availability without switching the user's
+current folder. A failed check leaves the entry
 unavailable. Rapid activations do not launch overlapping checks.
 
 If the active folder becomes unavailable during viewing, retain its current
