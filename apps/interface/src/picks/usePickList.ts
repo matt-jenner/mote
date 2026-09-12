@@ -13,7 +13,7 @@ export interface PickOrigin {
 
 export interface PickToastAction {
 	label: string;
-	run(): void;
+	run(): void | Promise<void>;
 }
 
 export interface PickToastState {
@@ -46,6 +46,12 @@ type OptimisticOperation =
 interface UndoState {
 	items: PickItem[];
 	expiresAt: number;
+}
+
+interface QueuedMutation {
+	run(): Promise<void>;
+	resolve(): void;
+	reject(error: unknown): void;
 }
 
 export interface PickListStore {
@@ -119,6 +125,8 @@ class PickListStoreImplementation implements PickListStore {
 	private toastTimer: ReturnType<typeof setTimeout> | null = null;
 	private undo: UndoState | null = null;
 	private clearPromise: Promise<void> | null = null;
+	private readonly mutationQueue: QueuedMutation[] = [];
+	private mutationRunning = false;
 	private state: PickListController;
 
 	constructor(private readonly service: PhotoService) {
@@ -250,6 +258,48 @@ class PickListStoreImplementation implements PickListStore {
 		this.publishMessage("Couldn't update picks");
 	}
 
+	private lifecycleIsActive(lifecycleId: number): boolean {
+		return this.activeStop !== null && lifecycleId === this.lifecycleId;
+	}
+
+	private enqueueMutation(run: () => Promise<void>): Promise<void> {
+		const mutation = new Promise<void>((resolve, reject) => {
+			this.mutationQueue.push({ run, resolve, reject });
+		});
+		this.runNextMutation();
+		return mutation;
+	}
+
+	private runNextMutation(): void {
+		if (this.mutationRunning) return;
+		const mutation = this.mutationQueue.shift();
+		if (!mutation) return;
+		this.mutationRunning = true;
+		let result: Promise<void>;
+		try {
+			result = mutation.run();
+		} catch (error) {
+			this.finishMutation();
+			mutation.reject(error);
+			return;
+		}
+		void result.then(
+			() => {
+				this.finishMutation();
+				mutation.resolve();
+			},
+			(error: unknown) => {
+				this.finishMutation();
+				mutation.reject(error);
+			},
+		);
+	}
+
+	private finishMutation(): void {
+		this.mutationRunning = false;
+		this.runNextMutation();
+	}
+
 	private mutateAsset(
 		assetId: string,
 		operation: OptimisticOperation,
@@ -261,16 +311,20 @@ class PickListStoreImplementation implements PickListStore {
 
 		this.operations = [...this.operations, operation];
 		this.publish();
-		const mutation = persist().then(
-			(snapshot) => {
-				this.acceptMutation(operation.id, snapshot);
-				this.publishMessage(message);
-			},
-			(error: unknown) => {
-				this.rejectMutation(operation.id);
+		const lifecycleId = this.lifecycleId;
+		const mutation = this.enqueueMutation(async () => {
+			try {
+				const snapshot = await persist();
+				if (this.lifecycleIsActive(lifecycleId)) {
+					this.acceptMutation(operation.id, snapshot);
+					this.publishMessage(message);
+				}
+			} catch (error) {
+				if (this.lifecycleIsActive(lifecycleId))
+					this.rejectMutation(operation.id);
 				throw error;
-			},
-		);
+			}
+		});
 		this.pendingAssets.set(assetId, mutation);
 		const release = () => {
 			if (this.pendingAssets.get(assetId) === mutation)
@@ -329,8 +383,11 @@ class PickListStoreImplementation implements PickListStore {
 		};
 		this.operations = [...this.operations, operation];
 		this.publish();
-		const mutation = this.service.clearPicks().then(
-			(snapshot) => {
+		const lifecycleId = this.lifecycleId;
+		const mutation = this.enqueueMutation(async () => {
+			try {
+				const snapshot = await this.service.clearPicks();
+				if (!this.lifecycleIsActive(lifecycleId)) return;
 				this.acceptMutation(operation.id, snapshot);
 				this.undo = {
 					items: cleared,
@@ -341,16 +398,16 @@ class PickListStoreImplementation implements PickListStore {
 				this.toast = {
 					id: ++this.toastId,
 					message: "Picks cleared",
-					action: { label: "Undo", run: () => void this.undoClear() },
+					action: { label: "Undo", run: this.undoClear },
 				};
 				this.scheduleToastDismissal(undoDurationMs);
 				this.publish();
-			},
-			(error: unknown) => {
-				this.rejectMutation(operation.id);
+			} catch (error) {
+				if (this.lifecycleIsActive(lifecycleId))
+					this.rejectMutation(operation.id);
 				throw error;
-			},
-		);
+			}
+		});
 		this.clearPromise = mutation;
 		const release = () => {
 			if (this.clearPromise === mutation) this.clearPromise = null;
@@ -359,9 +416,9 @@ class PickListStoreImplementation implements PickListStore {
 		return mutation;
 	};
 
-	private undoClear = async (): Promise<void> => {
+	private undoClear = (): Promise<void> => {
 		const undo = this.undo;
-		if (!undo || Date.now() >= undo.expiresAt) return;
+		if (!undo || Date.now() >= undo.expiresAt) return Promise.resolve();
 		this.undo = null;
 		this.clearToastTimer();
 		this.toast = null;
@@ -372,20 +429,26 @@ class PickListStoreImplementation implements PickListStore {
 		};
 		this.operations = [...this.operations, operation];
 		this.publish();
-		try {
-			const restored = await this.service.restorePicks(
-				undo.items.map(({ assetId, sourceFolderId, sourceLabel }) => ({
-					assetId,
-					sourceFolderId,
-					sourceLabel,
-				})),
-			);
-			this.acceptMutation(operation.id, restored);
-			this.publishMessage("Picks restored");
-		} catch (error) {
-			this.rejectMutation(operation.id);
-			throw error;
-		}
+		const lifecycleId = this.lifecycleId;
+		return this.enqueueMutation(async () => {
+			try {
+				const restored = await this.service.restorePicks(
+					undo.items.map(({ assetId, sourceFolderId, sourceLabel }) => ({
+						assetId,
+						sourceFolderId,
+						sourceLabel,
+					})),
+				);
+				if (this.lifecycleIsActive(lifecycleId)) {
+					this.acceptMutation(operation.id, restored);
+					this.publishMessage("Picks restored");
+				}
+			} catch (error) {
+				if (this.lifecycleIsActive(lifecycleId))
+					this.rejectMutation(operation.id);
+				throw error;
+			}
+		});
 	};
 
 	private requestDerivatives = (

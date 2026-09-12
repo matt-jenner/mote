@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PhotoServiceProvider } from "../app/PhotoServiceContext";
-import { PickToast } from "../components/PickToast";
+import { consumePickToastAction, PickToast } from "../components/PickToast";
 import { createInMemoryPhotoService } from "../services/inMemoryPhotoService";
 import type { PhotoService, WallAsset } from "../services/photoService";
 import {
@@ -125,6 +125,146 @@ describe("pick list controller", () => {
 		expect(store.getState().count).toBe(0);
 		expect(store.getState().isPicked(rejected.id)).toBe(false);
 		expect(store.getState().announcement).toBe("Couldn't update picks");
+	});
+
+	it("persists Clear before a later Add without hiding the optimistic Add", async () => {
+		const first = asset("first");
+		const later = asset("later");
+		const clearGate = deferred<void>();
+		const addGate = deferred<void>();
+		const memory = createInMemoryPhotoService({ wallAssets: [first, later] });
+		await memory.addPick(reference(first));
+		const clearPicks = vi.fn(async () => {
+			await clearGate.promise;
+			return memory.clearPicks();
+		});
+		const addPick = vi.fn(async (pick: ReturnType<typeof reference>) => {
+			await addGate.promise;
+			return memory.addPick(pick);
+		});
+		const service: PhotoService = { ...memory, addPick, clearPicks };
+		const store = createPickListStore(service);
+		const stop = store.start();
+
+		const clearing = store.getState().clear();
+		const adding = store.getState().toggle(later, origin);
+
+		expect(clearPicks).toHaveBeenCalledOnce();
+		expect(addPick).not.toHaveBeenCalled();
+		expect(store.getState().snapshot.items.map((item) => item.assetId)).toEqual(
+			["later"],
+		);
+
+		clearGate.resolve(undefined);
+		await clearing;
+		await Promise.resolve();
+		expect(addPick).toHaveBeenCalledOnce();
+		expect(memory.getPicks().items).toHaveLength(0);
+		expect(store.getState().snapshot.items.map((item) => item.assetId)).toEqual(
+			["later"],
+		);
+
+		addGate.resolve(undefined);
+		await adding;
+		expect(memory.getPicks().items.map((item) => item.assetId)).toEqual([
+			"later",
+		]);
+		expect(store.getState().snapshot.items.map((item) => item.assetId)).toEqual(
+			["later"],
+		);
+		stop();
+	});
+
+	it("persists Add before a later Clear", async () => {
+		const added = asset("added");
+		const addGate = deferred<void>();
+		const memory = createInMemoryPhotoService({ wallAssets: [added] });
+		const addPick = vi.fn(async (pick: ReturnType<typeof reference>) => {
+			await addGate.promise;
+			return memory.addPick(pick);
+		});
+		const clearPicks = vi.fn(() => memory.clearPicks());
+		const service: PhotoService = { ...memory, addPick, clearPicks };
+		const store = createPickListStore(service);
+		const stop = store.start();
+
+		const adding = store.getState().toggle(added, origin);
+		const clearing = store.getState().clear();
+
+		expect(store.getState().count).toBe(0);
+		expect(clearPicks).not.toHaveBeenCalled();
+		addGate.resolve(undefined);
+		await adding;
+		await clearing;
+
+		expect(clearPicks).toHaveBeenCalledOnce();
+		expect(memory.getPicks().items).toHaveLength(0);
+		expect(store.getState().count).toBe(0);
+		stop();
+	});
+
+	it("persists a pending Add before overlapping Undo", async () => {
+		const first = asset("first");
+		const later = asset("later");
+		const addGate = deferred<void>();
+		const memory = createInMemoryPhotoService({ wallAssets: [first, later] });
+		await memory.addPick(reference(first));
+		const addPick = vi.fn(async (pick: ReturnType<typeof reference>) => {
+			await addGate.promise;
+			return memory.addPick(pick);
+		});
+		const restorePicks = vi.fn(memory.restorePicks);
+		const service: PhotoService = { ...memory, addPick, restorePicks };
+		const store = createPickListStore(service);
+		const stop = store.start();
+		await store.getState().clear();
+
+		const adding = store.getState().toggle(later, origin);
+		const restoring = store.getState().undoClear();
+
+		expect(restorePicks).not.toHaveBeenCalled();
+		expect(store.getState().snapshot.items.map((item) => item.assetId)).toEqual(
+			["first", "later"],
+		);
+		addGate.resolve(undefined);
+		await Promise.all([adding, restoring]);
+
+		expect(restorePicks).toHaveBeenCalledOnce();
+		expect(memory.getPicks().items.map((item) => item.assetId)).toEqual([
+			"first",
+			"later",
+		]);
+		expect(store.getState().snapshot.items.map((item) => item.assetId)).toEqual(
+			["first", "later"],
+		);
+		stop();
+	});
+
+	it("does no completion work when stopped before Clear resolves", async () => {
+		vi.useFakeTimers();
+		const first = asset("first");
+		const clearGate = deferred<PickListSnapshot>();
+		const memory = createInMemoryPhotoService({ wallAssets: [first] });
+		await memory.addPick(reference(first));
+		const service: PhotoService = {
+			...memory,
+			clearPicks: () => clearGate.promise,
+		};
+		const store = createPickListStore(service);
+		const stop = store.start();
+		const listener = vi.fn();
+		store.subscribe(listener);
+		const clearing = store.getState().clear();
+		listener.mockClear();
+
+		stop();
+		clearGate.resolve(snapshot([], 2));
+		await clearing;
+
+		expect(listener).not.toHaveBeenCalled();
+		expect(store.getState().toast).toBeNull();
+		expect(store.getState().announcement).toBe("");
+		expect(vi.getTimerCount()).toBe(0);
 	});
 
 	it("offers Clear Undo for exactly five seconds", async () => {
@@ -275,5 +415,28 @@ describe("pick list provider", () => {
 		expect(markup).toContain('<button type="button">Undo</button>');
 		expect(markup).not.toContain("autofocus");
 		expect(markup).not.toContain('tabindex="-1"');
+	});
+
+	it("consumes a rejected Undo action after the controller announces it", async () => {
+		vi.useFakeTimers();
+		const first = asset("first");
+		const memory = createInMemoryPhotoService({ wallAssets: [first] });
+		await memory.addPick(reference(first));
+		const service: PhotoService = {
+			...memory,
+			restorePicks: async () => {
+				throw new Error("Restore failed");
+			},
+		};
+		const store = createPickListStore(service);
+		const stop = store.start();
+		await store.getState().clear();
+		const action = store.getState().toast?.action;
+		if (!action) throw new Error("Expected Undo action");
+
+		await expect(consumePickToastAction(action)).resolves.toBeUndefined();
+
+		expect(store.getState().announcement).toBe("Couldn't update picks");
+		stop();
 	});
 });
