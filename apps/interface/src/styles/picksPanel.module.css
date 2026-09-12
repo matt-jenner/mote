@@ -91,6 +91,16 @@
 	border-radius: var(--radius-small);
 }
 
+.thumbnailButton {
+	padding: 0;
+	cursor: pointer;
+}
+
+.thumbnailButton:focus-visible {
+	outline: 2px solid var(--focus-ring);
+	outline-offset: 2px;
+}
+
 .thumbnail img {
 	display: block;
 	width: 100%;

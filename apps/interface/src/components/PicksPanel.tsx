@@ -15,6 +15,9 @@ import { PickRow } from "./PickRow";
 
 export type PicksPanelMode = "desktop" | "mobile";
 
+export const PICKS_DESKTOP_PANEL_ID = "picks-panel-desktop";
+export const PICKS_MOBILE_SHEET_ID = "picks-sheet-mobile";
+
 const copyFailureMessages: Record<PickCopyFailureCode, string> = {
 	source_unavailable: "Original unavailable",
 	destination_unavailable: "Destination unavailable",
@@ -30,7 +33,7 @@ interface PicksPanelProps {
 	onReview?: (assetId: string, launchTarget: HTMLElement) => void;
 	onOpenPick?: (assetId: string, launchTarget: HTMLElement) => void;
 	onRemovePick?: (assetId: string) => void;
-	reviewOpen?: boolean;
+	viewerOpen?: boolean;
 }
 
 function pickCountLabel(count: number): string {
@@ -44,6 +47,8 @@ export function PicksTrigger({
 	className,
 	triggerRef,
 	copy,
+	controlsId,
+	inert = false,
 }: {
 	count: number;
 	expanded: boolean;
@@ -51,6 +56,8 @@ export function PicksTrigger({
 	className?: string;
 	triggerRef?: Ref<HTMLButtonElement>;
 	copy?: PickCopyState;
+	controlsId: string;
+	inert?: boolean;
 }) {
 	const progress =
 		copy?.phase === "copying"
@@ -60,7 +67,9 @@ export function PicksTrigger({
 				: "";
 	return (
 		<button
+			aria-controls={controlsId}
 			aria-expanded={expanded}
+			aria-hidden={inert}
 			aria-label={`Picks, ${pickCountLabel(count)}${progress ? `, ${progress}` : ""}`}
 			className={className}
 			onClick={(event) => {
@@ -68,6 +77,7 @@ export function PicksTrigger({
 				event.currentTarget.focus();
 			}}
 			ref={triggerRef}
+			inert={inert}
 			type="button"
 		>
 			<Bookmark aria-hidden="true" size={18} strokeWidth={1.8} />
@@ -82,19 +92,26 @@ export function PicksToolbarButton({
 	expanded,
 	onClick,
 	className,
+	triggerRef,
+	viewerOpen = false,
 }: {
 	expanded: boolean;
 	onClick: () => void;
 	className?: string;
+	triggerRef?: Ref<HTMLButtonElement>;
+	viewerOpen?: boolean;
 }) {
 	const picks = usePickList();
 	return (
 		<PicksTrigger
 			className={className}
 			count={picks.count}
+			controlsId={PICKS_DESKTOP_PANEL_ID}
 			copy={picks.copy}
 			expanded={expanded}
 			onClick={onClick}
+			inert={viewerOpen}
+			triggerRef={triggerRef}
 		/>
 	);
 }
@@ -107,7 +124,7 @@ export function PicksPanel({
 	onReview,
 	onOpenPick,
 	onRemovePick,
-	reviewOpen = false,
+	viewerOpen = false,
 }: PicksPanelProps) {
 	const picks = usePickList();
 	const service = usePhotoService();
@@ -176,11 +193,13 @@ export function PicksPanel({
 		return () => window.removeEventListener("popstate", closeOnPlatformBack);
 	}, [isMobile, onClose, open]);
 
-	const openMobileSheet = () => {
+	const openMobileSheet = () => onOpen();
+
+	useEffect(() => {
+		if (!isMobile || !open || historyEntry.current) return;
 		window.history.pushState({ picksSheet: true }, "");
 		historyEntry.current = true;
-		onOpen();
-	};
+	}, [isMobile, open]);
 
 	useEffect(() => {
 		if ((open && isMobile) || !historyEntry.current) return;
@@ -270,6 +289,7 @@ export function PicksPanel({
 							<PickRow
 								item={item}
 								key={item.assetId}
+								onOpen={onOpenPick}
 								onRemove={(assetId) =>
 									onRemovePick
 										? onRemovePick(assetId)
@@ -287,19 +307,6 @@ export function PicksPanel({
 													{copyFailureMessages[failure.code]}
 												</span>
 											))}
-										{item.asset && onOpenPick ? (
-											<button
-												aria-label={`Review ${item.asset.displayName}`}
-												className={styles.reviewButton}
-												data-pick-review-asset-id={item.assetId}
-												onClick={(event) =>
-													onOpenPick(item.assetId, event.currentTarget)
-												}
-												type="button"
-											>
-												Review
-											</button>
-										) : null}
 									</div>
 								}
 							/>
@@ -380,8 +387,11 @@ export function PicksPanel({
 		if (!open) return null;
 		return (
 			<aside
+				aria-hidden={viewerOpen}
 				aria-label="Picks"
 				className={styles.desktopPanel}
+				id={PICKS_DESKTOP_PANEL_ID}
+				inert={viewerOpen}
 				onKeyDown={trapFocus}
 				ref={dialogRef}
 			>
@@ -395,12 +405,14 @@ export function PicksPanel({
 			<PicksTrigger
 				className={styles.mobileBar}
 				count={picks.count}
+				controlsId={PICKS_MOBILE_SHEET_ID}
 				copy={picks.copy}
 				expanded={open}
+				inert={viewerOpen}
 				onClick={open ? onClose : openMobileSheet}
 				triggerRef={mobileTriggerRef}
 			/>
-			{open && !reviewOpen ? (
+			{open && !viewerOpen ? (
 				<div className={styles.mobileBackdrop}>
 					<button
 						aria-label="Dismiss picks"
@@ -413,6 +425,7 @@ export function PicksPanel({
 						aria-label="Picks"
 						aria-modal="true"
 						className={styles.mobileSheet}
+						id={PICKS_MOBILE_SHEET_ID}
 						onKeyDown={trapFocus}
 						ref={dialogRef}
 						role="dialog"

@@ -802,6 +802,9 @@ describe("responsive Picks panel", () => {
 		const { screen } = await renderPicksApp();
 		const trigger = screen.getByRole("button", { name: "Picks, 2 picks" });
 		await expect.element(trigger).toHaveAttribute("aria-expanded", "false");
+		await expect
+			.element(trigger)
+			.toHaveAttribute("aria-controls", "picks-panel-desktop");
 		const closedBackground = getComputedStyle(
 			trigger.element(),
 		).backgroundColor;
@@ -812,6 +815,7 @@ describe("responsive Picks panel", () => {
 		await trigger.click();
 		const panel = screen.getByRole("complementary", { name: "Picks" });
 		await expect.element(panel).toBeVisible();
+		await expect.element(panel).toHaveAttribute("id", "picks-panel-desktop");
 		expect(getComputedStyle(trigger.element()).backgroundColor).not.toBe(
 			closedBackground,
 		);
@@ -836,14 +840,71 @@ describe("responsive Picks panel", () => {
 		expect(
 			screen.getByRole("complementary", { name: "Picks" }).query(),
 		).toBeNull();
+		await expect.poll(() => document.activeElement).toBe(trigger.element());
 		await trigger.click();
+		panel.getByRole("button", { name: "Clear picks" }).element().focus();
 		await userEvent.keyboard("{Escape}");
 		expect(
 			screen.getByRole("complementary", { name: "Picks" }).query(),
 		).toBeNull();
+		await expect.poll(() => document.activeElement).toBe(trigger.element());
 		await expect.element(trigger).toHaveAttribute("aria-expanded", "false");
 		await expect.element(trigger).toHaveTextContent("2");
 	});
+
+	for (const width of [1440, 390]) {
+		it(`keeps every Picks control out of reach during wall and pick review at ${width}px`, async () => {
+			await page.viewport(width, 844);
+			const { screen, service } = await renderPicksApp();
+			await service.finishFixtureScan();
+			const trigger = screen.getByRole("button", { name: "Picks, 2 picks" });
+			const triggerElement = trigger.element() as HTMLButtonElement;
+			await screen.getByRole("button", { name: "Open DSC_8421.jpg" }).click();
+			await expect
+				.element(screen.getByRole("dialog", { name: "Photo viewer" }))
+				.toBeVisible();
+			expect(triggerElement.inert).toBe(true);
+			expect(triggerElement.getAttribute("aria-hidden")).toBe("true");
+			await screen
+				.getByRole("dialog", { name: "Photo viewer" })
+				.getByRole("button", { name: "Back to photos" })
+				.click();
+			await expect.poll(() => triggerElement.inert).toBe(false);
+
+			await trigger.click();
+			const panel = screen.getByRole(
+				width >= 900 ? "complementary" : "dialog",
+				{ name: "Picks" },
+			);
+			const panelElement = panel.element() as HTMLElement;
+			await panel.getByRole("button", { name: "Review DSC_8421.jpg" }).click();
+			await expect
+				.element(screen.getByRole("dialog", { name: "Photo viewer" }))
+				.toBeVisible();
+			expect(triggerElement.inert).toBe(true);
+			expect(triggerElement.getAttribute("aria-hidden")).toBe("true");
+			if (width >= 900) {
+				expect(panelElement.inert).toBe(true);
+				expect(panelElement.getAttribute("aria-hidden")).toBe("true");
+			} else {
+				expect(
+					screen.getByRole("dialog", { name: "Picks" }).query(),
+				).toBeNull();
+			}
+			await screen
+				.getByRole("dialog", { name: "Photo viewer" })
+				.getByRole("button", { name: "Back to photos" })
+				.click();
+			await expect.poll(() => triggerElement.inert).toBe(false);
+			await expect
+				.element(
+					screen.getByRole(width >= 900 ? "complementary" : "dialog", {
+						name: "Picks",
+					}),
+				)
+				.toBeVisible();
+		});
+	}
 
 	it("keeps a preview warning distinct from an unavailable source", async () => {
 		const { screen } = await renderPicksApp({ previewWarning: true });
@@ -998,6 +1059,63 @@ describe("responsive Picks panel", () => {
 						'button[aria-label="Review DSC_8421.jpg"]',
 					)[1],
 			);
+	});
+
+	it("uses each hydrated row thumbnail as its accessible review launcher", async () => {
+		const { screen } = await renderPicksApp();
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+		const thumbnail = panel.getByRole("button", {
+			name: "Review DSC_8421.jpg",
+		});
+		expect(thumbnail.element().querySelector("img")).not.toBeNull();
+		await thumbnail.click();
+		await expect
+			.element(screen.getByTestId("viewer-status"))
+			.toHaveTextContent("DSC_8421.jpg, Picks · 1 of 2");
+	});
+
+	it("removes a retained pick in the viewer after its active folder is removed", async () => {
+		const { screen, service } = await renderPicksApp();
+		const activeEntryId = service.getSavedFolders().activeEntryId;
+		if (!activeEntryId) throw new Error("Missing active saved folder");
+		await service.removeSavedFolder(activeEntryId);
+		await expect
+			.element(screen.getByRole("button", { name: "Picks, 2 picks" }))
+			.toBeVisible();
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		await screen
+			.getByRole("complementary", { name: "Picks" })
+			.getByRole("button", { name: "Review DSC_8421.jpg" })
+			.click();
+		const remove = screen
+			.getByRole("dialog", { name: "Photo viewer" })
+			.getByRole("button", { name: "Remove DSC_8421.jpg from picks" });
+		await expect.element(remove).toBeEnabled();
+		await remove.click();
+		await expect
+			.element(screen.getByTestId("viewer-status"))
+			.toHaveTextContent("IMG_3094.jpg, Picks · 1 of 1");
+		expect(service.getPicks().items.map((item) => item.assetId)).toEqual([
+			"offline",
+		]);
+	});
+
+	it("opens Picks from the add confirmation without changing membership", async () => {
+		const { screen, service } = await renderPicksApp();
+		await service.finishFixtureScan();
+		await screen
+			.getByRole("button", { name: "Add DSC_9999.jpg to picks" })
+			.click();
+		await expect
+			.element(screen.getByRole("button", { name: "View", exact: true }))
+			.toBeVisible();
+		const before = service.getPicks();
+		await screen.getByRole("button", { name: "View", exact: true }).click();
+		await expect
+			.element(screen.getByRole("complementary", { name: "Picks" }))
+			.toBeVisible();
+		expect(service.getPicks()).toEqual(before);
 	});
 
 	it("moves to the next pick when removing the current reviewed pick", async () => {
@@ -1157,6 +1275,9 @@ describe("responsive Picks panel", () => {
 		document.documentElement.style.setProperty("--safe-area-bottom", "16px");
 		const { screen } = await renderPicksApp();
 		const bar = screen.getByRole("button", { name: "Picks, 2 picks" });
+		await expect
+			.element(bar)
+			.toHaveAttribute("aria-controls", "picks-sheet-mobile");
 		const barBounds = bar.element().getBoundingClientRect();
 		expect(barBounds.height).toBeGreaterThanOrEqual(56);
 		expect(barBounds.bottom).toBeCloseTo(828, 0);
@@ -1173,6 +1294,7 @@ describe("responsive Picks panel", () => {
 		await bar.click();
 		const sheet = screen.getByRole("dialog", { name: "Picks" });
 		await expect.element(sheet).toHaveAttribute("aria-modal", "true");
+		await expect.element(sheet).toHaveAttribute("id", "picks-sheet-mobile");
 		const sheetBounds = sheet.element().getBoundingClientRect();
 		expect(sheetBounds.height).toBeGreaterThan(680);
 		expect(sheetBounds.height).toBeLessThan(730);

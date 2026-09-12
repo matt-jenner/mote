@@ -6,6 +6,7 @@ import styles from "../styles/picksPanel.module.css";
 
 interface PickRowProps {
 	item: PickItem;
+	onOpen?: (assetId: string, launchTarget: HTMLElement) => void;
 	onRemove: (assetId: string) => void;
 	action?: ReactNode;
 }
@@ -23,7 +24,7 @@ function thumbnailUrl(
 	}
 }
 
-export function PickRow({ item, onRemove, action }: PickRowProps) {
+export function PickRow({ item, onOpen, onRemove, action }: PickRowProps) {
 	const service = usePhotoService();
 	const url = thumbnailUrl(item, service.derivativeUrl);
 	const sourceUnavailable =
@@ -42,9 +43,21 @@ export function PickRow({ item, onRemove, action }: PickRowProps) {
 
 	return (
 		<li className={styles.pickRow}>
-			<div aria-hidden="true" className={styles.thumbnail}>
-				{url ? <img alt="" src={url} /> : null}
-			</div>
+			{item.asset && onOpen ? (
+				<button
+					aria-label={`Review ${item.asset.displayName}`}
+					className={`${styles.thumbnail} ${styles.thumbnailButton}`}
+					data-pick-review-asset-id={item.assetId}
+					onClick={(event) => onOpen(item.assetId, event.currentTarget)}
+					type="button"
+				>
+					{url ? <img alt="" src={url} /> : null}
+				</button>
+			) : (
+				<div aria-hidden="true" className={styles.thumbnail}>
+					{url ? <img alt="" src={url} /> : null}
+				</div>
+			)}
 			<div className={styles.rowDetails}>
 				<span className={styles.filename}>
 					{item.asset?.displayName ?? item.assetId}

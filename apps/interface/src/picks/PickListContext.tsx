@@ -36,7 +36,11 @@ export function pickOriginFromSavedFolders(
 export function PickListProvider({
 	children,
 	origin,
-}: PropsWithChildren<{ origin: PickOrigin | null }>) {
+	onViewPicks,
+}: PropsWithChildren<{
+	origin: PickOrigin | null;
+	onViewPicks?: () => void;
+}>) {
 	const service = usePhotoService();
 	const controller = usePickListController(service);
 	const value = useMemo(() => ({ controller, origin }), [controller, origin]);
@@ -52,7 +56,7 @@ export function PickListProvider({
 					{controller.snapshot.persistenceError}
 				</aside>
 			) : null}
-			<PickToast toast={controller.toast} />
+			<PickToast onViewPicks={onViewPicks} toast={controller.toast} />
 			<div
 				aria-atomic="true"
 				aria-live="polite"

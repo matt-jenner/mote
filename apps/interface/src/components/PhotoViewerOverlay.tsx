@@ -191,12 +191,13 @@ export function PhotoViewerOverlay({
 		onClose();
 	}, [onClose, reportInteraction]);
 	const handleTogglePick = useCallback(() => {
-		if (!asset || !pickOrigin) return;
+		if (!asset) return;
 		reportInteraction();
 		if (picks.isPicked(asset.id) && onRemovePick) {
 			onRemovePick(asset.id);
 			return;
 		}
+		if (!pickOrigin) return;
 		void picks.toggle(asset, pickOrigin).catch(() => {});
 	}, [asset, onRemovePick, pickOrigin, picks, reportInteraction]);
 	const controls = useViewerControls({
@@ -626,7 +627,7 @@ export function PhotoViewerOverlay({
 					}
 					aria-pressed={picks.isPicked(asset.id)}
 					className={styles.viewerPick}
-					disabled={!pickOrigin}
+					disabled={!picks.isPicked(asset.id) && !pickOrigin}
 					onClick={handleTogglePick}
 					tabIndex={state.controlsVisible ? 0 : -1}
 					type="button"

@@ -1,6 +1,8 @@
 import { Menu, X } from "lucide-react";
 import {
+	type Dispatch,
 	type KeyboardEvent,
+	type SetStateAction,
 	useCallback,
 	useEffect,
 	useLayoutEffect,
@@ -40,12 +42,15 @@ import { WallToolbar } from "./WallToolbar";
 
 function AppShellContents({
 	controller,
+	picksOpen,
+	setPicksOpen,
 }: {
 	controller: ReturnType<typeof useAppController>;
+	picksOpen: boolean;
+	setPicksOpen: Dispatch<SetStateAction<boolean>>;
 }) {
 	const service = usePhotoService();
 	const [drawerOpen, setDrawerOpen] = useState(false);
-	const [picksOpen, setPicksOpen] = useState(false);
 	const [isMobile, setIsMobile] = useState(
 		() => window.matchMedia("(max-width: 899px)").matches,
 	);
@@ -69,6 +74,8 @@ function AppShellContents({
 	} | null>(null);
 	const drawerRef = useRef<HTMLElement>(null);
 	const drawerTriggerRef = useRef<HTMLButtonElement>(null);
+	const picksTriggerRef = useRef<HTMLButtonElement>(null);
+	const desktopPicksWasOpen = useRef(false);
 	const drawerCloseRef = useRef<HTMLButtonElement>(null);
 	const permanentFolderTriggerRef = useRef<HTMLButtonElement>(null);
 	const folderRestoreFocusRef = useRef<HTMLElement | null>(null);
@@ -256,7 +263,7 @@ function AppShellContents({
 		setHighlightedAssetId(anchor.assetId);
 		const timer = window.setTimeout(() => setHighlightedAssetId(null), 600);
 		return () => window.clearTimeout(timer);
-	}, [viewer.open, viewer.returnAnchor]);
+	}, [setPicksOpen, viewer.open, viewer.returnAnchor]);
 
 	useEffect(() => {
 		if (
@@ -317,6 +324,17 @@ function AppShellContents({
 			if (!folderBrowserOpen) drawerTriggerRef.current?.focus();
 		}
 	}, [drawerOpen, folderBrowserOpen]);
+
+	useLayoutEffect(() => {
+		if (isMobile) return;
+		if (picksOpen) {
+			desktopPicksWasOpen.current = true;
+			return;
+		}
+		if (!desktopPicksWasOpen.current) return;
+		desktopPicksWasOpen.current = false;
+		picksTriggerRef.current?.focus({ preventScroll: true });
+	}, [isMobile, picksOpen]);
 
 	useLayoutEffect(() => {
 		if (folderBrowserOpen || !restoreFolderFocusPendingRef.current) return;
@@ -443,6 +461,8 @@ function AppShellContents({
 								className={`${styles.picksToolbarTrigger} ${picksPanelStyles.toolbarTrigger}`}
 								expanded={picksOpen}
 								onClick={() => setPicksOpen((open) => !open)}
+								triggerRef={picksTriggerRef}
+								viewerOpen={viewer.open}
 							/>
 						) : null}
 						<AppearanceMenu
@@ -481,7 +501,7 @@ function AppShellContents({
 						onRemovePick={handleRemovePick}
 						onReview={handleOpenPickReview}
 						open={picksOpen}
-						reviewOpen={viewer.open && viewer.sequence === "picks"}
+						viewerOpen={viewer.open}
 					/>
 				) : (
 					<PicksPanel
@@ -492,7 +512,7 @@ function AppShellContents({
 						onRemovePick={handleRemovePick}
 						onReview={handleOpenPickReview}
 						open={picksOpen}
-						reviewOpen={viewer.open && viewer.sequence === "picks"}
+						viewerOpen={viewer.open}
 					/>
 				)}
 				{viewer.open ? (
@@ -612,10 +632,18 @@ function AppShellContents({
 
 export function AppShell() {
 	const controller = useAppController();
+	const [picksOpen, setPicksOpen] = useState(false);
 	const pickOrigin = pickOriginFromSavedFolders(controller.state?.savedFolders);
 	return (
-		<PickListProvider origin={pickOrigin}>
-			<AppShellContents controller={controller} />
+		<PickListProvider
+			onViewPicks={() => setPicksOpen(true)}
+			origin={pickOrigin}
+		>
+			<AppShellContents
+				controller={controller}
+				picksOpen={picksOpen}
+				setPicksOpen={setPicksOpen}
+			/>
 		</PickListProvider>
 	);
 }
