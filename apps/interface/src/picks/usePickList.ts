@@ -53,7 +53,30 @@ export interface PickCopyState {
 	total: number;
 	copiedCount: number;
 	failedAssetIds: readonly string[];
+	failures: readonly PickCopyFailure[];
 	message: string;
+}
+
+export type PickCopyFailureCode =
+	| "source_unavailable"
+	| "destination_unavailable"
+	| "destination_is_source"
+	| "copy_failed";
+
+export interface PickCopyFailure {
+	assetId: string;
+	code: PickCopyFailureCode;
+}
+
+function boundedCopyFailureCode(code: string | null): PickCopyFailureCode {
+	switch (code) {
+		case "source_unavailable":
+		case "destination_unavailable":
+		case "destination_is_source":
+			return code;
+		default:
+			return "copy_failed";
+	}
 }
 
 type OptimisticOperation =
@@ -136,6 +159,7 @@ class PickListStoreImplementation implements PickListStore {
 		total: 0,
 		copiedCount: 0,
 		failedAssetIds: [],
+		failures: [],
 		message: "",
 	};
 	private authoritative: PickListSnapshot;
@@ -148,6 +172,7 @@ class PickListStoreImplementation implements PickListStore {
 	private announcement = "";
 	private announcementId = 0;
 	private toast: PickToastState | null = null;
+	private deferredCopyToast: PickToastState | null = null;
 	private toastId = 0;
 	private toastTimer: ReturnType<typeof setTimeout> | null = null;
 	private undo: UndoState | null = null;
@@ -209,6 +234,24 @@ class PickListStoreImplementation implements PickListStore {
 
 	private buildState(): PickListController {
 		const snapshot = applyOperations(this.authoritative, this.operations);
+		// A running attempt owns its snapshot. Reconcile retry eligibility only
+		// after it settles, using saved membership so rejected removals stay retryable.
+		if (this.copy.phase === "partial") {
+			const savedIds = new Set(
+				this.authoritative.items.map((item) => item.assetId),
+			);
+			const failures = this.copy.failures.filter((failure) =>
+				savedIds.has(failure.assetId),
+			);
+			if (failures.length !== this.copy.failures.length) {
+				this.copy = {
+					...this.copy,
+					failures,
+					failedAssetIds: failures.map((failure) => failure.assetId),
+					phase: failures.length > 0 ? "partial" : "complete",
+				};
+			}
+		}
 		return {
 			copy: this.copy,
 			copyOriginals: this.copyOriginals,
@@ -271,26 +314,37 @@ class PickListStoreImplementation implements PickListStore {
 				result.failedCount > 0
 					? `Copied ${result.copiedCount} of ${total}`
 					: `Copied ${result.copiedCount} originals`;
+			const failures = result.items
+				.filter((item) => item.status === "failed")
+				.map((item) => ({
+					assetId: item.assetId,
+					code: boundedCopyFailureCode(item.errorCode),
+				}));
 			this.copy = {
 				phase: result.failedCount > 0 ? "partial" : "complete",
 				total,
 				completed: total,
 				copiedCount: result.copiedCount,
-				failedAssetIds: result.items
-					.filter((item) => item.status === "failed")
-					.map((item) => item.assetId),
+				failedAssetIds: failures.map((failure) => failure.assetId),
+				failures,
 				message,
 			};
 			this.announcement = message;
 			this.announcementId += 1;
-			this.toast = {
+			const completionToast = {
 				id: ++this.toastId,
 				message,
 				...(result.copiedCount > 0
 					? { action: { label: "Show folder", run: this.showCopyFolder } }
 					: {}),
 			};
-			this.scheduleToastDismissal(confirmationDurationMs);
+			if (this.undo && Date.now() < this.undo.expiresAt) {
+				this.deferredCopyToast = completionToast;
+			} else {
+				this.toast = completionToast;
+				this.deferredCopyToast = null;
+				this.scheduleToastDismissal(confirmationDurationMs);
+			}
 			this.publish();
 		} catch (error) {
 			this.copy = previous;
@@ -359,8 +413,10 @@ class PickListStoreImplementation implements PickListStore {
 		this.clearToastTimer();
 		this.toastTimer = setTimeout(() => {
 			this.toastTimer = null;
-			this.toast = null;
 			this.undo = null;
+			this.toast = this.deferredCopyToast;
+			this.deferredCopyToast = null;
+			if (this.toast) this.scheduleToastDismissal(confirmationDurationMs);
 			this.publish();
 		}, delay);
 	}

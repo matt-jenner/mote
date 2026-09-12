@@ -4,6 +4,7 @@ import { PhotoServiceProvider } from "../app/PhotoServiceContext";
 import { consumePickToastAction, PickToast } from "../components/PickToast";
 import { createInMemoryPhotoService } from "../services/inMemoryPhotoService";
 import type {
+	CopyResult,
 	DerivativeRequest,
 	PhotoService,
 	WallAsset,
@@ -50,6 +51,48 @@ const snapshot = (
 	persistenceError,
 });
 
+const partialCopy: CopyResult = {
+	kind: "complete",
+	copiedCount: 1,
+	failedCount: 1,
+	warningCode: null,
+	items: [
+		{
+			assetId: "first",
+			status: "copied",
+			destinationName: "first.jpg",
+			errorCode: null,
+		},
+		{
+			assetId: "second",
+			status: "failed",
+			destinationName: null,
+			errorCode: "source_unavailable",
+		},
+	],
+};
+
+async function copyFixture(
+	copyPickedOriginals: PhotoService["copyPickedOriginals"],
+) {
+	const memory = createInMemoryPhotoService({
+		wallAssets: [asset("first"), asset("second"), asset("later")],
+	});
+	await memory.addPick(reference(asset("first")));
+	await memory.addPick(reference(asset("second")));
+	let shown = 0;
+	const store = createPickListStore({
+		...memory,
+		copyPickedOriginals,
+		showLastCopyDestination: async () => {
+			shown += 1;
+		},
+	});
+	const stop = store.start();
+	await Promise.resolve();
+	return { store, memory, stop, shown: () => shown };
+}
+
 function deferred<T>() {
 	let resolve!: (value: T) => void;
 	let reject!: (reason?: unknown) => void;
@@ -65,6 +108,151 @@ afterEach(() => {
 });
 
 describe("pick list controller", () => {
+	it("retires removed failures so a later pick joins a fresh copy", async () => {
+		const batches: Array<readonly string[] | null> = [];
+		const { store, stop } = await copyFixture(async (ids) => {
+			batches.push(ids);
+			return batches.length === 1 ? partialCopy : { kind: "cancelled" };
+		});
+		await store.getState().copyOriginals();
+		await store.getState().remove("second");
+		expect(store.getState().copy.failedAssetIds).toEqual([]);
+		expect(store.getState().copy.failures).toEqual([]);
+		expect(store.getState().copy.phase).toBe("complete");
+		await store.getState().toggle(asset("later"), origin);
+		await store.getState().copyOriginals();
+		expect(batches).toEqual([
+			["first", "second"],
+			["first", "later"],
+		]);
+		stop();
+	});
+
+	it("retries only retained failures even when new picks arrive, then retires Clear", async () => {
+		const batches: Array<readonly string[] | null> = [];
+		const { store, stop } = await copyFixture(async (ids) => {
+			batches.push(ids);
+			return batches.length === 1 ? partialCopy : { kind: "cancelled" };
+		});
+		await store.getState().copyOriginals();
+		await store.getState().toggle(asset("later"), origin);
+		await store.getState().copyOriginals();
+		expect(batches).toEqual([["first", "second"], ["second"]]);
+		await store.getState().clear();
+		expect(store.getState().copy).toMatchObject({
+			phase: "complete",
+			failedAssetIds: [],
+			failures: [],
+		});
+		stop();
+	});
+
+	it("leaves an active retry immutable and reconciles removal when its picker cancels", async () => {
+		const retry = deferred<CopyResult>();
+		let attempts = 0;
+		const { store, stop } = await copyFixture(async () =>
+			++attempts === 1 ? partialCopy : retry.promise,
+		);
+		await store.getState().copyOriginals();
+		const copying = store.getState().copyOriginals();
+		const active = store.getState().copy;
+		await store.getState().remove("second");
+		expect(store.getState().copy).toBe(active);
+		retry.resolve({ kind: "cancelled" });
+		await copying;
+		expect(store.getState().copy).toMatchObject({
+			phase: "complete",
+			failedAssetIds: [],
+			failures: [],
+		});
+		stop();
+	});
+
+	it("keeps the original Undo deadline and exposes queued copy feedback after it expires", async () => {
+		vi.useFakeTimers();
+		const result = deferred<CopyResult>();
+		const { store, stop, shown } = await copyFixture(() => result.promise);
+		const copying = store.getState().copyOriginals();
+		await store.getState().clear();
+		const undoToast = store.getState().toast;
+		vi.advanceTimersByTime(1_000);
+		result.resolve(partialCopy);
+		await copying;
+		expect(store.getState().toast).toBe(undoToast);
+		expect(store.getState().announcement).toBe("Copied 1 of 2");
+		expect(store.getState().copy).toMatchObject({
+			phase: "complete",
+			failedAssetIds: [],
+		});
+		vi.advanceTimersByTime(3_999);
+		expect(store.getState().toast).toBe(undoToast);
+		vi.advanceTimersByTime(1);
+		expect(store.getState().toast).toMatchObject({
+			message: "Copied 1 of 2",
+			action: { label: "Show folder" },
+		});
+		await store.getState().toast?.action?.run();
+		expect(shown()).toBe(1);
+		vi.advanceTimersByTime(3_000);
+		expect(store.getState().toast).toBeNull();
+		stop();
+	});
+
+	it("can still restore Clear at the end of its Undo window after copy completion", async () => {
+		vi.useFakeTimers();
+		const result = deferred<CopyResult>();
+		const { store, stop, memory } = await copyFixture(() => result.promise);
+		const copying = store.getState().copyOriginals();
+		await store.getState().clear();
+		result.resolve(partialCopy);
+		await copying;
+		vi.advanceTimersByTime(4_999);
+		expect(store.getState().toast?.action?.label).toBe("Undo");
+		await store.getState().toast?.action?.run();
+		expect(memory.getPicks().items.map((pick) => pick.assetId)).toEqual([
+			"first",
+			"second",
+		]);
+		stop();
+	});
+
+	it("retains only bounded per-item failure reasons", async () => {
+		const { store, stop } = await copyFixture(async () => ({
+			kind: "complete",
+			copiedCount: 0,
+			failedCount: 3,
+			warningCode: null,
+			items: [
+				{
+					assetId: "first",
+					status: "failed",
+					destinationName: null,
+					errorCode: "destination_unavailable",
+				},
+				{
+					assetId: "second",
+					status: "failed",
+					destinationName: null,
+					errorCode: "source_unavailable",
+				},
+				{
+					assetId: "later",
+					status: "failed",
+					destinationName: null,
+					errorCode: "/private/secret/debug-detail",
+				},
+			],
+		}));
+		await store.getState().toggle(asset("later"), origin);
+		await store.getState().copyOriginals();
+		expect(store.getState().copy.failures).toEqual([
+			{ assetId: "first", code: "destination_unavailable" },
+			{ assetId: "second", code: "source_unavailable" },
+			{ assetId: "later", code: "copy_failed" },
+		]);
+		expect(JSON.stringify(store.getState().copy)).not.toContain("/private/");
+		stop();
+	});
 	it("keeps the viewer planner priority when requesting pick derivatives", async () => {
 		const requests: DerivativeRequest[] = [];
 		const memory = createInMemoryPhotoService();

@@ -9,11 +9,18 @@ import {
 } from "react";
 import { usePhotoService } from "../app/PhotoServiceContext";
 import { usePickList } from "../picks/PickListContext";
-import type { PickCopyState } from "../picks/usePickList";
+import type { PickCopyFailureCode, PickCopyState } from "../picks/usePickList";
 import styles from "../styles/picksPanel.module.css";
 import { PickRow } from "./PickRow";
 
 export type PicksPanelMode = "desktop" | "mobile";
+
+const copyFailureMessages: Record<PickCopyFailureCode, string> = {
+	source_unavailable: "Original unavailable",
+	destination_unavailable: "Destination unavailable",
+	destination_is_source: "Destination is a source folder",
+	copy_failed: "Couldn't copy original",
+};
 
 interface PicksPanelProps {
 	mode: PicksPanelMode;
@@ -265,9 +272,16 @@ export function PicksPanel({
 								}
 								action={
 									<div>
-										{picks.copy.failedAssetIds.includes(item.assetId) ? (
-											<span className={styles.sourceWarning}>Copy failed</span>
-										) : null}
+										{picks.copy.failures
+											.filter((failure) => failure.assetId === item.assetId)
+											.map((failure) => (
+												<span
+													key={failure.assetId}
+													className={styles.sourceWarning}
+												>
+													{copyFailureMessages[failure.code]}
+												</span>
+											))}
 										{item.asset && onOpenPick ? (
 											<button
 												aria-label={`Review ${item.asset.displayName}`}

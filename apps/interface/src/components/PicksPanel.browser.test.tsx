@@ -197,6 +197,209 @@ async function renderControllablePicksApp(initial: PickListSnapshot): Promise<{
 }
 
 describe("responsive Picks panel", () => {
+	it("retires removed failures and copies the current picks after a new pick is added", async () => {
+		const batches: Array<readonly string[] | null> = [];
+		const { screen, service } = await renderPicksApp({
+			copy: async (ids) => {
+				batches.push(ids);
+				return batches.length === 1
+					? {
+							kind: "complete",
+							copiedCount: 1,
+							failedCount: 1,
+							warningCode: null,
+							items: [
+								{
+									assetId: "coast",
+									status: "copied",
+									destinationName: "coast.jpg",
+									errorCode: null,
+								},
+								{
+									assetId: "offline",
+									status: "failed",
+									destinationName: null,
+									errorCode: "source_unavailable",
+								},
+							],
+						}
+					: { kind: "cancelled" };
+			},
+		});
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+		await panel.getByRole("button", { name: "Copy 2 originals…" }).click();
+		await panel.getByRole("button", { name: "Remove IMG_3094.jpg" }).click();
+		await service.addPick({
+			assetId: "unpicked",
+			sourceFolderId: "Family",
+			sourceLabel: "Family",
+		});
+		await expect
+			.element(panel.getByRole("button", { name: "Copy 2 originals…" }))
+			.toBeEnabled();
+		await panel.getByRole("button", { name: "Copy 2 originals…" }).click();
+		expect(batches).toEqual([
+			["coast", "offline"],
+			["coast", "unpicked"],
+		]);
+	});
+
+	it("keeps new picks out of retry and retires retry after Clear", async () => {
+		const batches: Array<readonly string[] | null> = [];
+		const { screen, service } = await renderPicksApp({
+			copy: async (ids) => {
+				batches.push(ids);
+				return batches.length === 1
+					? {
+							kind: "complete",
+							copiedCount: 0,
+							failedCount: 2,
+							warningCode: null,
+							items: ["coast", "offline"].map((assetId) => ({
+								assetId,
+								status: "failed" as const,
+								destinationName: null,
+								errorCode: "copy_failed",
+							})),
+						}
+					: { kind: "cancelled" };
+			},
+		});
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+		await panel.getByRole("button", { name: "Copy 2 originals…" }).click();
+		await service.addPick({
+			assetId: "unpicked",
+			sourceFolderId: "Family",
+			sourceLabel: "Family",
+		});
+		await panel.getByRole("button", { name: "Retry 2 originals…" }).click();
+		expect(batches).toEqual([
+			["coast", "offline"],
+			["coast", "offline"],
+		]);
+		await panel.getByRole("button", { name: "Clear picks" }).click();
+		await expect
+			.element(panel.getByText("Add photos to picks as you browse."))
+			.toBeVisible();
+		expect(panel.getByRole("button", { name: /Retry/ }).query()).toBeNull();
+	});
+
+	it("preserves Undo through copy completion then shows the queued folder action without moving focus", async () => {
+		let finish!: (result: CopyResult) => void;
+		let shown = 0;
+		const { screen } = await renderPicksApp({
+			copy: () =>
+				new Promise((resolve) => {
+					finish = resolve;
+				}),
+			showFolder: async () => {
+				shown += 1;
+			},
+		});
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+		await panel.getByRole("button", { name: "Copy 2 originals…" }).click();
+		await panel.getByRole("button", { name: "Clear picks" }).click();
+		const toast = document.querySelector("[data-toast-id]");
+		await panel.getByRole("button", { name: "Close picks" }).click();
+		const trigger = screen.getByRole("button", { name: /Picks, 0 picks/ });
+		trigger.element().focus();
+		await new Promise<void>((resolve) => window.setTimeout(resolve, 1_000));
+		finish({
+			kind: "complete",
+			copiedCount: 2,
+			failedCount: 0,
+			warningCode: null,
+			items: ["coast", "offline"].map((assetId) => ({
+				assetId,
+				status: "copied" as const,
+				destinationName: `${assetId}.jpg`,
+				errorCode: null,
+			})),
+		});
+		await expect
+			.poll(() =>
+				[...document.querySelectorAll("[aria-live='polite']")].some((region) =>
+					region.textContent?.includes("Copied 2 originals"),
+				),
+			)
+			.toBe(true);
+		expect(document.querySelector("[data-toast-id]")).toBe(toast);
+		await expect
+			.element(screen.getByRole("button", { name: "Undo", exact: true }))
+			.toBeVisible();
+		await new Promise<void>((resolve) => window.setTimeout(resolve, 3_200));
+		await expect
+			.element(screen.getByRole("button", { name: "Undo", exact: true }))
+			.toBeVisible();
+		await expect
+			.element(screen.getByRole("button", { name: "Show folder", exact: true }))
+			.toBeVisible();
+		expect(document.activeElement).toBe(trigger.element());
+		await screen
+			.getByRole("button", { name: "Show folder", exact: true })
+			.click();
+		expect(shown).toBe(1);
+	});
+
+	it("shows bounded failure reasons on their matching rows", async () => {
+		const { screen } = await renderPicksApp({
+			previewWarning: true,
+			copy: async () => ({
+				kind: "complete",
+				copiedCount: 0,
+				failedCount: 3,
+				warningCode: null,
+				items: [
+					{
+						assetId: "coast",
+						status: "failed",
+						destinationName: null,
+						errorCode: "destination_unavailable",
+					},
+					{
+						assetId: "offline",
+						status: "failed",
+						destinationName: null,
+						errorCode: "source_unavailable",
+					},
+					{
+						assetId: "preview-warning",
+						status: "failed",
+						destinationName: null,
+						errorCode: "/private/raw-error",
+					},
+				],
+			}),
+		});
+		await screen.getByRole("button", { name: "Picks, 3 picks" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+		await panel.getByRole("button", { name: "Copy 3 originals…" }).click();
+		await expect
+			.element(panel.getByText("Destination unavailable", { exact: true }))
+			.toBeVisible();
+		expect(
+			panel
+				.getByText("Destination unavailable", { exact: true })
+				.element()
+				.closest("li")?.textContent,
+		).toContain("DSC_8421.jpg");
+		await expect
+			.element(panel.getByText("Original unavailable", { exact: true }))
+			.toBeVisible();
+		expect(
+			panel
+				.getByText("Original unavailable", { exact: true })
+				.element()
+				.closest("li")?.textContent,
+		).toContain("IMG_3094.jpg");
+		await expect
+			.element(panel.getByText("Couldn't copy original", { exact: true }))
+			.toBeVisible();
+		expect(panel.element().textContent).not.toContain("/private/");
+	});
 	it("keeps native copy progress in the trigger after closing and clearing picks", async () => {
 		let progress!: (event: CopyProgress) => void;
 		let finish!: (result: CopyResult) => void;
@@ -266,7 +469,7 @@ describe("responsive Picks panel", () => {
 		});
 		await expect
 			.poll(() => document.querySelector("[data-toast-id]")?.textContent)
-			.toContain("Copied 2 originals");
+			.toContain("Picks cleared");
 		await expect
 			.poll(() =>
 				[...document.querySelectorAll("[aria-live='polite']")]
@@ -315,7 +518,7 @@ describe("responsive Picks panel", () => {
 			panel.getByRole("button", { name: "Show folder" }).query(),
 		).toBeNull();
 		await panel.getByRole("button", { name: "Copy 2 originals…" }).click();
-		await expect.element(panel.getByText("Copy failed")).toBeVisible();
+		await expect.element(panel.getByText("Original unavailable")).toBeVisible();
 		await expect
 			.poll(() => document.querySelector("[data-toast-id]")?.textContent)
 			.toContain("Copied 1 of 2");
