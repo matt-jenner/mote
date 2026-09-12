@@ -4,6 +4,17 @@ The hosted image serves the web interface and API on port 8080. It runs as UID a
 
 The `/photos` mount is the highest folder the web interface can browse. Choose **Add folder** in the hosted interface to list its child directories, move through nested directories, and open any contained folder as the gallery source. The browser never receives the host path and cannot navigate above the mounted root. **Include subfolders** controls whether the gallery shows only photos directly inside the selected folder or also includes its descendants.
 
+## Accent colour
+
+Set `MOTE_ACCENT_COLOR` to a six-digit CSS hex colour such as `#7C3AED`
+to replace the green interface accent. The server reads it at startup and sends
+the resolved value to browsers. Missing, empty, and invalid values use Mote's
+default green. Restart the server after changing it.
+
+Desktop builds ignore this variable. They use the operating system accent
+colour when the embedded WebView exposes it, with the Mote green fallback on
+WebViews that do not provide a system colour.
+
 ## Saved folders
 
 Opening a folder adds a shortcut to the left sidebar. Its menu lets you rename
@@ -87,6 +98,7 @@ podman run -d --name photo-viewer \
   -e PHOTO_VIEWER_CACHE_DIR=/var/cache/photo-viewer \
   -e PHOTO_VIEWER_SOURCE_ROOT=/photos \
   -e PHOTO_VIEWER_BIND=0.0.0.0:8080 \
+  -e MOTE_ACCENT_COLOR \
   -v /srv/photos:/photos:ro,Z \
   -v "$PHOTO_VIEWER_DATA_PATH:/var/lib/photo-viewer:Z" \
   -v "$PHOTO_VIEWER_CACHE_PATH:/var/cache/photo-viewer:Z" \
@@ -102,6 +114,7 @@ docker run -d --name photo-viewer \
   -e PHOTO_VIEWER_CACHE_DIR=/var/cache/photo-viewer \
   -e PHOTO_VIEWER_SOURCE_ROOT=/photos \
   -e PHOTO_VIEWER_BIND=0.0.0.0:8080 \
+  -e MOTE_ACCENT_COLOR \
   -v /srv/photos:/photos:ro \
   -v "$PHOTO_VIEWER_DATA_PATH:/var/lib/photo-viewer" \
   -v "$PHOTO_VIEWER_CACHE_PATH:/var/cache/photo-viewer" \
@@ -121,6 +134,7 @@ cat > ./runtime/compose.env <<EOF
 PHOTO_PATH="/mnt/archive/photos"
 PHOTO_VIEWER_DATA_PATH="$PWD/runtime/data"
 PHOTO_VIEWER_CACHE_PATH="$PWD/runtime/cache"
+MOTE_ACCENT_COLOR="#7C3AED"
 EOF
 podman compose --env-file ./runtime/compose.env \
   -f deploy/compose.yaml up -d --build

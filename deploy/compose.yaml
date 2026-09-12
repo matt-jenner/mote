@@ -12,6 +12,7 @@ services:
       PHOTO_VIEWER_CACHE_DIR: /var/cache/photo-viewer
       PHOTO_VIEWER_SOURCE_ROOT: /photos
       PHOTO_VIEWER_BIND: 0.0.0.0:8080
+      MOTE_ACCENT_COLOR: "${MOTE_ACCENT_COLOR:-}"
     volumes:
       - "${PHOTO_PATH:-/srv/photos}:/photos:ro,Z"
       - "${PHOTO_VIEWER_DATA_PATH:?PHOTO_VIEWER_DATA_PATH must name a host directory}:/var/lib/photo-viewer:Z"

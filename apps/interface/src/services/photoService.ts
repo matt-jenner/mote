@@ -47,6 +47,7 @@ export interface BootstrapState {
 	settings: SettingsState;
 	activeSource: SourceSummary | null;
 	savedFolders: SavedFolderSnapshot;
+	accentColor?: string;
 }
 
 export type ChooseFolderResult =

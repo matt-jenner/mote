@@ -129,7 +129,9 @@ describe("Tauri PhotoService", () => {
 		};
 		const service = createTauriPhotoService(invoke);
 
-		await service.getBootstrapState();
+		await expect(service.getBootstrapState()).resolves.toMatchObject({
+			accentColor: "system",
+		});
 		await service.chooseFolder();
 		await service.updateAppearance("dark");
 		await service.updateGalleryScope("currentFolder");

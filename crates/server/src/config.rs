@@ -21,6 +21,7 @@ pub struct ServerConfig {
     local: LocalStatePaths,
     bind: SocketAddr,
     source_root: PathBuf,
+    accent_color: Option<String>,
     #[cfg(unix)]
     source_startup: Arc<Mutex<Option<SourceStartupValidation>>>,
     web_root: StaticWebRoot,
@@ -119,6 +120,7 @@ impl ServerConfig {
             local,
             bind: bind.unwrap_or("127.0.0.1:8080").parse()?,
             source_root,
+            accent_color: None,
             #[cfg(unix)]
             source_startup: Arc::new(Mutex::new(Some(source_startup))),
             web_root,
@@ -143,7 +145,11 @@ impl ServerConfig {
                 return Err(ConfigError::InvalidEnvironment("PHOTO_VIEWER_WEB_ROOT"));
             }
         };
-        Self::new(data_dir, cache_dir, bind.as_deref(), source_root, web_root)
+        let mut config = Self::new(data_dir, cache_dir, bind.as_deref(), source_root, web_root)?;
+        config.accent_color = env::var("MOTE_ACCENT_COLOR")
+            .ok()
+            .and_then(|value| configured_accent_color(&value));
+        Ok(config)
     }
 
     pub fn prepare(&self) -> Result<(), ConfigError> {
@@ -203,6 +209,10 @@ impl ServerConfig {
 
     pub fn source_root(&self) -> &Path {
         &self.source_root
+    }
+
+    pub fn accent_color(&self) -> Option<&str> {
+        self.accent_color.as_deref()
     }
 
     pub fn web_root(&self) -> &Path {
@@ -370,5 +380,33 @@ fn required_path(name: &'static str) -> Result<PathBuf, ConfigError> {
         Ok(value) => Ok(PathBuf::from(value)),
         Err(env::VarError::NotPresent) => Err(ConfigError::MissingEnvironment(name)),
         Err(env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidEnvironment(name)),
+    }
+}
+
+fn configured_accent_color(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 7 || bytes[0] != b'#' || !bytes[1..].iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    Some(value.to_ascii_uppercase())
+}
+
+#[cfg(test)]
+mod accent_color_tests {
+    use super::configured_accent_color;
+
+    #[test]
+    fn configured_accent_accepts_six_digit_hex_and_normalizes_case() {
+        assert_eq!(
+            configured_accent_color("#7c3aed"),
+            Some("#7C3AED".to_owned())
+        );
+    }
+
+    #[test]
+    fn configured_accent_rejects_values_that_are_not_six_digit_hex() {
+        for value in ["", "7C3AED", "#7C3AE", "#7C3AED00", "purple", "#ZZ3AED"] {
+            assert_eq!(configured_accent_color(value), None, "{value}");
+        }
     }
 }

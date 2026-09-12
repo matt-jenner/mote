@@ -82,3 +82,59 @@
 	--safe-area-bottom: env(safe-area-inset-bottom);
 	--safe-area-left: env(safe-area-inset-left);
 }
+
+:root[data-accent="custom"] {
+	--selection: color-mix(in srgb, var(--accent-color) 14%, var(--canvas));
+	--progress-accent: var(--accent-color);
+	--primary-control: var(--accent-color);
+	--primary-control-text: var(--accent-color-text);
+	--mote-green: var(--accent-color);
+	--mote-green-dark: var(--accent-color);
+}
+
+@supports (color: AccentColor) {
+	:root[data-accent="system"] {
+		--accent-color: AccentColor;
+		--accent-color-text: AccentColorText;
+		--selection: color-mix(in srgb, var(--accent-color) 14%, var(--canvas));
+		--progress-accent: var(--accent-color);
+		--primary-control: var(--accent-color);
+		--primary-control-text: var(--accent-color-text);
+		--mote-green: var(--accent-color);
+		--mote-green-dark: var(--accent-color);
+	}
+
+	:root[data-theme="dark"][data-accent="system"] {
+		--selection: color-mix(in srgb, var(--accent-color) 24%, var(--canvas));
+	}
+
+	@media (prefers-color-scheme: dark) {
+		:root[data-theme="system"][data-accent="system"] {
+			--selection: color-mix(in srgb, var(--accent-color) 24%, var(--canvas));
+		}
+	}
+}
+
+@supports (color: -apple-system-control-accent) and
+	(color: -apple-system-selected-text) {
+	:root[data-accent="system"] {
+		--accent-color: -apple-system-control-accent;
+		--accent-color-text: -apple-system-selected-text;
+		--selection: color-mix(in srgb, var(--accent-color) 14%, var(--canvas));
+		--progress-accent: var(--accent-color);
+		--primary-control: var(--accent-color);
+		--primary-control-text: var(--accent-color-text);
+		--mote-green: var(--accent-color);
+		--mote-green-dark: var(--accent-color);
+	}
+}
+
+:root[data-theme="dark"][data-accent="custom"] {
+	--selection: color-mix(in srgb, var(--accent-color) 24%, var(--canvas));
+}
+
+@media (prefers-color-scheme: dark) {
+	:root[data-theme="system"][data-accent="custom"] {
+		--selection: color-mix(in srgb, var(--accent-color) 24%, var(--canvas));
+	}
+}

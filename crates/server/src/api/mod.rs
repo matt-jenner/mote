@@ -116,6 +116,7 @@ pub(crate) async fn bootstrap(State(state): State<AppState>) -> impl IntoRespons
             video: false,
         },
         source_available,
+        accent_color: state.accent_color.clone(),
     })
 }
 
