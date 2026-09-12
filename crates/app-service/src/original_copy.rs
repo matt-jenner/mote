@@ -231,10 +231,16 @@ impl AppService {
         let original_name = source.relative.file_name().ok_or("source_unavailable")?;
         let mut suffix = 1_u64;
         loop {
-            scan_names(destination, reserved).map_err(|_| "destination_unavailable")?;
             let name = candidate_name(original_name, suffix);
             suffix = suffix.checked_add(1).ok_or("destination_unavailable")?;
-            if !reserved.insert(fold_name(&name)) {
+            let key = fold_name(&name);
+            if reserved.contains(&key) {
+                continue;
+            }
+            // Earlier items already reserved their suffixes. Refresh external
+            // entries only once we have a candidate that might be available.
+            scan_names(destination, reserved).map_err(|_| "destination_unavailable")?;
+            if !reserved.insert(key) {
                 continue;
             }
             // Revalidate every creation attempt, including retries after another
@@ -329,6 +335,8 @@ fn fold_name(name: &OsStr) -> String {
 }
 
 fn scan_names(directory: &Path, reserved: &mut HashSet<String>) -> io::Result<()> {
+    #[cfg(all(test, unix))]
+    tests::DIRECTORY_SCANS.with(|count| count.set(count.get() + 1));
     for entry in fs::read_dir(directory)? {
         reserved.insert(fold_name(&entry?.file_name()));
     }
@@ -350,31 +358,44 @@ fn candidate_name(original: &OsStr, suffix: u64) -> OsString {
 }
 
 fn remove_created_file(target: &Path, output: &File) {
-    if !fs::symlink_metadata(target).is_ok_and(|metadata| metadata.is_file()) {
-        return;
-    }
-    let Ok(current) = File::open(target) else {
+    let Ok(current) = fs::symlink_metadata(target) else {
         return;
     };
-    if same_file(output, &current) {
+    if !current.is_file() {
+        return;
+    }
+    #[cfg(unix)]
+    let is_output = {
+        use std::os::unix::fs::MetadataExt;
+        output
+            .metadata()
+            .is_ok_and(|output| output.dev() == current.dev() && output.ino() == current.ino())
+    };
+    #[cfg(windows)]
+    let is_output = same_file(output, target);
+    if is_output {
         // Revalidation protects normal destination changes. An adversarial
         // rename between identity checking and unlink needs descriptor APIs.
         let _ = fs::remove_file(target);
     }
 }
 
-#[cfg(unix)]
-fn same_file(left: &File, right: &File) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match (left.metadata(), right.metadata()) {
-        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
-        _ => false,
-    }
-}
-
 #[cfg(windows)]
-fn same_file(left: &File, right: &File) -> bool {
+fn same_file(left: &File, target: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
+
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    // Identity lookup must not require READ_DATA on a write-only output, and
+    // must not follow a reparse point substituted after symlink_metadata.
+    let Ok(right) = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(target)
+    else {
+        return false;
+    };
 
     // Stable Rust does not expose the Windows file identity in MetadataExt.
     #[repr(C)]
@@ -413,12 +434,64 @@ fn same_file(left: &File, right: &File) -> bool {
             ))
         }
     }
-    identity(left).is_some_and(|left| identity(right) == Some(left))
+    identity(left).is_some_and(|left| identity(&right) == Some(left))
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    thread_local! {
+        pub(super) static DIRECTORY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    // Catches rescanning for every suffix already reserved by earlier items.
+    #[test]
+    fn same_basename_batch_scans_at_most_once_per_item() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("source");
+        let destination = temp.path().join("exports");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let service = AppService::open(crate::AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let mut items = Vec::new();
+        for index in 0..250 {
+            let relative = PathBuf::from(format!("{index}/IMG_2048.jpg"));
+            fs::create_dir(root.join(index.to_string())).unwrap();
+            fs::write(root.join(&relative), format!("original {index}")).unwrap();
+            items.push(PreparedItem {
+                asset_id: uuid::Uuid::new_v4().to_string(),
+                source: Some(PreparedSource {
+                    root: root.clone(),
+                    relative,
+                }),
+            });
+        }
+        let batch = OriginalCopyBatch {
+            items,
+            source_roots: vec![root],
+        };
+        DIRECTORY_SCANS.with(|count| count.set(0));
+        let result = service.copy_originals(batch, &destination).unwrap();
+        assert_eq!((result.copied_count, result.failed_count), (250, 0));
+        assert_eq!(
+            result.items[249].destination_name.as_deref(),
+            Some("IMG_2048 (250).jpg")
+        );
+        assert_eq!(
+            fs::read(destination.join("IMG_2048 (250).jpg")).unwrap(),
+            b"original 249"
+        );
+        let scans = DIRECTORY_SCANS.with(|count| count.get());
+        assert!(
+            scans <= 251,
+            "250 copies needed {scans} directory scans, expected at most 251"
+        );
+    }
 
     // Catches Unicode case aliases receiving separate collision reservations.
     #[test]
@@ -439,6 +512,7 @@ mod tests {
     // Catches cleanup deleting a replacement at the incomplete output's old path.
     #[test]
     fn failed_copy_cleanup_preserves_replacement_file() {
+        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("export.jpg");
         let output = OpenOptions::new()
@@ -446,6 +520,11 @@ mod tests {
             .create_new(true)
             .open(&target)
             .unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o200)).unwrap();
+        assert!(
+            File::open(&target).is_err(),
+            "test requires a non-root runner"
+        );
         fs::rename(&target, temp.path().join("moved-incomplete.jpg")).unwrap();
         fs::write(&target, b"replacement must survive").unwrap();
         remove_created_file(&target, &output);
@@ -455,6 +534,7 @@ mod tests {
     // Catches cleanup leaving its own partial file behind after a write failure.
     #[test]
     fn failed_copy_cleanup_removes_only_its_own_incomplete_file() {
+        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("export.jpg");
         let other = temp.path().join("other.jpg");
@@ -464,6 +544,11 @@ mod tests {
             .open(&target)
             .unwrap();
         std::io::Write::write_all(&mut output, b"incomplete").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o200)).unwrap();
+        assert!(
+            File::open(&target).is_err(),
+            "test requires a non-root runner"
+        );
         fs::write(&other, b"previous export").unwrap();
         remove_created_file(&target, &output);
         assert!(!target.exists());

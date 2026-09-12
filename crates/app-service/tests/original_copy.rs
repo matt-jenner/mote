@@ -582,11 +582,22 @@ fn dropped_batch_and_failed_operation_preserve_previous_destination() {
 // Limit only a child process, so parallel service tests keep their normal limits.
 #[cfg(unix)]
 #[test]
-fn filesystem_write_failure_removes_partial_output_and_preserves_source() {
+fn filesystem_write_failure_removes_unreadable_partial_output_and_preserves_source() {
     const CHILD_ROOT: &str = "PHOTO_COPY_WRITE_FAILURE_CHILD_ROOT";
     const CHILD_ID: &str = "PHOTO_COPY_WRITE_FAILURE_CHILD_ID";
     if let Some(root) = std::env::var_os(CHILD_ROOT) {
         let root = PathBuf::from(root);
+        let probe = root.join("exports/write-only-probe");
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .unwrap();
+        assert!(
+            fs::File::open(&probe).is_err(),
+            "restrictive umask must deny data reads"
+        );
+        fs::remove_file(probe).unwrap();
         let service =
             AppService::open(AppConfig::new(root.join("data"), root.join("cache"))).unwrap();
         let batch = service
@@ -608,13 +619,13 @@ fn filesystem_write_failure_removes_partial_output_and_preserves_source() {
     let child = std::process::Command::new("/bin/sh")
         .args([
             "-c",
-            "trap '' XFSZ; ulimit -f 32; exec \"$@\"",
+            "trap '' XFSZ; ulimit -f 32; umask 0444; exec \"$@\"",
             "copy-write-failure",
         ])
         .arg(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "filesystem_write_failure_removes_partial_output_and_preserves_source",
+            "filesystem_write_failure_removes_unreadable_partial_output_and_preserves_source",
             "--nocapture",
         ])
         .env(CHILD_ROOT, fixture.temp.path())
