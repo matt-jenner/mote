@@ -270,6 +270,58 @@
 	border-bottom: 1px solid var(--separator);
 }
 
+.pickToast,
+.pickPersistenceWarning {
+	position: fixed;
+	left: 50%;
+	z-index: 70;
+	max-width: min(440px, calc(100vw - 32px));
+	font-size: 13px;
+	line-height: 1.4;
+	transform: translateX(-50%);
+}
+
+.pickToast {
+	bottom: calc(var(--safe-area-bottom) + var(--space-6));
+	display: flex;
+	align-items: center;
+	gap: var(--space-4);
+	min-height: 44px;
+	padding: var(--space-2) var(--space-2) var(--space-2) var(--space-4);
+	color: var(--text-primary);
+	background: var(--canvas-elevated);
+	border: 1px solid var(--separator);
+	border-radius: var(--radius-medium);
+	box-shadow: var(--overlay-shadow);
+}
+
+.pickToast button {
+	min-height: 36px;
+	padding: 0 var(--space-3);
+	color: var(--focus-ring);
+	font: inherit;
+	font-weight: 650;
+	background: transparent;
+	border: 0;
+	border-radius: var(--radius-small);
+	cursor: pointer;
+}
+
+.pickToast button:focus-visible {
+	outline: 2px solid var(--focus-ring);
+	outline-offset: 2px;
+}
+
+.pickPersistenceWarning {
+	top: calc(var(--safe-area-top) + var(--space-3));
+	padding: var(--space-2) var(--space-4);
+	color: var(--text-primary);
+	background: var(--selection);
+	border: 1px solid var(--separator);
+	border-radius: var(--radius-small);
+	box-shadow: 0 8px 24px rgb(0 0 0 / 14%);
+}
+
 .drawerTrigger,
 .drawerBackdrop {
 	display: none;
