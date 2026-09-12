@@ -1,4 +1,4 @@
-import { CircleAlert } from "lucide-react";
+import { Check, CircleAlert, Plus } from "lucide-react";
 import { useCallback, useLayoutEffect, useRef, useState } from "react";
 import {
 	imageSourceUnavailable,
@@ -26,6 +26,8 @@ interface PhotoTileProps {
 	positioned: PositionedWallAsset;
 	service: PhotoService;
 	onOpen?: (assetId: string) => void;
+	onTogglePick?: (asset: PositionedWallAsset["asset"]) => void;
+	picked?: boolean;
 	highlighted?: boolean;
 }
 
@@ -52,6 +54,8 @@ export function PhotoTile({
 	positioned,
 	service,
 	onOpen = () => undefined,
+	onTogglePick,
+	picked = false,
 	highlighted = false,
 }: PhotoTileProps) {
 	const { asset } = positioned;
@@ -295,7 +299,7 @@ export function PhotoTile({
 			) : null}
 		</>
 	);
-	const className = `${styles.tile} ${highlighted ? styles.tileReturnHighlight : ""}`;
+	const className = `${styles.tile} ${picked ? styles.tilePicked : ""} ${highlighted ? styles.tileReturnHighlight : ""}`;
 	const canOpen =
 		asset.mediaKind !== "video" &&
 		phase === "interactive" &&
@@ -317,6 +321,28 @@ export function PhotoTile({
 		>
 			{layers}
 			{sourceUnavailable ? <SourceWarningBadge /> : null}
+			{onTogglePick && asset.mediaKind !== "video" ? (
+				<button
+					aria-label={
+						picked
+							? `Remove ${asset.displayName} from picks`
+							: `Add ${asset.displayName} to picks`
+					}
+					aria-pressed={picked}
+					className={styles.tilePickButton}
+					onClick={(event) => {
+						event.stopPropagation();
+						onTogglePick(asset);
+					}}
+					type="button"
+				>
+					{picked ? (
+						<Check aria-hidden="true" size={18} strokeWidth={2.2} />
+					) : (
+						<Plus aria-hidden="true" size={18} strokeWidth={2} />
+					)}
+				</button>
+			) : null}
 			{canOpen ? (
 				<button
 					aria-label={`Open ${asset.displayName}`}

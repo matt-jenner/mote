@@ -6,6 +6,7 @@ import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { PhotoServiceProvider } from "../app/PhotoServiceContext";
 import { emptySavedFolders } from "../folders/savedFolders";
+import { PickListProvider } from "../picks/PickListContext";
 import {
 	createInMemoryPhotoService,
 	type InMemoryPhotoService,
@@ -1949,6 +1950,84 @@ describe("immersive photo viewer checkpoint", () => {
 		await expect.element(tile).toHaveFocus();
 	});
 
+	it("keeps wall and viewer pick toggles synchronized through pending mutations", async () => {
+		const service = serviceWithReadyPhotos();
+		const addGate = gate<void>();
+		const removeGate = gate<void>();
+		const addPick = service.addPick.bind(service);
+		const removePick = service.removePick.bind(service);
+		service.addPick = async (reference) => {
+			await addGate.promise;
+			return addPick(reference);
+		};
+		service.removePick = async (assetId) => {
+			await removeGate.promise;
+			return removePick(assetId);
+		};
+		const view = await renderViewerWall(service);
+		await view.getByRole("button", { name: "Choose Folder" }).click();
+		await service.finishFixtureScan();
+
+		const wallPick = view.getByRole("button", {
+			name: "Add Coast to picks",
+			exact: true,
+		});
+		const open = view.getByRole("button", {
+			name: "Open Coast",
+			exact: true,
+		});
+		await wallPick.click();
+		await expect
+			.element(
+				view.getByRole("button", {
+					name: "Remove Coast from picks",
+					exact: true,
+				}),
+			)
+			.toHaveAttribute("aria-pressed", "true");
+		expect(
+			view.getByRole("dialog", { name: "Photo viewer" }).query(),
+		).toBeNull();
+
+		await open.click();
+		const viewerPick = view
+			.getByRole("button", {
+				name: "Remove Coast from picks",
+				exact: true,
+			})
+			.last();
+		await expect.element(viewerPick).toHaveAttribute("aria-pressed", "true");
+		expect(viewerPick.element().closest("[data-viewer-chrome]")).not.toBeNull();
+		expect(viewerPick.element().tabIndex).toBe(0);
+
+		addGate.resolve();
+		await expect.poll(() => service.getPicks().items).toHaveLength(1);
+		await viewerPick.click();
+		await expect
+			.element(
+				view
+					.getByRole("button", {
+						name: "Add Coast to picks",
+						exact: true,
+					})
+					.last(),
+			)
+			.toHaveAttribute("aria-pressed", "false");
+		await expect
+			.element(
+				view
+					.getByRole("button", {
+						name: "Add Coast to picks",
+						exact: true,
+					})
+					.first(),
+			)
+			.toHaveAttribute("aria-pressed", "false");
+
+		removeGate.resolve();
+		await expect.poll(() => service.getPicks().items).toHaveLength(0);
+	});
+
 	it("keeps indexed videos poster-only and non-openable", async () => {
 		const video = {
 			...asset("clip", "Clip", 1),
@@ -2530,7 +2609,11 @@ describe("immersive photo viewer checkpoint", () => {
 	it("keeps malformed geometry and zero-natural previews at Fit while navigation works", async () => {
 		const view = await render(
 			<PhotoServiceProvider service={invalidGeometryService}>
-				<InvalidGeometryViewerHarness />
+				<PickListProvider
+					origin={{ sourceFolderId: "test-folder", sourceLabel: "Test folder" }}
+				>
+					<InvalidGeometryViewerHarness />
+				</PickListProvider>
 			</PhotoServiceProvider>,
 		);
 		const stage = view.getByTestId("viewer-stage");
@@ -4822,6 +4905,10 @@ describe("immersive photo viewer checkpoint", () => {
 		(tile.element() as HTMLButtonElement).click();
 		const back = view.getByRole("button", { name: "Back to photos" });
 		await expect.element(back).toBeVisible();
+		const info = view.getByRole("button", { name: "Photo information" });
+		const pick = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.getByRole("button", { name: "Add Photo 1 to picks" });
 		const previous = view.getByRole("button", { name: "Previous photo" });
 		const next = view.getByRole("button", { name: "Next photo" });
 		const folders = view.getByRole("button", {
@@ -4833,6 +4920,10 @@ describe("immersive photo viewer checkpoint", () => {
 			.getByRole("button", { name: "Coast", exact: true });
 		await back.element().focus();
 		await userEvent.keyboard("{Tab}");
+		expect(document.activeElement).toBe(info.element());
+		await userEvent.keyboard("{Tab}");
+		expect(document.activeElement).toBe(pick.element());
+		await userEvent.keyboard("{Tab}");
 		expect(document.activeElement).toBe(previous.element());
 		await userEvent.keyboard("{Tab}");
 		expect(document.activeElement).toBe(next.element());
@@ -4843,6 +4934,10 @@ describe("immersive photo viewer checkpoint", () => {
 		expect(document.activeElement).toBe(next.element());
 		await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
 		expect(document.activeElement).toBe(previous.element());
+		await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
+		expect(document.activeElement).toBe(pick.element());
+		await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
+		expect(document.activeElement).toBe(info.element());
 		await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
 		expect(document.activeElement).toBe(back.element());
 	});

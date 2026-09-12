@@ -1,4 +1,4 @@
-import { ChevronLeft, ChevronRight, Info } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight, Info, Plus } from "lucide-react";
 import {
 	type KeyboardEvent as ReactKeyboardEvent,
 	useCallback,
@@ -7,6 +7,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { usePickList, usePickListOrigin } from "../picks/PickListContext";
 import type { PhotoService, WallAsset } from "../services/photoService";
 import styles from "../styles/photoViewer.module.css";
 import { findViewerIndex, shouldLoadViewerPage } from "../viewer/photoSequence";
@@ -92,6 +93,8 @@ export function PhotoViewerOverlay({
 	onRequestNearViewportDerivatives,
 	onSetWallInteraction = () => undefined,
 }: PhotoViewerOverlayProps) {
+	const picks = usePickList();
+	const pickOrigin = usePickListOrigin();
 	const backRef = useRef<HTMLButtonElement>(null);
 	const dialogRef = useRef<HTMLElement>(null);
 	const [previewFailedKey, setPreviewFailedKey] = useState<string | null>(null);
@@ -178,6 +181,11 @@ export function PhotoViewerOverlay({
 		reportInteraction();
 		onClose();
 	}, [onClose, reportInteraction]);
+	const handleTogglePick = useCallback(() => {
+		if (!asset || !pickOrigin) return;
+		reportInteraction();
+		void picks.toggle(asset, pickOrigin).catch(() => {});
+	}, [asset, pickOrigin, picks, reportInteraction]);
 	const controls = useViewerControls({
 		controlsVisible: state.controlsVisible,
 		onHide: handleHideControls,
@@ -582,6 +590,38 @@ export function PhotoViewerOverlay({
 				>
 					<ChevronLeft aria-hidden="true" size={22} strokeWidth={1.7} />
 				</button>
+				<button
+					aria-expanded={state.infoOpen}
+					aria-label="Photo information"
+					aria-hidden={!infoVisible}
+					className={`${styles.viewerInfoButton} ${!infoVisible ? styles.viewerInfoHidden : ""}`}
+					data-viewer-info="true"
+					onClick={() => handleSetInfoOpen(true)}
+					tabIndex={infoVisible ? 0 : -1}
+					type="button"
+				>
+					<Info aria-hidden="true" size={20} strokeWidth={1.7} />
+				</button>
+				<button
+					aria-label={
+						picks.isPicked(asset.id)
+							? `Remove ${asset.displayName} from picks`
+							: `Add ${asset.displayName} to picks`
+					}
+					aria-pressed={picks.isPicked(asset.id)}
+					className={styles.viewerPick}
+					disabled={!pickOrigin}
+					onClick={handleTogglePick}
+					tabIndex={state.controlsVisible ? 0 : -1}
+					type="button"
+				>
+					{picks.isPicked(asset.id) ? (
+						<Check aria-hidden="true" size={18} strokeWidth={2.2} />
+					) : (
+						<Plus aria-hidden="true" size={18} strokeWidth={2} />
+					)}
+					<span>{picks.isPicked(asset.id) ? "Picked" : "Pick"}</span>
+				</button>
 			</div>
 			<ViewerStage
 				asset={asset}
@@ -681,18 +721,6 @@ export function PhotoViewerOverlay({
 				<span key={zoomAnnouncementRevision}>{announcedZoomLabel}</span>
 				{nextCursor ? " loaded" : ""}
 			</div>
-			<button
-				aria-expanded={state.infoOpen}
-				aria-label="Photo information"
-				aria-hidden={!infoVisible}
-				className={`${styles.viewerInfoButton} ${!infoVisible ? styles.viewerInfoHidden : ""}`}
-				data-viewer-info="true"
-				onClick={() => handleSetInfoOpen(true)}
-				tabIndex={infoVisible ? 0 : -1}
-				type="button"
-			>
-				<Info aria-hidden="true" size={20} strokeWidth={1.7} />
-			</button>
 			{state.infoOpen ? (
 				<PhotoInfoDrawer
 					asset={asset}
