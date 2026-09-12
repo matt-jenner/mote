@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import type {
 	DerivativeClass,
+	DerivativePriority,
 	PhotoService,
 	WallAsset,
 } from "../services/photoService";
@@ -30,7 +31,11 @@ export interface PickListController {
 	remove(assetId: string): Promise<void>;
 	clear(): Promise<void>;
 	undoClear(): Promise<void>;
-	requestDerivatives(assetIds: readonly string[], kind: DerivativeClass): void;
+	requestDerivatives(
+		assetIds: readonly string[],
+		kind: DerivativeClass,
+		priority?: DerivativePriority,
+	): void;
 	announcement: string;
 	announcementId: number;
 	toast: PickToastState | null;
@@ -478,12 +483,13 @@ class PickListStoreImplementation implements PickListStore {
 	private requestDerivatives = (
 		assetIds: readonly string[],
 		kind: DerivativeClass,
+		priority: DerivativePriority = "visible",
 	): void => {
 		void this.service
 			.requestPickDerivatives({
 				assetIds: [...assetIds],
 				kind,
-				priority: "visible",
+				priority,
 			})
 			.catch(() => {});
 	};

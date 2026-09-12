@@ -3,7 +3,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { PhotoServiceProvider } from "../app/PhotoServiceContext";
 import { consumePickToastAction, PickToast } from "../components/PickToast";
 import { createInMemoryPhotoService } from "../services/inMemoryPhotoService";
-import type { PhotoService, WallAsset } from "../services/photoService";
+import type {
+	DerivativeRequest,
+	PhotoService,
+	WallAsset,
+} from "../services/photoService";
 import {
 	PickListProvider,
 	pickOriginFromSavedFolders,
@@ -61,6 +65,35 @@ afterEach(() => {
 });
 
 describe("pick list controller", () => {
+	it("keeps the viewer planner priority when requesting pick derivatives", async () => {
+		const requests: DerivativeRequest[] = [];
+		const memory = createInMemoryPhotoService();
+		const service: PhotoService = {
+			...memory,
+			requestPickDerivatives: async (request) => {
+				requests.push({ ...request, assetIds: [...request.assetIds] });
+			},
+		};
+		const store = createPickListStore(service);
+
+		(
+			store.getState().requestDerivatives as (
+				assetIds: readonly string[],
+				kind: "screenPreview",
+				priority: "nearViewport",
+			) => void
+		)(["forest"], "screenPreview", "nearViewport");
+		await expect
+			.poll(() => requests)
+			.toEqual([
+				{
+					assetIds: ["forest"],
+					kind: "screenPreview",
+					priority: "nearViewport",
+				},
+			]);
+	});
+
 	it("starts with the synchronous snapshot and accepts the loaded snapshot", async () => {
 		const first = asset("first");
 		const loaded = asset("loaded");

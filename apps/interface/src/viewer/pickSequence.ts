@@ -14,8 +14,13 @@ export function nextPickAfterRemoval(
 	items: readonly PickItem[],
 	assetId: string,
 ): string | null {
-	const sequence = hydratePickSequence(items);
-	const index = sequence.findIndex((item) => item.id === assetId);
+	const index = items.findIndex((item) => item.assetId === assetId);
 	if (index < 0) return null;
-	return sequence[index + 1]?.id ?? sequence[index - 1]?.id ?? null;
+	for (const item of items.slice(index + 1)) {
+		if (item.asset) return item.asset.id;
+	}
+	for (const item of items.slice(0, index).reverse()) {
+		if (item.asset) return item.asset.id;
+	}
+	return null;
 }

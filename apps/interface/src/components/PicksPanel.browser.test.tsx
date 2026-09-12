@@ -3,11 +3,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { PhotoServiceProvider } from "../app/PhotoServiceContext";
+import type { PickListSnapshot } from "../picks/pickList";
 import {
 	createInMemoryPhotoService,
 	type InMemoryPhotoService,
 } from "../services/inMemoryPhotoService";
-import type { WallAsset } from "../services/photoService";
+import type { PhotoService, WallAsset } from "../services/photoService";
 import "../styles/global.css";
 import "../styles/tokens.css";
 import { AppShell } from "./AppShell";
@@ -51,6 +52,23 @@ const unavailable: WallAsset = {
 	},
 };
 
+const unpicked: WallAsset = {
+	...coast,
+	id: "unpicked",
+	displayName: "DSC_9999.jpg",
+	provisionalOrder: 3,
+};
+
+const longWall = Array.from(
+	{ length: 30 },
+	(_, index): WallAsset => ({
+		...coast,
+		id: `wall-only-${index}`,
+		displayName: `WALL_${index}.jpg`,
+		provisionalOrder: index + 10,
+	}),
+);
+
 const previewWarning: WallAsset = {
 	...coast,
 	id: "preview-warning",
@@ -60,7 +78,7 @@ const previewWarning: WallAsset = {
 };
 
 async function renderPicksApp(
-	options: { previewWarning?: boolean } = {},
+	options: { previewWarning?: boolean; longWall?: boolean } = {},
 ): Promise<{
 	screen: Awaited<ReturnType<typeof render>>;
 	service: InMemoryPhotoService;
@@ -70,6 +88,13 @@ async function renderPicksApp(
 		wallAssets: [
 			{ ...coast, wallThumbnailUrl: "/demo-photos/coast.jpg" },
 			{ ...unavailable, wallThumbnailUrl: "/demo-photos/coast.jpg" },
+			{ ...unpicked, wallThumbnailUrl: "/demo-photos/coast.jpg" },
+			...(options.longWall
+				? longWall.map((asset) => ({
+						...asset,
+						wallThumbnailUrl: "/demo-photos/coast.jpg",
+					}))
+				: []),
 			...(options.previewWarning
 				? [{ ...previewWarning, wallThumbnailUrl: "/demo-photos/coast.jpg" }]
 				: []),
@@ -104,6 +129,56 @@ async function renderPicksApp(
 	await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
 	await screen.getByRole("button", { name: "Choose Folder" }).click();
 	return { screen, service };
+}
+
+function createControllablePicksService(initial: PickListSnapshot): {
+	service: PhotoService;
+	publish(snapshot: PickListSnapshot): void;
+} {
+	const memory = createInMemoryPhotoService({
+		selectedFolderName: "Family",
+		wallAssets: [
+			{ ...coast, wallThumbnailUrl: "/demo-photos/coast.jpg" },
+			{ ...unavailable, wallThumbnailUrl: "/demo-photos/coast.jpg" },
+		],
+	});
+	let snapshot = initial;
+	const listeners = new Set<(next: PickListSnapshot) => void>();
+	return {
+		service: {
+			...memory,
+			getPicks: () => snapshot,
+			loadPicks: async () => snapshot,
+			watchPicks: (listener) => {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			},
+		},
+		publish(next) {
+			snapshot = next;
+			for (const listener of listeners) listener(snapshot);
+		},
+	};
+}
+
+async function renderControllablePicksApp(initial: PickListSnapshot): Promise<{
+	screen: Awaited<ReturnType<typeof render>>;
+	publish(snapshot: PickListSnapshot): void;
+}> {
+	const { service, publish } = createControllablePicksService(initial);
+	const queryClient = new QueryClient({
+		defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+	});
+	const screen = await render(
+		<QueryClientProvider client={queryClient}>
+			<PhotoServiceProvider service={service}>
+				<AppShell />
+			</PhotoServiceProvider>
+		</QueryClientProvider>,
+	);
+	await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+	await screen.getByRole("button", { name: "Choose Folder" }).click();
+	return { screen, publish };
 }
 
 describe("responsive Picks panel", () => {
@@ -185,6 +260,216 @@ describe("responsive Picks panel", () => {
 		await expect
 			.element(screen.getByTestId("viewer-status"))
 			.toHaveTextContent("Picks · 1 of 2");
+	});
+
+	it("keeps cross-folder review navigation and its filmstrip to picks", async () => {
+		const { screen } = await renderPicksApp();
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+		await panel.getByRole("button", { name: "Review picks" }).click();
+		const viewer = screen.getByRole("dialog", { name: "Photo viewer" });
+
+		await viewer.getByRole("button", { name: "Next photo" }).click();
+		await expect
+			.element(screen.getByTestId("viewer-status"))
+			.toHaveTextContent("IMG_3094.jpg, Picks · 2 of 2");
+		await viewer.getByRole("button", { name: "Previous photo" }).click();
+		await userEvent.keyboard("{ArrowRight}");
+		await expect
+			.element(screen.getByTestId("viewer-status"))
+			.toHaveTextContent("IMG_3094.jpg, Picks · 2 of 2");
+		await viewer
+			.getByRole("group", { name: "Photo filmstrip" })
+			.getByRole("button", { name: "DSC_8421.jpg" })
+			.click();
+		await expect
+			.element(screen.getByTestId("viewer-status"))
+			.toHaveTextContent("DSC_8421.jpg, Picks · 1 of 2");
+		expect(
+			viewer
+				.getByRole("group", { name: "Photo filmstrip" })
+				.getByRole("button", { name: "DSC_9999.jpg" })
+				.query(),
+		).toBeNull();
+	});
+
+	it("keeps touch-swipe review navigation within the pick sequence", async () => {
+		await page.viewport(390, 844);
+		const { screen } = await renderPicksApp();
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		const sheet = screen.getByRole("dialog", { name: "Picks" });
+		await sheet.getByRole("button", { name: "Review picks" }).click();
+		const viewer = screen
+			.getByRole("dialog", { name: "Photo viewer" })
+			.element();
+		viewer.dispatchEvent(
+			new PointerEvent("pointerdown", {
+				bubbles: true,
+				clientX: 310,
+				clientY: 420,
+				pointerId: 1,
+				pointerType: "touch",
+			}),
+		);
+		viewer.dispatchEvent(
+			new PointerEvent("pointerup", {
+				bubbles: true,
+				clientX: 70,
+				clientY: 420,
+				pointerId: 1,
+				pointerType: "touch",
+			}),
+		);
+		await expect
+			.element(screen.getByTestId("viewer-status"))
+			.toHaveTextContent("IMG_3094.jpg, Picks · 2 of 2");
+		const filmstrip = viewer.querySelector("[aria-label='Photo filmstrip']");
+		if (!filmstrip) throw new Error("Missing pick review filmstrip");
+		await expect
+			.element(
+				filmstrip.querySelector<HTMLElement>("[aria-label='IMG_3094.jpg']"),
+			)
+			.toBeVisible();
+		expect(filmstrip.querySelector("[aria-label='DSC_9999.jpg']")).toBeNull();
+	});
+
+	it("returns to the Pick panel launcher without moving the wall scroll", async () => {
+		const { screen } = await renderPicksApp({ longWall: true });
+		const wall = screen
+			.getByTestId("photo-wall")
+			.element()
+			.querySelector<HTMLElement>("[aria-label='Photos']");
+		if (!wall) throw new Error("Missing scrollable photo wall");
+		wall.scrollTop = 160;
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+		const review = panel.getByRole("button", { name: "Review picks" });
+		await review.click();
+		await screen
+			.getByRole("dialog", { name: "Photo viewer" })
+			.getByRole("button", { name: "Back to photos" })
+			.click();
+		await expect
+			.poll(() => screen.getByRole("dialog", { name: "Photo viewer" }).query())
+			.toBeNull();
+		await expect.poll(() => document.activeElement).toBe(review.element());
+		expect(wall.scrollTop).toBe(160);
+	});
+
+	it("moves to the next pick when removing the current reviewed pick", async () => {
+		const { screen } = await renderPicksApp();
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		await screen
+			.getByRole("complementary", { name: "Picks" })
+			.getByRole("button", { name: "Review picks" })
+			.click();
+		await screen
+			.getByRole("dialog", { name: "Photo viewer" })
+			.getByRole("button", { name: "Remove DSC_8421.jpg from picks" })
+			.click();
+		await expect
+			.element(screen.getByTestId("viewer-status"))
+			.toHaveTextContent("IMG_3094.jpg, Picks · 1 of 1");
+	});
+
+	it("moves to the previous pick, then closes the sole remaining review", async () => {
+		const { screen } = await renderPicksApp();
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+		await panel.getByRole("button", { name: "Review picks" }).click();
+		const viewer = screen.getByRole("dialog", { name: "Photo viewer" });
+		await viewer.getByRole("button", { name: "Next photo" }).click();
+		await viewer
+			.getByRole("button", { name: "Remove IMG_3094.jpg from picks" })
+			.click();
+		await expect
+			.element(screen.getByTestId("viewer-status"))
+			.toHaveTextContent("DSC_8421.jpg, Picks · 1 of 1");
+		await viewer
+			.getByRole("button", { name: "Remove DSC_8421.jpg from picks" })
+			.click();
+		await expect
+			.poll(() => screen.getByRole("dialog", { name: "Photo viewer" }).query())
+			.toBeNull();
+		await expect
+			.element(panel.getByText("Add photos to picks as you browse."))
+			.toBeVisible();
+	});
+
+	it("does not offer stale, asset-less picks as review targets", async () => {
+		const { screen } = await renderControllablePicksApp({
+			revision: 1,
+			items: [
+				{
+					assetId: "stale-photo",
+					sourceFolderId: "Missing",
+					sourceLabel: "Disconnected folder",
+					asset: null,
+				},
+			],
+			persistenceError: null,
+		});
+		await screen.getByRole("button", { name: "Picks, 1 pick" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+		expect(
+			panel.getByRole("button", { name: "Review stale-photo" }).query(),
+		).toBeNull();
+		expect(
+			(
+				panel
+					.getByRole("button", { name: "Review picks" })
+					.element() as HTMLButtonElement
+			).disabled,
+		).toBe(true);
+	});
+
+	it("moves a rehydrated-away reviewed pick to the next pick, then closes", async () => {
+		const initial: PickListSnapshot = {
+			revision: 1,
+			items: [
+				{
+					assetId: coast.id,
+					sourceFolderId: "Family",
+					sourceLabel: "Family",
+					asset: coast,
+				},
+				{
+					assetId: unavailable.id,
+					sourceFolderId: "Archive",
+					sourceLabel: "Mountain archive",
+					asset: unavailable,
+				},
+			],
+			persistenceError: null,
+		};
+		const [coastPick, unavailablePick] = initial.items;
+		if (!coastPick || !unavailablePick)
+			throw new Error("Missing controlled review picks");
+		const { screen, publish } = await renderControllablePicksApp(initial);
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		await screen
+			.getByRole("complementary", { name: "Picks" })
+			.getByRole("button", { name: "Review picks" })
+			.click();
+		publish({
+			...initial,
+			revision: 2,
+			items: [{ ...coastPick, asset: null }, unavailablePick],
+		});
+		await expect
+			.element(screen.getByTestId("viewer-status"))
+			.toHaveTextContent("IMG_3094.jpg, Picks · 1 of 1");
+		publish({
+			...initial,
+			revision: 3,
+			items: initial.items.map((item) => ({ ...item, asset: null })),
+		});
+		await expect
+			.poll(() => screen.getByRole("dialog", { name: "Photo viewer" }).query())
+			.toBeNull();
+		await expect
+			.element(screen.getByRole("complementary", { name: "Picks" }))
+			.toBeVisible();
 	});
 
 	it("clears immediately without closing and publishes the shared Undo toast", async () => {

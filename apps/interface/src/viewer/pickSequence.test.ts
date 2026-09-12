@@ -62,4 +62,20 @@ describe("pickSequence", () => {
 			null,
 		);
 	});
+
+	it("keeps the old insertion position when the current pick becomes stale", () => {
+		const items = [
+			pick("coast", asset("coast")),
+			pick("forest", null),
+			pick("city", asset("city")),
+		];
+
+		expect(nextPickAfterRemoval(items, "forest")).toBe("city");
+		expect(
+			nextPickAfterRemoval(
+				[pick("coast", asset("coast")), pick("forest", null)],
+				"forest",
+			),
+		).toBe("coast");
+	});
 });

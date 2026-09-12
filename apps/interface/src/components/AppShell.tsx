@@ -274,6 +274,29 @@ function AppShellContents({
 	]);
 
 	useEffect(() => {
+		if (
+			!viewer.open ||
+			viewer.sequence !== "picks" ||
+			!viewer.currentAssetId ||
+			pickAssets.some((asset) => asset.id === viewer.currentAssetId)
+		)
+			return;
+		const nextAssetId = nextPickAfterRemoval(
+			picks.snapshot.items,
+			viewer.currentAssetId,
+		);
+		if (nextAssetId) dispatchViewer({ type: "select", assetId: nextAssetId });
+		else handleCloseViewer();
+	}, [
+		handleCloseViewer,
+		pickAssets,
+		picks.snapshot.items,
+		viewer.currentAssetId,
+		viewer.open,
+		viewer.sequence,
+	]);
+
+	useEffect(() => {
 		if (drawerOpen) {
 			drawerWasOpen.current = true;
 			drawerCloseRef.current?.focus();
@@ -497,7 +520,11 @@ function AppShellContents({
 						onRequestPreviewDerivatives={
 							viewer.sequence === "picks"
 								? async (request) => {
-										picks.requestDerivatives(request.assetIds, request.kind);
+										picks.requestDerivatives(
+											request.assetIds,
+											request.kind,
+											request.priority,
+										);
 									}
 								: undefined
 						}
