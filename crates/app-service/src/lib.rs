@@ -5,6 +5,7 @@ mod dto;
 mod folder_access;
 mod gallery;
 mod hosted_runtime;
+mod picks;
 mod saved_folders;
 mod scan;
 mod service;
@@ -19,6 +20,7 @@ pub use dto::{
     OrderState, ScanProgressDto, SortDirection, WallAsset, WallMediaKind, WallPage,
     WallPreviewCounts, WallQueryRequest, WallShapeState, WallUpdate, WallWarningState,
 };
+pub use dto::{PickItem, PickListSnapshot, PickReference};
 pub use folder_access::{
     AccessReply, FolderAccessCoordinator, FolderAccessKey, FolderAccessTarget, FolderProbe,
     FolderProbeOutcome, ValidatedFolder,

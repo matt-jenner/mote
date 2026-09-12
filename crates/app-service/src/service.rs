@@ -431,6 +431,7 @@ impl MetadataReader for ReaderAdapter {
 #[derive(Clone)]
 pub struct AppService {
     pub(crate) gallery: crate::GalleryEngine,
+    pub(crate) pick_gallery: crate::GalleryEngine,
     pub(crate) state: Arc<Mutex<ServiceState>>,
     pub(crate) scheduler: Arc<IndexScheduler>,
     #[allow(dead_code)]
@@ -517,7 +518,7 @@ pub enum AppServiceError {
     InvalidLimit,
     #[error("invalid asset identifier")]
     InvalidAssetId,
-    #[error("asset is not in the active wall")]
+    #[error("asset is not in the authorized folder group")]
     ForeignAsset,
     #[error("asset was not found")]
     UnknownAsset,
@@ -582,8 +583,10 @@ impl AppService {
             cache_root.clone(),
             catalog_path.clone(),
         );
+        let pick_gallery = gallery.for_photo_picks(protected_groups.clone());
         let service = Self {
             gallery,
+            pick_gallery,
             state,
             scheduler,
             coordinator,
