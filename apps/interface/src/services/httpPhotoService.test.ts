@@ -12,6 +12,7 @@ import { PhotoServiceError, type WallUpdate } from "./photoService";
 
 class MemoryStorage implements Storage {
 	private readonly values = new Map<string, string>();
+	readonly reads: string[] = [];
 	readonly writes: Array<[string, string]> = [];
 
 	get length(): number {
@@ -23,6 +24,11 @@ class MemoryStorage implements Storage {
 	}
 
 	getItem(key: string): string | null {
+		this.reads.push(key);
+		return this.values.get(key) ?? null;
+	}
+
+	peek(key: string): string | null {
 		return this.values.get(key) ?? null;
 	}
 
@@ -208,6 +214,36 @@ afterEach(() => {
 });
 
 describe("HTTP PhotoService", () => {
+	it("waits for bootstrap root identity before reading browser pick storage", async () => {
+		const localStorage = savedPreferences();
+		let releaseBootstrap!: (response: Response) => void;
+		let markRequested!: () => void;
+		const requested = new Promise<void>((resolve) => {
+			markRequested = resolve;
+		});
+		const service = createHttpPhotoService({
+			localStorage,
+			sessionStorage: new MemoryStorage(),
+			fetch: async () => {
+				markRequested();
+				return new Promise<Response>((resolve) => {
+					releaseBootstrap = resolve;
+				});
+			},
+			randomUuid: () => "client-a",
+		});
+
+		const loading = service.getBootstrapState();
+		await requested;
+		expect(
+			localStorage.reads.some((key) => key.startsWith("mote.picks.v1.")),
+		).toBe(false);
+		releaseBootstrap(json({ ...bootstrapResponse, rootId: "root-a" }));
+		await loading;
+		expect(localStorage.reads).toContain("mote.picks.v1.root-a");
+		service.dispose();
+	});
+
 	it("hydrates root-scoped picks by source folder without replacing the active selection", async () => {
 		const localStorage = savedPreferences();
 		const calls: RecordedRequest[] = [];
@@ -260,8 +296,12 @@ describe("HTTP PhotoService", () => {
 			items: [],
 			persistenceError: null,
 		});
-		expect(localStorage.getItem("mote.picks.v1.root-a")).toBeNull();
+		expect(
+			localStorage.reads.some((key) => key.startsWith("mote.picks.v1.")),
+		).toBe(false);
+		expect(localStorage.peek("mote.picks.v1.root-a")).toBeNull();
 		await service.getBootstrapState();
+		expect(localStorage.reads).toContain("mote.picks.v1.root-a");
 		await service.selectFolder("Trips/Iceland");
 		await service.addPick({
 			assetId: "asset-a",

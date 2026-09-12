@@ -43,6 +43,7 @@ const internalError = () =>
 
 const wallWatchRetryDelayMs = 100;
 const maxWallWatchRetryDelayMs = 1_000;
+const maxPickBatchSize = 250;
 
 export type WallSubscriptionId = string;
 
@@ -97,14 +98,76 @@ export function createTauriPhotoService(
 		for (const listener of pickListeners) listener(clonePicks(picks));
 		return clonePicks(picks);
 	};
+	const invokePickCommand = (command: string, args?: Record<string, unknown>) =>
+		invokePhotoCommand<NativePickListSnapshot>(invokeCommand, command, args);
 	const pickCommand = async (command: string, args?: Record<string, unknown>) =>
-		publishPicks(
-			await invokePhotoCommand<NativePickListSnapshot>(
+		publishPicks(await invokePickCommand(command, args));
+	const restorePicks = async (
+		references: readonly PickReference[],
+	): Promise<PickListSnapshot> => {
+		if (references.length <= maxPickBatchSize) {
+			return pickCommand("restore_photo_picks", {
+				references: references.map((reference) => ({ ...reference })),
+			});
+		}
+		const chunks: PickReference[][] = [];
+		for (
+			let offset = 0;
+			offset < references.length;
+			offset += maxPickBatchSize
+		) {
+			chunks.push(
+				references
+					.slice(offset, offset + maxPickBatchSize)
+					.map((reference) => ({ ...reference })),
+			);
+		}
+		let completedChunk = false;
+		let finalSnapshot: NativePickListSnapshot | null = null;
+		try {
+			for (const chunk of chunks.reverse()) {
+				finalSnapshot = await invokePickCommand("restore_photo_picks", {
+					references: chunk,
+				});
+				completedChunk = true;
+			}
+		} catch (error) {
+			if (completedChunk) {
+				try {
+					publishPicks(await invokePickCommand("list_photo_picks"));
+				} catch {
+					// Preserve the mutation failure if the recovery read also fails.
+				}
+			}
+			throw error;
+		}
+		if (finalSnapshot === null) throw internalError();
+		return publishPicks(finalSnapshot);
+	};
+	const requestPickDerivatives = async (
+		request: DerivativeRequest,
+	): Promise<void> => {
+		const chunks =
+			request.assetIds.length === 0
+				? [[]]
+				: Array.from(
+						{
+							length: Math.ceil(request.assetIds.length / maxPickBatchSize),
+						},
+						(_, index) =>
+							request.assetIds.slice(
+								index * maxPickBatchSize,
+								(index + 1) * maxPickBatchSize,
+							),
+					);
+		for (const assetIds of chunks) {
+			await invokePhotoCommand<void>(
 				invokeCommand,
-				command,
-				args,
-			),
-		);
+				"request_pick_derivatives",
+				{ request: { ...request, assetIds } },
+			);
+		}
+	};
 	const publish = (value: SavedFolderSnapshot) => {
 		if ((value.revision ?? 0) < (saved.revision ?? 0))
 			return cloneSavedFolders(saved);
@@ -158,14 +221,8 @@ export function createTauriPhotoService(
 		removePick: (assetId: string) =>
 			pickCommand("remove_photo_pick", { assetId }),
 		clearPicks: () => pickCommand("clear_photo_picks"),
-		restorePicks: (references: readonly PickReference[]) =>
-			pickCommand("restore_photo_picks", {
-				references: references.map((reference) => ({ ...reference })),
-			}),
-		requestPickDerivatives: (request: DerivativeRequest) =>
-			invokePhotoCommand(invokeCommand, "request_pick_derivatives", {
-				request,
-			}),
+		restorePicks,
+		requestPickDerivatives,
 		originalDownloadUrl: () => null,
 		getSavedFolders: () => cloneSavedFolders(saved),
 		watchSavedFolders: (listener) => {
