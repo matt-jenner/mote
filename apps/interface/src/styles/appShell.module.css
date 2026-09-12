@@ -7,6 +7,10 @@
 	color: var(--text-primary);
 }
 
+.appShellPicksOpen {
+	grid-template-columns: 288px minmax(0, 1fr) minmax(304px, 320px);
+}
+
 .workspace {
 	display: flex;
 	flex-direction: column;
@@ -25,6 +29,10 @@
 	padding: 0 32px;
 	background: color-mix(in srgb, var(--canvas-elevated) 94%, var(--canvas));
 	border-bottom: 1px solid var(--separator);
+}
+
+.picksToolbarTrigger {
+	flex: 0 0 auto;
 }
 
 .titleGroup {
@@ -614,12 +622,21 @@
 @media (max-width: 899px) {
 	.appShell {
 		display: block;
+		position: relative;
 		min-height: calc(100dvh - var(--safe-area-top) - var(--safe-area-bottom));
 	}
 
 	.workspace {
 		height: 100%;
 		min-height: 100%;
+	}
+
+	.workspace [aria-label="Photos"] > div {
+		padding-bottom: calc(
+			var(--wall-content-padding) +
+			56px +
+			var(--safe-area-bottom)
+		);
 	}
 
 	.toolbar {

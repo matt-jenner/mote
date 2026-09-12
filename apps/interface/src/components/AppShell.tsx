@@ -28,6 +28,7 @@ import { AppearanceMenu } from "./AppearanceMenu";
 import { HostedFolderBrowser } from "./HostedFolderBrowser";
 import { NavigationRail } from "./NavigationRail";
 import { PhotoViewerOverlay } from "./PhotoViewerOverlay";
+import { PicksPanel, PicksToolbarButton } from "./PicksPanel";
 import { SourceCanvas } from "./SourceCanvas";
 import { WallToolbar } from "./WallToolbar";
 
@@ -35,6 +36,10 @@ export function AppShell() {
 	const controller = useAppController();
 	const service = usePhotoService();
 	const [drawerOpen, setDrawerOpen] = useState(false);
+	const [picksOpen, setPicksOpen] = useState(false);
+	const [isMobile, setIsMobile] = useState(
+		() => window.matchMedia("(max-width: 899px)").matches,
+	);
 	const [folderBrowserBreadcrumbs, setFolderBrowserBreadcrumbs] = useState<
 		ReturnType<PhotoService["folderBrowserState"]>["breadcrumbs"] | null
 	>(null);
@@ -210,12 +215,16 @@ export function AppShell() {
 
 	useEffect(() => {
 		const phoneViewport = window.matchMedia("(max-width: 899px)");
+		const updateViewport = () => setIsMobile(phoneViewport.matches);
 		const closeDrawerAbovePhoneWidth = (event: MediaQueryListEvent) => {
 			if (!event.matches) setDrawerOpen(false);
 		};
 
+		updateViewport();
+		phoneViewport.addEventListener("change", updateViewport);
 		phoneViewport.addEventListener("change", closeDrawerAbovePhoneWidth);
 		return () => {
+			phoneViewport.removeEventListener("change", updateViewport);
 			phoneViewport.removeEventListener("change", closeDrawerAbovePhoneWidth);
 		};
 	}, []);
@@ -248,7 +257,11 @@ export function AppShell() {
 	return (
 		<PickListProvider origin={pickOrigin}>
 			<SourceUnavailableContext value={folderUnavailable}>
-				<div className={styles.appShell}>
+				<div
+					className={`${styles.appShell} ${
+						picksOpen && !isMobile ? styles.appShellPicksOpen : ""
+					}`}
+				>
 					<NavigationRail
 						savedFolders={controller.state?.savedFolders}
 						onActivate={async (id) => {
@@ -262,13 +275,23 @@ export function AppShell() {
 						folderBrowserOpen={folderBrowserOpen}
 						folderButtonRef={permanentFolderTriggerRef}
 						folderSelection={controller.capabilities.folderSelection}
-						inert={drawerOpen || viewer.open || folderBrowserOpen}
+						inert={
+							drawerOpen ||
+							viewer.open ||
+							folderBrowserOpen ||
+							(picksOpen && isMobile)
+						}
 						onChooseFolder={chooseFolder}
 					/>
 					<section
 						aria-label="Photo workspace"
 						className={styles.workspace}
-						inert={drawerOpen || viewer.open || folderBrowserOpen}
+						inert={
+							drawerOpen ||
+							viewer.open ||
+							folderBrowserOpen ||
+							(picksOpen && isMobile)
+						}
 					>
 						<header className={styles.toolbar}>
 							<button
@@ -302,6 +325,13 @@ export function AppShell() {
 									retryable={Boolean(wall.state.error)}
 								/>
 							) : null}
+							{!isMobile ? (
+								<PicksToolbarButton
+									className={styles.picksToolbarTrigger}
+									expanded={picksOpen}
+									onClick={() => setPicksOpen((open) => !open)}
+								/>
+							) : null}
 							<AppearanceMenu
 								onChange={controller.updateAppearance}
 								value={appearance}
@@ -329,6 +359,21 @@ export function AppShell() {
 							/>
 						)}
 					</section>
+					{!isMobile ? (
+						<PicksPanel
+							mode="desktop"
+							onClose={() => setPicksOpen(false)}
+							onOpen={() => setPicksOpen(true)}
+							open={picksOpen}
+						/>
+					) : (
+						<PicksPanel
+							mode="mobile"
+							onClose={() => setPicksOpen(false)}
+							onOpen={() => setPicksOpen(true)}
+							open={picksOpen}
+						/>
+					)}
 					{viewer.open ? (
 						<PhotoViewerOverlay
 							assets={wall.state.items.filter(
