@@ -203,18 +203,34 @@ class PickListStoreImplementation implements PickListStore {
 		for (const listener of this.listeners) listener();
 	}
 
-	private acceptSnapshot(next: PickListSnapshot): void {
+	private rebuildState(notifyListeners: boolean): void {
+		if (notifyListeners) {
+			this.publish();
+			return;
+		}
+		this.state = this.buildState();
+	}
+
+	private acceptSnapshot(
+		next: PickListSnapshot,
+		notifyListeners = true,
+		announceWarning = true,
+	): void {
 		const current = this.authoritative;
-		if (next.revision < current.revision) return;
+		if (next.revision < current.revision) {
+			this.rebuildState(notifyListeners);
+			return;
+		}
 		this.authoritative = cloneSnapshot(next);
 		if (
+			announceWarning &&
 			next.persistenceError &&
 			next.persistenceError !== current.persistenceError
 		) {
 			this.publishMessage(next.persistenceError, false);
 			return;
 		}
-		this.publish();
+		this.rebuildState(notifyListeners);
 	}
 
 	private publishMessage(message: string, temporary = true): void {
@@ -248,14 +264,22 @@ class PickListStoreImplementation implements PickListStore {
 		);
 	}
 
-	private acceptMutation(id: number, snapshot: PickListSnapshot): void {
+	private acceptMutation(
+		id: number,
+		snapshot: PickListSnapshot,
+		announce: boolean,
+	): void {
 		this.removeOperation(id);
-		this.acceptSnapshot(snapshot);
+		this.acceptSnapshot(snapshot, this.activeStop !== null, announce);
 	}
 
-	private rejectMutation(id: number): void {
+	private rejectMutation(id: number, announce: boolean): void {
 		this.removeOperation(id);
-		this.publishMessage("Couldn't update picks");
+		if (announce) {
+			this.publishMessage("Couldn't update picks");
+			return;
+		}
+		this.rebuildState(this.activeStop !== null);
 	}
 
 	private lifecycleIsActive(lifecycleId: number): boolean {
@@ -315,13 +339,13 @@ class PickListStoreImplementation implements PickListStore {
 		const mutation = this.enqueueMutation(async () => {
 			try {
 				const snapshot = await persist();
-				if (this.lifecycleIsActive(lifecycleId)) {
-					this.acceptMutation(operation.id, snapshot);
+				const announce = this.lifecycleIsActive(lifecycleId);
+				this.acceptMutation(operation.id, snapshot, announce);
+				if (announce) {
 					this.publishMessage(message);
 				}
 			} catch (error) {
-				if (this.lifecycleIsActive(lifecycleId))
-					this.rejectMutation(operation.id);
+				this.rejectMutation(operation.id, this.lifecycleIsActive(lifecycleId));
 				throw error;
 			}
 		});
@@ -387,8 +411,9 @@ class PickListStoreImplementation implements PickListStore {
 		const mutation = this.enqueueMutation(async () => {
 			try {
 				const snapshot = await this.service.clearPicks();
-				if (!this.lifecycleIsActive(lifecycleId)) return;
-				this.acceptMutation(operation.id, snapshot);
+				const announce = this.lifecycleIsActive(lifecycleId);
+				this.acceptMutation(operation.id, snapshot, announce);
+				if (!announce) return;
 				this.undo = {
 					items: cleared,
 					expiresAt: Date.now() + undoDurationMs,
@@ -403,8 +428,7 @@ class PickListStoreImplementation implements PickListStore {
 				this.scheduleToastDismissal(undoDurationMs);
 				this.publish();
 			} catch (error) {
-				if (this.lifecycleIsActive(lifecycleId))
-					this.rejectMutation(operation.id);
+				this.rejectMutation(operation.id, this.lifecycleIsActive(lifecycleId));
 				throw error;
 			}
 		});
@@ -439,13 +463,13 @@ class PickListStoreImplementation implements PickListStore {
 						sourceLabel,
 					})),
 				);
-				if (this.lifecycleIsActive(lifecycleId)) {
-					this.acceptMutation(operation.id, restored);
+				const announce = this.lifecycleIsActive(lifecycleId);
+				this.acceptMutation(operation.id, restored, announce);
+				if (announce) {
 					this.publishMessage("Picks restored");
 				}
 			} catch (error) {
-				if (this.lifecycleIsActive(lifecycleId))
-					this.rejectMutation(operation.id);
+				this.rejectMutation(operation.id, this.lifecycleIsActive(lifecycleId));
 				throw error;
 			}
 		});

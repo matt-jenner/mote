@@ -267,6 +267,94 @@ describe("pick list controller", () => {
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
+	it("retires a Clear completed while stopped before restart and Add", async () => {
+		vi.useFakeTimers();
+		const first = asset("first");
+		const later = asset("later");
+		const clearGate = deferred<void>();
+		const memory = createInMemoryPhotoService({ wallAssets: [first, later] });
+		await memory.addPick(reference(first));
+		const service: PhotoService = {
+			...memory,
+			clearPicks: async () => {
+				await clearGate.promise;
+				return memory.clearPicks();
+			},
+		};
+		const store = createPickListStore(service);
+		const stop = store.start();
+		const clearing = store.getState().clear();
+
+		stop();
+		clearGate.resolve(undefined);
+		await clearing;
+		const stopRestart = store.start();
+		await store.getState().toggle(later, origin);
+
+		expect(memory.getPicks().items.map((item) => item.assetId)).toEqual([
+			"later",
+		]);
+		expect(store.getState().snapshot.items.map((item) => item.assetId)).toEqual(
+			["later"],
+		);
+		expect(vi.getTimerCount()).toBe(1);
+		stopRestart();
+	});
+
+	it("retires an Add completed while stopped before restart and Remove", async () => {
+		const added = asset("added");
+		const addGate = deferred<void>();
+		const memory = createInMemoryPhotoService({ wallAssets: [added] });
+		const service: PhotoService = {
+			...memory,
+			addPick: async (pick) => {
+				await addGate.promise;
+				return memory.addPick(pick);
+			},
+		};
+		const store = createPickListStore(service);
+		const stop = store.start();
+		const adding = store.getState().toggle(added, origin);
+
+		stop();
+		addGate.resolve(undefined);
+		await adding;
+		const stopRestart = store.start();
+		await store.getState().remove(added.id);
+
+		expect(memory.getPicks().items).toHaveLength(0);
+		expect(store.getState().count).toBe(0);
+		stopRestart();
+	});
+
+	it("retires Undo completed while stopped before restart and Remove", async () => {
+		const first = asset("first");
+		const restoreGate = deferred<void>();
+		const memory = createInMemoryPhotoService({ wallAssets: [first] });
+		await memory.addPick(reference(first));
+		const service: PhotoService = {
+			...memory,
+			restorePicks: async (cleared) => {
+				await restoreGate.promise;
+				return memory.restorePicks(cleared);
+			},
+		};
+		const store = createPickListStore(service);
+		const stop = store.start();
+		await store.getState().clear();
+		const restoring = store.getState().undoClear();
+
+		stop();
+		restoreGate.resolve(undefined);
+		await restoring;
+		const stopRestart = store.start();
+		await store.getState().remove(first.id);
+
+		expect(memory.getPicks().items).toHaveLength(0);
+		expect(store.getState().count).toBe(0);
+		stopRestart();
+	});
+
 	it("offers Clear Undo for exactly five seconds", async () => {
 		vi.useFakeTimers();
 		const first = asset("first");
