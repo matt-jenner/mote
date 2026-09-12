@@ -45,6 +45,8 @@ pub struct AppState {
     pub(crate) folder_root: Option<Arc<ContainedFolderRoot>>,
     pub(crate) gallery: Option<Arc<GalleryEngine>>,
     pub(crate) allow_original_downloads: bool,
+    #[cfg(unix)]
+    pub(crate) original_root: Option<Arc<static_host::PinnedDirectory>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +124,8 @@ impl AppState {
             folder_root: None,
             gallery: None,
             allow_original_downloads: false,
+            #[cfg(unix)]
+            original_root: None,
         }
     }
 
@@ -136,6 +140,8 @@ impl AppState {
             folder_root: Some(Arc::new(ContainedFolderRoot::new(source_root)?)),
             gallery: None,
             allow_original_downloads: false,
+            #[cfg(unix)]
+            original_root: None,
         })
     }
 
@@ -236,6 +242,7 @@ impl AppState {
             )),
             gallery: None,
             allow_original_downloads: config.allow_original_downloads(),
+            original_root: Some(Arc::new(source_startup.clone_original_root()?)),
         };
         source_startup_hook(SourceStartupTestStage::AfterFolderConstruction);
         source_startup_hook(SourceStartupTestStage::BeforeGalleryConstruction);
@@ -327,6 +334,7 @@ pub fn build_router(state: AppState, web_root: StaticWebRoot) -> Router {
             axum::routing::post(api::request_derivatives),
         )
         .route("/api/v1/derivatives/{id}", get(api::derivative))
+        .route("/api/v1/originals/{assetId}", get(api::original))
         .route(
             "/healthz",
             get(|State(state): State<AppState>| async move { health::healthz(state).await }),

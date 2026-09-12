@@ -35,6 +35,10 @@ export function PickRow({ item, onRemove, action }: PickRowProps) {
 		: item.asset?.warning
 			? "Preview unavailable"
 			: null;
+	const downloadUrl =
+		!sourceUnavailable && service.capabilities.originalAction === "download"
+			? service.originalDownloadUrl(item.assetId)
+			: null;
 
 	return (
 		<li className={styles.pickRow}>
@@ -55,6 +59,7 @@ export function PickRow({ item, onRemove, action }: PickRowProps) {
 						{warning}
 					</span>
 				) : null}
+				{downloadUrl ? <a href={downloadUrl}>Download original</a> : null}
 			</div>
 			{action}
 			<button

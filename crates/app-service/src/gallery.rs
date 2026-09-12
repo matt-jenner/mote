@@ -1202,6 +1202,52 @@ impl GalleryEngine {
             .map_err(Into::into)
     }
 
+    /// Resolves a catalog identity only within the configured hosted library.
+    /// The caller must open the relative key from its pinned source descriptor.
+    pub fn resolve_hosted_original(
+        &self,
+        asset_id: photo_domain::AssetId,
+    ) -> Result<(RelativePathKey, String, photo_domain::MediaKind), AppServiceError> {
+        let library_id = self
+            .hosted_library_id
+            .ok_or(AppServiceError::ForeignAsset)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| AppServiceError::StatePoisoned)?;
+        let catalog = state.libraries.catalog();
+        let asset = catalog
+            .find_asset(asset_id)?
+            .ok_or(AppServiceError::UnknownAsset)?;
+        if asset.library_id != library_id {
+            return Err(AppServiceError::ForeignAsset);
+        }
+        let library = catalog
+            .find_library(library_id)?
+            .ok_or(AppServiceError::UnknownAsset)?;
+        if asset.availability != photo_domain::Availability::Available
+            || library.availability != photo_domain::Availability::Available
+        {
+            return Err(AppServiceError::UnknownAsset);
+        }
+        let path = asset
+            .relative_path
+            .to_path_buf()
+            .map_err(|_| AppServiceError::UnknownAsset)?;
+        if path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(AppServiceError::UnknownAsset);
+        }
+        let filename = path
+            .file_name()
+            .ok_or(AppServiceError::UnknownAsset)?
+            .to_string_lossy()
+            .into_owned();
+        Ok((asset.relative_path, filename, asset.media_kind))
+    }
+
     /// Resolves a bounded pick batch without opening a source or starting a scan.
     pub fn resolve_assets(
         &self,

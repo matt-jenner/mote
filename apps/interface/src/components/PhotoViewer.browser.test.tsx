@@ -2593,11 +2593,7 @@ describe("immersive photo viewer checkpoint", () => {
 			expect(seriousViolations(await axe.run(document))).toEqual([]);
 		};
 		await runAxe();
-		(
-			view
-				.getByRole("button", { name: "Zoom in" })
-				.element() as HTMLButtonElement
-		).click();
+		await view.getByRole("button", { name: "Zoom in" }).click();
 		await expect
 			.element(view.getByTestId("viewer-stage"))
 			.toHaveAttribute("data-viewer-mode", "zoomed");

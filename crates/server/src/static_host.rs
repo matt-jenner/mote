@@ -307,6 +307,42 @@ impl PinnedDirectory {
         Self::open_with_identity_hook(path, || {})
     }
 
+    /// Duplicate the held descriptor without resolving its informational path.
+    /// Source roots acquire their download mount boundary from that descriptor.
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        let directory = self.directory.try_clone()?;
+        let mount_policy = self.mount_policy.clone();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let mount_policy = Some(match mount_policy {
+            Some(policy) => policy,
+            None => MountPolicy::capture(&directory, MountIdentityProvider::system())?,
+        });
+        Ok(Self {
+            directory,
+            identity: self.identity,
+            display_path: self.display_path.clone(),
+            mount_policy,
+        })
+    }
+
+    pub(crate) fn open_regular_file(&self, path: &Path) -> io::Result<std::fs::File> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if self.mount_policy.is_none() {
+                return Err(mount_transition_error());
+            }
+            self.open_file(path)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = path;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "original serving is unavailable",
+            ))
+        }
+    }
+
     fn open_with_identity_hook<F>(path: &Path, after_identity_capture: F) -> io::Result<Self>
     where
         F: FnOnce(),
@@ -1219,6 +1255,7 @@ mod secure_open_tests {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::symlink;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
@@ -1237,6 +1274,78 @@ mod secure_open_tests {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
         bytes
+    }
+
+    #[test]
+    fn original_descriptor_clone_preserves_mount_policy_for_each_opened_component() {
+        for target in ["", "trip", "trip/photo.jpg"] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir(temp.path().join("trip")).unwrap();
+            std::fs::write(temp.path().join("trip/photo.jpg"), b"ORIGINAL").unwrap();
+            let changed = DirectoryIdentity::from_metadata(
+                &std::fs::metadata(temp.path().join(target)).unwrap(),
+            );
+            let transitioned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = transitioned.clone();
+            let provider = MountIdentityProvider::for_test(move |file| {
+                let identity = DirectoryIdentity::from_metadata(&file.metadata()?);
+                Ok(MountIdentity::synthetic(
+                    if flag.load(Ordering::SeqCst) && identity == changed {
+                        2
+                    } else {
+                        1
+                    },
+                ))
+            });
+            let pinned = PinnedDirectory::open_with_mount_provider(temp.path(), provider).unwrap();
+            let clone = pinned.try_clone().unwrap();
+            drop(pinned);
+            assert_eq!(
+                read(
+                    clone
+                        .open_regular_file(std::path::Path::new("trip/photo.jpg"))
+                        .unwrap()
+                ),
+                b"ORIGINAL"
+            );
+            transitioned.store(true, Ordering::SeqCst);
+            assert!(
+                clone
+                    .open_regular_file(std::path::Path::new("trip/photo.jpg"))
+                    .is_err(),
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn original_clone_uses_pinned_ancestors_and_rejects_final_symlink_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(source.join("trip")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(source.join("trip/photo.jpg"), b"ORIGINAL").unwrap();
+        std::fs::write(outside.join("photo.jpg"), b"SECRET").unwrap();
+        let pinned = PinnedDirectory::open(&source).unwrap();
+        let clone = pinned.try_clone().unwrap();
+        let file = clone
+            .open_file_with_hook(std::path::Path::new("trip/photo.jpg"), || {
+                std::fs::rename(source.join("trip"), source.join("retained-trip")).unwrap();
+                symlink(&outside, source.join("trip")).unwrap();
+            })
+            .unwrap();
+        assert_eq!(read(file), b"ORIGINAL");
+        let result =
+            clone.open_file_with_hook(std::path::Path::new("retained-trip/photo.jpg"), || {
+                std::fs::remove_file(source.join("retained-trip/photo.jpg")).unwrap();
+                symlink(
+                    outside.join("photo.jpg"),
+                    source.join("retained-trip/photo.jpg"),
+                )
+                .unwrap();
+            });
+        assert!(result.is_err());
     }
 
     #[test]

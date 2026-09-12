@@ -562,6 +562,9 @@ export function PhotoViewerOverlay({
 					controlsFocused.current = false;
 					controls.resume();
 				}
+				// A boundary navigation button can become disabled and lose focus to body.
+				if (target.hasAttribute("disabled") && next === null)
+					dialogRef.current?.focus({ preventScroll: true });
 			}}
 			onKeyDownCapture={handleKeyDown}
 			onLostPointerCapture={(event) => {

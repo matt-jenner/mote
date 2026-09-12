@@ -285,6 +285,12 @@ impl SourceStartupValidation {
 
 #[cfg(unix)]
 impl SourceStartupLease {
+    pub(crate) fn clone_original_root(&self) -> Result<PinnedDirectory, ConfigError> {
+        self.operational
+            .try_clone()
+            .map_err(|_| ConfigError::SourceRootChanged)
+    }
+
     pub(crate) fn into_prevalidated_source(
         self,
         operational_path: PathBuf,

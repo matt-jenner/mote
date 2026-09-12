@@ -4,6 +4,7 @@ import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { PhotoServiceProvider } from "../app/PhotoServiceContext";
 import type { PickListSnapshot } from "../picks/pickList";
+import { createHttpPhotoService } from "../services/httpPhotoService";
 import {
 	createInMemoryPhotoService,
 	type InMemoryPhotoService,
@@ -88,6 +89,7 @@ async function renderPicksApp(
 		longWall?: boolean;
 		copy?: PhotoService["copyPickedOriginals"];
 		showFolder?: () => Promise<void>;
+		originalAction?: "download" | "none";
 	} = {},
 ): Promise<{
 	screen: Awaited<ReturnType<typeof render>>;
@@ -130,6 +132,24 @@ async function renderPicksApp(
 		service.capabilities.originalAction = "copy";
 		service.copyPickedOriginals = options.copy;
 		service.showLastCopyDestination = options.showFolder ?? (async () => {});
+	}
+	if (options.originalAction) {
+		const hosted = createHttpPhotoService({
+			fetch: async () =>
+				Response.json({
+					rootId: null,
+					capabilities: {
+						folderBrowser: true,
+						video: false,
+						originalDownloads: options.originalAction === "download",
+					},
+					sourceAvailable: true,
+				}),
+		});
+		await hosted.getBootstrapState();
+		service.capabilities.originalAction = hosted.capabilities.originalAction;
+		service.originalDownloadUrl = hosted.originalDownloadUrl;
+		hosted.dispose();
 	}
 	const queryClient = new QueryClient({
 		defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -197,6 +217,68 @@ async function renderControllablePicksApp(initial: PickListSnapshot): Promise<{
 }
 
 describe("responsive Picks panel", () => {
+	it("offers one hosted original link per available row, including preview failures", async () => {
+		const { screen } = await renderPicksApp({
+			originalAction: "download",
+			previewWarning: true,
+		});
+		await screen.getByRole("button", { name: "Picks, 3 picks" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+		const links = panel.element().querySelectorAll<HTMLAnchorElement>("a");
+		expect(
+			Array.from(links, (link) => [
+				link.textContent,
+				link.getAttribute("href"),
+			]),
+		).toEqual([
+			["Download original", "/api/v1/originals/coast"],
+			["Download original", "/api/v1/originals/preview-warning"],
+		]);
+		expect(
+			panel.getByRole("button", { name: /Copy|Download/i }).query(),
+		).toBeNull();
+		await expect
+			.element(panel.getByRole("button", { name: "Review picks" }))
+			.toBeEnabled();
+	});
+
+	it("keeps hosted review enabled with one quiet note and no original actions when disabled", async () => {
+		const { screen } = await renderPicksApp({ originalAction: "none" });
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+		expect(panel.element().querySelectorAll("a")).toHaveLength(0);
+		expect(
+			panel.getByRole("button", { name: /Copy|Download/i }).query(),
+		).toBeNull();
+		await expect
+			.element(panel.getByText("This site does not offer original downloads."))
+			.toBeVisible();
+		await panel.getByRole("button", { name: "Review picks" }).click();
+		await expect
+			.element(screen.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+	});
+
+	it("encodes hosted original identifiers and returns no URL without download capability", async () => {
+		const hosted = createHttpPhotoService({
+			fetch: async () =>
+				Response.json({
+					rootId: null,
+					capabilities: {
+						folderBrowser: true,
+						video: false,
+						originalDownloads: true,
+					},
+					sourceAvailable: true,
+				}),
+		});
+		expect(hosted.originalDownloadUrl("photo/with ?#%")).toBeNull();
+		await hosted.getBootstrapState();
+		expect(hosted.originalDownloadUrl("photo/with ?#%")).toBe(
+			"/api/v1/originals/photo%2Fwith%20%3F%23%25",
+		);
+		hosted.dispose();
+	});
 	it("retires removed failures and copies the current picks after a new pick is added", async () => {
 		const batches: Array<readonly string[] | null> = [];
 		const { screen, service } = await renderPicksApp({
@@ -656,7 +738,14 @@ describe("responsive Picks panel", () => {
 		await expect
 			.element(screen.getByTestId("viewer-status"))
 			.toHaveTextContent("IMG_3094.jpg, Picks · 2 of 2");
-		await viewer.getByRole("button", { name: "Previous photo" }).click();
+		const previous = viewer.getByRole("button", { name: "Previous photo" });
+		await previous.click();
+		await expect.element(previous).toBeDisabled();
+		// Complete the disabled-control blur that WebKit may defer until after a keypress.
+		(previous.element() as HTMLButtonElement).blur();
+		await expect
+			.poll(() => viewer.element().contains(document.activeElement))
+			.toBe(true);
 		await userEvent.keyboard("{ArrowRight}");
 		await expect
 			.element(screen.getByTestId("viewer-status"))

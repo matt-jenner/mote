@@ -940,7 +940,10 @@ export function createHttpPhotoService(
 				}
 			}
 		},
-		originalDownloadUrl: () => null,
+		originalDownloadUrl: (assetId) =>
+			capabilities.originalAction === "download"
+				? `/api/v1/originals/${encodeURIComponent(assetId)}`
+				: null,
 		async copyPickedOriginals() {
 			throw new PhotoServiceError(
 				"unsupportedCapability",

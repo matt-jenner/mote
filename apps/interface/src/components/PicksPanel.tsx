@@ -258,6 +258,11 @@ export function PicksPanel({
 					<X aria-hidden="true" size={22} strokeWidth={1.8} />
 				</button>
 			</div>
+			{service.capabilities.originalAction === "none" ? (
+				<p className={styles.panelCount}>
+					This site does not offer original downloads.
+				</p>
+			) : null}
 			{showCopyActions ? (
 				<>
 					<ul className={styles.pickList}>
@@ -327,7 +332,8 @@ export function PicksPanel({
 								Review picks
 							</button>
 						) : null}
-						{hasItems || copying || picks.copy.phase === "partial" ? (
+						{service.capabilities.originalAction === "copy" &&
+						(hasItems || copying || picks.copy.phase === "partial") ? (
 							<button
 								className={styles.copyButton}
 								disabled={
