@@ -1118,6 +1118,45 @@ describe("responsive Picks panel", () => {
 		expect(service.getPicks()).toEqual(before);
 	});
 
+	it("keeps desktop Picks open when Escape closes a covering viewer", async () => {
+		const { screen, service } = await renderPicksApp();
+		await service.finishFixtureScan();
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		await screen.getByRole("button", { name: "Open DSC_8421.jpg" }).click();
+		await expect
+			.element(screen.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+
+		await userEvent.keyboard("{Escape}");
+
+		expect(
+			screen.getByRole("dialog", { name: "Photo viewer" }).query(),
+		).toBeNull();
+		await expect
+			.element(screen.getByRole("complementary", { name: "Picks" }))
+			.toBeVisible();
+	});
+
+	it("leaves immersive review and reveals Picks from the View confirmation", async () => {
+		const { screen, service } = await renderPicksApp();
+		await service.finishFixtureScan();
+		await service.removePick("coast");
+		await expect
+			.element(screen.getByRole("button", { name: "Picks, 1 pick" }))
+			.toBeVisible();
+		await screen.getByRole("button", { name: "Open DSC_8421.jpg" }).click();
+		const viewer = screen.getByRole("dialog", { name: "Photo viewer" });
+		await viewer
+			.getByRole("button", { name: "Add DSC_8421.jpg to picks" })
+			.click();
+		await screen.getByRole("button", { name: "View", exact: true }).click();
+
+		expect(viewer.query()).toBeNull();
+		await expect
+			.element(screen.getByRole("complementary", { name: "Picks" }))
+			.toBeVisible();
+	});
+
 	it("moves to the next pick when removing the current reviewed pick", async () => {
 		const { screen } = await renderPicksApp();
 		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();

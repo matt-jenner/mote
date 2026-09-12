@@ -217,17 +217,23 @@ export function PicksPanel({
 	);
 
 	useEffect(() => {
-		if (isMobile || !open) return;
+		if (isMobile || !open || viewerOpen) return;
 		const closeOnEscape = (event: globalThis.KeyboardEvent) => {
-			if (event.key !== "Escape") return;
+			if (
+				event.defaultPrevented ||
+				event.key !== "Escape" ||
+				document.querySelector('[role="dialog"][aria-label="Photo viewer"]')
+			)
+				return;
 			event.preventDefault();
 			onClose();
 		};
 		window.addEventListener("keydown", closeOnEscape);
 		return () => window.removeEventListener("keydown", closeOnEscape);
-	}, [isMobile, onClose, open]);
+	}, [isMobile, onClose, open, viewerOpen]);
 
 	const trapFocus = (event: KeyboardEvent<HTMLElement>) => {
+		if (viewerOpen) return;
 		if (event.key === "Escape") {
 			event.preventDefault();
 			onClose();

@@ -2,6 +2,7 @@ import { Menu, X } from "lucide-react";
 import {
 	type Dispatch,
 	type KeyboardEvent,
+	type MutableRefObject,
 	type SetStateAction,
 	useCallback,
 	useEffect,
@@ -44,10 +45,12 @@ function AppShellContents({
 	controller,
 	picksOpen,
 	setPicksOpen,
+	viewPicksActionRef,
 }: {
 	controller: ReturnType<typeof useAppController>;
 	picksOpen: boolean;
 	setPicksOpen: Dispatch<SetStateAction<boolean>>;
+	viewPicksActionRef: MutableRefObject<() => void>;
 }) {
 	const service = usePhotoService();
 	const [drawerOpen, setDrawerOpen] = useState(false);
@@ -213,6 +216,18 @@ function AppShellContents({
 			viewer.sequence,
 		],
 	);
+
+	useLayoutEffect(() => {
+		viewPicksActionRef.current = () => {
+			if (viewer.open) {
+				closingAnchorRef.current = null;
+				closingReturnSurfaceRef.current = "wall";
+				closingFocusFallbackRef.current = false;
+				dispatchViewer({ type: "close" });
+			}
+			setPicksOpen(true);
+		};
+	}, [setPicksOpen, viewer.open, viewPicksActionRef]);
 
 	useLayoutEffect(() => {
 		if (viewer.open) {
@@ -633,16 +648,18 @@ function AppShellContents({
 export function AppShell() {
 	const controller = useAppController();
 	const [picksOpen, setPicksOpen] = useState(false);
+	const viewPicksActionRef = useRef<() => void>(() => setPicksOpen(true));
 	const pickOrigin = pickOriginFromSavedFolders(controller.state?.savedFolders);
 	return (
 		<PickListProvider
-			onViewPicks={() => setPicksOpen(true)}
+			onViewPicks={() => viewPicksActionRef.current()}
 			origin={pickOrigin}
 		>
 			<AppShellContents
 				controller={controller}
 				picksOpen={picksOpen}
 				setPicksOpen={setPicksOpen}
+				viewPicksActionRef={viewPicksActionRef}
 			/>
 		</PickListProvider>
 	);
