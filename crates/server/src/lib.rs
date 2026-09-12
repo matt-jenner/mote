@@ -44,6 +44,7 @@ pub struct AppState {
     pub(crate) cache_root: Arc<PathBuf>,
     pub(crate) folder_root: Option<Arc<ContainedFolderRoot>>,
     pub(crate) gallery: Option<Arc<GalleryEngine>>,
+    pub(crate) allow_original_downloads: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,6 +121,7 @@ impl AppState {
             cache_root: Arc::new(cache_root),
             folder_root: None,
             gallery: None,
+            allow_original_downloads: false,
         }
     }
 
@@ -133,6 +135,7 @@ impl AppState {
             cache_root: Arc::new(cache_root),
             folder_root: Some(Arc::new(ContainedFolderRoot::new(source_root)?)),
             gallery: None,
+            allow_original_downloads: false,
         })
     }
 
@@ -232,6 +235,7 @@ impl AppState {
                 ),
             )),
             gallery: None,
+            allow_original_downloads: config.allow_original_downloads(),
         };
         source_startup_hook(SourceStartupTestStage::AfterFolderConstruction);
         source_startup_hook(SourceStartupTestStage::BeforeGalleryConstruction);
@@ -276,7 +280,9 @@ impl AppState {
         config.validate_source_roots(&cataloged_roots)?;
         let writer = CacheWriter::new(config.cache_dir())?;
         let report = writer.reconcile_catalog(&mut catalog)?;
-        Ok((Self::new(catalog, config.cache_dir().to_owned()), report))
+        let mut state = Self::new(catalog, config.cache_dir().to_owned());
+        state.allow_original_downloads = config.allow_original_downloads();
+        Ok((state, report))
     }
 
     /// Exercises the exact non-Unix source-disabled composer on the current

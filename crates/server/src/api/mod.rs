@@ -116,6 +116,7 @@ pub(crate) async fn bootstrap(State(state): State<AppState>) -> impl IntoRespons
         capabilities: Capabilities {
             folder_browser: state.folder_root.is_some(),
             video: false,
+            original_downloads: state.allow_original_downloads,
         },
         source_available,
     })

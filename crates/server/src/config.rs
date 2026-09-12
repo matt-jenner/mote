@@ -21,6 +21,7 @@ pub struct ServerConfig {
     local: LocalStatePaths,
     bind: SocketAddr,
     source_root: PathBuf,
+    allow_original_downloads: bool,
     #[cfg(unix)]
     source_startup: Arc<Mutex<Option<SourceStartupValidation>>>,
     web_root: StaticWebRoot,
@@ -48,6 +49,8 @@ pub enum ConfigError {
     InvalidEnvironment(&'static str),
     #[error("PHOTO_VIEWER_BIND is not a valid socket address: {0}")]
     InvalidBind(#[from] AddrParseError),
+    #[error("PHOTO_VIEWER_ALLOW_ORIGINAL_DOWNLOADS must be empty, 0, false, 1, or true")]
+    InvalidOriginalDownloads,
     #[error("catalog data and cache directories must not be inside a source root")]
     InsideSourceRoot,
     #[error("configured source root is not a directory")]
@@ -119,6 +122,7 @@ impl ServerConfig {
             local,
             bind: bind.unwrap_or("127.0.0.1:8080").parse()?,
             source_root,
+            allow_original_downloads: false,
             #[cfg(unix)]
             source_startup: Arc::new(Mutex::new(Some(source_startup))),
             web_root,
@@ -143,7 +147,24 @@ impl ServerConfig {
                 return Err(ConfigError::InvalidEnvironment("PHOTO_VIEWER_WEB_ROOT"));
             }
         };
-        Self::new(data_dir, cache_dir, bind.as_deref(), source_root, web_root)
+        let allow_original_downloads = match env::var("PHOTO_VIEWER_ALLOW_ORIGINAL_DOWNLOADS") {
+            Ok(value)
+                if value.is_empty() || value == "0" || value.eq_ignore_ascii_case("false") =>
+            {
+                false
+            }
+            Ok(value) if value == "1" || value.eq_ignore_ascii_case("true") => true,
+            Ok(_) => return Err(ConfigError::InvalidOriginalDownloads),
+            Err(env::VarError::NotPresent) => false,
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::InvalidEnvironment(
+                    "PHOTO_VIEWER_ALLOW_ORIGINAL_DOWNLOADS",
+                ));
+            }
+        };
+        let mut config = Self::new(data_dir, cache_dir, bind.as_deref(), source_root, web_root)?;
+        config.allow_original_downloads = allow_original_downloads;
+        Ok(config)
     }
 
     pub fn prepare(&self) -> Result<(), ConfigError> {
@@ -199,6 +220,16 @@ impl ServerConfig {
 
     pub const fn bind(&self) -> SocketAddr {
         self.bind
+    }
+
+    pub const fn allow_original_downloads(&self) -> bool {
+        self.allow_original_downloads
+    }
+
+    #[doc(hidden)]
+    pub fn with_allow_original_downloads(mut self, allow_original_downloads: bool) -> Self {
+        self.allow_original_downloads = allow_original_downloads;
+        self
     }
 
     pub fn source_root(&self) -> &Path {

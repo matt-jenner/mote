@@ -99,7 +99,11 @@ interface RecordedRequest {
 }
 
 const bootstrapResponse = {
-	capabilities: { folderBrowser: true, video: false },
+	capabilities: {
+		folderBrowser: true,
+		video: false,
+		originalDownloads: false,
+	},
 	sourceAvailable: true,
 };
 
@@ -241,6 +245,32 @@ describe("HTTP PhotoService", () => {
 		releaseBootstrap(json({ ...bootstrapResponse, rootId: "root-a" }));
 		await loading;
 		expect(localStorage.reads).toContain("mote.picks.v1.root-a");
+		service.dispose();
+	});
+
+	it("maps the bootstrap original-download capability without probing a download URL", async () => {
+		const fetch = vi.fn(async () =>
+			json({
+				capabilities: {
+					folderBrowser: true,
+					video: false,
+					originalDownloads: true,
+				},
+				sourceAvailable: true,
+			}),
+		);
+		const service = createHttpPhotoService({
+			localStorage: savedPreferences(),
+			sessionStorage: new MemoryStorage(),
+			fetch,
+			randomUuid: () => "client-a",
+		});
+
+		await service.getBootstrapState();
+
+		expect(service.capabilities.originalAction).toBe("download");
+		expect(fetch).toHaveBeenCalledOnce();
+		expect(fetch).toHaveBeenCalledWith("/api/v1/bootstrap", undefined);
 		service.dispose();
 	});
 
@@ -764,11 +794,26 @@ describe("HTTP PhotoService", () => {
 
 	it.each([
 		{
-			name: "malformed bootstrap",
+			name: "bootstrap without an original-download capability",
 			localStorage: savedPreferences(),
 			fetch: async () =>
 				json({
-					capabilities: { folderBrowser: "yes", video: false },
+					capabilities: { folderBrowser: true, video: false },
+					sourceAvailable: true,
+				}),
+			act: (service: ReturnType<typeof createHttpPhotoService>) =>
+				service.getBootstrapState(),
+		},
+		{
+			name: "bootstrap with a non-boolean original-download capability",
+			localStorage: savedPreferences(),
+			fetch: async () =>
+				json({
+					capabilities: {
+						folderBrowser: true,
+						video: false,
+						originalDownloads: "yes",
+					},
 					sourceAvailable: true,
 				}),
 			act: (service: ReturnType<typeof createHttpPhotoService>) =>

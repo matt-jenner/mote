@@ -72,6 +72,11 @@ interface SelectionSummary {
 	availability: SourceAvailability;
 }
 
+interface BootstrapResponse {
+	rootId: string | null;
+	originalDownloads: boolean;
+}
+
 interface ActiveWatch {
 	listener: (update: WallUpdate) => void;
 	stream: EventSourceLike | null;
@@ -217,7 +222,7 @@ function decodeSelectionSummary(value: unknown): SelectionSummary {
 	};
 }
 
-function decodeBootstrap(value: unknown): string | null {
+function decodeBootstrap(value: unknown): BootstrapResponse {
 	const bootstrap = record(value, [
 		"capabilities",
 		"sourceAvailable",
@@ -226,11 +231,15 @@ function decodeBootstrap(value: unknown): string | null {
 	const capabilities = record(bootstrap.capabilities, [
 		"folderBrowser",
 		"video",
+		"originalDownloads",
 	]);
 	booleanValue(capabilities.folderBrowser);
 	booleanValue(capabilities.video);
 	booleanValue(bootstrap.sourceAvailable);
-	return bootstrap.rootId == null ? null : stringValue(bootstrap.rootId);
+	return {
+		rootId: bootstrap.rootId == null ? null : stringValue(bootstrap.rootId),
+		originalDownloads: booleanValue(capabilities.originalDownloads),
+	};
 }
 
 function decodeFolderAccess(value: unknown): FolderAccess {
@@ -564,6 +573,12 @@ export function createHttpPhotoService(
 	const deadlines = new Map<string, number>();
 	const pendingChecks = new Map<string, Promise<void>>();
 	const selectionIntent = createSelectionIntent();
+	const capabilities = {
+		chooseFolder: true,
+		folderSelection: "hosted" as const,
+		locateFolder: false,
+		originalAction: "none" as "download" | "none",
+	};
 	const savedSnapshot = () => ({
 		...(folderStore?.read() ?? emptySavedFolders()),
 		access: Object.fromEntries(
@@ -1050,16 +1065,15 @@ export function createHttpPhotoService(
 			);
 			return savedSnapshot();
 		},
-		capabilities: {
-			chooseFolder: true,
-			folderSelection: "hosted",
-			locateFolder: false,
-			originalAction: "none",
-		},
+		capabilities,
 		async getBootstrapState() {
 			const bootstrapIntent = selectionIntent.begin();
-			const nextRoot = await requestJson("/api/v1/bootstrap", decodeBootstrap);
+			const bootstrap = await requestJson("/api/v1/bootstrap", decodeBootstrap);
 			if (!selectionIntent.isCurrent(bootstrapIntent)) return bootstrapState();
+			capabilities.originalAction = bootstrap.originalDownloads
+				? "download"
+				: "none";
+			const nextRoot = bootstrap.rootId;
 			if (nextRoot !== null) {
 				if (rootId !== nextRoot) {
 					stopSelectionResources();

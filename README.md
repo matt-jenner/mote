@@ -173,6 +173,14 @@ cargo run --release -p photo-server
 
 Set `PHOTO_VIEWER_BIND` only when a different socket is required. For example, `PHOTO_VIEWER_BIND=127.0.0.1:18080` keeps the service loopback-only on another port. `GET /healthz` reports database, cache, aggregate source, and warning health without exposing source paths or filenames.
 
+## Hosted and Docker configuration
+
+| Variable | Default | Accepted values | Effect |
+| --- | --- | --- | --- |
+| `PHOTO_VIEWER_ALLOW_ORIGINAL_DOWNLOADS` | off | empty, `0`, `false`, `1`, or `true`, with ASCII case ignored for `true` and `false` | When on, the hosted bootstrap advertises original-download support. Restart the server or container after changing it. |
+
+The setting is disabled unless explicitly enabled. Any other non-empty value stops startup with a configuration error.
+
 PowerShell uses the same variables:
 
 ```powershell
