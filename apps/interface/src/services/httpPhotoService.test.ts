@@ -343,6 +343,9 @@ describe("HTTP PhotoService", () => {
 			sourceFolderId: "folder-two",
 			sourceLabel: "Stored trip label",
 		});
+		await expect
+			.poll(() => service.getPicks().items.map((item) => item.asset?.id))
+			.toEqual(["asset-a", "asset-b"]);
 		const snapshot = await service.loadPicks();
 		await service.requestPickDerivatives({
 			assetIds: ["asset-b", "asset-a"],
@@ -378,7 +381,16 @@ describe("HTTP PhotoService", () => {
 				call.url.endsWith("/assets") || call.url.endsWith("/derivatives"),
 		);
 		expect(
-			pickCalls.map(({ url, init }) => [url, requestBody({ url, init })]),
+			// Mutations now hydrate automatically as well as on an explicit refresh.
+			// Compare each distinct request contract, including its source and IDs.
+			[
+				...new Map(
+					pickCalls.map(({ url, init }) => {
+						const request = [url, requestBody({ url, init })];
+						return [JSON.stringify(request), request];
+					}),
+				).values(),
+			],
 		).toEqual([
 			[
 				"/api/v1/selections/selection-folder-one/assets",

@@ -462,6 +462,15 @@ describe("open and return shell", () => {
 		await expect
 			.element(screen.getByRole("button", { name: "Open sources" }))
 			.toBeVisible();
+		const picks = screen.getByRole("button", { name: "Picks, 0 picks" });
+		await expect.element(picks).toHaveAttribute("aria-expanded", "false");
+		await picks.click();
+		const sheet = screen.getByRole("dialog", { name: "Picks" });
+		await expect
+			.element(sheet.getByText("Add photos to picks as you browse."))
+			.toBeVisible();
+		await sheet.getByRole("button", { name: "Close picks" }).click();
+		await expect.element(picks).toHaveFocus();
 		await expect
 			.element(
 				screen.getByRole("navigation", {

@@ -1,11 +1,11 @@
 import {
 	addPickReference,
 	clearPickReferences,
-	removePickReference,
-	restoreClearedPickReferences,
 	type PickItem,
 	type PickListSnapshot,
 	type PickReference,
+	removePickReference,
+	restoreClearedPickReferences,
 } from "./pickList";
 
 export interface BrowserPicks {
@@ -34,7 +34,9 @@ function cloneReference(reference: PickReference): PickReference {
 	};
 }
 
-function cloneReferences(references: readonly PickReference[]): PickReference[] {
+function cloneReferences(
+	references: readonly PickReference[],
+): PickReference[] {
 	return references.map(cloneReference);
 }
 
@@ -106,7 +108,10 @@ function decodeStored(value: unknown): StoredPicks {
 	return { revision: value.revision as number, items };
 }
 
-export function createBrowserPicks(localStorage: Storage, rootId: string): BrowserPicks {
+export function createBrowserPicks(
+	localStorage: Storage,
+	rootId: string,
+): BrowserPicks {
 	const key = `mote.picks.v1.${encodeURIComponent(rootId)}`;
 	const listeners = new Set<(snapshot: PickListSnapshot) => void>();
 	let persistenceError: string | null = null;
@@ -139,7 +144,10 @@ export function createBrowserPicks(localStorage: Storage, rootId: string): Brows
 		try {
 			localStorage.setItem(
 				key,
-				JSON.stringify({ revision: next.revision, items: cloneReferences(next.items) }),
+				JSON.stringify({
+					revision: next.revision,
+					items: cloneReferences(next.items),
+				}),
 			);
 			persistenceError = null;
 		} catch {

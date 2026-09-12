@@ -1,4 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import axe from "axe-core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
@@ -25,6 +26,32 @@ const safeAreaProperties = [
 	"--safe-area-bottom",
 	"--safe-area-left",
 ] as const;
+
+async function wcagViolations() {
+	return (
+		await axe.run(document, {
+			runOnly: {
+				type: "tag",
+				values: ["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"],
+			},
+		})
+	).violations;
+}
+
+async function captureCopyState(state: string) {
+	const previous = document.documentElement.dataset.theme;
+	try {
+		for (const theme of ["light", "dark"]) {
+			document.documentElement.dataset.theme = theme;
+			await page.screenshot({
+				path: `../../.vitest-attachments/picks-${theme}-1440-copy-${state}.png`,
+			});
+		}
+	} finally {
+		if (previous === undefined) delete document.documentElement.dataset.theme;
+		else document.documentElement.dataset.theme = previous;
+	}
+}
 
 const coast: WallAsset = {
 	id: "coast",
@@ -217,6 +244,112 @@ async function renderControllablePicksApp(initial: PickListSnapshot): Promise<{
 }
 
 describe("responsive Picks panel", () => {
+	for (const theme of ["light", "dark"] as const) {
+		for (const width of [1440, 768, 390]) {
+			it(`keeps Picks accessible at ${width}px in ${theme} appearance`, async () => {
+				await page.viewport(width, 844);
+				const previousTheme = document.documentElement.dataset.theme;
+				const { screen } = await renderPicksApp({
+					originalAction: "download",
+					previewWarning: true,
+				});
+				document.documentElement.dataset.theme = theme;
+				try {
+					await expect
+						.element(
+							screen.getByRole("button", {
+								name: "Remove IMG_4172.jpg from picks",
+							}),
+						)
+						.toHaveAttribute("aria-pressed", "true");
+					const wallPick = screen
+						.getByRole("button", { name: "Remove IMG_4172.jpg from picks" })
+						.element();
+					expect(getComputedStyle(wallPick).transitionDuration).toBe("0s");
+					expect(await wcagViolations()).toEqual([]);
+					await page.screenshot({
+						path: `../../.vitest-attachments/picks-${theme}-${width}-wall.png`,
+					});
+					const trigger = screen.getByRole("button", {
+						name: "Picks, 3 picks",
+					});
+					await trigger.click();
+					const panel = screen.getByRole(
+						width >= 900 ? "complementary" : "dialog",
+						{ name: "Picks" },
+					);
+					const remove = panel
+						.getByRole("button", { name: "Remove DSC_8421.jpg" })
+						.element();
+					const row = remove.closest("li");
+					if (!row) throw new Error("Missing pick row");
+					expect(remove.getBoundingClientRect().left).toBeGreaterThan(
+						row.getBoundingClientRect().left +
+							row.getBoundingClientRect().width / 2,
+					);
+					expect(await wcagViolations()).toEqual([]);
+					await page.screenshot({
+						path: `../../.vitest-attachments/picks-${theme}-${width}-panel.png`,
+					});
+					if (width < 900) {
+						for (const control of panel
+							.element()
+							.querySelectorAll("button, a")) {
+							const bounds = control.getBoundingClientRect();
+							expect(
+								bounds.width,
+								control.getAttribute("aria-label") ??
+									control.textContent ??
+									"control",
+							).toBeGreaterThanOrEqual(44);
+							expect(
+								bounds.height,
+								control.getAttribute("aria-label") ??
+									control.textContent ??
+									"control",
+							).toBeGreaterThanOrEqual(44);
+						}
+						for (const element of [
+							panel.element(),
+							...panel.element().querySelectorAll("*"),
+						]) {
+							expect(getComputedStyle(element).transitionDuration).toBe("0s");
+						}
+					}
+					await panel.getByRole("button", { name: "Review picks" }).click();
+					const viewer = screen.getByRole("dialog", { name: "Photo viewer" });
+					await expect.element(viewer).toBeVisible();
+					expect(await wcagViolations()).toEqual([]);
+					await page.screenshot({
+						path: `../../.vitest-attachments/picks-${theme}-${width}-review.png`,
+					});
+					await viewer.getByRole("button", { name: "Back to photos" }).click();
+					await expect
+						.poll(() => document.activeElement)
+						.toBe(
+							panel.getByRole("button", { name: "Review picks" }).element(),
+						);
+					await panel.getByRole("button", { name: "Clear picks" }).click();
+					await expect
+						.element(panel.getByText("Add photos to picks as you browse."))
+						.toBeVisible();
+					expect(
+						[...document.querySelectorAll("[aria-live='polite']")].some(
+							(region) => region.textContent?.includes("Picks cleared"),
+						),
+					).toBe(true);
+					await page.screenshot({
+						path: `../../.vitest-attachments/picks-${theme}-${width}-empty.png`,
+					});
+				} finally {
+					if (previousTheme === undefined)
+						delete document.documentElement.dataset.theme;
+					else document.documentElement.dataset.theme = previousTheme;
+				}
+			});
+		}
+	}
+
 	it("offers one hosted original link per available row, including preview failures", async () => {
 		const { screen } = await renderPicksApp({
 			originalAction: "download",
@@ -506,6 +639,7 @@ describe("responsive Picks panel", () => {
 		await expect
 			.element(panel.getByRole("progressbar", { name: "Copy originals" }))
 			.toHaveAttribute("value", "0");
+		await captureCopyState("progress");
 		await panel.getByRole("button", { name: "Remove DSC_8421.jpg" }).click();
 		await panel.getByRole("button", { name: "Clear picks" }).click();
 		await expect
@@ -601,6 +735,7 @@ describe("responsive Picks panel", () => {
 		).toBeNull();
 		await panel.getByRole("button", { name: "Copy 2 originals…" }).click();
 		await expect.element(panel.getByText("Original unavailable")).toBeVisible();
+		await captureCopyState("partial");
 		await expect
 			.poll(() => document.querySelector("[data-toast-id]")?.textContent)
 			.toContain("Copied 1 of 2");

@@ -59,9 +59,13 @@ export function PickRow({ item, onRemove, action }: PickRowProps) {
 						{warning}
 					</span>
 				) : null}
-				{downloadUrl ? <a href={downloadUrl}>Download original</a> : null}
+				{downloadUrl ? (
+					<a className={styles.downloadLink} href={downloadUrl}>
+						Download original
+					</a>
+				) : null}
+				{action}
 			</div>
-			{action}
 			<button
 				aria-label={`Remove ${item.asset?.displayName ?? item.assetId}`}
 				className={styles.removeButton}

@@ -29,7 +29,11 @@ class MemoryStorage implements Storage {
 	}
 }
 
-const reference = (assetId: string, sourceFolderId = "folder-1", sourceLabel = "Family") => ({
+const reference = (
+	assetId: string,
+	sourceFolderId = "folder-1",
+	sourceLabel = "Family",
+) => ({
 	assetId,
 	sourceFolderId,
 	sourceLabel,
@@ -49,12 +53,16 @@ describe("browser picks", () => {
 		picks.add(reference("asset-2", "folder-2", "Trips"));
 		picks.remove("asset-2");
 
-		expect(JSON.parse(storage.getItem("mote.picks.v1.root-a") ?? "null")).toEqual({
+		expect(
+			JSON.parse(storage.getItem("mote.picks.v1.root-a") ?? "null"),
+		).toEqual({
 			revision: 3,
 			items: [reference("asset-1")],
 		});
 		expect(storage.getItem("mote.picks.v1.root-b")).toBeNull();
-		expect(picks.read().items).toEqual([{ ...reference("asset-1"), asset: null }]);
+		expect(picks.read().items).toEqual([
+			{ ...reference("asset-1"), asset: null },
+		]);
 	});
 
 	it("recovers valid records around malformed stored entries", () => {
@@ -90,12 +98,14 @@ describe("browser picks", () => {
 			JSON.stringify({ revision: 4, items: [reference("asset-2")] }),
 		);
 
-		picks.handleStorageEvent(
-			{ key: "mote.picks.v1.root-a", storageArea: storage } as unknown as StorageEvent,
-		);
-		picks.handleStorageEvent(
-			{ key: "mote.picks.v1.root-b", storageArea: storage } as unknown as StorageEvent,
-		);
+		picks.handleStorageEvent({
+			key: "mote.picks.v1.root-a",
+			storageArea: storage,
+		} as unknown as StorageEvent);
+		picks.handleStorageEvent({
+			key: "mote.picks.v1.root-b",
+			storageArea: storage,
+		} as unknown as StorageEvent);
 
 		expect(picks.read().items.map((item) => item.assetId)).toEqual(["asset-2"]);
 		expect(snapshots).toEqual([["asset-2"]]);

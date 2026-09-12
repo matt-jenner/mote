@@ -220,7 +220,11 @@ function AppShellContents({
 					focusTarget.focus({ preventScroll: true });
 				else
 					document
-						.querySelector<HTMLElement>("button[aria-label='Review picks']")
+						.querySelector<HTMLElement>(
+							focusTarget?.getAttribute("aria-label")
+								? `button[aria-label="${CSS.escape(focusTarget.getAttribute("aria-label") ?? "")}"]`
+								: "[data-picks-review]",
+						)
 						?.focus({ preventScroll: true });
 			});
 			if (wallRegionRef.current)

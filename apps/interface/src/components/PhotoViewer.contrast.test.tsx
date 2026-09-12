@@ -5,6 +5,22 @@ import "../styles/tokens.css";
 import "../styles/global.css";
 import styles from "../styles/photoViewer.module.css";
 
+it("preserves a visible selected pick control and keyboard outline in forced colors", async () => {
+	const view = await render(
+		<button className={styles.viewerPick} aria-pressed="true" type="button">
+			Picked
+		</button>,
+	);
+	const pick = view.getByRole("button", { name: "Picked" });
+	pick.element().focus();
+	const computed = getComputedStyle(pick.element());
+	expect(computed.borderTopStyle).not.toBe("none");
+	expect(Number.parseFloat(computed.borderTopWidth)).toBeGreaterThanOrEqual(1);
+	expect(computed.color).not.toBe(computed.backgroundColor);
+	expect(computed.outlineStyle).not.toBe("none");
+	await expect.element(pick).toHaveAttribute("aria-pressed", "true");
+});
+
 it("keeps the navigator viewport border visible in forced-colors mode", async () => {
 	const view = await render(
 		<ViewerNavigator

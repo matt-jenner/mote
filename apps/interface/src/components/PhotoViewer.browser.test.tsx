@@ -5168,6 +5168,10 @@ describe("immersive photo viewer checkpoint", () => {
 		await expect
 			.element(view.getByTestId("viewer-status"))
 			.toHaveTextContent("Second, Picks · 2 of 2");
+		await expect
+			.element(view.getByRole("button", { name: "Add Second to picks" }))
+			.toHaveAttribute("aria-pressed", "false");
+		expect(seriousViolations(await axe.run(document))).toEqual([]);
 	});
 
 	it("uses the pick derivative request path for a pick review preview", async () => {

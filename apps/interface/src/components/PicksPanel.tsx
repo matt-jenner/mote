@@ -290,6 +290,7 @@ export function PicksPanel({
 										{item.asset && onOpenPick ? (
 											<button
 												aria-label={`Review ${item.asset.displayName}`}
+												className={styles.reviewButton}
 												onClick={(event) =>
 													onOpenPick(item.assetId, event.currentTarget)
 												}
@@ -323,6 +324,7 @@ export function PicksPanel({
 							<button
 								className={styles.reviewButton}
 								disabled={!onReview || !firstReviewableItem}
+								data-picks-review
 								onClick={(event) => {
 									if (!firstReviewableItem || !onReview) return;
 									onReview(firstReviewableItem.assetId, event.currentTarget);

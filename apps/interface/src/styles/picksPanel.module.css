@@ -104,6 +104,11 @@
 	min-width: 0;
 }
 
+.downloadLink {
+	color: var(--text-primary);
+	font-size: 13px;
+}
+
 .filename {
 	overflow: hidden;
 	font-size: 14px;
@@ -120,7 +125,7 @@
 }
 
 .sourceWarning {
-	color: var(--unavailable);
+	color: var(--text-secondary);
 	font-size: 12px;
 }
 
@@ -233,6 +238,11 @@
 }
 
 @media (max-width: 899px) {
+	.downloadLink {
+		display: inline-flex;
+		align-items: center;
+		min-height: 44px;
+	}
 	.mobileBar {
 		position: absolute;
 		right: 0;

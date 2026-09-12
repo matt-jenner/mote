@@ -324,6 +324,12 @@ button.tile {
 	border-color: color-mix(in srgb, var(--focus-ring) 72%, #ffffff);
 }
 
+@media (prefers-reduced-motion: reduce) {
+	.tilePickButton {
+		transition: none;
+	}
+}
+
 @media (hover: hover) and (pointer: fine) {
 	.tilePickButton[aria-pressed="false"] {
 		opacity: 0.64;

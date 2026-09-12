@@ -1093,7 +1093,11 @@ export function createHttpPhotoService(
 						rootId,
 					);
 					publishPicks(pickStore.read());
-					unsubscribePickStore = pickStore.subscribe(publishPicks);
+					unsubscribePickStore = pickStore.subscribe((snapshot) => {
+						publishPicks(snapshot);
+						void service.loadPicks().catch(() => {});
+					});
+					await service.loadPicks().catch(() => {});
 					for (const key of Object.keys(access)) delete access[key];
 					deadlines.clear();
 				}

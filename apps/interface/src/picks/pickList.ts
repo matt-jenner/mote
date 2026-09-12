@@ -50,10 +50,12 @@ export function restoreClearedPickReferences(
 ): PickReference[] {
 	const restored: PickReference[] = [];
 	for (const reference of cleared) {
-		if (!hasAssetId(restored, reference.assetId)) restored.push({ ...reference });
+		if (!hasAssetId(restored, reference.assetId))
+			restored.push({ ...reference });
 	}
 	for (const reference of current) {
-		if (!hasAssetId(restored, reference.assetId)) restored.push({ ...reference });
+		if (!hasAssetId(restored, reference.assetId))
+			restored.push({ ...reference });
 	}
 	return restored;
 }

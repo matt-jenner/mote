@@ -2,9 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
 	addPickReference,
 	clearPickReferences,
+	type PickReference,
 	removePickReference,
 	restoreClearedPickReferences,
-	type PickReference,
 } from "./pickList";
 
 const pick = (
@@ -25,9 +25,9 @@ describe("pick-list reference helpers", () => {
 	});
 
 	it("removes only the matching asset ID", () => {
-		expect(removePickReference([pick("asset-1"), pick("asset-2")], "asset-1")).toEqual([
-			pick("asset-2"),
-		]);
+		expect(
+			removePickReference([pick("asset-1"), pick("asset-2")], "asset-1"),
+		).toEqual([pick("asset-2")]);
 	});
 
 	it("clears every reference", () => {
@@ -37,7 +37,11 @@ describe("pick-list reference helpers", () => {
 	it("restores cleared unique references before selections made after clear", () => {
 		expect(
 			restoreClearedPickReferences(
-				[pick("asset-1"), pick("asset-2"), pick("asset-1", "old-folder", "Old")],
+				[
+					pick("asset-1"),
+					pick("asset-2"),
+					pick("asset-1", "old-folder", "Old"),
+				],
 				[pick("asset-2", "new-folder", "New"), pick("asset-3")],
 			),
 		).toEqual([pick("asset-1"), pick("asset-2"), pick("asset-3")]);
