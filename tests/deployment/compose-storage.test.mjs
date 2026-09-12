@@ -111,3 +111,17 @@ test("hosted Compose bind-mounts the catalogue and derivative cache", () => {
 	}
 	assert.equal(configuration.volumes, undefined);
 });
+
+test("hosted Compose passes through an optional runtime accent colour", () => {
+	const configuration = parse(
+		renderCompose({
+			...environmentWithStoragePaths(),
+			MOTE_ACCENT_COLOR: "#7C3AED",
+		}),
+	);
+
+	assert.equal(
+		configuration.services["photo-viewer"].environment.MOTE_ACCENT_COLOR,
+		"#7C3AED",
+	);
+});

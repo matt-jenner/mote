@@ -73,6 +73,7 @@ export function createTauriPhotoService(
 		return cloneSavedFolders(saved);
 	};
 	const accept = (state: BootstrapState) => {
+		state = { ...state, accentColor: "system" };
 		if (
 			(state.savedFolders?.revision ?? 0) < (saved.revision ?? 0) &&
 			lastState

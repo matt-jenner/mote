@@ -400,6 +400,27 @@ describe("HTTP PhotoService", () => {
 		).toBe("/api/v1/derivatives/cache%2Fkey");
 	});
 
+	it("carries the hosted runtime accent into browser state", async () => {
+		const fetch = vi.fn(async () =>
+			json({
+				...bootstrapResponse,
+				rootId: null,
+				accentColor: "#7C3AED",
+			}),
+		);
+		const service = createHttpPhotoService({
+			localStorage: savedPreferences(),
+			sessionStorage: new MemoryStorage(),
+			fetch,
+			eventSourceFactory: () => new FakeEventSource("unused"),
+			randomUuid: () => "client-a",
+		});
+
+		await expect(service.getBootstrapState()).resolves.toMatchObject({
+			accentColor: "#7C3AED",
+		});
+	});
+
 	it("tolerates a legacy folder response without an image count", async () => {
 		const service = createHttpPhotoService({
 			localStorage: savedPreferences(),

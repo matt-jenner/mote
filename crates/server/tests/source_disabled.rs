@@ -41,6 +41,8 @@ async fn source_disabled_startup_keeps_health_and_api_available_without_static_s
     let bootstrap = json(request(&app, "/api/v1/bootstrap").await).await;
     assert_eq!(bootstrap["capabilities"]["folderBrowser"], false);
     assert_eq!(bootstrap["sourceAvailable"], false);
+    assert!(bootstrap.as_object().unwrap().contains_key("accentColor"));
+    assert_eq!(bootstrap["accentColor"], serde_json::Value::Null);
 
     for uri in [
         "/api/v1/folders",

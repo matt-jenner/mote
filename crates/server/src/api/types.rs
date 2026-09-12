@@ -46,6 +46,7 @@ pub struct BootstrapResponse {
     pub root_id: Option<String>,
     pub capabilities: Capabilities,
     pub source_available: bool,
+    pub accent_color: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

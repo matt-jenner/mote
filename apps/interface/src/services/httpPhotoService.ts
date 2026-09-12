@@ -215,11 +215,17 @@ function decodeSelectionSummary(value: unknown): SelectionSummary {
 	};
 }
 
-function decodeBootstrap(value: unknown): string | null {
+interface HostedBootstrap {
+	rootId: string | null;
+	accentColor: string | null;
+}
+
+function decodeBootstrap(value: unknown): HostedBootstrap {
 	const bootstrap = record(value, [
 		"capabilities",
 		"sourceAvailable",
 		"rootId",
+		"accentColor",
 	]);
 	const capabilities = record(bootstrap.capabilities, [
 		"folderBrowser",
@@ -228,7 +234,11 @@ function decodeBootstrap(value: unknown): string | null {
 	booleanValue(capabilities.folderBrowser);
 	booleanValue(capabilities.video);
 	booleanValue(bootstrap.sourceAvailable);
-	return bootstrap.rootId == null ? null : stringValue(bootstrap.rootId);
+	return {
+		rootId: bootstrap.rootId == null ? null : stringValue(bootstrap.rootId),
+		accentColor:
+			bootstrap.accentColor == null ? null : stringValue(bootstrap.accentColor),
+	};
 }
 
 function decodeFolderAccess(value: unknown): FolderAccess {
@@ -538,6 +548,7 @@ export function createHttpPhotoService(
 	const watches = new Set<ActiveWatch>();
 	let folderStore: ReturnType<typeof createBrowserSavedFolders> | null = null;
 	let rootId: string | null = null;
+	let accentColor: string | null = null;
 	const folderListeners = new Set<(value: SavedFolderSnapshot) => void>();
 	const access: Record<string, FolderAccess> = {};
 	const deadlines = new Map<string, number>();
@@ -562,6 +573,7 @@ export function createHttpPhotoService(
 			galleryScope: stored.galleryScope,
 		},
 		activeSource: activeSource === null ? null : { ...activeSource },
+		...(accentColor === null ? {} : { accentColor }),
 	});
 
 	const fetchResponse = async (
@@ -921,7 +933,12 @@ export function createHttpPhotoService(
 		},
 		async getBootstrapState() {
 			const bootstrapIntent = selectionIntent.begin();
-			const nextRoot = await requestJson("/api/v1/bootstrap", decodeBootstrap);
+			const nextBootstrap = await requestJson(
+				"/api/v1/bootstrap",
+				decodeBootstrap,
+			);
+			accentColor = nextBootstrap.accentColor;
+			const nextRoot = nextBootstrap.rootId;
 			if (!selectionIntent.isCurrent(bootstrapIntent)) return bootstrapState();
 			if (nextRoot !== null) {
 				if (rootId !== nextRoot) {

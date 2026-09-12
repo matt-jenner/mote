@@ -7,6 +7,7 @@ import type {
 	ChooseFolderResult,
 	GalleryScope,
 } from "../services/photoService";
+import { applyAccentColor } from "../theme/applyAccentColor";
 import { applyAppearance } from "../theme/applyAppearance";
 import { usePhotoService } from "./PhotoServiceContext";
 
@@ -27,7 +28,10 @@ export function useAppController() {
 	});
 
 	useEffect(() => {
-		if (bootstrap.data) applyAppearance(bootstrap.data.settings.appearance);
+		if (bootstrap.data) {
+			applyAppearance(bootstrap.data.settings.appearance);
+			applyAccentColor(bootstrap.data.accentColor);
+		}
 	}, [bootstrap.data]);
 
 	const folder = useMutation({

@@ -212,6 +212,9 @@ describe("open and return shell", () => {
 			document.documentElement.style.removeProperty(property);
 		}
 		document.documentElement.dataset.theme = "system";
+		delete document.documentElement.dataset.accent;
+		document.documentElement.style.removeProperty("--accent-color");
+		document.documentElement.style.removeProperty("--accent-color-text");
 		document.documentElement.style.colorScheme = "light dark";
 	});
 
@@ -424,6 +427,33 @@ describe("open and return shell", () => {
 		await expect
 			.poll(() => document.documentElement.dataset.theme)
 			.toBe("dark");
+	});
+
+	it("applies the hosted runtime accent to primary controls", async () => {
+		const memory = createInMemoryPhotoService({ cancelFolderPicker: true });
+		const state = await memory.getBootstrapState();
+		const service: PhotoService = {
+			...memory,
+			getBootstrapState: async () => ({
+				...state,
+				accentColor: "#777777",
+			}),
+		};
+		const screen = await renderApp(service);
+		const primary = screen.getByRole("button", { name: "Choose Folder" });
+
+		await expect
+			.poll(() => document.documentElement.dataset.accent)
+			.toBe("custom");
+		expect(getComputedStyle(primary.element()).backgroundColor).toBe(
+			"rgb(119, 119, 119)",
+		);
+		expect(
+			contrastRatio(
+				getComputedStyle(primary.element()).color,
+				getComputedStyle(primary.element()).backgroundColor,
+			),
+		).toBeGreaterThanOrEqual(4.5);
 	});
 
 	it("returns focus to Appearance after choosing an override", async () => {
