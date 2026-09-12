@@ -45,6 +45,9 @@ pub struct AppState {
     pub(crate) folder_root: Option<Arc<ContainedFolderRoot>>,
     pub(crate) gallery: Option<Arc<GalleryEngine>>,
     pub(crate) accent_color: Option<String>,
+    pub(crate) allow_original_downloads: bool,
+    #[cfg(unix)]
+    pub(crate) original_root: Option<Arc<static_host::PinnedDirectory>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +125,9 @@ impl AppState {
             folder_root: None,
             gallery: None,
             accent_color: None,
+            allow_original_downloads: false,
+            #[cfg(unix)]
+            original_root: None,
         }
     }
 
@@ -136,6 +142,9 @@ impl AppState {
             folder_root: Some(Arc::new(ContainedFolderRoot::new(source_root)?)),
             gallery: None,
             accent_color: None,
+            allow_original_downloads: false,
+            #[cfg(unix)]
+            original_root: None,
         })
     }
 
@@ -236,6 +245,8 @@ impl AppState {
             )),
             gallery: None,
             accent_color: config.accent_color().map(ToOwned::to_owned),
+            allow_original_downloads: config.allow_original_downloads(),
+            original_root: Some(Arc::new(source_startup.clone_original_root()?)),
         };
         source_startup_hook(SourceStartupTestStage::AfterFolderConstruction);
         source_startup_hook(SourceStartupTestStage::BeforeGalleryConstruction);
@@ -282,6 +293,7 @@ impl AppState {
         let report = writer.reconcile_catalog(&mut catalog)?;
         let mut state = Self::new(catalog, config.cache_dir().to_owned());
         state.accent_color = config.accent_color().map(ToOwned::to_owned);
+        state.allow_original_downloads = config.allow_original_downloads();
         Ok((state, report))
     }
 
@@ -312,6 +324,10 @@ pub fn build_router(state: AppState, web_root: StaticWebRoot) -> Router {
         )
         .route("/api/v1/selections/{id}", get(api::selection_summary))
         .route("/api/v1/selections/{id}/wall", get(api::wall))
+        .route(
+            "/api/v1/selections/{id}/assets",
+            axum::routing::post(api::resolve_assets),
+        )
         .route("/api/v1/selections/{id}/access", get(api::folder_access))
         .route(
             "/api/v1/selections/{id}/interaction",
@@ -323,6 +339,7 @@ pub fn build_router(state: AppState, web_root: StaticWebRoot) -> Router {
             axum::routing::post(api::request_derivatives),
         )
         .route("/api/v1/derivatives/{id}", get(api::derivative))
+        .route("/api/v1/originals/{assetId}", get(api::original))
         .route(
             "/healthz",
             get(|State(state): State<AppState>| async move { health::healthz(state).await }),

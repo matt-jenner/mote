@@ -1,4 +1,4 @@
-import { ChevronLeft, ChevronRight, Info } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight, Info, Plus } from "lucide-react";
 import {
 	type KeyboardEvent as ReactKeyboardEvent,
 	useCallback,
@@ -7,7 +7,12 @@ import {
 	useRef,
 	useState,
 } from "react";
-import type { PhotoService, WallAsset } from "../services/photoService";
+import { usePickList, usePickListOrigin } from "../picks/PickListContext";
+import type {
+	DerivativeRequest,
+	PhotoService,
+	WallAsset,
+} from "../services/photoService";
 import styles from "../styles/photoViewer.module.css";
 import { findViewerIndex, shouldLoadViewerPage } from "../viewer/photoSequence";
 import { useViewerControls } from "../viewer/useViewerControls";
@@ -73,6 +78,8 @@ interface PhotoViewerOverlayProps {
 	nextCursor: string | null;
 	onLoadMore: () => void;
 	onRequestNearViewportDerivatives: (assetIds: readonly string[]) => void;
+	onRequestPreviewDerivatives?: (request: DerivativeRequest) => Promise<void>;
+	onRemovePick?: (assetId: string) => void;
 	onSetWallInteraction?: (active: boolean) => void;
 }
 
@@ -90,8 +97,12 @@ export function PhotoViewerOverlay({
 	nextCursor,
 	onLoadMore,
 	onRequestNearViewportDerivatives,
+	onRequestPreviewDerivatives,
+	onRemovePick,
 	onSetWallInteraction = () => undefined,
 }: PhotoViewerOverlayProps) {
+	const picks = usePickList();
+	const pickOrigin = usePickListOrigin();
 	const backRef = useRef<HTMLButtonElement>(null);
 	const dialogRef = useRef<HTMLElement>(null);
 	const [previewFailedKey, setPreviewFailedKey] = useState<string | null>(null);
@@ -116,6 +127,7 @@ export function PhotoViewerOverlay({
 		assets,
 		currentIndex,
 		previewGeneration: state.previewGeneration,
+		requestDerivatives: onRequestPreviewDerivatives,
 	});
 	const previewFailureKey = `${asset?.id ?? ""}:${state.previewGeneration}:${preview.currentUrl ?? ""}`;
 	const handlePreviewFailure = useCallback(
@@ -178,6 +190,16 @@ export function PhotoViewerOverlay({
 		reportInteraction();
 		onClose();
 	}, [onClose, reportInteraction]);
+	const handleTogglePick = useCallback(() => {
+		if (!asset) return;
+		reportInteraction();
+		if (picks.isPicked(asset.id) && onRemovePick) {
+			onRemovePick(asset.id);
+			return;
+		}
+		if (!pickOrigin) return;
+		void picks.toggle(asset, pickOrigin).catch(() => {});
+	}, [asset, onRemovePick, pickOrigin, picks, reportInteraction]);
 	const controls = useViewerControls({
 		controlsVisible: state.controlsVisible,
 		onHide: handleHideControls,
@@ -541,6 +563,9 @@ export function PhotoViewerOverlay({
 					controlsFocused.current = false;
 					controls.resume();
 				}
+				// A boundary navigation button can become disabled and lose focus to body.
+				if (target.hasAttribute("disabled") && next === null)
+					dialogRef.current?.focus({ preventScroll: true });
 			}}
 			onKeyDownCapture={handleKeyDown}
 			onLostPointerCapture={(event) => {
@@ -581,6 +606,38 @@ export function PhotoViewerOverlay({
 					type="button"
 				>
 					<ChevronLeft aria-hidden="true" size={22} strokeWidth={1.7} />
+				</button>
+				<button
+					aria-expanded={state.infoOpen}
+					aria-label="Photo information"
+					aria-hidden={!infoVisible}
+					className={`${styles.viewerInfoButton} ${!infoVisible ? styles.viewerInfoHidden : ""}`}
+					data-viewer-info="true"
+					onClick={() => handleSetInfoOpen(true)}
+					tabIndex={infoVisible ? 0 : -1}
+					type="button"
+				>
+					<Info aria-hidden="true" size={20} strokeWidth={1.7} />
+				</button>
+				<button
+					aria-label={
+						picks.isPicked(asset.id)
+							? `Remove ${asset.displayName} from picks`
+							: `Add ${asset.displayName} to picks`
+					}
+					aria-pressed={picks.isPicked(asset.id)}
+					className={styles.viewerPick}
+					disabled={!picks.isPicked(asset.id) && !pickOrigin}
+					onClick={handleTogglePick}
+					tabIndex={state.controlsVisible ? 0 : -1}
+					type="button"
+				>
+					{picks.isPicked(asset.id) ? (
+						<Check aria-hidden="true" size={18} strokeWidth={2.2} />
+					) : (
+						<Plus aria-hidden="true" size={18} strokeWidth={2} />
+					)}
+					<span>{picks.isPicked(asset.id) ? "Picked" : "Pick"}</span>
 				</button>
 			</div>
 			<ViewerStage
@@ -676,23 +733,14 @@ export function PhotoViewerOverlay({
 				data-testid="viewer-status"
 				role="status"
 			>
-				{asset.displayName}, photo {currentPosition} of {assets.length}
+				{asset.displayName},{" "}
+				{state.sequence === "picks"
+					? `Picks · ${currentPosition} of ${assets.length}`
+					: `photo ${currentPosition} of ${assets.length}`}
 				{`, `}
 				<span key={zoomAnnouncementRevision}>{announcedZoomLabel}</span>
 				{nextCursor ? " loaded" : ""}
 			</div>
-			<button
-				aria-expanded={state.infoOpen}
-				aria-label="Photo information"
-				aria-hidden={!infoVisible}
-				className={`${styles.viewerInfoButton} ${!infoVisible ? styles.viewerInfoHidden : ""}`}
-				data-viewer-info="true"
-				onClick={() => handleSetInfoOpen(true)}
-				tabIndex={infoVisible ? 0 : -1}
-				type="button"
-			>
-				<Info aria-hidden="true" size={20} strokeWidth={1.7} />
-			</button>
 			{state.infoOpen ? (
 				<PhotoInfoDrawer
 					asset={asset}

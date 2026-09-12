@@ -8,6 +8,8 @@ import {
 	sourceIsUnavailable,
 } from "../folders/savedFolders";
 import { createSelectionIntent } from "../folders/selectionIntent";
+import { type BrowserPicks, createBrowserPicks } from "../picks/browserPicks";
+import type { PickListSnapshot, PickReference } from "../picks/pickList";
 import {
 	type BrowserPreferences,
 	createBrowserPreferences,
@@ -68,6 +70,12 @@ interface SelectionSummary {
 	displayName: string;
 	breadcrumbs: FolderBreadcrumb[];
 	availability: SourceAvailability;
+}
+
+interface BootstrapResponse {
+	rootId: string | null;
+	originalDownloads: boolean;
+	accentColor: string | null;
 }
 
 interface ActiveWatch {
@@ -215,12 +223,7 @@ function decodeSelectionSummary(value: unknown): SelectionSummary {
 	};
 }
 
-interface HostedBootstrap {
-	rootId: string | null;
-	accentColor: string | null;
-}
-
-function decodeBootstrap(value: unknown): HostedBootstrap {
+function decodeBootstrap(value: unknown): BootstrapResponse {
 	const bootstrap = record(value, [
 		"capabilities",
 		"sourceAvailable",
@@ -230,6 +233,7 @@ function decodeBootstrap(value: unknown): HostedBootstrap {
 	const capabilities = record(bootstrap.capabilities, [
 		"folderBrowser",
 		"video",
+		"originalDownloads",
 	]);
 	booleanValue(capabilities.folderBrowser);
 	booleanValue(capabilities.video);
@@ -238,6 +242,7 @@ function decodeBootstrap(value: unknown): HostedBootstrap {
 		rootId: bootstrap.rootId == null ? null : stringValue(bootstrap.rootId),
 		accentColor:
 			bootstrap.accentColor == null ? null : stringValue(bootstrap.accentColor),
+		originalDownloads: booleanValue(capabilities.originalDownloads),
 	};
 }
 
@@ -349,6 +354,10 @@ function decodeWallPage(value: unknown): WallPage {
 		totalCount: integerValue(page.totalCount),
 		previewCounts: decodePreviewCounts(page.previewCounts),
 	};
+}
+
+function decodeResolvedAssets(value: unknown): Array<WallAsset | null> {
+	return arrayValue(value, (asset) => nullable(asset, decodeWallAsset));
 }
 
 function decodePreviewCounts(value: unknown) {
@@ -547,6 +556,22 @@ export function createHttpPhotoService(
 	let replayValue: bigint | null = null;
 	const watches = new Set<ActiveWatch>();
 	let folderStore: ReturnType<typeof createBrowserSavedFolders> | null = null;
+	let pickStore: BrowserPicks | null = null;
+	let unsubscribePickStore: (() => void) | null = null;
+	let pickHydrationGeneration = 0;
+	let picks: PickListSnapshot = {
+		revision: 0,
+		items: [],
+		persistenceError: null,
+	};
+	const pickListeners = new Set<(value: PickListSnapshot) => void>();
+	const clonePicks = (value: PickListSnapshot): PickListSnapshot =>
+		structuredClone(value);
+	const publishPicks = (value: PickListSnapshot) => {
+		picks = clonePicks(value);
+		for (const listener of pickListeners) listener(clonePicks(picks));
+		return clonePicks(picks);
+	};
 	let rootId: string | null = null;
 	let accentColor: string | null = null;
 	const folderListeners = new Set<(value: SavedFolderSnapshot) => void>();
@@ -554,6 +579,12 @@ export function createHttpPhotoService(
 	const deadlines = new Map<string, number>();
 	const pendingChecks = new Map<string, Promise<void>>();
 	const selectionIntent = createSelectionIntent();
+	const capabilities = {
+		chooseFolder: true,
+		folderSelection: "hosted" as const,
+		locateFolder: false,
+		originalAction: "none" as "download" | "none",
+	};
 	const savedSnapshot = () => ({
 		...(folderStore?.read() ?? emptySavedFolders()),
 		access: Object.fromEntries(
@@ -790,6 +821,7 @@ export function createHttpPhotoService(
 	};
 
 	const storageChanged = (event: StorageEvent) => {
+		pickStore?.handleStorageEvent(event);
 		if (
 			!folderStore ||
 			(event.key !== null && !event.key.startsWith(folderStore.prefix))
@@ -814,6 +846,128 @@ export function createHttpPhotoService(
 	globalThis.addEventListener?.("storage", storageChanged);
 
 	const service: HttpPhotoService = {
+		getPicks: () => clonePicks(picks),
+		watchPicks(listener) {
+			pickListeners.add(listener);
+			return () => pickListeners.delete(listener);
+		},
+		async loadPicks() {
+			const hydrationGeneration = ++pickHydrationGeneration;
+			const store = pickStore;
+			if (store === null) return clonePicks(picks);
+			const storedPicks = store.read();
+			const groups = new Map<string, string[]>();
+			for (const item of storedPicks.items) {
+				const ids = groups.get(item.sourceFolderId) ?? [];
+				ids.push(item.assetId);
+				groups.set(item.sourceFolderId, ids);
+			}
+			const resolved = new Map<string, WallAsset | null>();
+			for (const [sourceFolderId, ids] of groups) {
+				for (let offset = 0; offset < ids.length; offset += 250) {
+					const assetIds = ids.slice(offset, offset + 250);
+					const assets = await requestJson(
+						`/api/v1/selections/${encodeURIComponent(`selection-${sourceFolderId}`)}/assets`,
+						decodeResolvedAssets,
+						{
+							method: "POST",
+							headers: { "content-type": "application/json" },
+							body: JSON.stringify({ assetIds }),
+						},
+					);
+					if (assets.length !== assetIds.length) throw internalError();
+					for (let index = 0; index < assetIds.length; index += 1) {
+						const id = assetIds[index];
+						const asset = assets[index];
+						if (id === undefined || asset === undefined) throw internalError();
+						if (asset !== null && asset.id !== id) throw internalError();
+						resolved.set(id, asset);
+					}
+				}
+			}
+			if (
+				pickStore !== store ||
+				hydrationGeneration !== pickHydrationGeneration
+			)
+				return clonePicks(picks);
+			const latest = store.read();
+			return publishPicks({
+				...latest,
+				items: latest.items.map((reference) => ({
+					assetId: reference.assetId,
+					sourceFolderId: reference.sourceFolderId,
+					sourceLabel: reference.sourceLabel,
+					asset: resolved.get(reference.assetId) ?? null,
+				})),
+			});
+		},
+		async addPick(reference: PickReference) {
+			if (pickStore === null) return clonePicks(picks);
+			pickStore.add(reference);
+			return clonePicks(picks);
+		},
+		async removePick(assetId: string) {
+			if (pickStore === null) return clonePicks(picks);
+			pickStore.remove(assetId);
+			return clonePicks(picks);
+		},
+		async clearPicks() {
+			if (pickStore === null) return clonePicks(picks);
+			pickStore.clear();
+			return clonePicks(picks);
+		},
+		async restorePicks(cleared: readonly PickReference[]) {
+			if (pickStore === null) return clonePicks(picks);
+			pickStore.restore(cleared);
+			return clonePicks(picks);
+		},
+		async requestPickDerivatives(request: DerivativeRequest) {
+			const byId = new Map(
+				picks.items.map((item) => [item.assetId, item.sourceFolderId]),
+			);
+			const groups = new Map<string, string[]>();
+			for (const assetId of request.assetIds) {
+				const sourceFolderId = byId.get(assetId);
+				if (sourceFolderId === undefined)
+					throw new PhotoServiceError(
+						"assetNotFound",
+						"That photo is no longer available.",
+					);
+				const ids = groups.get(sourceFolderId) ?? [];
+				ids.push(assetId);
+				groups.set(sourceFolderId, ids);
+			}
+			for (const [sourceFolderId, ids] of groups) {
+				for (let offset = 0; offset < ids.length; offset += 250) {
+					await requestNoContent(
+						`/api/v1/selections/${encodeURIComponent(`selection-${sourceFolderId}`)}/derivatives`,
+						{
+							scope: "includeSubfolders",
+							request: {
+								...request,
+								assetIds: ids.slice(offset, offset + 250),
+							},
+						},
+					);
+				}
+			}
+		},
+		originalDownloadUrl: (assetId) =>
+			capabilities.originalAction === "download"
+				? `/api/v1/originals/${encodeURIComponent(assetId)}`
+				: null,
+		async copyPickedOriginals() {
+			throw new PhotoServiceError(
+				"unsupportedCapability",
+				"Copying originals is available in the desktop app.",
+			);
+		},
+		async showLastCopyDestination() {
+			throw new PhotoServiceError(
+				"unsupportedCapability",
+				"Opening the copy destination is available in the desktop app.",
+			);
+		},
 		getSavedFolders: savedSnapshot,
 		watchSavedFolders: (listener) => {
 			folderListeners.add(listener);
@@ -926,20 +1080,16 @@ export function createHttpPhotoService(
 			);
 			return savedSnapshot();
 		},
-		capabilities: {
-			chooseFolder: true,
-			folderSelection: "hosted",
-			locateFolder: false,
-		},
+		capabilities,
 		async getBootstrapState() {
 			const bootstrapIntent = selectionIntent.begin();
-			const nextBootstrap = await requestJson(
-				"/api/v1/bootstrap",
-				decodeBootstrap,
-			);
-			accentColor = nextBootstrap.accentColor;
-			const nextRoot = nextBootstrap.rootId;
+			const bootstrap = await requestJson("/api/v1/bootstrap", decodeBootstrap);
 			if (!selectionIntent.isCurrent(bootstrapIntent)) return bootstrapState();
+			accentColor = bootstrap.accentColor;
+			capabilities.originalAction = bootstrap.originalDownloads
+				? "download"
+				: "none";
+			const nextRoot = bootstrap.rootId;
 			if (nextRoot !== null) {
 				if (rootId !== nextRoot) {
 					stopSelectionResources();
@@ -950,6 +1100,17 @@ export function createHttpPhotoService(
 						options.sessionStorage ?? globalThis.sessionStorage,
 						rootId,
 					);
+					unsubscribePickStore?.();
+					pickStore = createBrowserPicks(
+						options.localStorage ?? globalThis.localStorage,
+						rootId,
+					);
+					publishPicks(pickStore.read());
+					unsubscribePickStore = pickStore.subscribe((snapshot) => {
+						publishPicks(snapshot);
+						void service.loadPicks().catch(() => {});
+					});
+					await service.loadPicks().catch(() => {});
 					for (const key of Object.keys(access)) delete access[key];
 					deadlines.clear();
 				}
@@ -1177,6 +1338,9 @@ export function createHttpPhotoService(
 			disposed = true;
 			selectionIntent.invalidate();
 			globalThis.removeEventListener?.("storage", storageChanged);
+			unsubscribePickStore?.();
+			unsubscribePickStore = null;
+			pickListeners.clear();
 			folderListeners.clear();
 		},
 	};

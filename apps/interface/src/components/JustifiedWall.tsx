@@ -28,6 +28,8 @@ interface JustifiedWallProps {
 	busy: boolean;
 	regionRef?: RefObject<HTMLElement | null>;
 	onOpen: (assetId: string) => void;
+	isPicked: (assetId: string) => boolean;
+	onTogglePick: (asset: WallAsset) => void;
 	highlightedAssetId?: string | null;
 }
 
@@ -86,6 +88,8 @@ export function JustifiedWall({
 	busy,
 	regionRef: forwardedRegionRef,
 	onOpen,
+	isPicked,
+	onTogglePick,
 	highlightedAssetId = null,
 }: JustifiedWallProps) {
 	const localRegionRef = useRef<HTMLElement>(null);
@@ -343,6 +347,8 @@ export function JustifiedWall({
 							<PhotoTile
 								key={`${row.items[0]?.asset.id ?? "row"}:${item.asset.id}`}
 								onOpen={onOpen}
+								onTogglePick={onTogglePick}
+								picked={isPicked(item.asset.id)}
 								positioned={item}
 								service={service}
 								highlighted={highlightedAssetId === item.asset.id}

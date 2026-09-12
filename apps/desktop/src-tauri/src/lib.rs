@@ -32,6 +32,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .register_uri_scheme_protocol("photo-derivative", |context, request| {
             let state = context.app_handle().state::<DesktopState>();
             handle_derivative_request(&state.service, request)
@@ -61,11 +62,21 @@ pub fn run() {
             app.manage(DesktopState {
                 service,
                 wall_subscriptions: Default::default(),
+                copy_operation: Default::default(),
+                last_completed_copy_destination: Default::default(),
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap_state,
+            commands::list_photo_picks,
+            commands::add_photo_pick,
+            commands::remove_photo_pick,
+            commands::clear_photo_picks,
+            commands::restore_photo_picks,
+            commands::request_pick_derivatives,
+            commands::copy_picked_originals,
+            commands::show_last_copy_destination,
             commands::choose_folder,
             commands::rename_saved_folder,
             commands::remove_saved_folder,

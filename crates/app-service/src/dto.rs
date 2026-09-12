@@ -75,6 +75,29 @@ pub struct WallAsset {
     pub rating: Option<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickReference {
+    pub asset_id: String,
+    pub source_folder_id: String,
+    pub source_label: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickItem {
+    #[serde(flatten)]
+    pub reference: PickReference,
+    pub asset: Option<WallAsset>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickListSnapshot {
+    pub revision: u64,
+    pub items: Vec<PickItem>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum WallMediaKind {

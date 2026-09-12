@@ -46,6 +46,7 @@ function folderService(overrides: Partial<PhotoService> = {}): PhotoService {
 			chooseFolder: true,
 			folderSelection: "hosted",
 			locateFolder: false,
+			originalAction: "none",
 		},
 		listFolders: async () => structuredClone(rootListing),
 		selectFolder: async () => ({ kind: "cancelled" }),

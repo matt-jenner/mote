@@ -214,7 +214,7 @@
 .tile {
 	position: relative;
 	flex: 0 0 auto;
-	min-width: 0;
+	min-width: 44px;
 	padding: 0;
 	margin: 0;
 	overflow: hidden;
@@ -229,6 +229,16 @@ button.tile {
 
 .tileReturnHighlight {
 	box-shadow: 0 0 0 2px var(--focus-ring);
+}
+
+.tilePicked {
+	box-shadow: inset 0 0 0 2px var(--focus-ring);
+}
+
+.tilePicked.tileReturnHighlight {
+	box-shadow:
+		inset 0 0 0 2px var(--focus-ring),
+		0 0 0 2px var(--focus-ring);
 }
 
 .neutralLayer,
@@ -275,6 +285,66 @@ button.tile {
 .tileOpenOverlay:focus-visible {
 	outline: 2px solid var(--focus-ring);
 	outline-offset: -2px;
+}
+
+.tilePickButton {
+	position: absolute;
+	top: 6px;
+	left: 6px;
+	z-index: 2;
+	display: grid;
+	place-items: center;
+	width: 44px;
+	height: 44px;
+	padding: 0;
+	color: #f4f5f6;
+	background: rgb(8 9 11 / 68%);
+	border: 1px solid rgb(255 255 255 / 22%);
+	border-radius: 50%;
+	box-shadow: 0 2px 8px rgb(0 0 0 / 18%);
+	cursor: pointer;
+	opacity: 1;
+	transition:
+		opacity var(--fade-duration) ease,
+		background-color var(--fade-duration) ease;
+}
+
+.tile[data-controls-stacked="true"] .tilePickButton {
+	top: 0;
+	left: 0;
+}
+
+.tile[data-controls-stacked="true"] > [role="img"] {
+	top: 52px;
+	right: 0;
+}
+
+.tilePickButton[aria-pressed="true"] {
+	background: var(--primary-control);
+	border-color: color-mix(in srgb, var(--focus-ring) 72%, #ffffff);
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.tilePickButton {
+		transition: none;
+	}
+}
+
+@media (hover: hover) and (pointer: fine) {
+	.tilePickButton[aria-pressed="false"] {
+		opacity: 0.64;
+	}
+
+	.tile:hover .tilePickButton,
+	.tilePickButton:focus-visible {
+		opacity: 1;
+	}
+}
+
+@media (hover: none), (pointer: coarse) {
+	.tilePickButton {
+		opacity: 1;
+	}
 }
 
 .tileWarning {

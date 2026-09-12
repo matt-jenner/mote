@@ -9,7 +9,7 @@ const stateDirectory = path.resolve(
 
 export default defineConfig({
 	testDir: ".",
-	testMatch: "hosted.spec.ts",
+	testMatch: "*.spec.ts",
 	fullyParallel: false,
 	workers: 1,
 	retries: 0,

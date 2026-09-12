@@ -24,7 +24,8 @@ export default defineConfig({
 			{
 				test: {
 					name: "unit",
-					include: ["src/**/*.test.ts"],
+					include: ["src/**/*.test.{ts,tsx}"],
+					exclude: ["src/**/*.{browser,motion,contrast}.test.tsx"],
 					environment: "node",
 				},
 			},

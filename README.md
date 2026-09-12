@@ -69,6 +69,52 @@ npm run test:browser
 npm run --workspace @photo-viewer/interface build
 ```
 
+## Keep and review Picks
+
+Use a photo's pick control to keep it in Picks. Picks collect photos across
+saved folders in the order you add them. Review picks opens that sequence;
+changing folders or removing a saved folder shortcut does not remove its picks.
+Unavailable photos stay listed with a warning, and cached previews remain
+viewable.
+
+Desktop Picks live in the local catalogue and survive app restarts within the
+same profile. Hosted Picks live in this browser's local storage, separately for
+each server root. Tabs on the same site update when another tab changes Picks.
+Clearing site data removes the hosted list; a different browser has its own
+list. If storage is unavailable, Picks remain usable in the current tab and a
+warning explains that they cannot be saved.
+
+Remove a row to drop one pick. **Clear picks** empties the list immediately and
+offers **Undo** in the notification. Undo restores the cleared sequence ahead of
+photos added since Clear, without duplicates. Closing Picks, reviewing photos,
+copying, and downloading do not clear the list.
+
+On desktop, **Copy originals…** asks for a destination. Existing files are never
+overwritten: name collisions receive a numbered suffix. Mote remembers the
+destination for the next picker after a successful copy. **Show folder** opens
+the completed copy's destination. Partial failures remain visible on their
+rows; Retry opens the picker again and retries only failed originals. Changes
+to Picks during a copy do not change the batch already running. Source photos
+remain untouched.
+
+Hosted sites offer a **Download original** link on each available row only when
+the administrator enables `PHOTO_VIEWER_ALLOW_ORIGINAL_DOWNLOADS=true` and
+restarts the server or container. The default is off. Each link downloads that
+one original; opening Picks and reviewing previews never downloads originals.
+
+To verify the hosted Picks workflow locally, install Playwright Chromium, build
+the web app, then run:
+
+```bash
+npm run web:build
+npm run test:hosted -- --grep Picks
+```
+
+The tests start two temporary loopback servers with disposable source copies,
+separate catalogues and caches, and downloads off/on. They require Cargo and
+built web assets. The broader container lifecycle smoke test is documented in
+the [hosted deployment guide](docs/deployment/hosted.md).
+
 ## Run the macOS desktop app
 
 For normal desktop development, use the default profile:
@@ -172,6 +218,14 @@ cargo run --release -p photo-server
 ```
 
 Set `PHOTO_VIEWER_BIND` only when a different socket is required. For example, `PHOTO_VIEWER_BIND=127.0.0.1:18080` keeps the service loopback-only on another port. `GET /healthz` reports database, cache, aggregate source, and warning health without exposing source paths or filenames.
+
+## Hosted and Docker configuration
+
+| Variable | Default | Accepted values | Effect |
+| --- | --- | --- | --- |
+| `PHOTO_VIEWER_ALLOW_ORIGINAL_DOWNLOADS` | off | empty, `0`, `false`, `1`, or `true`, with ASCII case ignored for `true` and `false` | When on, the hosted bootstrap advertises original-download support. Restart the server or container after changing it. |
+
+The setting is disabled unless explicitly enabled. Any other non-empty value stops startup with a configuration error.
 
 PowerShell uses the same variables:
 

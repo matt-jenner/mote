@@ -33,6 +33,12 @@ pub(crate) struct DerivativeHttpRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolveAssetsRequest {
+    pub asset_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EventsParams {
     pub client_id: String,
@@ -54,4 +60,5 @@ pub struct BootstrapResponse {
 pub struct Capabilities {
     pub folder_browser: bool,
     pub video: bool,
+    pub original_downloads: bool,
 }

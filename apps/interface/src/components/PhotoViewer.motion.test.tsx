@@ -5,8 +5,28 @@ import { render } from "vitest-browser-react";
 import type { PhotoService, WallAsset } from "../services/photoService";
 import "../styles/tokens.css";
 import "../styles/global.css";
+import wallStyles from "../styles/photoWall.module.css";
 import { ViewerNavigator } from "./ViewerNavigator";
 import { ViewerStage } from "./ViewerStage";
+
+it("retains pick feedback transitions when motion is allowed", async () => {
+	const view = await render(
+		<button
+			className={wallStyles.tilePickButton}
+			aria-pressed="true"
+			type="button"
+		>
+			Picked
+		</button>,
+	);
+	expect(window.matchMedia("(prefers-reduced-motion: reduce)").matches).toBe(
+		false,
+	);
+	expect(
+		getComputedStyle(view.getByRole("button", { name: "Picked" }).element())
+			.transitionDuration,
+	).not.toBe("0s");
+});
 
 const pixel =
 	"data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";

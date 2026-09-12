@@ -3,10 +3,15 @@ export interface ViewerReturnAnchor {
 	scrollTop: number;
 }
 
+export type ViewerSequence = "wall" | "picks";
+export type ViewerReturnSurface = "wall" | "picksPanel";
+
 export interface ViewerState {
 	open: boolean;
 	currentAssetId: string | null;
 	returnAnchor: ViewerReturnAnchor | null;
+	sequence: ViewerSequence;
+	returnSurface: ViewerReturnSurface;
 	infoOpen: boolean;
 	controlsVisible: boolean;
 	filmstripVisible: boolean;
@@ -18,6 +23,8 @@ export type ViewerAction =
 			type: "open";
 			assetId: string;
 			anchor: ViewerReturnAnchor;
+			sequence?: ViewerSequence;
+			returnSurface?: ViewerReturnSurface;
 	  }
 	| { type: "close" }
 	| { type: "select"; assetId: string }
@@ -30,6 +37,8 @@ export const initialViewerState: ViewerState = {
 	open: false,
 	currentAssetId: null,
 	returnAnchor: null,
+	sequence: "wall",
+	returnSurface: "wall",
 	infoOpen: false,
 	controlsVisible: true,
 	filmstripVisible: true,
@@ -47,6 +56,8 @@ export function viewerReducer(
 				open: true,
 				currentAssetId: action.assetId,
 				returnAnchor: action.anchor,
+				sequence: action.sequence ?? "wall",
+				returnSurface: action.returnSurface ?? "wall",
 				previewGeneration: state.previewGeneration + 1,
 			};
 		case "close":

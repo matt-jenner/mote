@@ -1,7 +1,7 @@
 import { type RefObject, useEffect, useMemo, useState } from "react";
 import { usePhotoService } from "../app/PhotoServiceContext";
 import type { PhotoWallController } from "../app/usePhotoWall";
-import type { SourceSummary } from "../services/photoService";
+import type { SourceSummary, WallAsset } from "../services/photoService";
 import styles from "../styles/photoWall.module.css";
 import { layoutJustifiedRows } from "../wall/layoutJustifiedRows";
 import { JustifiedWall } from "./JustifiedWall";
@@ -11,6 +11,8 @@ interface PhotoWallCanvasProps {
 	wall: PhotoWallController;
 	regionRef: RefObject<HTMLElement | null>;
 	onOpen: (assetId: string) => void;
+	isPicked: (assetId: string) => boolean;
+	onTogglePick: (asset: WallAsset) => void;
 	highlightedAssetId?: string | null;
 }
 
@@ -19,6 +21,8 @@ export function PhotoWallCanvas({
 	wall,
 	regionRef,
 	onOpen,
+	isPicked,
+	onTogglePick,
 	highlightedAssetId = null,
 }: PhotoWallCanvasProps) {
 	const service = usePhotoService();
@@ -87,6 +91,8 @@ export function PhotoWallCanvas({
 				scrollEpoch={wall.state.scrollEpoch}
 				busy={wall.progress.busy}
 				onOpen={onOpen}
+				isPicked={isPicked}
+				onTogglePick={onTogglePick}
 				highlightedAssetId={highlightedAssetId}
 			/>
 		</main>
