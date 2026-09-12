@@ -5,6 +5,7 @@ mod dto;
 mod folder_access;
 mod gallery;
 mod hosted_runtime;
+mod original_copy;
 mod picks;
 mod saved_folders;
 mod scan;
@@ -33,6 +34,7 @@ pub use gallery::{
 };
 pub use hosted_runtime::SelectionEventSubscription;
 pub use hosted_runtime::SequencedWallUpdate;
+pub use original_copy::{CopyItemResult, CopyItemStatus, OriginalCopyBatch, OriginalCopyResult};
 pub use photo_domain::GalleryScope;
 pub use photo_indexer::MetadataReader;
 pub use service::{AppService, AppServiceError};

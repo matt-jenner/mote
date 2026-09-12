@@ -530,6 +530,12 @@ pub enum AppServiceError {
     DerivativeUnavailable,
     #[error("folder selection was superseded by a newer valid selection")]
     SelectionSuperseded,
+    #[error("original copy preparation failed")]
+    CopyPreparationFailed,
+    #[error("copy destination is unavailable")]
+    CopyDestinationUnavailable,
+    #[error("copy destination must be outside every source library")]
+    CopyDestinationIsSource,
 }
 
 impl AppService {
