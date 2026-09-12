@@ -145,10 +145,10 @@ export function PicksPanel({
 	};
 
 	useEffect(() => {
-		if (open || !historyEntry.current) return;
+		if ((open && isMobile) || !historyEntry.current) return;
 		historyEntry.current = false;
 		window.history.back();
-	}, [open]);
+	}, [isMobile, open]);
 
 	useEffect(
 		() => () => {

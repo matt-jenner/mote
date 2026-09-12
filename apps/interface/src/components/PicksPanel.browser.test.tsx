@@ -288,6 +288,27 @@ describe("responsive Picks panel", () => {
 			.toBeNull();
 	});
 
+	it("unwinds mobile sheet history when the viewport switches to desktop", async () => {
+		await page.viewport(390, 844);
+		window.history.pushState({ picksViewportTest: true }, "");
+		const { screen } = await renderPicksApp();
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		await expect.poll(() => window.history.state?.picksSheet).toBe(true);
+
+		await page.viewport(900, 844);
+		await expect.poll(() => window.history.state?.picksViewportTest).toBe(true);
+		await expect
+			.element(screen.getByRole("complementary", { name: "Picks" }))
+			.toBeVisible();
+		window.history.back();
+		await expect
+			.poll(() => window.history.state?.picksViewportTest)
+			.toBeUndefined();
+		await expect
+			.element(screen.getByRole("complementary", { name: "Picks" }))
+			.toBeVisible();
+	});
+
 	it("restores sheet focus after removing the focused row and clearing the focused action", async () => {
 		await page.viewport(390, 844);
 		const { screen } = await renderPicksApp();
