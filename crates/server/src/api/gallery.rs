@@ -5,7 +5,7 @@ use axum::response::IntoResponse;
 use photo_app_service::{AppServiceError, GalleryScope, SortDirection, WallQueryRequest};
 use std::path::Path as FsPath;
 
-use super::types::{CreateSelectionRequest, InteractionRequest, WallParams};
+use super::types::{CreateSelectionRequest, InteractionRequest, ResolveAssetsRequest, WallParams};
 use super::{invalid_request, query_pairs, validate_ascii_identifier, validate_decoded_identifier};
 use crate::{AppState, FolderError};
 
@@ -118,6 +118,33 @@ pub(crate) async fn wall(
         .await
         .map_err(map_service_error)?;
     Ok(Json(page))
+}
+
+pub(crate) async fn resolve_assets(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+    request: Request,
+) -> Result<impl IntoResponse, super::ApiError> {
+    require_no_query(raw_query.as_deref())?;
+    validate_ascii_identifier(&id, 128)?;
+    let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+        .await
+        .map_err(|_| invalid_request())?;
+    let request: ResolveAssetsRequest =
+        serde_json::from_slice(&body).map_err(|_| invalid_request())?;
+    if !(1..=250).contains(&request.asset_ids.len()) {
+        return Err(invalid_request());
+    }
+    for asset_id in &request.asset_ids {
+        validate_ascii_identifier(asset_id, 128)?;
+    }
+    let engine = gallery(&state)?;
+    let selection = engine.resolve_selection(&id).map_err(map_service_error)?;
+    let assets = engine
+        .resolve_assets(&selection, &request.asset_ids)
+        .map_err(map_service_error)?;
+    Ok(Json(assets))
 }
 
 pub(crate) async fn interaction(

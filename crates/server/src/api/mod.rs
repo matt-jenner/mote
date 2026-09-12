@@ -6,7 +6,9 @@ mod types;
 
 pub(crate) use derivative::{derivative, request_derivatives};
 pub(crate) use events::events;
-pub(crate) use gallery::{create_selection, folder_access, interaction, selection_summary, wall};
+pub(crate) use gallery::{
+    create_selection, folder_access, interaction, resolve_assets, selection_summary, wall,
+};
 
 use axum::Json;
 use axum::extract::{RawQuery, State};

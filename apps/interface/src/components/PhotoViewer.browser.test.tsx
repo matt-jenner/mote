@@ -311,6 +311,7 @@ function previewService(
 			chooseFolder: false,
 			folderSelection: "native",
 			locateFolder: false,
+			originalAction: "none",
 		},
 		getBootstrapState: async () => ({
 			savedFolders: emptySavedFolders(),

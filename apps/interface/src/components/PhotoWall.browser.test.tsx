@@ -139,6 +139,15 @@ class TestIntersectionObserver {
 }
 
 class ControlledWallService implements PhotoService {
+	getPicks = () => ({ revision: 0, items: [], persistenceError: null });
+	watchPicks = () => () => {};
+	loadPicks = async () => this.getPicks();
+	addPick = async () => this.getPicks();
+	removePick = async () => this.getPicks();
+	clearPicks = async () => this.getPicks();
+	restorePicks = async () => this.getPicks();
+	requestPickDerivatives = async () => {};
+	originalDownloadUrl = () => null;
 	getSavedFolders = () => this.sourceState.savedFolders;
 	watchSavedFolders = () => () => {};
 	renameSavedFolder = async () => this.sourceState;
@@ -173,6 +182,7 @@ class ControlledWallService implements PhotoService {
 			chooseFolder: folderSelection === "native",
 			folderSelection,
 			locateFolder: false,
+			originalAction: "none",
 		};
 		this.sourceState = {
 			savedFolders: emptySavedFolders(),

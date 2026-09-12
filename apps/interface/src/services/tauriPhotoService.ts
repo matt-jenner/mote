@@ -5,6 +5,11 @@ import {
 	type SavedFolderSnapshot,
 	sortSavedFolders,
 } from "../folders/savedFolders";
+import type {
+	PickItem,
+	PickListSnapshot,
+	PickReference,
+} from "../picks/pickList";
 import {
 	type Appearance,
 	type BootstrapState,
@@ -55,6 +60,22 @@ export type ChannelFactory = (
 	listener: (update: WallUpdate) => void,
 ) => ServiceChannel<WallUpdate>;
 
+interface NativePickListSnapshot {
+	revision: number;
+	items: PickItem[];
+}
+
+const clonePicks = (snapshot: PickListSnapshot): PickListSnapshot =>
+	structuredClone(snapshot);
+
+const fromNativePicks = (
+	snapshot: NativePickListSnapshot,
+): PickListSnapshot => ({
+	revision: snapshot.revision,
+	items: structuredClone(snapshot.items),
+	persistenceError: null,
+});
+
 export function createTauriPhotoService(
 	invokeCommand: InvokeCommand = invoke,
 	channelFactory: ChannelFactory = (listener) => new Channel(listener),
@@ -64,6 +85,26 @@ export function createTauriPhotoService(
 	let saved = emptySavedFolders();
 	let lastState: BootstrapState | null = null;
 	const listeners = new Set<(snapshot: SavedFolderSnapshot) => void>();
+	let picks: PickListSnapshot = {
+		revision: 0,
+		items: [],
+		persistenceError: null,
+	};
+	const pickListeners = new Set<(snapshot: PickListSnapshot) => void>();
+	const publishPicks = (value: NativePickListSnapshot) => {
+		if (value.revision < picks.revision) return clonePicks(picks);
+		picks = fromNativePicks(value);
+		for (const listener of pickListeners) listener(clonePicks(picks));
+		return clonePicks(picks);
+	};
+	const pickCommand = async (command: string, args?: Record<string, unknown>) =>
+		publishPicks(
+			await invokePhotoCommand<NativePickListSnapshot>(
+				invokeCommand,
+				command,
+				args,
+			),
+		);
 	const publish = (value: SavedFolderSnapshot) => {
 		if ((value.revision ?? 0) < (saved.revision ?? 0))
 			return cloneSavedFolders(saved);
@@ -103,6 +144,29 @@ export function createTauriPhotoService(
 		return result;
 	};
 	return {
+		getPicks: () => clonePicks(picks),
+		watchPicks(listener) {
+			pickListeners.add(listener);
+			return () => pickListeners.delete(listener);
+		},
+		loadPicks: () => pickCommand("list_photo_picks"),
+		addPick: (reference: PickReference) =>
+			pickCommand("add_photo_pick", {
+				assetId: reference.assetId,
+				sourceFolderId: reference.sourceFolderId,
+			}),
+		removePick: (assetId: string) =>
+			pickCommand("remove_photo_pick", { assetId }),
+		clearPicks: () => pickCommand("clear_photo_picks"),
+		restorePicks: (references: readonly PickReference[]) =>
+			pickCommand("restore_photo_picks", {
+				references: references.map((reference) => ({ ...reference })),
+			}),
+		requestPickDerivatives: (request: DerivativeRequest) =>
+			invokePhotoCommand(invokeCommand, "request_pick_derivatives", {
+				request,
+			}),
+		originalDownloadUrl: () => null,
 		getSavedFolders: () => cloneSavedFolders(saved),
 		watchSavedFolders: (listener) => {
 			listeners.add(listener);
@@ -127,6 +191,7 @@ export function createTauriPhotoService(
 			chooseFolder: true,
 			folderSelection: "native",
 			locateFolder: false,
+			originalAction: "copy",
 		},
 		getBootstrapState: () => stateCommand("get_bootstrap_state"),
 		chooseFolder: () => selectCommand("choose_folder"),

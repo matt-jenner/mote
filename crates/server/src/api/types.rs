@@ -33,6 +33,12 @@ pub(crate) struct DerivativeHttpRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolveAssetsRequest {
+    pub asset_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EventsParams {
     pub client_id: String,

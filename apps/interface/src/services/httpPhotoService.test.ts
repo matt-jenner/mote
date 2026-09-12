@@ -204,9 +204,198 @@ function recordedState(request: RecordedRequest): unknown {
 
 afterEach(() => {
 	vi.useRealTimers();
+	vi.unstubAllGlobals();
 });
 
 describe("HTTP PhotoService", () => {
+	it("hydrates root-scoped picks by source folder without replacing the active selection", async () => {
+		const localStorage = savedPreferences();
+		const calls: RecordedRequest[] = [];
+		const assets = {
+			"asset-a": representativeAsset,
+			"asset-b": {
+				...representativeAsset,
+				id: "asset-b",
+				displayName: "Glacier.jpg",
+				wallThumbnail: null,
+				screenPreview: null,
+			},
+		};
+		const fetch = vi.fn(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = String(input);
+				calls.push({ url, init });
+				if (url === "/api/v1/bootstrap")
+					return json({ ...bootstrapResponse, rootId: "root-a" });
+				if (url === "/api/v1/selections")
+					return json(
+						{
+							...selectionSummary,
+							folderId: "active-folder",
+							sourceId: "root-a",
+						},
+						201,
+					);
+				if (url.endsWith("/assets")) {
+					const body = requestBody({ url, init }) as { assetIds: string[] };
+					return json(
+						body.assetIds.map((id) => assets[id as keyof typeof assets]),
+					);
+				}
+				if (url.endsWith("/derivatives")) return noContent();
+				if (url.includes("/wall?")) return json(emptyWallPage);
+				throw new Error(`unexpected request ${url}`);
+			},
+		);
+		const service = createHttpPhotoService({
+			localStorage,
+			sessionStorage: new MemoryStorage(),
+			fetch,
+			eventSourceFactory: (url) => new FakeEventSource(url),
+			randomUuid: () => "client-a",
+		});
+
+		expect(service.getPicks()).toEqual({
+			revision: 0,
+			items: [],
+			persistenceError: null,
+		});
+		expect(localStorage.getItem("mote.picks.v1.root-a")).toBeNull();
+		await service.getBootstrapState();
+		await service.selectFolder("Trips/Iceland");
+		await service.addPick({
+			assetId: "asset-a",
+			sourceFolderId: "folder-one",
+			sourceLabel: "Stored family label",
+		});
+		await service.addPick({
+			assetId: "asset-b",
+			sourceFolderId: "folder-two",
+			sourceLabel: "Stored trip label",
+		});
+		const snapshot = await service.loadPicks();
+		await service.requestPickDerivatives({
+			assetIds: ["asset-b", "asset-a"],
+			priority: "nearViewport",
+			kind: "wallThumbnail",
+		});
+		await service.queryWall({
+			cursor: null,
+			limit: 10,
+			direction: "oldestFirst",
+		});
+
+		expect(
+			snapshot.items.map(({ assetId, sourceLabel, asset }) => ({
+				assetId,
+				sourceLabel,
+				resolvedId: asset?.id,
+			})),
+		).toEqual([
+			{
+				assetId: "asset-a",
+				sourceLabel: "Stored family label",
+				resolvedId: "asset-a",
+			},
+			{
+				assetId: "asset-b",
+				sourceLabel: "Stored trip label",
+				resolvedId: "asset-b",
+			},
+		]);
+		const pickCalls = calls.filter(
+			(call) =>
+				call.url.endsWith("/assets") || call.url.endsWith("/derivatives"),
+		);
+		expect(
+			pickCalls.map(({ url, init }) => [url, requestBody({ url, init })]),
+		).toEqual([
+			[
+				"/api/v1/selections/selection-folder-one/assets",
+				{ assetIds: ["asset-a"] },
+			],
+			[
+				"/api/v1/selections/selection-folder-two/assets",
+				{ assetIds: ["asset-b"] },
+			],
+			[
+				"/api/v1/selections/selection-folder-two/derivatives",
+				{
+					scope: "includeSubfolders",
+					request: {
+						assetIds: ["asset-b"],
+						priority: "nearViewport",
+						kind: "wallThumbnail",
+					},
+				},
+			],
+			[
+				"/api/v1/selections/selection-folder-one/derivatives",
+				{
+					scope: "includeSubfolders",
+					request: {
+						assetIds: ["asset-a"],
+						priority: "nearViewport",
+						kind: "wallThumbnail",
+					},
+				},
+			],
+		]);
+		expect(calls.at(-1)?.url).toContain("/selections/selection-a/wall?");
+		expect(service.capabilities.originalAction).toBe("none");
+		expect(service.originalDownloadUrl("asset-a")).toBeNull();
+		service.dispose();
+	});
+
+	it("refreshes its pick snapshot when another tab writes the same root", async () => {
+		const localStorage = new MemoryStorage();
+		const storageListeners: Array<(event: StorageEvent) => void> = [];
+		vi.stubGlobal(
+			"addEventListener",
+			(type: string, listener: EventListener) => {
+				if (type === "storage")
+					storageListeners.push(
+						listener as unknown as (event: StorageEvent) => void,
+					);
+			},
+		);
+		vi.stubGlobal("removeEventListener", () => undefined);
+		const service = createHttpPhotoService({
+			localStorage,
+			sessionStorage: new MemoryStorage(),
+			fetch: async () => json({ ...bootstrapResponse, rootId: "root-a" }),
+			randomUuid: () => "client-a",
+		});
+		await service.getBootstrapState();
+		const revisions: number[] = [];
+		service.watchPicks((snapshot) => revisions.push(snapshot.revision));
+		localStorage.setItem(
+			"mote.picks.v1.root-a",
+			JSON.stringify({
+				revision: 7,
+				items: [
+					{
+						assetId: "asset-a",
+						sourceFolderId: "folder-a",
+						sourceLabel: "Family",
+					},
+				],
+			}),
+		);
+
+		for (const listener of storageListeners)
+			listener({
+				key: "mote.picks.v1.root-a",
+				storageArea: localStorage,
+			} as unknown as StorageEvent);
+
+		expect(service.getPicks()).toMatchObject({
+			revision: 7,
+			items: [{ assetId: "asset-a", sourceLabel: "Family", asset: null }],
+		});
+		expect(revisions).toEqual([7]);
+		service.dispose();
+	});
 	it("restores independent browser and tab state against one server", async () => {
 		const firstLocal = savedPreferences({
 			selectionId: "selection-a",

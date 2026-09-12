@@ -8,6 +8,8 @@ import {
 	sourceIsUnavailable,
 } from "../folders/savedFolders";
 import { createSelectionIntent } from "../folders/selectionIntent";
+import { type BrowserPicks, createBrowserPicks } from "../picks/browserPicks";
+import type { PickListSnapshot, PickReference } from "../picks/pickList";
 import {
 	type BrowserPreferences,
 	createBrowserPreferences,
@@ -341,6 +343,10 @@ function decodeWallPage(value: unknown): WallPage {
 	};
 }
 
+function decodeResolvedAssets(value: unknown): Array<WallAsset | null> {
+	return arrayValue(value, (asset) => nullable(asset, decodeWallAsset));
+}
+
 function decodePreviewCounts(value: unknown) {
 	const counts = record(value, ["wallReady", "screenReady"]);
 	return {
@@ -537,6 +543,21 @@ export function createHttpPhotoService(
 	let replayValue: bigint | null = null;
 	const watches = new Set<ActiveWatch>();
 	let folderStore: ReturnType<typeof createBrowserSavedFolders> | null = null;
+	let pickStore: BrowserPicks | null = null;
+	let unsubscribePickStore: (() => void) | null = null;
+	let picks: PickListSnapshot = {
+		revision: 0,
+		items: [],
+		persistenceError: null,
+	};
+	const pickListeners = new Set<(value: PickListSnapshot) => void>();
+	const clonePicks = (value: PickListSnapshot): PickListSnapshot =>
+		structuredClone(value);
+	const publishPicks = (value: PickListSnapshot) => {
+		picks = clonePicks(value);
+		for (const listener of pickListeners) listener(clonePicks(picks));
+		return clonePicks(picks);
+	};
 	let rootId: string | null = null;
 	const folderListeners = new Set<(value: SavedFolderSnapshot) => void>();
 	const access: Record<string, FolderAccess> = {};
@@ -778,6 +799,7 @@ export function createHttpPhotoService(
 	};
 
 	const storageChanged = (event: StorageEvent) => {
+		pickStore?.handleStorageEvent(event);
 		if (
 			!folderStore ||
 			(event.key !== null && !event.key.startsWith(folderStore.prefix))
@@ -802,6 +824,108 @@ export function createHttpPhotoService(
 	globalThis.addEventListener?.("storage", storageChanged);
 
 	const service: HttpPhotoService = {
+		getPicks: () => clonePicks(picks),
+		watchPicks(listener) {
+			pickListeners.add(listener);
+			return () => pickListeners.delete(listener);
+		},
+		async loadPicks() {
+			const store = pickStore;
+			if (store === null) return clonePicks(picks);
+			const storedPicks = store.read();
+			const groups = new Map<string, string[]>();
+			for (const item of storedPicks.items) {
+				const ids = groups.get(item.sourceFolderId) ?? [];
+				ids.push(item.assetId);
+				groups.set(item.sourceFolderId, ids);
+			}
+			const resolved = new Map<string, WallAsset | null>();
+			for (const [sourceFolderId, ids] of groups) {
+				for (let offset = 0; offset < ids.length; offset += 250) {
+					const assetIds = ids.slice(offset, offset + 250);
+					const assets = await requestJson(
+						`/api/v1/selections/${encodeURIComponent(`selection-${sourceFolderId}`)}/assets`,
+						decodeResolvedAssets,
+						{
+							method: "POST",
+							headers: { "content-type": "application/json" },
+							body: JSON.stringify({ assetIds }),
+						},
+					);
+					if (assets.length !== assetIds.length) throw internalError();
+					for (let index = 0; index < assetIds.length; index += 1) {
+						const id = assetIds[index];
+						const asset = assets[index];
+						if (id === undefined || asset === undefined) throw internalError();
+						if (asset !== null && asset.id !== id) throw internalError();
+						resolved.set(id, asset);
+					}
+				}
+			}
+			if (pickStore !== store) return clonePicks(picks);
+			const latest = store.read();
+			return publishPicks({
+				...latest,
+				items: latest.items.map((reference) => ({
+					assetId: reference.assetId,
+					sourceFolderId: reference.sourceFolderId,
+					sourceLabel: reference.sourceLabel,
+					asset: resolved.get(reference.assetId) ?? null,
+				})),
+			});
+		},
+		async addPick(reference: PickReference) {
+			if (pickStore === null) return clonePicks(picks);
+			pickStore.add(reference);
+			return clonePicks(picks);
+		},
+		async removePick(assetId: string) {
+			if (pickStore === null) return clonePicks(picks);
+			pickStore.remove(assetId);
+			return clonePicks(picks);
+		},
+		async clearPicks() {
+			if (pickStore === null) return clonePicks(picks);
+			pickStore.clear();
+			return clonePicks(picks);
+		},
+		async restorePicks(cleared: readonly PickReference[]) {
+			if (pickStore === null) return clonePicks(picks);
+			pickStore.restore(cleared);
+			return clonePicks(picks);
+		},
+		async requestPickDerivatives(request: DerivativeRequest) {
+			const byId = new Map(
+				picks.items.map((item) => [item.assetId, item.sourceFolderId]),
+			);
+			const groups = new Map<string, string[]>();
+			for (const assetId of request.assetIds) {
+				const sourceFolderId = byId.get(assetId);
+				if (sourceFolderId === undefined)
+					throw new PhotoServiceError(
+						"assetNotFound",
+						"That photo is no longer available.",
+					);
+				const ids = groups.get(sourceFolderId) ?? [];
+				ids.push(assetId);
+				groups.set(sourceFolderId, ids);
+			}
+			for (const [sourceFolderId, ids] of groups) {
+				for (let offset = 0; offset < ids.length; offset += 250) {
+					await requestNoContent(
+						`/api/v1/selections/${encodeURIComponent(`selection-${sourceFolderId}`)}/derivatives`,
+						{
+							scope: "includeSubfolders",
+							request: {
+								...request,
+								assetIds: ids.slice(offset, offset + 250),
+							},
+						},
+					);
+				}
+			}
+		},
+		originalDownloadUrl: () => null,
 		getSavedFolders: savedSnapshot,
 		watchSavedFolders: (listener) => {
 			folderListeners.add(listener);
@@ -918,6 +1042,7 @@ export function createHttpPhotoService(
 			chooseFolder: true,
 			folderSelection: "hosted",
 			locateFolder: false,
+			originalAction: "none",
 		},
 		async getBootstrapState() {
 			const bootstrapIntent = selectionIntent.begin();
@@ -933,6 +1058,13 @@ export function createHttpPhotoService(
 						options.sessionStorage ?? globalThis.sessionStorage,
 						rootId,
 					);
+					unsubscribePickStore?.();
+					pickStore = createBrowserPicks(
+						options.localStorage ?? globalThis.localStorage,
+						rootId,
+					);
+					publishPicks(pickStore.read());
+					unsubscribePickStore = pickStore.subscribe(publishPicks);
 					for (const key of Object.keys(access)) delete access[key];
 					deadlines.clear();
 				}
@@ -1160,6 +1292,9 @@ export function createHttpPhotoService(
 			disposed = true;
 			selectionIntent.invalidate();
 			globalThis.removeEventListener?.("storage", storageChanged);
+			unsubscribePickStore?.();
+			unsubscribePickStore = null;
+			pickListeners.clear();
 			folderListeners.clear();
 		},
 	};

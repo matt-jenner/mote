@@ -1,4 +1,5 @@
 import type { SavedFolderSnapshot } from "../folders/savedFolders";
+import type { PickListSnapshot, PickReference } from "../picks/pickList";
 
 export type Appearance = "system" | "light" | "dark";
 export type GalleryScope = "currentFolder" | "includeSubfolders";
@@ -57,6 +58,7 @@ export interface PhotoServiceCapabilities {
 	chooseFolder: boolean;
 	folderSelection: "native" | "hosted";
 	locateFolder: boolean;
+	originalAction: "copy" | "download" | "none";
 }
 
 export type SortDirection = "oldestFirst" | "newestFirst";
@@ -191,6 +193,15 @@ export type WallUpdate = WallUpdateBase | ResyncRequiredUpdate;
 
 export interface PhotoService {
 	readonly capabilities: PhotoServiceCapabilities;
+	getPicks(): PickListSnapshot;
+	watchPicks(listener: (snapshot: PickListSnapshot) => void): () => void;
+	loadPicks(): Promise<PickListSnapshot>;
+	addPick(reference: PickReference): Promise<PickListSnapshot>;
+	removePick(assetId: string): Promise<PickListSnapshot>;
+	clearPicks(): Promise<PickListSnapshot>;
+	restorePicks(cleared: readonly PickReference[]): Promise<PickListSnapshot>;
+	requestPickDerivatives(request: DerivativeRequest): Promise<void>;
+	originalDownloadUrl(assetId: string): string | null;
 	getSavedFolders(): SavedFolderSnapshot;
 	watchSavedFolders(
 		listener: (snapshot: SavedFolderSnapshot) => void,

@@ -82,6 +82,7 @@ describe("Tauri PhotoService", () => {
 			chooseFolder: true,
 			folderSelection: "native",
 			locateFolder: false,
+			originalAction: "copy",
 		});
 		expect(service.folderBrowserState()).toEqual({
 			breadcrumbs: [],
@@ -140,6 +141,103 @@ describe("Tauri PhotoService", () => {
 			["update_appearance", { appearance: "dark" }],
 			["update_gallery_scope", { scope: "currentFolder" }],
 		]);
+	});
+
+	it("maps pick snapshots, mutations, and derivative requests to native commands", async () => {
+		const nativeSnapshots = [
+			{
+				revision: 4,
+				items: [
+					{
+						assetId: "asset-a",
+						sourceFolderId: "folder-a",
+						sourceLabel: "Family",
+						asset: null,
+					},
+				],
+			},
+			{ revision: 5, items: [] },
+			{ revision: 6, items: [] },
+			{ revision: 7, items: [] },
+			{ revision: 8, items: [] },
+			{ revision: 9, items: [] },
+		];
+		const calls: Array<[string, Record<string, unknown> | undefined]> = [];
+		const invoke: InvokeCommand = async <T>(
+			command: string,
+			args?: Record<string, unknown>,
+		) => {
+			calls.push([command, args]);
+			if (command === "request_pick_derivatives") return undefined as T;
+			return nativeSnapshots.shift() as T;
+		};
+		const service = createTauriPhotoService(invoke);
+		const revisions: number[] = [];
+		const stop = service.watchPicks((snapshot) => {
+			revisions.push(snapshot.revision);
+		});
+
+		await expect(service.loadPicks()).resolves.toMatchObject({
+			revision: 4,
+			persistenceError: null,
+		});
+		await service.addPick({
+			assetId: "asset-b",
+			sourceFolderId: "folder-b",
+			sourceLabel: "Trips",
+		});
+		await service.removePick("asset-a");
+		await service.clearPicks();
+		await service.restorePicks([
+			{
+				assetId: "asset-a",
+				sourceFolderId: "folder-a",
+				sourceLabel: "Family",
+			},
+		]);
+		await service.loadPicks();
+		await service.requestPickDerivatives({
+			assetIds: ["asset-a", "asset-b"],
+			priority: "visible",
+			kind: "screenPreview",
+		});
+		stop();
+
+		expect(service.getPicks()).toMatchObject({
+			revision: 9,
+			persistenceError: null,
+		});
+		expect(revisions).toEqual([4, 5, 6, 7, 8, 9]);
+		expect(calls).toEqual([
+			["list_photo_picks", undefined],
+			["add_photo_pick", { assetId: "asset-b", sourceFolderId: "folder-b" }],
+			["remove_photo_pick", { assetId: "asset-a" }],
+			["clear_photo_picks", undefined],
+			[
+				"restore_photo_picks",
+				{
+					references: [
+						{
+							assetId: "asset-a",
+							sourceFolderId: "folder-a",
+							sourceLabel: "Family",
+						},
+					],
+				},
+			],
+			["list_photo_picks", undefined],
+			[
+				"request_pick_derivatives",
+				{
+					request: {
+						assetIds: ["asset-a", "asset-b"],
+						priority: "visible",
+						kind: "screenPreview",
+					},
+				},
+			],
+		]);
+		expect(service.originalDownloadUrl("asset-a")).toBeNull();
 	});
 
 	it("converts a known native command failure to PhotoServiceError", async () => {

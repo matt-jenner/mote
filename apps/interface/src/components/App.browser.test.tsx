@@ -82,6 +82,7 @@ function hostedFolderService(): PhotoService {
 			chooseFolder: true,
 			folderSelection: "hosted",
 			locateFolder: false,
+			originalAction: "none",
 		},
 		chooseFolder: async () => {
 			throw new Error("Hosted mode must not open the native picker");
@@ -161,6 +162,7 @@ function hostedGalleryService(): {
 			chooseFolder: true,
 			folderSelection: "hosted",
 			locateFolder: false,
+			originalAction: "none",
 		},
 		getBootstrapState: async () => structuredClone(state),
 		chooseFolder: async () => {
