@@ -7,7 +7,9 @@ import {
 	useLayoutEffect,
 	useRef,
 } from "react";
+import { usePhotoService } from "../app/PhotoServiceContext";
 import { usePickList } from "../picks/PickListContext";
+import type { PickCopyState } from "../picks/usePickList";
 import styles from "../styles/picksPanel.module.css";
 import { PickRow } from "./PickRow";
 
@@ -34,17 +36,25 @@ export function PicksTrigger({
 	onClick,
 	className,
 	triggerRef,
+	copy,
 }: {
 	count: number;
 	expanded: boolean;
 	onClick: () => void;
 	className?: string;
 	triggerRef?: Ref<HTMLButtonElement>;
+	copy?: PickCopyState;
 }) {
+	const progress =
+		copy?.phase === "copying"
+			? `Copying ${copy.completed} / ${copy.total}`
+			: copy?.phase === "choosing"
+				? "Choosing destination…"
+				: "";
 	return (
 		<button
 			aria-expanded={expanded}
-			aria-label={`Picks, ${pickCountLabel(count)}`}
+			aria-label={`Picks, ${pickCountLabel(count)}${progress ? `, ${progress}` : ""}`}
 			className={className}
 			onClick={(event) => {
 				onClick();
@@ -56,6 +66,7 @@ export function PicksTrigger({
 			<Bookmark aria-hidden="true" size={18} strokeWidth={1.8} />
 			<span>Picks</span>
 			<span className={styles.triggerCount}>{count}</span>
+			{progress ? <span>{progress}</span> : null}
 		</button>
 	);
 }
@@ -74,6 +85,7 @@ export function PicksToolbarButton({
 		<PicksTrigger
 			className={className}
 			count={picks.count}
+			copy={picks.copy}
 			expanded={expanded}
 			onClick={onClick}
 		/>
@@ -91,6 +103,7 @@ export function PicksPanel({
 	reviewOpen = false,
 }: PicksPanelProps) {
 	const picks = usePickList();
+	const service = usePhotoService();
 	const dialogRef = useRef<HTMLElement>(null);
 	const closeRef = useRef<HTMLButtonElement>(null);
 	const mobileTriggerRef = useRef<HTMLButtonElement>(null);
@@ -100,6 +113,17 @@ export function PicksPanel({
 	const isMobile = mode === "mobile";
 	const items = picks.snapshot.items;
 	const hasItems = items.length > 0;
+	const copying =
+		picks.copy.phase === "choosing" || picks.copy.phase === "copying";
+	const showCopyActions = hasItems || picks.copy.phase !== "idle";
+	const copyLabel =
+		picks.copy.phase === "choosing"
+			? "Choosing destination…"
+			: picks.copy.phase === "copying"
+				? `Copying ${picks.copy.completed} / ${picks.copy.total}`
+				: picks.copy.phase === "partial"
+					? `Retry ${picks.copy.failedAssetIds.length} originals…`
+					: `Copy ${picks.count} ${picks.count === 1 ? "original" : "originals"}…`;
 	const firstReviewableItem = items.find((item) => item.asset !== null);
 
 	useEffect(() => {
@@ -227,7 +251,7 @@ export function PicksPanel({
 					<X aria-hidden="true" size={22} strokeWidth={1.8} />
 				</button>
 			</div>
-			{hasItems ? (
+			{showCopyActions ? (
 				<>
 					<ul className={styles.pickList}>
 						{items.map((item) => (
@@ -240,45 +264,87 @@ export function PicksPanel({
 										: void picks.remove(assetId).catch(() => {})
 								}
 								action={
-									item.asset && onOpenPick ? (
-										<button
-											aria-label={`Review ${item.asset.displayName}`}
-											onClick={(event) =>
-												onOpenPick(item.assetId, event.currentTarget)
-											}
-											type="button"
-										>
-											Review
-										</button>
-									) : undefined
+									<div>
+										{picks.copy.failedAssetIds.includes(item.assetId) ? (
+											<span className={styles.sourceWarning}>Copy failed</span>
+										) : null}
+										{item.asset && onOpenPick ? (
+											<button
+												aria-label={`Review ${item.asset.displayName}`}
+												onClick={(event) =>
+													onOpenPick(item.assetId, event.currentTarget)
+												}
+												type="button"
+											>
+												Review
+											</button>
+										) : null}
+									</div>
 								}
 							/>
 						))}
 					</ul>
+					{!hasItems ? (
+						<p className={styles.emptyState}>
+							Add photos to picks as you browse.
+						</p>
+					) : null}
 					<div className={styles.actions} data-testid="picks-actions">
-						<button
-							className={styles.reviewButton}
-							disabled={!onReview || !firstReviewableItem}
-							onClick={(event) => {
-								if (!firstReviewableItem || !onReview) return;
-								onReview(firstReviewableItem.assetId, event.currentTarget);
-							}}
-							type="button"
-						>
-							Review picks
-						</button>
-						<button className={styles.copyButton} disabled type="button">
-							<Copy aria-hidden="true" size={18} strokeWidth={1.8} />
-							Copy {picks.count} {picks.count === 1 ? "original" : "originals"}…
-						</button>
-						<button
-							className={styles.clearButton}
-							onClick={() => void picks.clear().catch(() => {})}
-							type="button"
-						>
-							<Trash2 aria-hidden="true" size={18} strokeWidth={1.8} />
-							Clear picks
-						</button>
+						{picks.copy.phase === "copying" ? (
+							<progress
+								aria-label="Copy originals"
+								value={picks.copy.completed}
+								max={picks.copy.total}
+							/>
+						) : null}
+						{!copying && picks.copy.message ? (
+							<p>{picks.copy.message}</p>
+						) : null}
+						{hasItems ? (
+							<button
+								className={styles.reviewButton}
+								disabled={!onReview || !firstReviewableItem}
+								onClick={(event) => {
+									if (!firstReviewableItem || !onReview) return;
+									onReview(firstReviewableItem.assetId, event.currentTarget);
+								}}
+								type="button"
+							>
+								Review picks
+							</button>
+						) : null}
+						{hasItems || copying || picks.copy.phase === "partial" ? (
+							<button
+								className={styles.copyButton}
+								disabled={
+									copying || service.capabilities.originalAction !== "copy"
+								}
+								onClick={() => void picks.copyOriginals()}
+								type="button"
+							>
+								<Copy aria-hidden="true" size={18} strokeWidth={1.8} />
+								{copyLabel}
+							</button>
+						) : null}
+						{picks.copy.copiedCount > 0 && !copying ? (
+							<button
+								type="button"
+								className={styles.reviewButton}
+								onClick={() => void picks.showCopyFolder()}
+							>
+								Show folder
+							</button>
+						) : null}
+						{hasItems ? (
+							<button
+								className={styles.clearButton}
+								onClick={() => void picks.clear().catch(() => {})}
+								type="button"
+							>
+								<Trash2 aria-hidden="true" size={18} strokeWidth={1.8} />
+								Clear picks
+							</button>
+						) : null}
 					</div>
 				</>
 			) : (
@@ -306,6 +372,7 @@ export function PicksPanel({
 			<PicksTrigger
 				className={styles.mobileBar}
 				count={picks.count}
+				copy={picks.copy}
 				expanded={open}
 				onClick={open ? onClose : openMobileSheet}
 				triggerRef={mobileTriggerRef}

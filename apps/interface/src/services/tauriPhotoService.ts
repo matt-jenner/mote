@@ -14,6 +14,8 @@ import {
 	type Appearance,
 	type BootstrapState,
 	type ChooseFolderResult,
+	type CopyProgress,
+	type CopyResult,
 	type DerivativeReference,
 	type DerivativeRequest,
 	type GalleryScope,
@@ -27,6 +29,10 @@ import {
 const internalErrorMessage = "Mote could not complete that request.";
 
 const nativeErrorMessages: Readonly<Record<string, string>> = {
+	copyInProgress: "An original copy is already in progress.",
+	copyDestinationIsSource: "Choose a destination outside your source folders.",
+	copyDestinationUnavailable: "The copy destination is unavailable.",
+	copyPreparationFailed: "Mote could not prepare these originals.",
 	folderUnavailable: "The selected folder is unavailable.",
 	folderNotDirectory: "Choose a folder, not a file.",
 	folderOverlapsSource: "That folder overlaps an existing source.",
@@ -80,6 +86,9 @@ const fromNativePicks = (
 export function createTauriPhotoService(
 	invokeCommand: InvokeCommand = invoke,
 	channelFactory: ChannelFactory = (listener) => new Channel(listener),
+	copyChannelFactory: (
+		listener: (progress: CopyProgress) => void,
+	) => ServiceChannel<CopyProgress> = (listener) => new Channel(listener),
 ): PhotoService {
 	let sortDirection: SortDirection = "oldestFirst";
 
@@ -224,6 +233,27 @@ export function createTauriPhotoService(
 		restorePicks,
 		requestPickDerivatives,
 		originalDownloadUrl: () => null,
+		async copyPickedOriginals(assetIds, listener) {
+			const channel = copyChannelFactory(listener);
+			try {
+				return await invokePhotoCommand<CopyResult>(
+					invokeCommand,
+					"copy_picked_originals",
+					{
+						assetIds: assetIds === null ? null : [...assetIds],
+						onEvent: channel,
+					},
+				);
+			} finally {
+				channel.onmessage = () => {};
+			}
+		},
+		showLastCopyDestination: () =>
+			invokePhotoCommand<void>(
+				invokeCommand,
+				"show_last_copy_destination",
+				undefined,
+			),
 		getSavedFolders: () => cloneSavedFolders(saved),
 		watchSavedFolders: (listener) => {
 			listeners.add(listener);

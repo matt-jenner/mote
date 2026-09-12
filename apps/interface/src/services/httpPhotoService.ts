@@ -926,6 +926,18 @@ export function createHttpPhotoService(
 			}
 		},
 		originalDownloadUrl: () => null,
+		async copyPickedOriginals() {
+			throw new PhotoServiceError(
+				"unsupportedCapability",
+				"Copying originals is available in the desktop app.",
+			);
+		},
+		async showLastCopyDestination() {
+			throw new PhotoServiceError(
+				"unsupportedCapability",
+				"Opening the copy destination is available in the desktop app.",
+			);
+		},
 		getSavedFolders: savedSnapshot,
 		watchSavedFolders: (listener) => {
 			folderListeners.add(listener);

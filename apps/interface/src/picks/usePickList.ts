@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import type {
+	CopyProgress,
 	DerivativeClass,
 	DerivativePriority,
 	PhotoService,
 	WallAsset,
 } from "../services/photoService";
+import { PhotoServiceError } from "../services/photoService";
 import type { PickItem, PickListSnapshot, PickReference } from "./pickList";
 
 export interface PickOrigin {
@@ -24,6 +26,9 @@ export interface PickToastState {
 }
 
 export interface PickListController {
+	copy: PickCopyState;
+	copyOriginals(): Promise<void>;
+	showCopyFolder(): Promise<void>;
 	snapshot: PickListSnapshot;
 	count: number;
 	isPicked(assetId: string): boolean;
@@ -40,6 +45,15 @@ export interface PickListController {
 	announcementId: number;
 	toast: PickToastState | null;
 	dismissToast(): void;
+}
+
+export interface PickCopyState {
+	phase: "idle" | "choosing" | "copying" | "complete" | "partial";
+	completed: number;
+	total: number;
+	copiedCount: number;
+	failedAssetIds: readonly string[];
+	message: string;
 }
 
 type OptimisticOperation =
@@ -116,6 +130,14 @@ function applyOperations(
 }
 
 class PickListStoreImplementation implements PickListStore {
+	private copy: PickCopyState = {
+		phase: "idle",
+		completed: 0,
+		total: 0,
+		copiedCount: 0,
+		failedAssetIds: [],
+		message: "",
+	};
 	private authoritative: PickListSnapshot;
 	private operations: OptimisticOperation[] = [];
 	private readonly listeners = new Set<() => void>();
@@ -188,6 +210,9 @@ class PickListStoreImplementation implements PickListStore {
 	private buildState(): PickListController {
 		const snapshot = applyOperations(this.authoritative, this.operations);
 		return {
+			copy: this.copy,
+			copyOriginals: this.copyOriginals,
+			showCopyFolder: this.showCopyFolder,
 			snapshot,
 			count: snapshot.items.length,
 			isPicked: this.isPicked,
@@ -207,6 +232,88 @@ class PickListStoreImplementation implements PickListStore {
 		this.state = this.buildState();
 		for (const listener of this.listeners) listener();
 	}
+
+	private copyOriginals = async (): Promise<void> => {
+		if (this.copy.phase === "choosing" || this.copy.phase === "copying") return;
+		const previous = this.copy;
+		const assetIds =
+			previous.phase === "partial"
+				? [...previous.failedAssetIds]
+				: this.state.snapshot.items.map((item) => item.assetId);
+		if (assetIds.length === 0) return;
+		this.copy = {
+			...previous,
+			phase: "choosing",
+			total: assetIds.length,
+			completed: 0,
+		};
+		this.publish();
+		try {
+			const result = await this.service.copyPickedOriginals(
+				assetIds,
+				(progress: CopyProgress) => {
+					this.copy = {
+						...this.copy,
+						phase: "copying",
+						completed: progress.completed,
+						total: progress.total,
+					};
+					this.publish();
+				},
+			);
+			if (result.kind === "cancelled") {
+				this.copy = previous;
+				this.publish();
+				return;
+			}
+			const total = result.items.length;
+			const message =
+				result.failedCount > 0
+					? `Copied ${result.copiedCount} of ${total}`
+					: `Copied ${result.copiedCount} originals`;
+			this.copy = {
+				phase: result.failedCount > 0 ? "partial" : "complete",
+				total,
+				completed: total,
+				copiedCount: result.copiedCount,
+				failedAssetIds: result.items
+					.filter((item) => item.status === "failed")
+					.map((item) => item.assetId),
+				message,
+			};
+			this.announcement = message;
+			this.announcementId += 1;
+			this.toast = {
+				id: ++this.toastId,
+				message,
+				...(result.copiedCount > 0
+					? { action: { label: "Show folder", run: this.showCopyFolder } }
+					: {}),
+			};
+			this.scheduleToastDismissal(confirmationDurationMs);
+			this.publish();
+		} catch (error) {
+			this.copy = previous;
+			this.publishMessage(
+				error instanceof PhotoServiceError
+					? error.message
+					: "Couldn't copy originals",
+			);
+		}
+	};
+
+	private showCopyFolder = async (): Promise<void> => {
+		if (this.copy.copiedCount === 0) return;
+		try {
+			await this.service.showLastCopyDestination();
+		} catch (error) {
+			this.publishMessage(
+				error instanceof PhotoServiceError
+					? error.message
+					: "Couldn't open the copy destination",
+			);
+		}
+	};
 
 	private rebuildState(notifyListeners: boolean): void {
 		if (notifyListeners) {

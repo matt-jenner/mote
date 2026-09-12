@@ -54,6 +54,20 @@ pub struct OriginalCopyResult {
 }
 
 impl AppService {
+    /// Native-only preference. Callers must check that the directory still exists.
+    pub fn last_copy_destination(&self) -> Result<Option<PathBuf>, AppServiceError> {
+        self.state()?
+            .libraries
+            .catalog()
+            .last_copy_destination()
+            .map_err(|_| AppServiceError::CopyPreparationFailed)?
+            .map(|path| {
+                path.to_path_buf()
+                    .map_err(|_| AppServiceError::CopyPreparationFailed)
+            })
+            .transpose()
+    }
+
     pub fn prepare_original_copy(
         &self,
         asset_ids: &[String],

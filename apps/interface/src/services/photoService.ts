@@ -54,6 +54,29 @@ export type ChooseFolderResult =
 	| { kind: "cancelled" }
 	| { kind: "selected"; state: BootstrapState };
 
+export interface CopyItemResult {
+	assetId: string;
+	status: "copied" | "failed";
+	destinationName: string | null;
+	errorCode: string | null;
+}
+
+export interface CopyProgress {
+	completed: number;
+	total: number;
+	item: CopyItemResult | null;
+}
+
+export type CopyResult =
+	| { kind: "cancelled" }
+	| {
+			kind: "complete";
+			items: CopyItemResult[];
+			copiedCount: number;
+			failedCount: number;
+			warningCode: string | null;
+	  };
+
 export interface PhotoServiceCapabilities {
 	chooseFolder: boolean;
 	folderSelection: "native" | "hosted";
@@ -202,6 +225,11 @@ export interface PhotoService {
 	restorePicks(cleared: readonly PickReference[]): Promise<PickListSnapshot>;
 	requestPickDerivatives(request: DerivativeRequest): Promise<void>;
 	originalDownloadUrl(assetId: string): string | null;
+	copyPickedOriginals(
+		assetIds: readonly string[] | null,
+		listener: (progress: CopyProgress) => void,
+	): Promise<CopyResult>;
+	showLastCopyDestination(): Promise<void>;
 	getSavedFolders(): SavedFolderSnapshot;
 	watchSavedFolders(
 		listener: (snapshot: SavedFolderSnapshot) => void,

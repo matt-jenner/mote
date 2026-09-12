@@ -8,7 +8,12 @@ import {
 	createInMemoryPhotoService,
 	type InMemoryPhotoService,
 } from "../services/inMemoryPhotoService";
-import type { PhotoService, WallAsset } from "../services/photoService";
+import type {
+	CopyProgress,
+	CopyResult,
+	PhotoService,
+	WallAsset,
+} from "../services/photoService";
 import "../styles/global.css";
 import "../styles/tokens.css";
 import { AppShell } from "./AppShell";
@@ -78,7 +83,12 @@ const previewWarning: WallAsset = {
 };
 
 async function renderPicksApp(
-	options: { previewWarning?: boolean; longWall?: boolean } = {},
+	options: {
+		previewWarning?: boolean;
+		longWall?: boolean;
+		copy?: PhotoService["copyPickedOriginals"];
+		showFolder?: () => Promise<void>;
+	} = {},
 ): Promise<{
 	screen: Awaited<ReturnType<typeof render>>;
 	service: InMemoryPhotoService;
@@ -116,6 +126,11 @@ async function renderPicksApp(
 		sourceFolderId: "Archive",
 		sourceLabel: "Mountain archive",
 	});
+	if (options.copy) {
+		service.capabilities.originalAction = "copy";
+		service.copyPickedOriginals = options.copy;
+		service.showLastCopyDestination = options.showFolder ?? (async () => {});
+	}
 	const queryClient = new QueryClient({
 		defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
 	});
@@ -182,6 +197,171 @@ async function renderControllablePicksApp(initial: PickListSnapshot): Promise<{
 }
 
 describe("responsive Picks panel", () => {
+	it("keeps native copy progress in the trigger after closing and clearing picks", async () => {
+		let progress!: (event: CopyProgress) => void;
+		let finish!: (result: CopyResult) => void;
+		const batches: Array<readonly string[] | null> = [];
+		const { screen, service } = await renderPicksApp({
+			copy: (ids, listener) => {
+				batches.push(ids);
+				progress = listener;
+				return new Promise((resolve) => {
+					finish = resolve;
+				});
+			},
+		});
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+		await panel.getByRole("button", { name: "Copy 2 originals…" }).click();
+		await expect
+			.element(panel.getByRole("button", { name: "Choosing destination…" }))
+			.toBeDisabled();
+		expect(batches).toEqual([["coast", "offline"]]);
+		progress({ completed: 0, total: 2, item: null });
+		await expect
+			.element(panel.getByRole("progressbar", { name: "Copy originals" }))
+			.toHaveAttribute("value", "0");
+		await panel.getByRole("button", { name: "Remove DSC_8421.jpg" }).click();
+		await panel.getByRole("button", { name: "Clear picks" }).click();
+		await expect
+			.element(panel.getByRole("progressbar", { name: "Copy originals" }))
+			.toHaveAttribute("max", "2");
+		await panel.getByRole("button", { name: "Close picks" }).click();
+		progress({
+			completed: 1,
+			total: 2,
+			item: {
+				assetId: "coast",
+				status: "copied",
+				destinationName: "one.jpg",
+				errorCode: null,
+			},
+		});
+		await expect
+			.element(
+				screen.getByRole("button", { name: /Picks, 0 picks, Copying 1 \/ 2/ }),
+			)
+			.toBeVisible();
+		expect(service.getPicks().items).toEqual([]);
+		expect(batches).toEqual([["coast", "offline"]]);
+		finish({
+			kind: "complete",
+			copiedCount: 2,
+			failedCount: 0,
+			warningCode: null,
+			items: [
+				{
+					assetId: "coast",
+					status: "copied",
+					destinationName: "one.jpg",
+					errorCode: null,
+				},
+				{
+					assetId: "offline",
+					status: "copied",
+					destinationName: "two.jpg",
+					errorCode: null,
+				},
+			],
+		});
+		await expect
+			.poll(() => document.querySelector("[data-toast-id]")?.textContent)
+			.toContain("Copied 2 originals");
+		await expect
+			.poll(() =>
+				[...document.querySelectorAll("[aria-live='polite']")]
+					.map((region) => region.textContent)
+					.join(" "),
+			)
+			.toContain("Copied 2 originals");
+	});
+
+	it("marks failed rows and retries only failed originals through a new picker attempt", async () => {
+		const batches: Array<readonly string[] | null> = [];
+		let shown = 0;
+		const { screen, service } = await renderPicksApp({
+			copy: async (ids) => {
+				batches.push(ids);
+				return batches.length === 1
+					? {
+							kind: "complete",
+							copiedCount: 1,
+							failedCount: 1,
+							warningCode: null,
+							items: [
+								{
+									assetId: "coast",
+									status: "copied",
+									destinationName: "one.jpg",
+									errorCode: null,
+								},
+								{
+									assetId: "offline",
+									status: "failed",
+									destinationName: null,
+									errorCode: "source_unavailable",
+								},
+							],
+						}
+					: { kind: "cancelled" };
+			},
+			showFolder: async () => {
+				shown += 1;
+			},
+		});
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+		expect(
+			panel.getByRole("button", { name: "Show folder" }).query(),
+		).toBeNull();
+		await panel.getByRole("button", { name: "Copy 2 originals…" }).click();
+		await expect.element(panel.getByText("Copy failed")).toBeVisible();
+		await expect
+			.poll(() => document.querySelector("[data-toast-id]")?.textContent)
+			.toContain("Copied 1 of 2");
+		await panel.getByRole("button", { name: "Show folder" }).click();
+		expect(shown).toBe(1);
+		await panel.getByRole("button", { name: "Retry 1 originals…" }).click();
+		await expect
+			.element(panel.getByRole("button", { name: "Retry 1 originals…" }))
+			.toBeEnabled();
+		expect(batches).toEqual([["coast", "offline"], ["offline"]]);
+		expect(service.getPicks().items).toHaveLength(2);
+	});
+
+	it("returns cancelled copies to idle and offers no folder for all-failed copies", async () => {
+		let attempt = 0;
+		const { screen } = await renderPicksApp({
+			copy: async () =>
+				++attempt === 1
+					? { kind: "cancelled" }
+					: {
+							kind: "complete",
+							copiedCount: 0,
+							failedCount: 2,
+							warningCode: null,
+							items: ["coast", "offline"].map((assetId) => ({
+								assetId,
+								status: "failed" as const,
+								destinationName: null,
+								errorCode: "copy_failed",
+							})),
+						},
+		});
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+		await panel.getByRole("button", { name: "Copy 2 originals…" }).click();
+		await expect
+			.element(panel.getByRole("button", { name: "Copy 2 originals…" }))
+			.toBeEnabled();
+		await panel.getByRole("button", { name: "Copy 2 originals…" }).click();
+		await expect
+			.element(panel.getByRole("button", { name: "Retry 2 originals…" }))
+			.toBeVisible();
+		expect(
+			panel.getByRole("button", { name: "Show folder" }).query(),
+		).toBeNull();
+	});
 	beforeEach(async () => {
 		await page.viewport(1440, 1024);
 	});

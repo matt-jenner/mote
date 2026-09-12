@@ -149,6 +149,12 @@ class ControlledWallService implements PhotoService {
 	restorePicks = async () => this.getPicks();
 	requestPickDerivatives = async () => {};
 	originalDownloadUrl = () => null;
+	copyPickedOriginals: PhotoService["copyPickedOriginals"] = async () => {
+		throw new Error("Copying is not supported by this wall fixture");
+	};
+	showLastCopyDestination = async () => {
+		throw new Error("No copy destination in this wall fixture");
+	};
 	getSavedFolders = () => this.sourceState.savedFolders;
 	watchSavedFolders = () => () => {};
 	renameSavedFolder = async () => this.sourceState;

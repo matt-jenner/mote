@@ -63,6 +63,8 @@ impl WallSubscriptionRegistry {
 pub struct DesktopState {
     pub service: AppService,
     pub wall_subscriptions: WallSubscriptionRegistry,
+    pub copy_operation: Arc<tokio::sync::Mutex<()>>,
+    pub last_completed_copy_destination: Arc<Mutex<Option<std::path::PathBuf>>>,
 }
 
 #[cfg(test)]

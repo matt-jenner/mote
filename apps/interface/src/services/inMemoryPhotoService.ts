@@ -213,6 +213,18 @@ export function createInMemoryPhotoService(
 			await service.requestDerivatives(request);
 		},
 		originalDownloadUrl: () => null,
+		async copyPickedOriginals() {
+			throw new PhotoServiceError(
+				"unsupportedCapability",
+				"Copying originals is available in the desktop app.",
+			);
+		},
+		async showLastCopyDestination() {
+			throw new PhotoServiceError(
+				"unsupportedCapability",
+				"Opening the copy destination is available in the desktop app.",
+			);
+		},
 		getSavedFolders: () => cloneSavedFolders(state.savedFolders),
 		watchSavedFolders(listener) {
 			savedListeners.add(listener);

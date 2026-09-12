@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
+import { createPickListStore } from "../picks/usePickList";
+import { createInMemoryPhotoService } from "./inMemoryPhotoService";
 import {
+	type CopyProgress,
+	type CopyResult,
 	type DerivativeRequest,
 	PhotoServiceError,
 	type WallUpdate,
@@ -79,6 +83,176 @@ const recordingInvoke =
 	};
 
 describe("Tauri PhotoService", () => {
+	it("owns one pending copy globally and preserves partial state when retry is cancelled", async () => {
+		const memory = createInMemoryPhotoService();
+		let release!: (result: CopyResult) => void;
+		let progress!: (event: CopyProgress) => void;
+		const ids: Array<readonly string[] | null> = [];
+		const store = createPickListStore({
+			...memory,
+			getPicks: () => ({
+				revision: 0,
+				persistenceError: null,
+				items: ["one", "two"].map((assetId) => ({
+					assetId,
+					sourceFolderId: "folder",
+					sourceLabel: "Folder",
+					asset: null,
+				})),
+			}),
+			copyPickedOriginals: (batch, listener) => {
+				ids.push(batch);
+				progress = listener;
+				return new Promise((resolve) => {
+					release = resolve;
+				});
+			},
+		});
+		const operation = store.getState().copyOriginals();
+		void store.getState().copyOriginals();
+		expect(ids).toEqual([["one", "two"]]);
+		expect(store.getState().copy.phase).toBe("choosing");
+		progress({
+			completed: 1,
+			total: 2,
+			item: {
+				assetId: "one",
+				status: "copied",
+				destinationName: "one.jpg",
+				errorCode: null,
+			},
+		});
+		expect(store.getState().copy).toMatchObject({
+			phase: "copying",
+			completed: 1,
+			total: 2,
+		});
+		release({
+			kind: "complete",
+			copiedCount: 1,
+			failedCount: 1,
+			warningCode: null,
+			items: [
+				{
+					assetId: "one",
+					status: "copied",
+					destinationName: "one.jpg",
+					errorCode: null,
+				},
+				{
+					assetId: "two",
+					status: "failed",
+					destinationName: null,
+					errorCode: "source_unavailable",
+				},
+			],
+		});
+		await operation;
+		expect(store.getState().copy).toMatchObject({
+			phase: "partial",
+			failedAssetIds: ["two"],
+			copiedCount: 1,
+		});
+		expect(store.getState().announcement).toBe("Copied 1 of 2");
+		const retry = store.getState().copyOriginals();
+		expect(ids).toEqual([["one", "two"], ["two"]]);
+		release({ kind: "cancelled" });
+		await retry;
+		expect(store.getState().copy).toMatchObject({
+			phase: "partial",
+			failedAssetIds: ["two"],
+			copiedCount: 1,
+		});
+	});
+	it("copies a frozen ID list with ordered channel progress and opens the last destination", async () => {
+		const calls: Array<[string, Record<string, unknown> | undefined]> = [];
+		const received: CopyProgress[] = [];
+		const item = {
+			assetId: "one",
+			status: "copied" as const,
+			destinationName: "one.jpg",
+			errorCode: null,
+		};
+		const result = {
+			kind: "complete",
+			items: [item],
+			copiedCount: 1,
+			failedCount: 0,
+			warningCode: null,
+		};
+		const service = createTauriPhotoService(
+			async <T>(command: string, args?: Record<string, unknown>) => {
+				calls.push([command, args]);
+				if (command === "copy_picked_originals") {
+					const channel = args?.onEvent as FakeChannel<CopyProgress>;
+					channel.emit({ completed: 0, total: 1, item: null });
+					channel.emit({ completed: 1, total: 1, item });
+					return result as T;
+				}
+				return undefined as T;
+			},
+			undefined,
+			(listener) => new FakeChannel(listener),
+		);
+		const ids = ["one"];
+		const copying = service.copyPickedOriginals(ids, (event) =>
+			received.push(event),
+		);
+		ids.push("later-pick");
+		expect(await copying).toEqual(result);
+		expect(calls[0]?.[1]?.assetIds).toEqual(["one"]);
+		expect(received).toEqual([
+			{ completed: 0, total: 1, item: null },
+			{ completed: 1, total: 1, item },
+		]);
+		await service.showLastCopyDestination();
+		expect(calls[1]).toEqual(["show_last_copy_destination", undefined]);
+	});
+
+	it("preserves picker cancellation and bounds copy errors without leaking native paths", async () => {
+		const cancelled = createTauriPhotoService(
+			async <T>() => ({ kind: "cancelled" }) as T,
+			undefined,
+			(listener) => new FakeChannel(listener),
+		);
+		expect(await cancelled.copyPickedOriginals(null, () => {})).toEqual({
+			kind: "cancelled",
+		});
+		for (const [code, message] of [
+			["copyInProgress", "An original copy is already in progress."],
+			[
+				"copyDestinationIsSource",
+				"Choose a destination outside your source folders.",
+			],
+			["copyDestinationUnavailable", "The copy destination is unavailable."],
+			["copyPreparationFailed", "Mote could not prepare these originals."],
+		] as const) {
+			const service = createTauriPhotoService(
+				async () => {
+					throw { code, message };
+				},
+				undefined,
+				(listener) => new FakeChannel(listener),
+			);
+			await expect(
+				service.copyPickedOriginals(null, () => {}),
+			).rejects.toMatchObject({ code, message });
+		}
+		const unsafe = createTauriPhotoService(
+			async () => {
+				throw {
+					code: "copyDestinationUnavailable",
+					message: "/private/secret",
+				};
+			},
+			undefined,
+			(listener) => new FakeChannel(listener),
+		);
+		await expect(unsafe.showLastCopyDestination()).rejects.toMatchObject({
+			code: "internal",
+			message: "Mote could not complete that request.",
+		});
+	});
 	it("keeps native folder selection isolated from hosted browser methods", async () => {
 		const service = createTauriPhotoService(recordingInvoke([]));
 
