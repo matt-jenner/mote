@@ -24,9 +24,9 @@ import type {
 	WallUpdate,
 	WallWarningState,
 } from "../services/photoService";
+import { layoutJustifiedRows } from "../wall/layoutJustifiedRows";
 import { AppShell } from "./AppShell";
 import { PhotoTile } from "./PhotoTile";
-import { layoutJustifiedRows } from "../wall/layoutJustifiedRows";
 import "../styles/tokens.css";
 import "../styles/global.css";
 
@@ -712,6 +712,92 @@ describe("progressive photo wall", () => {
 			).toBe(false);
 		}
 		await screen.unmount();
+
+		service.setDerivativeUrl(
+			"square-pick-wall",
+			"/demo-photos/coast.jpg?square-pick-wall=1",
+		);
+		service.setDerivativeUrl(
+			"wide-late-pick-wall",
+			"/demo-photos/coast.jpg?wide-late-pick-wall=1",
+		);
+		const lateWarningRows = layoutJustifiedRows(
+			[
+				asset("square-pick", "Square.jpg", 1, {
+					width: 1,
+					height: 1,
+					wallThumbnail: {
+						assetId: "square-pick",
+						kind: "wallThumbnail",
+						key: "square-pick-wall",
+					},
+				}),
+				asset("wide-late-pick", "Wide.jpg", 2, {
+					width: 6,
+					height: 1,
+					wallThumbnail: {
+						assetId: "wide-late-pick",
+						kind: "wallThumbnail",
+						key: "wide-late-pick-wall",
+					},
+				}),
+			],
+			{
+				containerWidth: 320,
+				targetRowHeight: 150,
+				gap: 4,
+				layoutComplete: true,
+			},
+		);
+		expect(lateWarningRows).toHaveLength(2);
+		const lateWarningScreen = await render(
+			<div style={{ width: 320 }}>
+				{lateWarningRows.flatMap((row) =>
+					row.items.map((positioned) => (
+						<PhotoTile
+							key={positioned.asset.id}
+							onTogglePick={() => undefined}
+							positioned={positioned}
+							service={service}
+						/>
+					)),
+				)}
+			</div>,
+		);
+		const squareTile = document.querySelector<HTMLElement>(
+			'[data-asset-id="square-pick"]',
+		);
+		const squareImage = squareTile?.querySelector<HTMLImageElement>("img");
+		if (!squareTile || !squareImage)
+			throw new Error("square preview was not rendered");
+		squareImage.dispatchEvent(new Event("error"));
+		await expect
+			.poll(() =>
+				squareTile.querySelector<HTMLElement>(
+					'[aria-label="Photo preview unavailable"]',
+				),
+			)
+			.not.toBeNull();
+		const latePick = lateWarningScreen
+			.getByRole("button", { name: "Add Square.jpg to picks" })
+			.element()
+			.getBoundingClientRect();
+		const lateWarning = squareTile
+			.querySelector<HTMLElement>('[aria-label="Photo preview unavailable"]')
+			?.getBoundingClientRect();
+		if (!lateWarning) throw new Error("late preview warning was not rendered");
+		const lateTileBounds = squareTile.getBoundingClientRect();
+		for (const bounds of [latePick, lateWarning]) {
+			expect(bounds.top).toBeGreaterThanOrEqual(lateTileBounds.top);
+			expect(bounds.bottom).toBeLessThanOrEqual(lateTileBounds.bottom);
+		}
+		expect(
+			latePick.left < lateWarning.right &&
+				latePick.right > lateWarning.left &&
+				latePick.top < lateWarning.bottom &&
+				latePick.bottom > lateWarning.top,
+		).toBe(false);
+		await lateWarningScreen.unmount();
 	});
 
 	it("uses the restored direction for the first wall request and remembers changes", async () => {

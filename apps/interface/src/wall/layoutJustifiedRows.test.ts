@@ -157,13 +157,34 @@ describe("layoutJustifiedRows", () => {
 		});
 		expect(rows).toHaveLength(2);
 		for (const row of rows) {
-			expect(row.items.every((item) => item.width >= 44 && item.height >= 44)).toBe(
-				true,
-			);
+			expect(
+				row.items.every((item) => item.width >= 44 && item.height >= 44),
+			).toBe(true);
 			expect(row.width).toBeLessThanOrEqual(320);
 			const last = row.items.at(-1);
 			expect((last?.left ?? 0) + (last?.width ?? 0)).toBeLessThanOrEqual(320);
 			for (const item of row.items) {
+				expect(item.width / item.height).toBeCloseTo(
+					item.asset.width / item.asset.height,
+					10,
+				);
+			}
+		}
+	});
+
+	it("reserves inset pick and late warning geometry for every asset", () => {
+		const rows = layoutJustifiedRows(assets([1, 6]), {
+			containerWidth: 320,
+			targetRowHeight: 150,
+			gap: 4,
+			layoutComplete: true,
+		});
+
+		expect(rows).toHaveLength(2);
+		for (const row of rows) {
+			expect(row.width).toBeLessThanOrEqual(320);
+			for (const item of row.items) {
+				expect(item.height).toBeGreaterThanOrEqual(item.width < 82 ? 70 : 50);
 				expect(item.width / item.height).toBeCloseTo(
 					item.asset.width / item.asset.height,
 					10,

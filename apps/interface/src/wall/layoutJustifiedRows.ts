@@ -59,9 +59,6 @@ function assertAssetDimensions(asset: WallAsset): void {
 
 function minimumControlHeight(asset: WallAsset): number {
 	const aspectRatio = asset.width / asset.height;
-	if (!asset.warning) {
-		return Math.max(MINIMUM_TILE_WIDTH, MINIMUM_TILE_WIDTH / aspectRatio);
-	}
 	const inlineHeight = Math.max(
 		INLINE_CONTROLS_MINIMUM_HEIGHT,
 		INLINE_CONTROLS_MINIMUM_WIDTH / aspectRatio,
@@ -113,14 +110,13 @@ function makeRow(
 	options: JustifiedLayoutOptions,
 	justified: boolean,
 ): JustifiedRow {
-	const { aspectRatios, availableWidth, maximumHeight, minimumHeight } =
-		rowGeometry(assets, options);
+	const { aspectRatios, maximumHeight, minimumHeight } = rowGeometry(
+		assets,
+		options,
+	);
 	const rowHeight = justified
 		? maximumHeight
-		: Math.min(
-				maximumHeight,
-				Math.max(options.targetRowHeight, minimumHeight),
-			);
+		: Math.min(maximumHeight, Math.max(options.targetRowHeight, minimumHeight));
 	if (!Number.isFinite(rowHeight) || rowHeight <= 0) {
 		throw new Error("Wall tile geometry must be finite and positive");
 	}
