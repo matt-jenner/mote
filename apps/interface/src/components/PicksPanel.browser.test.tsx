@@ -32,7 +32,7 @@ async function wcagViolations() {
 		await axe.run(document, {
 			runOnly: {
 				type: "tag",
-				values: ["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"],
+				values: ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"],
 			},
 		})
 	).violations;
@@ -117,6 +117,7 @@ async function renderPicksApp(
 		copy?: PhotoService["copyPickedOriginals"];
 		showFolder?: () => Promise<void>;
 		originalAction?: "download" | "none";
+		duplicateFilenames?: boolean;
 	} = {},
 ): Promise<{
 	screen: Awaited<ReturnType<typeof render>>;
@@ -126,7 +127,13 @@ async function renderPicksApp(
 		selectedFolderName: "Family",
 		wallAssets: [
 			{ ...coast, wallThumbnailUrl: "/demo-photos/coast.jpg" },
-			{ ...unavailable, wallThumbnailUrl: "/demo-photos/coast.jpg" },
+			{
+				...unavailable,
+				displayName: options.duplicateFilenames
+					? coast.displayName
+					: unavailable.displayName,
+				wallThumbnailUrl: "/demo-photos/coast.jpg",
+			},
 			{ ...unpicked, wallThumbnailUrl: "/demo-photos/coast.jpg" },
 			...(options.longWall
 				? longWall.map((asset) => ({
@@ -961,6 +968,36 @@ describe("responsive Picks panel", () => {
 			.toBeNull();
 		await expect.poll(() => document.activeElement).toBe(review.element());
 		expect(wall.scrollTop).toBe(160);
+	});
+
+	it("returns mobile review focus to the same asset when filenames repeat", async () => {
+		await page.viewport(390, 844);
+		const { screen } = await renderPicksApp({ duplicateFilenames: true });
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		const sheet = screen.getByRole("dialog", { name: "Picks" });
+		const launchers = sheet
+			.element()
+			.querySelectorAll<HTMLButtonElement>(
+				'button[aria-label="Review DSC_8421.jpg"]',
+			);
+		expect(launchers).toHaveLength(2);
+		launchers[1]?.click();
+		const viewer = screen.getByRole("dialog", { name: "Photo viewer" });
+		await expect.element(viewer).toBeVisible();
+		await viewer.getByRole("button", { name: "Back to photos" }).click();
+		await expect
+			.poll(() => screen.getByRole("dialog", { name: "Photo viewer" }).query())
+			.toBeNull();
+		await expect
+			.poll(() => document.activeElement)
+			.toBe(
+				screen
+					.getByRole("dialog", { name: "Picks" })
+					.element()
+					.querySelectorAll<HTMLButtonElement>(
+						'button[aria-label="Review DSC_8421.jpg"]',
+					)[1],
+			);
 	});
 
 	it("moves to the next pick when removing the current reviewed pick", async () => {

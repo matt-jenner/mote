@@ -291,6 +291,7 @@ export function PicksPanel({
 											<button
 												aria-label={`Review ${item.asset.displayName}`}
 												className={styles.reviewButton}
+												data-pick-review-asset-id={item.assetId}
 												onClick={(event) =>
 													onOpenPick(item.assetId, event.currentTarget)
 												}

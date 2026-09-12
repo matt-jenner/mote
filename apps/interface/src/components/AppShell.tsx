@@ -63,7 +63,10 @@ function AppShellContents({
 	const closingAnchorRef = useRef(viewer.returnAnchor);
 	const closingFocusFallbackRef = useRef(false);
 	const closingReturnSurfaceRef = useRef(viewer.returnSurface);
-	const pickReviewFocusRef = useRef<HTMLElement | null>(null);
+	const pickReviewFocusRef = useRef<{
+		element: HTMLElement;
+		assetId: string | null;
+	} | null>(null);
 	const drawerRef = useRef<HTMLElement>(null);
 	const drawerTriggerRef = useRef<HTMLButtonElement>(null);
 	const drawerCloseRef = useRef<HTMLButtonElement>(null);
@@ -132,7 +135,10 @@ function AppShellContents({
 	const handleOpenPickReview = useCallback(
 		(assetId: string, launchTarget: HTMLElement) => {
 			if (!pickAssets.some((asset) => asset.id === assetId)) return;
-			pickReviewFocusRef.current = launchTarget;
+			pickReviewFocusRef.current = {
+				element: launchTarget,
+				assetId: launchTarget.dataset.pickReviewAssetId ?? null,
+			};
 			dispatchViewer({
 				type: "open",
 				assetId,
@@ -216,13 +222,13 @@ function AppShellContents({
 			setPicksOpen(true);
 			const focusTarget = pickReviewFocusRef.current;
 			window.requestAnimationFrame(() => {
-				if (focusTarget?.isConnected)
-					focusTarget.focus({ preventScroll: true });
+				if (focusTarget?.element.isConnected)
+					focusTarget.element.focus({ preventScroll: true });
 				else
 					document
 						.querySelector<HTMLElement>(
-							focusTarget?.getAttribute("aria-label")
-								? `button[aria-label="${CSS.escape(focusTarget.getAttribute("aria-label") ?? "")}"]`
+							focusTarget?.assetId
+								? `[data-pick-review-asset-id="${CSS.escape(focusTarget.assetId)}"]`
 								: "[data-picks-review]",
 						)
 						?.focus({ preventScroll: true });

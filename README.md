@@ -71,11 +71,11 @@ npm run --workspace @photo-viewer/interface build
 
 ## Keep and review Picks
 
-Use a photo's pick control, or press `P` in the viewer, to keep it in Picks.
-Picks collect photos across saved folders in the order you add them. Review
-picks opens that sequence; changing folders or removing a saved folder shortcut
-does not remove its picks. Unavailable photos stay listed with a warning, and
-cached previews remain viewable.
+Use a photo's pick control to keep it in Picks. Picks collect photos across
+saved folders in the order you add them. Review picks opens that sequence;
+changing folders or removing a saved folder shortcut does not remove its picks.
+Unavailable photos stay listed with a warning, and cached previews remain
+viewable.
 
 Desktop Picks live in the local catalogue and survive app restarts within the
 same profile. Hosted Picks live in this browser's local storage, separately for

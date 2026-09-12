@@ -554,6 +554,7 @@ export function createHttpPhotoService(
 	let folderStore: ReturnType<typeof createBrowserSavedFolders> | null = null;
 	let pickStore: BrowserPicks | null = null;
 	let unsubscribePickStore: (() => void) | null = null;
+	let pickHydrationGeneration = 0;
 	let picks: PickListSnapshot = {
 		revision: 0,
 		items: [],
@@ -845,6 +846,7 @@ export function createHttpPhotoService(
 			return () => pickListeners.delete(listener);
 		},
 		async loadPicks() {
+			const hydrationGeneration = ++pickHydrationGeneration;
 			const store = pickStore;
 			if (store === null) return clonePicks(picks);
 			const storedPicks = store.read();
@@ -877,7 +879,11 @@ export function createHttpPhotoService(
 					}
 				}
 			}
-			if (pickStore !== store) return clonePicks(picks);
+			if (
+				pickStore !== store ||
+				hydrationGeneration !== pickHydrationGeneration
+			)
+				return clonePicks(picks);
 			const latest = store.read();
 			return publishPicks({
 				...latest,

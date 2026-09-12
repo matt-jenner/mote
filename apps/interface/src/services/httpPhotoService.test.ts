@@ -429,6 +429,79 @@ describe("HTTP PhotoService", () => {
 		service.dispose();
 	});
 
+	it("does not let an older hydration clear assets resolved for newer picks", async () => {
+		const localStorage = savedPreferences();
+		let resolveOlderRequest!: (response: Response) => void;
+		let markOlderRequestFinished!: () => void;
+		const olderRequest = new Promise<Response>((resolve) => {
+			resolveOlderRequest = resolve;
+		});
+		const olderRequestFinished = new Promise<void>((resolve) => {
+			markOlderRequestFinished = resolve;
+		});
+		let assetRequestCount = 0;
+		const secondAsset = {
+			...representativeAsset,
+			id: "asset-b",
+			displayName: "Glacier.jpg",
+		};
+		const fetch = vi.fn(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = String(input);
+				if (url === "/api/v1/bootstrap")
+					return json({ ...bootstrapResponse, rootId: "root-a" });
+				if (url.endsWith("/assets")) {
+					assetRequestCount += 1;
+					if (assetRequestCount === 1) {
+						return olderRequest.then((response) => {
+							markOlderRequestFinished();
+							return response;
+						});
+					}
+					const body = requestBody({ url, init }) as { assetIds: string[] };
+					return json(
+						body.assetIds.map((id) =>
+							id === representativeAsset.id ? representativeAsset : secondAsset,
+						),
+					);
+				}
+				throw new Error(`unexpected request ${url}`);
+			},
+		);
+		const service = createHttpPhotoService({
+			localStorage,
+			sessionStorage: new MemoryStorage(),
+			fetch,
+			randomUuid: () => "client-a",
+		});
+
+		await service.getBootstrapState();
+		await service.addPick({
+			assetId: representativeAsset.id,
+			sourceFolderId: "folder-one",
+			sourceLabel: "Family",
+		});
+		await expect.poll(() => assetRequestCount).toBe(1);
+		await service.addPick({
+			assetId: secondAsset.id,
+			sourceFolderId: "folder-one",
+			sourceLabel: "Family",
+		});
+		await expect
+			.poll(() => service.getPicks().items.map((item) => item.asset?.id))
+			.toEqual(["asset-a", "asset-b"]);
+
+		resolveOlderRequest(json([representativeAsset]));
+		await olderRequestFinished;
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+		expect(service.getPicks().items.map((item) => item.asset?.id)).toEqual([
+			"asset-a",
+			"asset-b",
+		]);
+		service.dispose();
+	});
+
 	it("refreshes its pick snapshot when another tab writes the same root", async () => {
 		const localStorage = new MemoryStorage();
 		const storageListeners: Array<(event: StorageEvent) => void> = [];
