@@ -171,6 +171,22 @@ describe("responsive Picks panel", () => {
 		await expect.element(panel.getByText("Source unavailable")).toBeVisible();
 	});
 
+	it("opens an immersive review from the ordered pick list", async () => {
+		const { screen } = await renderPicksApp();
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+		const review = panel.getByRole("button", { name: "Review picks" });
+
+		expect((review.element() as HTMLButtonElement).disabled).toBe(false);
+		await review.click();
+		await expect
+			.element(screen.getByRole("dialog", { name: "Photo viewer" }))
+			.toBeVisible();
+		await expect
+			.element(screen.getByTestId("viewer-status"))
+			.toHaveTextContent("Picks · 1 of 2");
+	});
+
 	it("clears immediately without closing and publishes the shared Undo toast", async () => {
 		const { screen } = await renderPicksApp();
 		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();

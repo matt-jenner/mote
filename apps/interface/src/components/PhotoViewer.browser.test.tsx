@@ -854,6 +854,8 @@ function InvalidGeometryViewerHarness() {
 				open: true,
 				currentAssetId: current.id,
 				returnAnchor: null,
+				sequence: "wall",
+				returnSurface: "wall",
 				infoOpen: false,
 				controlsVisible: true,
 				filmstripVisible: true,
@@ -1499,8 +1501,9 @@ describe("immersive photo viewer checkpoint", () => {
 						"zoom controls": dialog.querySelector<HTMLElement>(
 							"[data-viewer-zoom-controls]",
 						),
-						Navigator:
-							dialog.querySelector<HTMLElement>("[data-viewer-navigator]"),
+						Navigator: dialog.querySelector<HTMLElement>(
+							"[data-viewer-navigator]",
+						),
 					};
 					const boundsOverlap = (first: DOMRect, second: DOMRect) =>
 						first.left < second.right &&
@@ -1508,13 +1511,22 @@ describe("immersive photo viewer checkpoint", () => {
 						first.top < second.bottom &&
 						first.bottom > second.top;
 					for (const [name, control] of Object.entries(controls)) {
-						if (!control) throw new Error(`${name} was not rendered at ${width}px`);
+						if (!control)
+							throw new Error(`${name} was not rendered at ${width}px`);
 						const bounds = control.getBoundingClientRect();
-						expect(bounds.width, `${name} target width at ${width}px`).toBeGreaterThanOrEqual(44);
-						expect(bounds.height, `${name} target height at ${width}px`).toBeGreaterThanOrEqual(44);
+						expect(
+							bounds.width,
+							`${name} target width at ${width}px`,
+						).toBeGreaterThanOrEqual(44);
+						expect(
+							bounds.height,
+							`${name} target height at ${width}px`,
+						).toBeGreaterThanOrEqual(44);
 						for (const [obstacleName, obstacle] of Object.entries(obstacles)) {
 							if (!obstacle)
-								throw new Error(`${obstacleName} was not rendered at ${width}px`);
+								throw new Error(
+									`${obstacleName} was not rendered at ${width}px`,
+								);
 							expect(
 								boundsOverlap(bounds, obstacle.getBoundingClientRect()),
 								`${name} overlaps ${obstacleName} at ${width}px`,
@@ -5119,6 +5131,97 @@ describe("immersive photo viewer checkpoint", () => {
 				.querySelector("button[aria-current='true']")
 				?.getAttribute("aria-label"),
 		).toBe("Coast");
+	});
+
+	it("labels an explicitly supplied pick-only viewer sequence", async () => {
+		const service = previewService(async () => undefined);
+		const view = await render(
+			<PhotoServiceProvider service={service}>
+				<PickListProvider
+					origin={{ sourceFolderId: "folder", sourceLabel: "Folder" }}
+				>
+					<PhotoViewerOverlay
+						assets={[asset("first", "First", 1), asset("second", "Second", 2)]}
+						loading={false}
+						nextCursor={null}
+						onClose={() => undefined}
+						onHideControls={() => undefined}
+						onLoadMore={() => undefined}
+						onRequestNearViewportDerivatives={() => undefined}
+						onSelectAsset={() => undefined}
+						onSetInfoOpen={() => undefined}
+						onShowControls={() => undefined}
+						onToggleTouchControls={() => undefined}
+						service={service}
+						state={{
+							open: true,
+							currentAssetId: "second",
+							returnAnchor: null,
+							sequence: "picks",
+							returnSurface: "picksPanel",
+							infoOpen: false,
+							controlsVisible: true,
+							filmstripVisible: true,
+							previewGeneration: 1,
+						}}
+					/>
+				</PickListProvider>
+			</PhotoServiceProvider>,
+		);
+
+		await expect
+			.element(view.getByTestId("viewer-status"))
+			.toHaveTextContent("Second, Picks · 2 of 2");
+	});
+
+	it("uses the pick derivative request path for a pick review preview", async () => {
+		const service = previewService(async () => {
+			throw new Error("The wall request path must not run for a pick review");
+		});
+		const requests: DerivativeRequest[] = [];
+		const view = await render(
+			<PhotoServiceProvider service={service}>
+				<PickListProvider
+					origin={{ sourceFolderId: "folder", sourceLabel: "Folder" }}
+				>
+					<PhotoViewerOverlay
+						assets={[asset("picked", "Picked", 1)]}
+						loading={false}
+						nextCursor={null}
+						onClose={() => undefined}
+						onHideControls={() => undefined}
+						onLoadMore={() => undefined}
+						onRequestNearViewportDerivatives={() => undefined}
+						onRequestPreviewDerivatives={async (request) => {
+							requests.push(request);
+						}}
+						onSelectAsset={() => undefined}
+						onSetInfoOpen={() => undefined}
+						onShowControls={() => undefined}
+						onToggleTouchControls={() => undefined}
+						service={service}
+						state={{
+							open: true,
+							currentAssetId: "picked",
+							returnAnchor: null,
+							sequence: "picks",
+							returnSurface: "picksPanel",
+							infoOpen: false,
+							controlsVisible: true,
+							filmstripVisible: true,
+							previewGeneration: 1,
+						}}
+					/>
+				</PickListProvider>
+			</PhotoServiceProvider>,
+		);
+
+		await expect
+			.poll(() => requests)
+			.toEqual([
+				{ assetIds: ["picked"], kind: "screenPreview", priority: "visible" },
+			]);
+		await view.unmount();
 	});
 
 	it("holds the current photo while loading and then continues into the next page", async () => {

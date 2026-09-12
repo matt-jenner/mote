@@ -18,7 +18,10 @@ interface PicksPanelProps {
 	open: boolean;
 	onOpen: () => void;
 	onClose: () => void;
-	onReview?: () => void;
+	onReview?: (assetId: string, launchTarget: HTMLElement) => void;
+	onOpenPick?: (assetId: string, launchTarget: HTMLElement) => void;
+	onRemovePick?: (assetId: string) => void;
+	reviewOpen?: boolean;
 }
 
 function pickCountLabel(count: number): string {
@@ -83,6 +86,9 @@ export function PicksPanel({
 	onOpen,
 	onClose,
 	onReview,
+	onOpenPick,
+	onRemovePick,
+	reviewOpen = false,
 }: PicksPanelProps) {
 	const picks = usePickList();
 	const dialogRef = useRef<HTMLElement>(null);
@@ -94,6 +100,7 @@ export function PicksPanel({
 	const isMobile = mode === "mobile";
 	const items = picks.snapshot.items;
 	const hasItems = items.length > 0;
+	const firstReviewableItem = items.find((item) => item.asset !== null);
 
 	useEffect(() => {
 		if (!hasItems) return;
@@ -228,7 +235,22 @@ export function PicksPanel({
 								item={item}
 								key={item.assetId}
 								onRemove={(assetId) =>
-									void picks.remove(assetId).catch(() => {})
+									onRemovePick
+										? onRemovePick(assetId)
+										: void picks.remove(assetId).catch(() => {})
+								}
+								action={
+									item.asset && onOpenPick ? (
+										<button
+											aria-label={`Review ${item.asset.displayName}`}
+											onClick={(event) =>
+												onOpenPick(item.assetId, event.currentTarget)
+											}
+											type="button"
+										>
+											Review
+										</button>
+									) : undefined
 								}
 							/>
 						))}
@@ -236,8 +258,11 @@ export function PicksPanel({
 					<div className={styles.actions} data-testid="picks-actions">
 						<button
 							className={styles.reviewButton}
-							disabled={!onReview}
-							onClick={onReview}
+							disabled={!onReview || !firstReviewableItem}
+							onClick={(event) => {
+								if (!firstReviewableItem || !onReview) return;
+								onReview(firstReviewableItem.assetId, event.currentTarget);
+							}}
 							type="button"
 						>
 							Review picks
@@ -285,7 +310,7 @@ export function PicksPanel({
 				onClick={open ? onClose : openMobileSheet}
 				triggerRef={mobileTriggerRef}
 			/>
-			{open ? (
+			{open && !reviewOpen ? (
 				<div className={styles.mobileBackdrop}>
 					<button
 						aria-label="Dismiss picks"

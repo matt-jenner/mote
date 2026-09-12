@@ -8,7 +8,11 @@ import {
 	useState,
 } from "react";
 import { usePickList, usePickListOrigin } from "../picks/PickListContext";
-import type { PhotoService, WallAsset } from "../services/photoService";
+import type {
+	DerivativeRequest,
+	PhotoService,
+	WallAsset,
+} from "../services/photoService";
 import styles from "../styles/photoViewer.module.css";
 import { findViewerIndex, shouldLoadViewerPage } from "../viewer/photoSequence";
 import { useViewerControls } from "../viewer/useViewerControls";
@@ -74,6 +78,8 @@ interface PhotoViewerOverlayProps {
 	nextCursor: string | null;
 	onLoadMore: () => void;
 	onRequestNearViewportDerivatives: (assetIds: readonly string[]) => void;
+	onRequestPreviewDerivatives?: (request: DerivativeRequest) => Promise<void>;
+	onRemovePick?: (assetId: string) => void;
 	onSetWallInteraction?: (active: boolean) => void;
 }
 
@@ -91,6 +97,8 @@ export function PhotoViewerOverlay({
 	nextCursor,
 	onLoadMore,
 	onRequestNearViewportDerivatives,
+	onRequestPreviewDerivatives,
+	onRemovePick,
 	onSetWallInteraction = () => undefined,
 }: PhotoViewerOverlayProps) {
 	const picks = usePickList();
@@ -119,6 +127,7 @@ export function PhotoViewerOverlay({
 		assets,
 		currentIndex,
 		previewGeneration: state.previewGeneration,
+		requestDerivatives: onRequestPreviewDerivatives,
 	});
 	const previewFailureKey = `${asset?.id ?? ""}:${state.previewGeneration}:${preview.currentUrl ?? ""}`;
 	const handlePreviewFailure = useCallback(
@@ -184,8 +193,12 @@ export function PhotoViewerOverlay({
 	const handleTogglePick = useCallback(() => {
 		if (!asset || !pickOrigin) return;
 		reportInteraction();
+		if (picks.isPicked(asset.id) && onRemovePick) {
+			onRemovePick(asset.id);
+			return;
+		}
 		void picks.toggle(asset, pickOrigin).catch(() => {});
-	}, [asset, pickOrigin, picks, reportInteraction]);
+	}, [asset, onRemovePick, pickOrigin, picks, reportInteraction]);
 	const controls = useViewerControls({
 		controlsVisible: state.controlsVisible,
 		onHide: handleHideControls,
@@ -716,7 +729,10 @@ export function PhotoViewerOverlay({
 				data-testid="viewer-status"
 				role="status"
 			>
-				{asset.displayName}, photo {currentPosition} of {assets.length}
+				{asset.displayName},{" "}
+				{state.sequence === "picks"
+					? `Picks · ${currentPosition} of ${assets.length}`
+					: `photo ${currentPosition} of ${assets.length}`}
 				{`, `}
 				<span key={zoomAnnouncementRevision}>{announcedZoomLabel}</span>
 				{nextCursor ? " loaded" : ""}

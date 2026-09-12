@@ -639,6 +639,11 @@
 		);
 	}
 
+	.workspace > .canvas {
+		padding-bottom: calc(56px + var(--safe-area-bottom));
+		overflow-y: auto;
+	}
+
 	.toolbar {
 		flex-basis: 64px;
 	}
