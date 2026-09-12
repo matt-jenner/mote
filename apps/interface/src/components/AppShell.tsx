@@ -23,6 +23,7 @@ import {
 } from "../picks/PickListContext";
 import type { PhotoService } from "../services/photoService";
 import styles from "../styles/appShell.module.css";
+import picksPanelStyles from "../styles/picksPanel.module.css";
 import { initialViewerState, viewerReducer } from "../viewer/viewerReducer";
 import { AppearanceMenu } from "./AppearanceMenu";
 import { HostedFolderBrowser } from "./HostedFolderBrowser";
@@ -327,7 +328,7 @@ export function AppShell() {
 							) : null}
 							{!isMobile ? (
 								<PicksToolbarButton
-									className={styles.picksToolbarTrigger}
+									className={`${styles.picksToolbarTrigger} ${picksPanelStyles.toolbarTrigger}`}
 									expanded={picksOpen}
 									onClick={() => setPicksOpen((open) => !open)}
 								/>

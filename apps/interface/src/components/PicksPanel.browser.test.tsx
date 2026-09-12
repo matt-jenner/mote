@@ -51,7 +51,17 @@ const unavailable: WallAsset = {
 	},
 };
 
-async function renderPicksApp(): Promise<{
+const previewWarning: WallAsset = {
+	...coast,
+	id: "preview-warning",
+	displayName: "IMG_4172.jpg",
+	provisionalOrder: 3,
+	warning: { code: "previewUnavailable", retryable: true },
+};
+
+async function renderPicksApp(
+	options: { previewWarning?: boolean } = {},
+): Promise<{
 	screen: Awaited<ReturnType<typeof render>>;
 	service: InMemoryPhotoService;
 }> {
@@ -60,6 +70,9 @@ async function renderPicksApp(): Promise<{
 		wallAssets: [
 			{ ...coast, wallThumbnailUrl: "/demo-photos/coast.jpg" },
 			{ ...unavailable, wallThumbnailUrl: "/demo-photos/coast.jpg" },
+			...(options.previewWarning
+				? [{ ...previewWarning, wallThumbnailUrl: "/demo-photos/coast.jpg" }]
+				: []),
 		],
 	});
 	await service.addPick({
@@ -67,6 +80,12 @@ async function renderPicksApp(): Promise<{
 		sourceFolderId: "Family",
 		sourceLabel: "Family",
 	});
+	if (options.previewWarning)
+		await service.addPick({
+			assetId: previewWarning.id,
+			sourceFolderId: "Family",
+			sourceLabel: "Family",
+		});
 	await service.addPick({
 		assetId: unavailable.id,
 		sourceFolderId: "Archive",
@@ -101,6 +120,9 @@ describe("responsive Picks panel", () => {
 		const { screen } = await renderPicksApp();
 		const trigger = screen.getByRole("button", { name: "Picks, 2 picks" });
 		await expect.element(trigger).toHaveAttribute("aria-expanded", "false");
+		const closedBackground = getComputedStyle(
+			trigger.element(),
+		).backgroundColor;
 		const wall = screen.getByTestId("photo-wall").element();
 		const beforeWidth = wall.getBoundingClientRect().width;
 
@@ -108,6 +130,9 @@ describe("responsive Picks panel", () => {
 		await trigger.click();
 		const panel = screen.getByRole("complementary", { name: "Picks" });
 		await expect.element(panel).toBeVisible();
+		expect(getComputedStyle(trigger.element()).backgroundColor).not.toBe(
+			closedBackground,
+		);
 		expect(panel.element().getBoundingClientRect().width).toBeCloseTo(320, -1);
 		expect(wall.getBoundingClientRect().width).toBeLessThan(beforeWidth - 250);
 		expect(document.activeElement).toBe(trigger.element());
@@ -136,6 +161,14 @@ describe("responsive Picks panel", () => {
 		).toBeNull();
 		await expect.element(trigger).toHaveAttribute("aria-expanded", "false");
 		await expect.element(trigger).toHaveTextContent("2");
+	});
+
+	it("keeps a preview warning distinct from an unavailable source", async () => {
+		const { screen } = await renderPicksApp({ previewWarning: true });
+		await screen.getByRole("button", { name: "Picks, 3 picks" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+		await expect.element(panel.getByText("Preview unavailable")).toBeVisible();
+		await expect.element(panel.getByText("Source unavailable")).toBeVisible();
 	});
 
 	it("clears immediately without closing and publishes the shared Undo toast", async () => {
@@ -224,6 +257,7 @@ describe("responsive Picks panel", () => {
 		const { screen } = await renderPicksApp();
 		const bar = screen.getByRole("button", { name: "Picks, 2 picks" });
 		await bar.click();
+		await expect.poll(() => window.history.state?.picksSheet).toBe(true);
 		(
 			screen
 				.getByRole("button", { name: "Dismiss picks" })
@@ -234,7 +268,7 @@ describe("responsive Picks panel", () => {
 			.toBeNull();
 
 		await bar.click();
-		window.dispatchEvent(new PopStateEvent("popstate"));
+		window.history.back();
 		await expect
 			.poll(() => screen.getByRole("dialog", { name: "Picks" }).query())
 			.toBeNull();
@@ -252,5 +286,28 @@ describe("responsive Picks panel", () => {
 		await expect
 			.poll(() => screen.getByRole("dialog", { name: "Picks" }).query())
 			.toBeNull();
+	});
+
+	it("restores sheet focus after removing the focused row and clearing the focused action", async () => {
+		await page.viewport(390, 844);
+		const { screen } = await renderPicksApp();
+		const bar = screen.getByRole("button", { name: "Picks, 2 picks" });
+		await bar.click();
+		const sheet = screen.getByRole("dialog", { name: "Picks" });
+		const remove = sheet.getByRole("button", { name: "Remove DSC_8421.jpg" });
+		remove.element().focus();
+		await remove.click();
+		const close = sheet.getByRole("button", { name: "Close picks" });
+		await expect.poll(() => document.activeElement).toBe(close.element());
+		await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
+		expect(document.activeElement).toBe(
+			sheet.getByRole("button", { name: "Clear picks" }).element(),
+		);
+
+		sheet.getByRole("button", { name: "Clear picks" }).element().focus();
+		await sheet.getByRole("button", { name: "Clear picks" }).click();
+		await expect.poll(() => document.activeElement).toBe(close.element());
+		await userEvent.keyboard("{Tab}");
+		expect(document.activeElement).toBe(close.element());
 	});
 });

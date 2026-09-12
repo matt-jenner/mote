@@ -89,6 +89,7 @@ export function PicksPanel({
 	const closeRef = useRef<HTMLButtonElement>(null);
 	const mobileTriggerRef = useRef<HTMLButtonElement>(null);
 	const mobileWasOpen = useRef(false);
+	const historyEntry = useRef(false);
 	const dragStartY = useRef<number | null>(null);
 	const isMobile = mode === "mobile";
 	const items = picks.snapshot.items;
@@ -108,6 +109,15 @@ export function PicksPanel({
 	}, [isMobile, open]);
 
 	useLayoutEffect(() => {
+		if (!isMobile || !open || !dialogRef.current) return;
+		if (
+			items.length === 0 ||
+			!dialogRef.current.contains(document.activeElement)
+		)
+			closeRef.current?.focus();
+	}, [isMobile, items, open]);
+
+	useLayoutEffect(() => {
 		if (!isMobile) return;
 		if (open) {
 			mobileWasOpen.current = true;
@@ -120,10 +130,34 @@ export function PicksPanel({
 
 	useEffect(() => {
 		if (!isMobile || !open) return;
-		const closeOnPlatformBack = () => onClose();
+		const closeOnPlatformBack = () => {
+			historyEntry.current = false;
+			onClose();
+		};
 		window.addEventListener("popstate", closeOnPlatformBack);
 		return () => window.removeEventListener("popstate", closeOnPlatformBack);
 	}, [isMobile, onClose, open]);
+
+	const openMobileSheet = () => {
+		window.history.pushState({ picksSheet: true }, "");
+		historyEntry.current = true;
+		onOpen();
+	};
+
+	useEffect(() => {
+		if (open || !historyEntry.current) return;
+		historyEntry.current = false;
+		window.history.back();
+	}, [open]);
+
+	useEffect(
+		() => () => {
+			if (!historyEntry.current) return;
+			historyEntry.current = false;
+			window.history.back();
+		},
+		[],
+	);
 
 	useEffect(() => {
 		if (isMobile || !open) return;
@@ -248,7 +282,7 @@ export function PicksPanel({
 				className={styles.mobileBar}
 				count={picks.count}
 				expanded={open}
-				onClick={open ? onClose : onOpen}
+				onClick={open ? onClose : openMobileSheet}
 				triggerRef={mobileTriggerRef}
 			/>
 			{open ? (

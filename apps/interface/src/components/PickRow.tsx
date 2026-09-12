@@ -26,10 +26,15 @@ function thumbnailUrl(
 export function PickRow({ item, onRemove, action }: PickRowProps) {
 	const service = usePhotoService();
 	const url = thumbnailUrl(item, service.derivativeUrl);
-	const unavailable =
+	const sourceUnavailable =
 		item.asset === null ||
 		item.asset.availability !== "available" ||
-		item.asset.warning !== null;
+		item.asset.warning?.code === "sourceUnavailable";
+	const warning = sourceUnavailable
+		? "Source unavailable"
+		: item.asset?.warning
+			? "Preview unavailable"
+			: null;
 
 	return (
 		<li className={styles.pickRow}>
@@ -44,10 +49,10 @@ export function PickRow({ item, onRemove, action }: PickRowProps) {
 					<Folder aria-hidden="true" size={15} strokeWidth={1.7} />
 					{item.sourceLabel}
 				</span>
-				{unavailable ? (
+				{warning ? (
 					<span className={styles.sourceWarning} role="status">
 						<AlertTriangle aria-hidden="true" size={14} strokeWidth={1.8} />
-						Source unavailable
+						{warning}
 					</span>
 				) : null}
 			</div>

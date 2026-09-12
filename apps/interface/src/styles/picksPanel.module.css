@@ -120,7 +120,7 @@
 }
 
 .sourceWarning {
-	color: #a66a00;
+	color: var(--unavailable);
 	font-size: 12px;
 }
 
