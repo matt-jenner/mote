@@ -1394,6 +1394,9 @@ describe("immersive photo viewer checkpoint", () => {
 				"[data-viewer-chrome] [aria-label='Back to photos']",
 			);
 			const info = dialog.querySelector<HTMLElement>("[data-viewer-info]");
+			const pick = dialog.querySelector<HTMLElement>(
+				"[data-viewer-chrome] [aria-label$='to picks']",
+			);
 			const zoom = dialog.querySelector<HTMLElement>(
 				"[data-viewer-zoom-controls]",
 			);
@@ -1406,6 +1409,7 @@ describe("immersive photo viewer checkpoint", () => {
 				!next ||
 				!back ||
 				!info ||
+				!pick ||
 				!zoom ||
 				!filmstrip
 			)
@@ -1435,6 +1439,7 @@ describe("immersive photo viewer checkpoint", () => {
 					["Next", next],
 					["Back", back],
 					["Info", info],
+					["Pick", pick],
 					["zoom controls", zoom],
 					["filmstrip", filmstrip],
 					["open drawer", drawer],
@@ -1460,6 +1465,55 @@ describe("immersive photo viewer checkpoint", () => {
 				if (value) root.style.setProperty(property, value);
 				else root.style.removeProperty(property);
 			}
+			await page.viewport(1440, 1024);
+		}
+	});
+
+	it("keeps short-landscape chrome clear of navigation and zoom controls", async () => {
+		await page.viewport(568, 320);
+		const { view, tile } = await openAsset("Coast");
+		try {
+			(tile.element() as HTMLButtonElement).click();
+			await view.getByRole("button", { name: "Zoom in" }).click();
+			const dialog = view
+				.getByRole("dialog", { name: "Photo viewer" })
+				.element();
+			const controls = {
+				Back: dialog.querySelector<HTMLElement>("[aria-label='Back to photos']"),
+				Info: dialog.querySelector<HTMLElement>("[data-viewer-info]"),
+				Pick: dialog.querySelector<HTMLElement>(
+					"[data-viewer-chrome] [aria-label$='to picks']",
+				),
+			};
+			const obstacles = {
+				Previous: dialog.querySelector<HTMLElement>(
+					"[data-viewer-controls] [aria-label='Previous photo']",
+				),
+				"zoom controls": dialog.querySelector<HTMLElement>(
+					"[data-viewer-zoom-controls]",
+				),
+				Navigator: dialog.querySelector<HTMLElement>("[data-viewer-navigator]"),
+			};
+			const boundsOverlap = (first: DOMRect, second: DOMRect) =>
+				first.left < second.right &&
+				first.right > second.left &&
+				first.top < second.bottom &&
+				first.bottom > second.top;
+			for (const [name, control] of Object.entries(controls)) {
+				if (!control) throw new Error(`${name} was not rendered`);
+				const bounds = control.getBoundingClientRect();
+				expect(bounds.width, `${name} target width`).toBeGreaterThanOrEqual(44);
+				expect(bounds.height, `${name} target height`).toBeGreaterThanOrEqual(44);
+				for (const [obstacleName, obstacle] of Object.entries(obstacles)) {
+					if (!obstacle) throw new Error(`${obstacleName} was not rendered`);
+					expect(
+						boundsOverlap(bounds, obstacle.getBoundingClientRect()),
+						`${name} overlaps ${obstacleName}`,
+					).toBe(false);
+				}
+			}
+		} finally {
+			await view.unmount();
 			await page.viewport(1440, 1024);
 		}
 	});

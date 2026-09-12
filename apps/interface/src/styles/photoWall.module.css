@@ -214,7 +214,7 @@
 .tile {
 	position: relative;
 	flex: 0 0 auto;
-	min-width: 0;
+	min-width: 44px;
 	padding: 0;
 	margin: 0;
 	overflow: hidden;
@@ -294,8 +294,8 @@ button.tile {
 	z-index: 2;
 	display: grid;
 	place-items: center;
-	width: 36px;
-	height: 36px;
+	width: 44px;
+	height: 44px;
 	padding: 0;
 	color: #f4f5f6;
 	background: rgb(8 9 11 / 68%);
@@ -307,6 +307,16 @@ button.tile {
 	transition:
 		opacity var(--fade-duration) ease,
 		background-color var(--fade-duration) ease;
+}
+
+.tile[data-controls-stacked="true"] .tilePickButton {
+	top: 0;
+	left: 0;
+}
+
+.tile[data-controls-stacked="true"] > [role="img"] {
+	top: 52px;
+	right: 0;
 }
 
 .tilePickButton[aria-pressed="true"] {

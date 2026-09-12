@@ -9,6 +9,7 @@ export interface JustifiedLayoutOptions {
 
 /** Maximum CSS-pixel error accepted when checking fractional row geometry. */
 export const LAYOUT_GEOMETRY_TOLERANCE = 1e-9;
+const MINIMUM_TILE_WIDTH = 44;
 
 export interface PositionedWallAsset {
 	asset: WallAsset;
@@ -53,6 +54,44 @@ function assertAssetDimensions(asset: WallAsset): void {
 	}
 }
 
+function constrainWidths(
+	rawWidths: readonly number[],
+	targetWidth: number,
+	minimumWidth: number,
+): number[] {
+	const widths = rawWidths.map(() => 0);
+	const flexible = new Set(rawWidths.keys());
+	let remainingWidth = targetWidth;
+	while (flexible.size > 0) {
+		const remainingRawWidth = [...flexible].reduce(
+			(sum, index) => sum + (rawWidths[index] ?? 0),
+			0,
+		);
+		const scale = remainingWidth / remainingRawWidth;
+		const newlyClamped = [...flexible].filter(
+			(index) => (rawWidths[index] ?? 0) * scale < minimumWidth,
+		);
+		if (newlyClamped.length === 0) {
+			for (const index of flexible)
+				widths[index] = (rawWidths[index] ?? 0) * scale;
+			break;
+		}
+		for (const index of newlyClamped) {
+			widths[index] = minimumWidth;
+			remainingWidth -= minimumWidth;
+			flexible.delete(index);
+		}
+	}
+	const widthTotal = widths.reduce((sum, width) => sum + width, 0);
+	const adjustmentIndex = widths.reduce(
+		(widest, width, index) => (width > (widths[widest] ?? 0) ? index : widest),
+		0,
+	);
+	widths[adjustmentIndex] =
+		(widths[adjustmentIndex] ?? 0) + targetWidth - widthTotal;
+	return widths;
+}
+
 function makeRow(
 	assets: readonly WallAsset[],
 	options: JustifiedLayoutOptions,
@@ -75,21 +114,23 @@ function makeRow(
 	if (!Number.isFinite(rowHeight) || rowHeight <= 0) {
 		throw new Error("Wall tile geometry must be finite and positive");
 	}
-	const widths: number[] = [];
-	for (let index = 0; index < assets.length; index += 1) {
-		const ratio = aspectRatios[index];
-		if (ratio === undefined) {
-			throw new Error("Wall layout assets changed during measurement");
-		}
-		const width =
-			justified && index === assets.length - 1
-				? availableWidth - widths.reduce((sum, value) => sum + value, 0)
-				: ratio * rowHeight;
-		if (!Number.isFinite(width) || width <= 0) {
-			throw new Error("Wall tile geometry must be finite and positive");
-		}
-		widths.push(width);
-	}
+	const rawWidths = aspectRatios.map((ratio) => ratio * rowHeight);
+	const minimumWidth = Math.min(
+		MINIMUM_TILE_WIDTH,
+		availableWidth / assets.length,
+	);
+	const targetWidth = justified
+		? availableWidth
+		: Math.min(
+				availableWidth,
+				Math.max(
+					rawWidths.reduce((sum, width) => sum + width, 0),
+					minimumWidth * assets.length,
+				),
+			);
+	const widths = constrainWidths(rawWidths, targetWidth, minimumWidth);
+	if (widths.some((width) => !Number.isFinite(width) || width <= 0))
+		throw new Error("Wall tile geometry must be finite and positive");
 
 	const items: PositionedWallAsset[] = [];
 	let left = 0;
@@ -108,10 +149,7 @@ function makeRow(
 
 	return {
 		items,
-		width: justified
-			? options.containerWidth
-			: widths.reduce((sum, value) => sum + value, 0) +
-				options.gap * (assets.length - 1),
+		width: targetWidth + options.gap * (assets.length - 1),
 		height: rowHeight,
 		justified,
 	};
@@ -127,8 +165,20 @@ export function layoutJustifiedRows(
 	const rows: JustifiedRow[] = [];
 	let candidate: WallAsset[] = [];
 	let candidateAspectRatio = 0;
+	const maximumItemsPerRow = Math.max(
+		1,
+		Math.floor(
+			(options.containerWidth + options.gap) /
+				(MINIMUM_TILE_WIDTH + options.gap),
+		),
+	);
 
 	for (const asset of assets) {
+		if (candidate.length >= maximumItemsPerRow) {
+			rows.push(makeRow(candidate, options, true));
+			candidate = [];
+			candidateAspectRatio = 0;
+		}
 		candidate.push(asset);
 		candidateAspectRatio += asset.width / asset.height;
 		const availableWidth =

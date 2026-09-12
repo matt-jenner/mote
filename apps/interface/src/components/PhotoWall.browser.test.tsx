@@ -572,6 +572,22 @@ describe("progressive photo wall", () => {
 			expect(Number(getComputedStyle(pick.element()).opacity)).toBeGreaterThan(
 				0,
 			);
+			const pickClass = pick.element().classList[0];
+			const hasCoarseVisibilityRule = [...document.styleSheets].some((sheet) =>
+				[...sheet.cssRules].some(
+					(rule) =>
+						rule instanceof CSSMediaRule &&
+						rule.conditionText.includes("(pointer: coarse)") &&
+						[...rule.cssRules].some(
+							(nested) =>
+								nested instanceof CSSStyleRule &&
+								Boolean(pickClass) &&
+								nested.selectorText.includes(`.${pickClass}`) &&
+								nested.style.opacity === "1",
+						),
+				),
+			);
+			expect(hasCoarseVisibilityRule).toBe(true);
 
 			const warning = screen
 				.getByRole("img", { name: "Photo preview warning" })
@@ -621,6 +637,53 @@ describe("progressive photo wall", () => {
 			restoreImageRuntime();
 			restoreReducedMotion();
 		}
+	});
+
+	it("keeps a 44px pick target distinct from warnings on an ultra-narrow tile", async () => {
+		const service = new ControlledWallService();
+		const positioned = {
+			asset: asset("narrow-pick", "Portrait.jpg", 1, {
+				width: 1,
+				height: 4,
+				warning: { code: "derivativeUnavailable", retryable: true },
+			}),
+			left: 0,
+			width: 37.5,
+			height: 150,
+		};
+		const screen = await render(
+			<PhotoTile
+				onTogglePick={() => undefined}
+				picked={false}
+				positioned={positioned}
+				service={service}
+			/>,
+		);
+		const tile = document.querySelector<HTMLElement>(
+			'[data-asset-id="narrow-pick"]',
+		);
+		const pick = screen
+			.getByRole("button", { name: "Add Portrait.jpg to picks" })
+			.element();
+		const warning = screen
+			.getByRole("img", { name: "Photo preview warning" })
+			.element();
+		if (!tile) throw new Error("ultra-narrow tile was not rendered");
+		const tileBounds = tile.getBoundingClientRect();
+		const pickBounds = pick.getBoundingClientRect();
+		const warningBounds = warning.getBoundingClientRect();
+		expect(tileBounds.width).toBeGreaterThanOrEqual(44);
+		expect(pickBounds.width).toBeGreaterThanOrEqual(44);
+		expect(pickBounds.height).toBeGreaterThanOrEqual(44);
+		expect(pickBounds.left).toBeGreaterThanOrEqual(tileBounds.left);
+		expect(pickBounds.right).toBeLessThanOrEqual(tileBounds.right);
+		expect(
+			pickBounds.left < warningBounds.right &&
+				pickBounds.right > warningBounds.left &&
+				pickBounds.top < warningBounds.bottom &&
+				pickBounds.bottom > warningBounds.top,
+		).toBe(false);
+		await screen.unmount();
 	});
 
 	it("uses the restored direction for the first wall request and remembers changes", async () => {

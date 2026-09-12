@@ -310,6 +310,7 @@ export function PhotoTile({
 		<figure
 			className={className}
 			data-asset-id={asset.id}
+			data-controls-stacked={positioned.width < 82 ? "true" : undefined}
 			data-media-kind={asset.mediaKind}
 			title={
 				sourceUnavailable

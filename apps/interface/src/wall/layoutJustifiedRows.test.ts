@@ -133,7 +133,32 @@ describe("layoutJustifiedRows", () => {
 		expect(rows[0]?.width).toBeCloseTo(220 * 3 + 4, 5);
 	});
 
-	it("keeps the final complete tile exactly on the container edge", () => {
+	it("keeps ultra-narrow tiles wide enough for controls without overflowing", () => {
+		const single = layoutJustifiedRows(assets([0.25]), {
+			containerWidth: 366,
+			targetRowHeight: 150,
+			gap: 4,
+			layoutComplete: true,
+		});
+		expect(single[0]?.items[0]?.width).toBeGreaterThanOrEqual(44);
+		expect(single[0]?.width).toBeLessThanOrEqual(366);
+
+		const rows = layoutJustifiedRows(assets(Array(10).fill(0.25)), {
+			containerWidth: 320,
+			targetRowHeight: 150,
+			gap: 4,
+			layoutComplete: true,
+		});
+		expect(rows.length).toBeGreaterThan(1);
+		for (const row of rows) {
+			expect(row.items.every((item) => item.width >= 44)).toBe(true);
+			expect(row.width).toBeLessThanOrEqual(320);
+			const last = row.items.at(-1);
+			expect((last?.left ?? 0) + (last?.width ?? 0)).toBeLessThanOrEqual(320);
+		}
+	});
+
+	it("keeps the final complete tile on the edge while clamping narrow items", () => {
 		const fixture = assets([1])[0];
 		if (!fixture) throw new Error("expected a fixture asset");
 		const dimensions: readonly (readonly [number, number])[] = [
@@ -156,12 +181,7 @@ describe("layoutJustifiedRows", () => {
 
 		expect(row.justified).toBe(true);
 		expect(last.left + last.width).toBe(1000);
-		for (const item of row.items) {
-			expect(item.width / item.height).toBeCloseTo(
-				item.asset.width / item.asset.height,
-				10,
-			);
-		}
+		expect(row.items.every((item) => item.width >= 44)).toBe(true);
 	});
 
 	it("rejects an aspect ratio that underflows to zero", () => {
@@ -205,11 +225,13 @@ describe("layoutJustifiedRows", () => {
 		expect(Math.abs(last.left + last.width - 1000.1)).toBeLessThanOrEqual(
 			LAYOUT_GEOMETRY_TOLERANCE,
 		);
-		for (const item of row.items) {
+		expect(row.items.every((item) => item.width >= 44)).toBe(true);
+		for (let index = 1; index < row.items.length; index += 1) {
+			const previous = row.items[index - 1];
+			const current = row.items[index];
+			if (!previous || !current) throw new Error("expected adjacent tiles");
 			expect(
-				Math.abs(
-					item.width / item.height - item.asset.width / item.asset.height,
-				),
+				Math.abs(current.left - previous.left - previous.width - 4.1),
 			).toBeLessThanOrEqual(LAYOUT_GEOMETRY_TOLERANCE);
 		}
 	});
