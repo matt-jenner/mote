@@ -1470,50 +1470,62 @@ describe("immersive photo viewer checkpoint", () => {
 	});
 
 	it("keeps short-landscape chrome clear of navigation and zoom controls", async () => {
-		await page.viewport(568, 320);
-		const { view, tile } = await openAsset("Coast");
 		try {
-			(tile.element() as HTMLButtonElement).click();
-			await view.getByRole("button", { name: "Zoom in" }).click();
-			const dialog = view
-				.getByRole("dialog", { name: "Photo viewer" })
-				.element();
-			const controls = {
-				Back: dialog.querySelector<HTMLElement>("[aria-label='Back to photos']"),
-				Info: dialog.querySelector<HTMLElement>("[data-viewer-info]"),
-				Pick: dialog.querySelector<HTMLElement>(
-					"[data-viewer-chrome] [aria-label$='to picks']",
-				),
-			};
-			const obstacles = {
-				Previous: dialog.querySelector<HTMLElement>(
-					"[data-viewer-controls] [aria-label='Previous photo']",
-				),
-				"zoom controls": dialog.querySelector<HTMLElement>(
-					"[data-viewer-zoom-controls]",
-				),
-				Navigator: dialog.querySelector<HTMLElement>("[data-viewer-navigator]"),
-			};
-			const boundsOverlap = (first: DOMRect, second: DOMRect) =>
-				first.left < second.right &&
-				first.right > second.left &&
-				first.top < second.bottom &&
-				first.bottom > second.top;
-			for (const [name, control] of Object.entries(controls)) {
-				if (!control) throw new Error(`${name} was not rendered`);
-				const bounds = control.getBoundingClientRect();
-				expect(bounds.width, `${name} target width`).toBeGreaterThanOrEqual(44);
-				expect(bounds.height, `${name} target height`).toBeGreaterThanOrEqual(44);
-				for (const [obstacleName, obstacle] of Object.entries(obstacles)) {
-					if (!obstacle) throw new Error(`${obstacleName} was not rendered`);
-					expect(
-						boundsOverlap(bounds, obstacle.getBoundingClientRect()),
-						`${name} overlaps ${obstacleName}`,
-					).toBe(false);
+			for (const width of [390, 568]) {
+				await page.viewport(width, 320);
+				const { view, tile } = await openAsset("Coast");
+				try {
+					(tile.element() as HTMLButtonElement).click();
+					await view.getByRole("button", { name: "Zoom in" }).click();
+					const dialog = view
+						.getByRole("dialog", { name: "Photo viewer" })
+						.element();
+					const controls = {
+						Back: dialog.querySelector<HTMLElement>(
+							"[aria-label='Back to photos']",
+						),
+						Info: dialog.querySelector<HTMLElement>("[data-viewer-info]"),
+						Pick: dialog.querySelector<HTMLElement>(
+							"[data-viewer-chrome] [aria-label$='to picks']",
+						),
+					};
+					const obstacles = {
+						Previous: dialog.querySelector<HTMLElement>(
+							"[data-viewer-controls] [aria-label='Previous photo']",
+						),
+						Next: dialog.querySelector<HTMLElement>(
+							"[data-viewer-controls] [aria-label='Next photo']",
+						),
+						"zoom controls": dialog.querySelector<HTMLElement>(
+							"[data-viewer-zoom-controls]",
+						),
+						Navigator:
+							dialog.querySelector<HTMLElement>("[data-viewer-navigator]"),
+					};
+					const boundsOverlap = (first: DOMRect, second: DOMRect) =>
+						first.left < second.right &&
+						first.right > second.left &&
+						first.top < second.bottom &&
+						first.bottom > second.top;
+					for (const [name, control] of Object.entries(controls)) {
+						if (!control) throw new Error(`${name} was not rendered at ${width}px`);
+						const bounds = control.getBoundingClientRect();
+						expect(bounds.width, `${name} target width at ${width}px`).toBeGreaterThanOrEqual(44);
+						expect(bounds.height, `${name} target height at ${width}px`).toBeGreaterThanOrEqual(44);
+						for (const [obstacleName, obstacle] of Object.entries(obstacles)) {
+							if (!obstacle)
+								throw new Error(`${obstacleName} was not rendered at ${width}px`);
+							expect(
+								boundsOverlap(bounds, obstacle.getBoundingClientRect()),
+								`${name} overlaps ${obstacleName} at ${width}px`,
+							).toBe(false);
+						}
+					}
+				} finally {
+					await view.unmount();
 				}
 			}
 		} finally {
-			await view.unmount();
 			await page.viewport(1440, 1024);
 		}
 	});

@@ -26,6 +26,7 @@ import type {
 } from "../services/photoService";
 import { AppShell } from "./AppShell";
 import { PhotoTile } from "./PhotoTile";
+import { layoutJustifiedRows } from "../wall/layoutJustifiedRows";
 import "../styles/tokens.css";
 import "../styles/global.css";
 
@@ -639,50 +640,77 @@ describe("progressive photo wall", () => {
 		}
 	});
 
-	it("keeps a 44px pick target distinct from warnings on an ultra-narrow tile", async () => {
+	it("lays out a narrow portrait and panorama with unclipped pick and warning controls", async () => {
 		const service = new ControlledWallService();
-		const positioned = {
-			asset: asset("narrow-pick", "Portrait.jpg", 1, {
+		const source = [
+			asset("narrow-pick", "Portrait.jpg", 1, {
 				width: 1,
 				height: 4,
 				warning: { code: "derivativeUnavailable", retryable: true },
 			}),
-			left: 0,
-			width: 37.5,
-			height: 150,
-		};
+			asset("wide-pick", "Panorama.jpg", 2, {
+				width: 5,
+				height: 1,
+				warning: { code: "derivativeUnavailable", retryable: true },
+			}),
+		];
+		const rows = layoutJustifiedRows(source, {
+			containerWidth: 320,
+			targetRowHeight: 150,
+			gap: 4,
+			layoutComplete: true,
+		});
 		const screen = await render(
-			<PhotoTile
-				onTogglePick={() => undefined}
-				picked={false}
-				positioned={positioned}
-				service={service}
-			/>,
+			<div style={{ width: 320 }}>
+				{rows.flatMap((row) =>
+					row.items.map((positioned) => (
+						<PhotoTile
+							key={positioned.asset.id}
+							onTogglePick={() => undefined}
+							picked={false}
+							positioned={positioned}
+							service={service}
+						/>
+					)),
+				)}
+			</div>,
 		);
-		const tile = document.querySelector<HTMLElement>(
-			'[data-asset-id="narrow-pick"]',
-		);
-		const pick = screen
-			.getByRole("button", { name: "Add Portrait.jpg to picks" })
-			.element();
-		const warning = screen
-			.getByRole("img", { name: "Photo preview warning" })
-			.element();
-		if (!tile) throw new Error("ultra-narrow tile was not rendered");
-		const tileBounds = tile.getBoundingClientRect();
-		const pickBounds = pick.getBoundingClientRect();
-		const warningBounds = warning.getBoundingClientRect();
-		expect(tileBounds.width).toBeGreaterThanOrEqual(44);
-		expect(pickBounds.width).toBeGreaterThanOrEqual(44);
-		expect(pickBounds.height).toBeGreaterThanOrEqual(44);
-		expect(pickBounds.left).toBeGreaterThanOrEqual(tileBounds.left);
-		expect(pickBounds.right).toBeLessThanOrEqual(tileBounds.right);
-		expect(
-			pickBounds.left < warningBounds.right &&
-				pickBounds.right > warningBounds.left &&
-				pickBounds.top < warningBounds.bottom &&
-				pickBounds.bottom > warningBounds.top,
-		).toBe(false);
+		expect(rows).toHaveLength(2);
+		for (const positioned of rows.flatMap((row) => row.items)) {
+			const tile = document.querySelector<HTMLElement>(
+				`[data-asset-id="${positioned.asset.id}"]`,
+			);
+			const pick = screen
+				.getByRole("button", {
+					name: `Add ${positioned.asset.displayName} to picks`,
+				})
+				.element();
+			const warning = tile?.querySelector<HTMLElement>("[role='img']");
+			if (!tile || !warning) throw new Error("wall controls were not rendered");
+			const tileBounds = tile.getBoundingClientRect();
+			const pickBounds = pick.getBoundingClientRect();
+			const warningBounds = warning.getBoundingClientRect();
+			expect(tileBounds.width / tileBounds.height).toBeCloseTo(
+				positioned.asset.width / positioned.asset.height,
+				5,
+			);
+			expect(tileBounds.width).toBeGreaterThanOrEqual(44);
+			expect(tileBounds.right - tileBounds.left).toBeLessThanOrEqual(320);
+			expect(pickBounds.width).toBeGreaterThanOrEqual(44);
+			expect(pickBounds.height).toBeGreaterThanOrEqual(44);
+			for (const bounds of [pickBounds, warningBounds]) {
+				expect(bounds.left).toBeGreaterThanOrEqual(tileBounds.left);
+				expect(bounds.right).toBeLessThanOrEqual(tileBounds.right);
+				expect(bounds.top).toBeGreaterThanOrEqual(tileBounds.top);
+				expect(bounds.bottom).toBeLessThanOrEqual(tileBounds.bottom);
+			}
+			expect(
+				pickBounds.left < warningBounds.right &&
+					pickBounds.right > warningBounds.left &&
+					pickBounds.top < warningBounds.bottom &&
+					pickBounds.bottom > warningBounds.top,
+			).toBe(false);
+		}
 		await screen.unmount();
 	});
 

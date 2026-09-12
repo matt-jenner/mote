@@ -133,39 +133,52 @@ describe("layoutJustifiedRows", () => {
 		expect(rows[0]?.width).toBeCloseTo(220 * 3 + 4, 5);
 	});
 
-	it("keeps ultra-narrow tiles wide enough for controls without overflowing", () => {
+	it("raises an incomplete portrait row enough for its controls", () => {
 		const single = layoutJustifiedRows(assets([0.25]), {
 			containerWidth: 366,
 			targetRowHeight: 150,
 			gap: 4,
 			layoutComplete: true,
 		});
-		expect(single[0]?.items[0]?.width).toBeGreaterThanOrEqual(44);
-		expect(single[0]?.width).toBeLessThanOrEqual(366);
+		const row = single[0];
+		const item = row?.items[0];
+		if (!row || !item) throw new Error("expected a portrait row");
+		expect(item.width).toBeGreaterThanOrEqual(44);
+		expect(item.width / row.height).toBe(0.25);
+		expect(row.width).toBeLessThanOrEqual(366);
+	});
 
-		const rows = layoutJustifiedRows(assets(Array(10).fill(0.25)), {
+	it("splits mixed extreme assets without changing their aspect ratios", () => {
+		const rows = layoutJustifiedRows(assets([0.25, 5]), {
 			containerWidth: 320,
 			targetRowHeight: 150,
 			gap: 4,
 			layoutComplete: true,
 		});
-		expect(rows.length).toBeGreaterThan(1);
+		expect(rows).toHaveLength(2);
 		for (const row of rows) {
-			expect(row.items.every((item) => item.width >= 44)).toBe(true);
+			expect(row.items.every((item) => item.width >= 44 && item.height >= 44)).toBe(
+				true,
+			);
 			expect(row.width).toBeLessThanOrEqual(320);
 			const last = row.items.at(-1);
 			expect((last?.left ?? 0) + (last?.width ?? 0)).toBeLessThanOrEqual(320);
+			for (const item of row.items) {
+				expect(item.width / item.height).toBeCloseTo(
+					item.asset.width / item.asset.height,
+					10,
+				);
+			}
 		}
 	});
 
-	it("keeps the final complete tile on the edge while clamping narrow items", () => {
+	it("keeps the final complete tile exactly on the container edge", () => {
 		const fixture = assets([1])[0];
 		if (!fixture) throw new Error("expected a fixture asset");
 		const dimensions: readonly (readonly [number, number])[] = [
 			[4461, 4210],
 			[1394, 2162],
 			[2855, 1077],
-			[451, 4113],
 			[3049, 780],
 		];
 		const source = dimensions.map(([width, height], index) => ({
@@ -181,7 +194,12 @@ describe("layoutJustifiedRows", () => {
 
 		expect(row.justified).toBe(true);
 		expect(last.left + last.width).toBe(1000);
-		expect(row.items.every((item) => item.width >= 44)).toBe(true);
+		for (const item of row.items) {
+			expect(item.width / item.height).toBeCloseTo(
+				item.asset.width / item.asset.height,
+				10,
+			);
+		}
 	});
 
 	it("rejects an aspect ratio that underflows to zero", () => {
@@ -204,7 +222,7 @@ describe("layoutJustifiedRows", () => {
 			[1153, 630],
 			[988, 1741],
 			[766, 1649],
-			[3223, 413],
+			[1800, 413],
 		];
 		const source = dimensions.map(([width, height], index) => ({
 			...fixture,
@@ -225,7 +243,13 @@ describe("layoutJustifiedRows", () => {
 		expect(Math.abs(last.left + last.width - 1000.1)).toBeLessThanOrEqual(
 			LAYOUT_GEOMETRY_TOLERANCE,
 		);
-		expect(row.items.every((item) => item.width >= 44)).toBe(true);
+		for (const item of row.items) {
+			expect(
+				Math.abs(
+					item.width / item.height - item.asset.width / item.asset.height,
+				),
+			).toBeLessThanOrEqual(LAYOUT_GEOMETRY_TOLERANCE);
+		}
 		for (let index = 1; index < row.items.length; index += 1) {
 			const previous = row.items[index - 1];
 			const current = row.items[index];

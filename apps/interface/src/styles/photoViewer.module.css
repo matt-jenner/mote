@@ -349,6 +349,18 @@
 	.viewerNavigator {
 		right: calc(max(44px, var(--safe-area-right, 0px)) + 52px);
 	}
+
+	.viewerOverlay:has(.viewerNavigator) .viewerZoomControls {
+		top: calc(max(8px, var(--safe-area-top, 0px)) + 52px);
+		right: auto;
+		left: max(8px, var(--safe-area-left, 0px));
+	}
+}
+
+@media (orientation: landscape) and (max-height: 500px) and (max-width: 480px) {
+	.viewerNavigator {
+		display: none;
+	}
 }
 
 @media (max-width: 899px) {
