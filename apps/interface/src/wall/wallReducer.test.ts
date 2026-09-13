@@ -1202,6 +1202,62 @@ describe("wallReducer", () => {
 		expect(replaced.pagesExhausted).toBe(false);
 	});
 
+	it("retains only the remainder streamed by the newer generation when its first page settles", () => {
+		const retainedFirstPage = Array.from({ length: 100 }, (_, index) =>
+			wallAsset(`retained-${index}`, 1, index + 1),
+		);
+		const staleRemainder = Array.from({ length: 50 }, (_, index) =>
+			wallAsset(`stale-${index}`, 1, index + 101),
+		);
+		const oldItems = [...retainedFirstPage, ...staleRemainder];
+		const nextFirstPage = retainedFirstPage.map((asset) => ({ ...asset }));
+		const nextRemainder = Array.from({ length: 21 }, (_, index) =>
+			wallAsset(`new-${index}`, 1, index + 101),
+		);
+		const current = {
+			...activeState(),
+			items: oldItems,
+			totalCount: 150,
+			cursor: null,
+			pagesExhausted: true,
+			orderState: "settled" as const,
+			settledGeneration: 4,
+		};
+		const streamed = reduce(current, {
+			type: "catalogBatch",
+			assets: nextRemainder,
+			orderState: "settled",
+			selectionId: "selection-a",
+			generation: 5,
+			progress: { discovered: 121, shaped: 121, enriched: 100, total: 121 },
+		});
+		const requested = reduce(streamed, {
+			type: "pageRequestStarted",
+			requestId: "new-generation-with-streamed-remainder",
+			requestCursor: null,
+			requestEpoch: streamed.scrollEpoch,
+		});
+		const settled = reduce(requested, {
+			type: "metadataSettled",
+			assets: nextFirstPage,
+			totalCount: 121,
+			nextCursor: "new-page-2",
+			requestEpoch: streamed.scrollEpoch,
+			requestCursor: null,
+			requestId: "new-generation-with-streamed-remainder",
+			generation: 5,
+		});
+
+		expect(settled.items.map(({ id }) => id)).toEqual(
+			[...nextFirstPage, ...nextRemainder].map(({ id }) => id),
+		);
+		expect(settled.items[0]).toBe(streamed.items[0]);
+		expect(settled.items.some(({ id }) => id.startsWith("stale-"))).toBe(false);
+		expect(settled.totalCount).toBe(121);
+		expect(settled.cursor).toBe("new-page-2");
+		expect(settled.pagesExhausted).toBe(false);
+	});
+
 	it("keeps an advanced nonterminal cursor when settlement covers only earlier items", () => {
 		const loaded = Array.from({ length: 150 }, (_, index) =>
 			wallAsset(`asset-${index}`, 1, index + 1),

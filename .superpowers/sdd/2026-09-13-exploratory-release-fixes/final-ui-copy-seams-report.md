@@ -52,3 +52,19 @@ Fix-round verification:
 - Interface typecheck: passed.
 - Biome on the four fix-round interface files: passed.
 - `git diff --check`: passed.
+
+## Fix round 2
+
+The full browser suite exposed a second settlement edge: generation 2 streamed 21 photos after the 100 already displayed, then its authoritative query returned only the first 100 with a next-page cursor. Replacing the wall with that page correctly removed stale generation-1 assets, but also removed the 21 assets already observed in generation 2.
+
+The reducer now records asset IDs delivered by `catalogBatch` for the current generation. When a newer generation settles, it rebuilds the wall from the authoritative first page plus only that generation's streamed remainder, clears the tracking set, accepts the new total and cursor, and drops every unobserved prior-generation asset. Unchanged first-page asset objects are reused so settlement does not needlessly restart rendered tile preview state.
+
+The new reducer regression failed RED with 100 items instead of 121. It now proves that a paged generation-2 settlement retains its 21 streamed assets, removes 50 stale generation-1 assets, reports total 121, resets pagination to the new cursor, and preserves identity for unchanged first-page assets. `PhotoViewer.browser.test.tsx` was not changed; its existing “keeps catalog-loaded photos when a later settlement page is shorter” acceptance test remains the integrated contract.
+
+Fix-round-2 verification:
+
+- Focused wall reducer unit test: 59 tests passed.
+- Existing focused PhotoViewer browser acceptance test: 1 passed, 92 skipped.
+- Interface typecheck: passed.
+- Biome on the two changed wall files: passed.
+- `git diff --check`: passed.

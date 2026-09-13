@@ -30,6 +30,8 @@ export interface WallState {
 	error: string | null;
 	scanProgress: ScanProgressDto | null;
 	scanProgressGeneration: number | null;
+	streamedAssetGeneration: number | null;
+	streamedAssetIds: Record<string, true>;
 	sortPending: boolean;
 	derivativeRetrying: boolean;
 }
@@ -156,6 +158,8 @@ export const initialWallState: WallState = {
 	error: null,
 	scanProgress: null,
 	scanProgressGeneration: null,
+	streamedAssetGeneration: null,
+	streamedAssetIds: {},
 	sortPending: false,
 	derivativeRetrying: false,
 };
@@ -352,6 +356,22 @@ function mergeSettledAssets(
 	return mergeAssets(current, settled);
 }
 
+function replaceSettledAssets(
+	current: readonly WallAsset[],
+	settled: readonly WallAsset[],
+): MergeResult {
+	const merged = mergeAssets(current, settled);
+	const byId = new Map(merged.items.map((asset) => [asset.id, asset]));
+	const seen = new Set<string>();
+	const items = settled.flatMap((asset) => {
+		if (seen.has(asset.id)) return [];
+		seen.add(asset.id);
+		const retained = byId.get(asset.id);
+		return retained ? [retained] : [];
+	});
+	return { items, changed: !sameSequence(current, items) };
+}
+
 function preserveCatalogAvailability(
 	current: readonly WallAsset[],
 	incoming: readonly WallAsset[],
@@ -519,6 +539,40 @@ function reuseSequence(previous: WallAsset[], next: WallAsset[]): WallAsset[] {
 	return sameSequence(previous, next) ? previous : next;
 }
 
+interface StreamedAssetState {
+	generation: number | null;
+	ids: Record<string, true>;
+	changed: boolean;
+}
+
+function rememberStreamedAssets(
+	currentGeneration: number | null,
+	currentIds: Record<string, true>,
+	generation: number | undefined,
+	assets: readonly WallAsset[],
+): StreamedAssetState {
+	if (
+		generation === undefined ||
+		(currentGeneration !== null && generation < currentGeneration)
+	) {
+		return { generation: currentGeneration, ids: currentIds, changed: false };
+	}
+	if (currentGeneration === null || generation > currentGeneration) {
+		return {
+			generation,
+			ids: Object.fromEntries(assets.map((asset) => [asset.id, true])),
+			changed: true,
+		};
+	}
+	let ids = currentIds;
+	for (const asset of assets) {
+		if (ids[asset.id]) continue;
+		if (ids === currentIds) ids = { ...currentIds };
+		ids[asset.id] = true;
+	}
+	return { generation, ids, changed: ids !== currentIds };
+}
+
 export function wallReducer(state: WallState, action: WallAction): WallState {
 	switch (action.type) {
 		case "pageRequestStarted": {
@@ -552,6 +606,12 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 		}
 		case "catalogBatch": {
 			if (!matchesSelection(state, action.selectionId)) return state;
+			const streamed = rememberStreamedAssets(
+				state.streamedAssetGeneration,
+				state.streamedAssetIds,
+				action.generation,
+				action.assets,
+			);
 			const matchingAssets = state.sortPending
 				? action.assets.filter((asset) =>
 						state.items.some((current) => current.id === asset.id),
@@ -585,7 +645,8 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				!merged.changed &&
 				state.orderState === orderState &&
 				!remembered.changed &&
-				!progressChanged
+				!progressChanged &&
+				!streamed.changed
 			)
 				return state;
 			const sorted =
@@ -611,6 +672,8 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				scanProgressGeneration: acceptsProgress
 					? (action.generation ?? state.scanProgressGeneration)
 					: state.scanProgressGeneration,
+				streamedAssetGeneration: streamed.generation,
+				streamedAssetIds: streamed.ids,
 			};
 		}
 		case "progress": {
@@ -620,11 +683,18 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				action.generation < state.scanProgressGeneration
 			)
 				return state;
+			const startsNewStream =
+				state.streamedAssetGeneration === null ||
+				action.generation > state.streamedAssetGeneration;
 			return {
 				...state,
 				scanProgress: action.progress,
 				scanProgressGeneration: action.generation,
 				totalCount: action.progress.total ?? state.totalCount,
+				streamedAssetGeneration: startsNewStream
+					? action.generation
+					: state.streamedAssetGeneration,
+				streamedAssetIds: startsNewStream ? {} : state.streamedAssetIds,
 			};
 		}
 		case "derivativeRetrying":
@@ -884,12 +954,23 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				state.settledGeneration !== null &&
 				generation > state.settledGeneration &&
 				action.requestCursor === null;
+			const settledIds = new Set(action.assets.map((asset) => asset.id));
+			const streamedRemainder =
+				replacesCompleteGeneration &&
+				state.streamedAssetGeneration === generation
+					? state.items.filter(
+							(item) =>
+								state.streamedAssetIds[item.id] && !settledIds.has(item.id),
+						)
+					: [];
 			const merged = replacesCompleteGeneration
-				? mergeSettledAssets([], replacementPage)
+				? replaceSettledAssets(state.items, [
+						...replacementPage,
+						...streamedRemainder,
+					])
 				: mergeSettledAssets(state.items, replacementPage);
 			const items = reuseSequence(state.items, merged.items);
 			const previewCounts = pagePreviewCounts(state, action.previewCounts);
-			const settledIds = new Set(action.assets.map((asset) => asset.id));
 			const preservesLoadedRemainder =
 				!replacesCompleteGeneration &&
 				state.items.some((current) => !settledIds.has(current.id));
@@ -914,6 +995,8 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 					? state.pagesExhausted
 					: action.nextCursor === null,
 				settledGeneration: Math.max(state.settledGeneration ?? 0, generation),
+				streamedAssetGeneration: generation,
+				streamedAssetIds: {},
 				assetWarnings:
 					remembered.changed || recoveredWarnings !== state.assetWarnings
 						? remembered.warnings
