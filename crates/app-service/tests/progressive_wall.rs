@@ -970,9 +970,9 @@ async fn root_first_unavailable_selected_child_marks_only_its_group_offline() {
         child.join("child.jpg"),
     )
     .unwrap();
+    let reader = CountingReader::default();
     let service =
-        AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
-            .unwrap();
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(reader.clone())).unwrap();
     let mut updates = service.subscribe_wall_updates();
     service.start_scan(&fixture.source).await.unwrap();
     recv_until(&mut updates, |event| {
@@ -985,6 +985,7 @@ async fn root_first_unavailable_selected_child_marks_only_its_group_offline() {
     })
     .await;
     let before = service.bootstrap().unwrap();
+    let reads_before_check = reader.count();
     let unavailable = fixture.source.join("child-offline");
     std::fs::rename(&child, &unavailable).unwrap();
     let ids: Vec<_> = before
@@ -1008,6 +1009,21 @@ async fn root_first_unavailable_selected_child_marks_only_its_group_offline() {
     }
     let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
     let active = catalog.load_app_state().unwrap().active_selection.unwrap();
+    let assets = catalog.assets(active.library_id).unwrap();
+    assert_eq!(assets.len(), 5);
+    for asset in &assets {
+        let expected = if asset.display_path == "child/child.jpg" {
+            Availability::RootOffline
+        } else {
+            Availability::Available
+        };
+        assert_eq!(asset.availability, expected, "{}", asset.display_path);
+    }
+    assert_eq!(
+        reader.count(),
+        reads_before_check,
+        "folder access checks must not probe individual assets"
+    );
     let active_group = catalog
         .folder_group_for_path(active.library_id, &active.relative_folder)
         .unwrap()

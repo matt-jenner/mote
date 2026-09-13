@@ -125,6 +125,30 @@ impl<R: MetadataReader> Indexer<R> {
     }
 
     pub fn start(&self, request: ScanRequest) -> Result<ScanHandle, IndexError> {
+        self.start_with_discovery(request, discover_all)
+    }
+
+    fn start_with_discovery<F>(
+        &self,
+        request: ScanRequest,
+        discover: F,
+    ) -> Result<ScanHandle, IndexError>
+    where
+        F: FnOnce(
+                &Path,
+                &Path,
+                LibraryId,
+                Option<FolderGroupId>,
+                mpsc::Sender<DiscoveredAsset>,
+                watch::Receiver<bool>,
+                &FolderPolicyEngine,
+                &mpsc::Sender<IndexEvent>,
+                &AtomicU64,
+                &AtomicU64,
+            ) -> Result<(), IndexError>
+            + Send
+            + 'static,
+    {
         if !request.root.is_dir() {
             return Err(IndexError::RootUnavailable(request.root));
         }
@@ -155,7 +179,7 @@ impl<R: MetadataReader> Indexer<R> {
         let discovery_failure_count = discovery_failures.clone();
         let discovery_photo_failures = failed_photos.clone();
         let discovery = tokio::task::spawn_blocking(move || {
-            discover_all(
+            discover(
                 &discovery_root,
                 &library_root,
                 library_id,
@@ -493,6 +517,7 @@ impl<R: MetadataReader> Indexer<R> {
             if !summary.cancelled {
                 validate_completed_inventory(
                     discovered,
+                    failed_photos.load(Ordering::Relaxed),
                     known_inventory(&direct_inventory_total, &inventory_total),
                 )?;
             }
@@ -533,10 +558,14 @@ fn known_inventory(direct: &AtomicU64, recursive: &AtomicU64) -> Option<PhotoInv
 
 fn validate_completed_inventory(
     discovered: u64,
+    failed_photos: u64,
     inventory: Option<PhotoInventory>,
 ) -> Result<(), IndexError> {
+    // Independent walks may disagree about entries whose discovery metadata
+    // failed. Only those observed failures can explain a smaller inventory.
     if let Some(inventory) = inventory
-        && discovered != inventory.recursive
+        && (inventory.recursive < discovered.saturating_sub(failed_photos)
+            || inventory.recursive > discovered)
     {
         return Err(IndexError::InventoryMismatch {
             expected: inventory.recursive,
@@ -720,6 +749,110 @@ mod tests {
     use super::{PhotoInventory, validate_completed_inventory};
     use crate::{IndexError, IndexScheduler, InteractionMode, SchedulerConfig};
 
+    #[tokio::test]
+    async fn disappeared_discovery_joins_and_settles_surviving_assets() {
+        use crate::{CatalogWriter, DefaultMetadataReader, IndexEvent, Indexer, ScanRequest};
+        use photo_catalog::{Catalog, NewAsset, NewLibrary};
+        use photo_domain::{Availability, MediaKind, RelativePathKey};
+
+        let temp = tempfile::tempdir().unwrap();
+        image::RgbImage::new(8, 6)
+            .save(temp.path().join("survivor.jpg"))
+            .unwrap();
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let library = catalog
+            .add_library(&NewLibrary::configured("photos", temp.path()))
+            .unwrap();
+        let missing = NewAsset::minimal(
+            library.id,
+            RelativePathKey::from_relative_path(std::path::Path::new("vanished.jpg")).unwrap(),
+            "vanished.jpg",
+            MediaKind::Jpeg,
+            12,
+        );
+        catalog.upsert_asset(&missing).unwrap();
+        let generation = catalog.begin_generation(library.id).unwrap();
+        let indexer = Indexer::new(
+            DefaultMetadataReader,
+            photo_core::FolderPolicyEngine::new(Vec::new()).unwrap(),
+        );
+        let mut scan = indexer
+            .start_with_discovery(
+                ScanRequest::new(temp.path()).for_library(library.id),
+                |root,
+                 library_root,
+                 library_id,
+                 group,
+                 sender,
+                 cancel,
+                 policy,
+                 events,
+                 failures,
+                 photos| {
+                    // Discovery already observed this directory entry; its metadata lookup
+                    // now fails. The independent real inventory never sees the entry.
+                    assert!(
+                        super::discover_for_scan(
+                            library_root,
+                            &root.join("vanished.jpg"),
+                            library_id,
+                            None,
+                            events,
+                            failures,
+                            photos
+                        )?
+                        .is_none()
+                    );
+                    super::discover_all(
+                        root,
+                        library_root,
+                        library_id,
+                        group,
+                        sender,
+                        cancel,
+                        policy,
+                        events,
+                        failures,
+                        photos,
+                    )
+                },
+            )
+            .unwrap();
+        let mut completed = false;
+        while let Some(event) = scan.events.recv().await {
+            completed |= matches!(event, IndexEvent::Completed(_));
+            CatalogWriter::new(&mut catalog, library.id, generation)
+                .apply_batch(&[event])
+                .unwrap();
+        }
+        let summary = scan
+            .join()
+            .await
+            .expect("observed file disappearance must not abort completion");
+        assert!(completed);
+        assert_eq!(summary.discovered, 2);
+        assert_eq!(summary.failed, 1);
+        catalog.complete_generation(library.id, generation).unwrap();
+        let assets = catalog.assets(library.id).unwrap();
+        assert_eq!(assets.len(), 2);
+        assert_eq!(
+            catalog
+                .find_asset(missing.id)
+                .unwrap()
+                .unwrap()
+                .availability,
+            Availability::Missing
+        );
+        assert_eq!(
+            assets
+                .iter()
+                .find(|asset| asset.id != missing.id)
+                .unwrap()
+                .availability,
+            Availability::Available
+        );
+    }
+
     #[test]
     fn root_first_disappeared_file_does_not_abort_discovery() {
         let temp = tempfile::tempdir().unwrap();
@@ -771,6 +904,7 @@ mod tests {
     fn completion_rejects_a_partial_discovery_against_the_inventory() {
         let error = validate_completed_inventory(
             154,
+            0,
             Some(PhotoInventory {
                 direct: 2_092,
                 recursive: 2_092,
