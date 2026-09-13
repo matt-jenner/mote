@@ -35,7 +35,10 @@ pub use gallery::{
 };
 pub use hosted_runtime::SelectionEventSubscription;
 pub use hosted_runtime::SequencedWallUpdate;
-pub use original_copy::{CopyCancellation, CopyItemResult, CopyItemStatus, OriginalCopyBatch, OriginalCopyOutcome, OriginalCopyResult};
+pub use original_copy::{
+    CopyCancellation, CopyItemResult, CopyItemStatus, OriginalCopyBatch, OriginalCopyOutcome,
+    OriginalCopyResult,
+};
 pub use photo_domain::GalleryScope;
 pub use photo_indexer::MetadataReader;
 pub use service::{AppService, AppServiceError};

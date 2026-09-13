@@ -375,19 +375,20 @@ fn destination_loss_mid_batch_stops_and_keeps_completed_copy() {
     let fixture = Fixture::new(&["first.jpg", "second.jpg", "third.jpg"]);
     let moved = fixture.temp.path().join("unmounted");
     let mut reports = 0;
-    let result = fixture
-        .service
-        .copy_originals_with_progress(
-            fixture.service.prepare_original_copy(&fixture.ids).unwrap(),
-            &fixture.destination,
-            |_| {
-                reports += 1;
-                if reports == 1 {
-                    fs::rename(&fixture.destination, &moved).unwrap();
-                }
-            },
-        );
-    assert!(matches!(result, Err(AppServiceError::CopyDestinationMissing)));
+    let result = fixture.service.copy_originals_with_progress(
+        fixture.service.prepare_original_copy(&fixture.ids).unwrap(),
+        &fixture.destination,
+        |_| {
+            reports += 1;
+            if reports == 1 {
+                fs::rename(&fixture.destination, &moved).unwrap();
+            }
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(AppServiceError::CopyDestinationMissing)
+    ));
     assert_eq!(reports, 1);
     assert_eq!(names(&moved), ["first.jpg"]);
     assert!(!fixture.destination.exists());
