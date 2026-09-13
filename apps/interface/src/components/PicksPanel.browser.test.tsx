@@ -259,6 +259,36 @@ async function renderControllablePicksApp(initial: PickListSnapshot): Promise<{
 }
 
 describe("responsive Picks panel", () => {
+	it("enters cancellable zero progress through the native full-copy path", async () => {
+		let requested: readonly string[] | null | undefined;
+		let finish!: (result: CopyResult) => void;
+		const { screen } = await renderPicksApp({
+			copy: (ids, listener) => {
+				requested = ids;
+				listener({ completed: 0, total: 2, item: null });
+				return new Promise((resolve) => {
+					finish = resolve;
+				});
+			},
+		});
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+
+		await panel.getByRole("button", { name: "Copy 2 originals…" }).click();
+
+		expect(requested).toBeNull();
+		await expect
+			.element(panel.getByText("0 of 2", { exact: true }))
+			.toBeVisible();
+		await expect
+			.element(panel.getByRole("button", { name: "Cancel", exact: true }))
+			.toBeEnabled();
+		expect(
+			panel.getByRole("button", { name: "Clear picks" }).query(),
+		).toBeNull();
+		finish({ kind: "copyCancelled" });
+	});
+
 	it("owns full-width copy progress and cancellation inside the drawer", async () => {
 		let progress!: (event: CopyProgress) => void;
 		let finish!: (result: CopyResult) => void;
@@ -576,10 +606,7 @@ describe("responsive Picks panel", () => {
 			.element(panel.getByRole("button", { name: "Copy 2 originals…" }))
 			.toBeEnabled();
 		await panel.getByRole("button", { name: "Copy 2 originals…" }).click();
-		expect(batches).toEqual([
-			["coast", "offline"],
-			["coast", "unpicked"],
-		]);
+		expect(batches).toEqual([null, null]);
 	});
 
 	it("keeps new picks out of retry and retires retry after Clear", async () => {
@@ -612,10 +639,7 @@ describe("responsive Picks panel", () => {
 			sourceLabel: "Family",
 		});
 		await panel.getByRole("button", { name: "Retry 2 originals…" }).click();
-		expect(batches).toEqual([
-			["coast", "offline"],
-			["coast", "offline"],
-		]);
+		expect(batches).toEqual([null, ["coast", "offline"]]);
 		await panel.getByRole("button", { name: "Clear picks" }).click();
 		await expect
 			.element(panel.getByText("Add photos to picks as you browse."))
@@ -758,7 +782,7 @@ describe("responsive Picks panel", () => {
 		await expect
 			.element(panel.getByRole("button", { name: "Choosing destination…" }))
 			.toBeDisabled();
-		expect(batches).toEqual([["coast", "offline"]]);
+		expect(batches).toEqual([null]);
 		progress({ completed: 0, total: 2, item: null });
 		await expect
 			.element(panel.getByRole("progressbar", { name: "Copy originals" }))
@@ -786,7 +810,7 @@ describe("responsive Picks panel", () => {
 			.element(screen.getByRole("button", { name: "Picks, 1 pick" }))
 			.toBeVisible();
 		expect(service.getPicks().items).toHaveLength(1);
-		expect(batches).toEqual([["coast", "offline"]]);
+		expect(batches).toEqual([null]);
 		finish({
 			kind: "complete",
 			copiedCount: 2,
@@ -869,7 +893,7 @@ describe("responsive Picks panel", () => {
 		await expect
 			.element(panel.getByRole("button", { name: "Retry 1 originals…" }))
 			.toBeEnabled();
-		expect(batches).toEqual([["coast", "offline"], ["offline"]]);
+		expect(batches).toEqual([null, ["offline"]]);
 		expect(service.getPicks().items).toHaveLength(2);
 	});
 

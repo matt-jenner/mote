@@ -9,6 +9,7 @@ import type {
 	PhotoService,
 	WallAsset,
 } from "../services/photoService";
+import { PhotoServiceError } from "../services/photoService";
 import {
 	PickListProvider,
 	pickOriginFromSavedFolders,
@@ -110,6 +111,82 @@ afterEach(() => {
 });
 
 describe("pick list controller", () => {
+	it("uses the native post-picker pick snapshot for full copies and explicit IDs for retry", async () => {
+		const batches: Array<readonly string[] | null> = [];
+		const { store, stop } = await copyFixture(async (ids) => {
+			batches.push(ids);
+			return batches.length === 1
+				? partialCopy
+				: { kind: "selectionCancelled" };
+		});
+
+		await store.getState().copyOriginals();
+		await store.getState().copyOriginals();
+
+		expect(batches).toEqual([null, ["second"]]);
+		stop();
+	});
+
+	it.each([
+		["partial result", async () => partialCopy],
+		[
+			"native error",
+			async () => {
+				throw new PhotoServiceError(
+					"copyDestinationMissing",
+					"The destination folder no longer exists.",
+				);
+			},
+		],
+	] as const)(
+		"keeps an actionable copy %s visible for five seconds",
+		async (_case, copy) => {
+			vi.useFakeTimers();
+			const { store, stop } = await copyFixture(copy);
+
+			await store.getState().copyOriginals();
+			expect(store.getState().toast?.phase).toBe("visible");
+			vi.advanceTimersByTime(1_000);
+			expect(store.getState().toast).not.toBeNull();
+			vi.advanceTimersByTime(3_800);
+			expect(store.getState().toast?.phase).toBe("exiting");
+			vi.advanceTimersByTime(200);
+			expect(store.getState().toast).toBeNull();
+			stop();
+		},
+	);
+
+	it("defers a thrown copy error behind active Undo, then shows it for five seconds", async () => {
+		vi.useFakeTimers();
+		const { store, stop, memory } = await copyFixture(async () => {
+			throw new PhotoServiceError(
+				"copyDestinationMissing",
+				"The destination folder no longer exists.",
+			);
+		});
+		await store.getState().clear();
+		await memory.addPick(reference(asset("later")));
+		const undoToast = store.getState().toast;
+
+		await store.getState().copyOriginals();
+
+		expect(store.getState().toast).toBe(undoToast);
+		expect(store.getState().toast?.action?.label).toBe("Undo");
+		expect(store.getState().announcement).toBe(
+			"The destination folder no longer exists.",
+		);
+		vi.advanceTimersByTime(5_000);
+		expect(store.getState().toast).toMatchObject({
+			message: "The destination folder no longer exists.",
+			phase: "visible",
+		});
+		vi.advanceTimersByTime(4_800);
+		expect(store.getState().toast?.phase).toBe("exiting");
+		vi.advanceTimersByTime(200);
+		expect(store.getState().toast).toBeNull();
+		stop();
+	});
+
 	it("retries Cancel after its first native cancellation command rejects", async () => {
 		const worker = deferred<CopyResult>();
 		const firstCommand = deferred<void>();
@@ -358,10 +435,7 @@ describe("pick list controller", () => {
 		expect(store.getState().copy.phase).toBe("complete");
 		await store.getState().toggle(asset("later"), origin);
 		await store.getState().copyOriginals();
-		expect(batches).toEqual([
-			["first", "second"],
-			["first", "later"],
-		]);
+		expect(batches).toEqual([null, null]);
 		stop();
 	});
 
@@ -376,7 +450,7 @@ describe("pick list controller", () => {
 		await store.getState().copyOriginals();
 		await store.getState().toggle(asset("later"), origin);
 		await store.getState().copyOriginals();
-		expect(batches).toEqual([["first", "second"], ["second"]]);
+		expect(batches).toEqual([null, ["second"]]);
 		await store.getState().clear();
 		expect(store.getState().copy).toMatchObject({
 			phase: "idle",
@@ -435,7 +509,9 @@ describe("pick list controller", () => {
 		});
 		await store.getState().toast?.action?.run();
 		expect(shown()).toBe(1);
-		vi.advanceTimersByTime(3_000);
+		vi.advanceTimersByTime(4_800);
+		expect(store.getState().toast?.phase).toBe("exiting");
+		vi.advanceTimersByTime(200);
 		expect(store.getState().toast).toBeNull();
 		stop();
 	});
