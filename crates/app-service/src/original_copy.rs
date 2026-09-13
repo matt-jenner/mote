@@ -460,16 +460,15 @@ impl AppService {
             }
         });
         // Never unlink a substituted entry or a file beneath a newly selected source.
-        if let Some(current_directory) = copy_directory_path(&directory_identity) {
-            if self
+        if let Some(current_directory) = copy_directory_path(&directory_identity)
+            && self
                 .check_copy_destination(&current_directory, roots)
                 .is_ok()
-            {
-                remove_created_file(
-                    &current_directory.join(temporary.file_name().expect("generated filename")),
-                    &identity,
-                );
-            }
+        {
+            remove_created_file(
+                &current_directory.join(temporary.file_name().expect("generated filename")),
+                &identity,
+            );
         }
         published
     }
@@ -704,6 +703,9 @@ fn same_file(left: &File, target: &Path) -> bool {
 mod tests {
     use super::*;
 
+    type CopyStepHook = Box<dyn FnMut(&str)>;
+    type CopyFailureHook = Box<dyn FnMut(&str) -> io::Result<()>>;
+
     pub(super) fn copy_failure(step: &str) -> io::Result<()> {
         COPY_FAILURE.with(|hook| match hook.borrow_mut().as_mut() {
             Some(hook) => hook(step),
@@ -713,8 +715,8 @@ mod tests {
 
     thread_local! {
         pub(super) static DIRECTORY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-        pub(super) static COPY_STEP: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> = const { std::cell::RefCell::new(None) };
-        pub(super) static COPY_FAILURE: std::cell::RefCell<Option<Box<dyn FnMut(&str) -> io::Result<()>>>> = const { std::cell::RefCell::new(None) };
+        pub(super) static COPY_STEP: std::cell::RefCell<Option<CopyStepHook>> = const { std::cell::RefCell::new(None) };
+        pub(super) static COPY_FAILURE: std::cell::RefCell<Option<CopyFailureHook>> = const { std::cell::RefCell::new(None) };
     }
 
     #[test]
