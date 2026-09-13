@@ -1070,6 +1070,40 @@ describe("wallReducer", () => {
 		expect(settled.pagesExhausted).toBe(true);
 	});
 
+	it("keeps an advanced nonterminal cursor when settlement covers only earlier items", () => {
+		const loaded = Array.from({ length: 150 }, (_, index) =>
+			wallAsset(`asset-${index}`, 1, index + 1),
+		);
+		const current = {
+			...activeState(),
+			items: loaded,
+			cursor: "page-3",
+			pagesExhausted: false,
+		};
+		const requested = reduce(current, {
+			type: "pageRequestStarted",
+			requestId: "settle-earlier-page",
+			requestCursor: null,
+			requestEpoch: current.scrollEpoch,
+		});
+
+		const settled = reduce(requested, {
+			type: "metadataSettled",
+			assets: loaded.slice(0, 100),
+			totalCount: 150,
+			nextCursor: "page-2",
+			requestEpoch: current.scrollEpoch,
+			requestCursor: null,
+			requestId: "settle-earlier-page",
+		});
+
+		expect(settled.items.map((item) => item.id)).toEqual(
+			loaded.map((item) => item.id),
+		);
+		expect(settled.cursor).toBe("page-3");
+		expect(settled.pagesExhausted).toBe(false);
+	});
+
 	it("starts settled from a cached nonterminal page and preserves server order", () => {
 		const cachedRequest = reduce(initialWallState, {
 			type: "pageRequestStarted",

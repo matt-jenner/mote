@@ -1151,6 +1151,12 @@ describe("progressive photo wall", () => {
 		expect(
 			service.derivativeRequests.flatMap((request) => request.assetIds),
 		).not.toContain("provisional-40");
+		const provisionalFirstTile = wall
+			.element()
+			.querySelector<HTMLElement>("[data-asset-id='provisional-0']");
+		if (!provisionalFirstTile)
+			throw new Error("provisional tile was not rendered");
+		const provisionalWidth = provisionalFirstTile.getBoundingClientRect().width;
 
 		service.emit({
 			kind: "metadataSettled",
@@ -1159,14 +1165,58 @@ describe("progressive photo wall", () => {
 			generation: 1,
 		});
 		await expect.poll(() => service.queryRequests.length).toBe(2);
-		service.releaseQuery(1, pageOf([...provisional].reverse(), "settled"));
+		const settledStart = service.derivativeRequests.length;
+		const settlement = [...provisional].reverse().map((item) => ({
+			...item,
+			displayName: `Settled ${item.id}`,
+			dateState: "settled" as const,
+			width: 500,
+			height: 1_000,
+		}));
+		service.releaseQuery(1, pageOf(settlement, "settled"));
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("Preparing previews · 0 of 60");
 		await expect
 			.poll(
 				() =>
-					wall.element().querySelector<HTMLElement>("[data-asset-id]")?.dataset
-						.assetId,
+					wall
+						.element()
+						.querySelector<HTMLElement>("[data-asset-id='provisional-0']")
+						?.getBoundingClientRect().width,
 			)
-			.toBe("provisional-0");
+			.not.toBe(provisionalWidth);
+		await expect
+			.poll(() =>
+				[
+					...wall.element().querySelectorAll<HTMLElement>("[data-asset-id]"),
+				].map((tile) => tile.dataset.assetId),
+			)
+			.toEqual(provisional.map((item) => item.id));
+		await expect
+			.poll(() =>
+				service.derivativeRequests
+					.slice(settledStart)
+					.some((request) => request.priority === "visible"),
+			)
+			.toBe(true);
+		const settledIdle = idleCallbacks.splice(0);
+		expect(settledIdle.length).toBeGreaterThan(0);
+		expect(
+			service.derivativeRequests.flatMap((request) => request.assetIds),
+		).not.toContain("provisional-59");
+		for (const callback of settledIdle) callback();
+		while (idleCallbacks.length > 0)
+			for (const callback of idleCallbacks.splice(0)) callback();
+		await expect
+			.poll(() =>
+				service.derivativeRequests.some(
+					(request) =>
+						request.priority === "nearViewport" &&
+						request.assetIds.includes("provisional-59"),
+				),
+			)
+			.toBe(true);
 		screen.unmount();
 	});
 
