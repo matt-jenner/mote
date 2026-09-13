@@ -725,6 +725,9 @@ async fn completed_sibling_group_does_not_settle_a_new_child_selection() {
         matches!(event, WallUpdate::MetadataSettled { .. })
     })
     .await;
+    first.shutdown().await;
+    first.wait_for_collection_drivers_quiescent_test().await;
+    first.wait_for_derivative_tasks_quiescent_test().await;
     drop(first);
 
     let (reader, release) = BlockingReader::new();
@@ -3874,6 +3877,48 @@ async fn cancelled_screen_commit_waits_for_started_blocking_work() {
             1
         );
     }
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_retains_an_admitted_blocking_commit_until_it_drains() {
+    let (fixture, service, asset_id) = prepare_unready_fixture().await;
+    let commit_started = Arc::new(tokio::sync::Notify::new());
+    let commit_release = Arc::new(AtomicBool::new(false));
+    service
+        .install_managed_commit_started_test_gate(commit_started.clone(), commit_release.clone())
+        .await;
+    let request_service = service.clone();
+    let request = tokio::spawn(async move {
+        request_service
+            .request_derivatives(DerivativeRequest::visible(vec![asset_id]))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), commit_started.notified())
+        .await
+        .expect("commit should be admitted and running");
+    service.shutdown().await;
+    assert!(
+        !request.is_finished(),
+        "shutdown must not settle a started blocking commit early"
+    );
+    commit_release.store(true, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .expect("admitted commit must drain after release")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        Catalog::open(&fixture.config.catalog_path())
+            .unwrap()
+            .all_derivatives()
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.kind == "wall_thumbnail")
+            .count(),
+        1
+    );
+    assert_eq!(service.runtime_count_for_test(), 0);
 }
 
 #[cfg(debug_assertions)]

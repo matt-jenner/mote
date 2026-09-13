@@ -24,6 +24,17 @@ impl AppService {
         if !self.admit_desktop_scan(selection_token)? {
             return Ok(());
         }
+        #[cfg(test)]
+        {
+            let gate = self.scan_admission_test_gate.lock().await.take();
+            if let Some(gate) = gate {
+                let release = gate.release.notified();
+                tokio::pin!(release);
+                release.as_mut().enable();
+                gate.entered.notify_one();
+                release.await;
+            }
+        }
         let (bound, scope) = {
             // Keep bridge installation in the same transition critical section
             // as selection changes. A newer selection therefore cannot become
@@ -205,6 +216,9 @@ impl AppService {
     }
 
     fn desktop_selection_is_current_locked(&self, selection: SelectionToken) -> bool {
+        if self.gallery.folder_jobs.is_shutdown() {
+            return false;
+        }
         let Ok(state) = self.state() else {
             return false;
         };

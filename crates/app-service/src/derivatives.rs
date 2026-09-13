@@ -2800,6 +2800,14 @@ impl AppService {
         if self.derivative_runtime.is_some() {
             return Ok(self.clone());
         }
+        #[cfg(test)]
+        {
+            let gate = self.derivative_binding_test_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.send(()).unwrap();
+                gate.release.recv().unwrap();
+            }
+        }
         self.gallery
             .bind_desktop_derivatives(self, self.active_selection_token()?)
     }

@@ -399,6 +399,12 @@ pub(crate) struct ScanCompletionWakeTestHook {
     pub(crate) marker: Arc<Notify>,
 }
 
+#[cfg(test)]
+pub(crate) struct BlockingTestGate {
+    pub(crate) entered: std::sync::mpsc::Sender<()>,
+    pub(crate) release: std::sync::mpsc::Receiver<()>,
+}
+
 trait RecentSourceValidator: Send + Sync {
     fn validate_recent(&self, folder: &Path) -> Result<ValidatedSourceFolder, AddLibraryError>;
 }
@@ -447,6 +453,10 @@ pub struct AppService {
     pub(crate) gallery_scope_update: Arc<TokioMutex<()>>,
     #[cfg(test)]
     pub(crate) saved_activation_test_gate: Arc<TokioMutex<Option<CollectionTestGate>>>,
+    #[cfg(test)]
+    pub(crate) derivative_binding_test_gate: Arc<Mutex<Option<BlockingTestGate>>>,
+    #[cfg(test)]
+    pub(crate) scan_admission_test_gate: Arc<TokioMutex<Option<CollectionTestGate>>>,
     #[cfg(any(test, debug_assertions))]
     pub(crate) derivative_test_gate: Arc<TokioMutex<Option<DerivativeTestGate>>>,
     #[cfg(any(test, debug_assertions))]
@@ -610,6 +620,10 @@ impl AppService {
             gallery_scope_update: Arc::new(TokioMutex::new(())),
             #[cfg(test)]
             saved_activation_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(test)]
+            derivative_binding_test_gate: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            scan_admission_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]
             derivative_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]
@@ -1695,6 +1709,107 @@ mod tests {
             bound_b.coordinator.background_generation().await,
             b_generation
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_race_derivative_binding_rejects_without_stranding_receivers() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir(&source).unwrap();
+        ImageBuffer::from_pixel(2, 2, Rgb([10_u8, 20, 30]))
+            .save(source.join("photo.jpg"))
+            .unwrap();
+        let service = AppService::open(AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        service
+            .set_interaction(crate::InteractionState::Active)
+            .await;
+        let mut updates = service.subscribe_wall_updates();
+        service.start_scan(&source).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(
+                updates.recv().await.unwrap(),
+                WallUpdate::MetadataSettled { .. }
+            ) {}
+        })
+        .await
+        .unwrap();
+        let asset = service
+            .query_wall(crate::WallQueryRequest::oldest_first())
+            .await
+            .unwrap()
+            .items[0]
+            .id
+            .clone();
+        let (entered_send, entered_receive) = mpsc::channel();
+        let (release_send, release_receive) = mpsc::channel();
+        *service.derivative_binding_test_gate.lock().unwrap() = Some(super::BlockingTestGate {
+            entered: entered_send,
+            release: release_receive,
+        });
+        let request_service = service.clone();
+        let request = tokio::spawn(async move {
+            request_service
+                .request_derivatives(crate::DerivativeRequest::visible(vec![asset]))
+                .await
+        });
+        entered_receive
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        service.shutdown().await;
+        release_send.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), request)
+            .await
+            .expect(
+                "shutdown racing binding must resolve the request, not strand its queued receiver",
+            )
+            .unwrap();
+        assert!(result.is_err());
+        assert_eq!(service.runtime_count_for_test(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_race_scan_activation_cannot_install_a_late_bridge() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir(&source).unwrap();
+        let service = AppService::open(AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let token = service.select_recent(&source).unwrap().1;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *service.scan_admission_test_gate.lock().await = Some(super::CollectionTestGate {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let scan_service = service.clone();
+        let scan = tokio::spawn(async move { scan_service.start_selected_scan(token).await });
+        entered.notified().await;
+        service.shutdown().await;
+        let bridge_id = service
+            .next_bridge_id
+            .load(std::sync::atomic::Ordering::Acquire);
+        release.notify_waiters();
+        scan.await.unwrap().unwrap();
+        assert_eq!(
+            service
+                .next_bridge_id
+                .load(std::sync::atomic::Ordering::Acquire),
+            bridge_id,
+            "shutdown must prevent even a transient bridge installation"
+        );
+        assert!(
+            service.desktop_bridges.lock().unwrap().is_empty(),
+            "shutdown between transition sections must prevent bridge installation"
+        );
+        assert!(service.state().unwrap().active_scan.is_none());
+        assert_eq!(service.runtime_count_for_test(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

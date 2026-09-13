@@ -62,6 +62,17 @@ impl FolderJobRegistry {
         self.closed.load(Ordering::Acquire)
     }
 
+    /// A binding may escape only while its runtime belongs to the open
+    /// registry. A later shutdown then owns that runtime and closes its queue.
+    pub(crate) fn admits_binding(&self, runtime: &Arc<SelectionRuntime>) -> bool {
+        let runtimes = self.runtimes.lock().expect("folder jobs poisoned");
+        !self.is_shutdown()
+            && runtimes
+                .get(&(runtime.selection.library_id, runtime.selection.group_id))
+                .and_then(Weak::upgrade)
+                .is_some_and(|registered| Arc::ptr_eq(&registered, runtime))
+    }
+
     pub(crate) fn shutdown(&self) -> Vec<Arc<SelectionRuntime>> {
         let mut runtimes = self.runtimes.lock().expect("folder jobs poisoned");
         self.closed.store(true, Ordering::Release);

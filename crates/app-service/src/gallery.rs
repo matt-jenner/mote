@@ -1149,6 +1149,9 @@ impl GalleryEngine {
         selection: crate::service::SelectionToken,
     ) -> Result<crate::AppService, AppServiceError> {
         let runtime = self.runtime(&self.selection_from_token(selection)?);
+        if !self.folder_jobs.admits_binding(&runtime) {
+            return Err(AppServiceError::DerivativeUnavailable);
+        }
         let controls = runtime.desktop_controls.get_or_init(|| {
             let first = Arc::ptr_eq(&runtime.coordinator, &service.coordinator);
             crate::hosted_runtime::DesktopDerivativeControls {
