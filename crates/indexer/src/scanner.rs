@@ -667,6 +667,9 @@ fn source_access_warning(error: std::io::Error) -> MetadataReadWarning {
     MetadataReadWarning::new(code, error.to_string())
 }
 
+// Keep this signature aligned with the injectable discovery seam used by the
+// deterministic disappearance race test.
+#[allow(clippy::too_many_arguments)]
 fn discover_all(
     root: &Path,
     library_root: &Path,
