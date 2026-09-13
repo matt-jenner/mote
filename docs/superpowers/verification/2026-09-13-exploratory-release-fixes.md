@@ -32,7 +32,8 @@ The generated bundle was ad hoc signed after Tauri's build, then passed
 `codesign --verify --deep --strict --verbose=2`. Its identifier is
 `io.github.matt-jenner.mote`, its executable is a Mach-O 64-bit arm64 binary,
 and the executable SHA-256 is
-`603e8efa5aa5ac471c9a9f48ea3d19087032232ac7578b907ce44e08540d4e6c`.
+`083e02bc515504b0e43e6fac6c8013c1c21b925e06c14f2e31847db365305bca`
+for the final bundle rebuilt from `main`.
 
 The release feature set emits one non-failing dead-code warning for
 `GalleryEngine::cancel_runtime_scan`, which is exercised by the test feature
