@@ -27,8 +27,9 @@ version.
   local to the browser profile and site. The server does not store a user's
   picks.
 - Adding, copying, or downloading never clears the list automatically.
-- `Clear picks` acts immediately and offers a short-lived `Undo` action. It
-  does not open a confirmation dialog.
+- When no copy attempt is active, `Clear picks` acts immediately and offers
+  `Undo` for five seconds. It does not open a confirmation dialog. A successful
+  Clear also resets copy messages, row failures, and the Show folder action.
 - Removing a saved-folder shortcut does not remove picks from that folder.
   A pick remains until the user removes it or clears the list.
 - If a source or original becomes unavailable, retain the pick with an
@@ -118,30 +119,51 @@ themes, motion rules, and accessibility conventions.
 
 ## Desktop copy flow
 
-1. `Copy N originals...` opens the native destination-folder picker every time.
+1. `Copy N originals...` opens the native destination-folder picker every time,
+   before listing picks or preparing immutable batches. Dismissing the picker
+   silently restores the previous drawer copy state.
 2. When the operating system permits it, start the picker at the last
    destination used by a successful copy. Cancelling does not change that
    remembered destination.
 3. Reject a destination that is the same as, or contained within, a configured
    photo source. Mote must continue treating every configured source as
    read-only.
-4. Copy each original directly into the chosen destination. Do not reproduce
-   source-folder structure and do not alter source bytes or metadata.
+4. Write each original in bounded chunks to a private `.mote-copy-*` temporary
+   file in the chosen destination. Sync the completed bytes, close the writing
+   stream, then publish the final filename with a no-replace hard link and
+   remove the temporary entry by verified identity. Final filenames must never
+   expose incomplete bytes. Do not reproduce source-folder structure or alter
+   source bytes or metadata.
 5. Never overwrite a destination file. Resolve collisions within the batch and
    against existing files with a numeric suffix before the extension, such as
    `IMG_2048 (2).jpg`.
-6. Show determinate progress in the drawer and on the Picks toolbar button.
-   Closing the drawer does not cancel the copy.
+6. Show determinate progress only in the drawer, with one full-width progress
+   row and a right-aligned `X of N` count. The Picks toolbar button keeps its
+   count without copy progress. Closing the drawer does not cancel the copy.
 7. On success, report `Copied N originals` and offer `Show folder`. Keep all
    picks selected.
 8. On partial success, report `Copied X of N` and mark the failed rows with a
    concise reason. Successful copies remain in place, failed picks remain
    selected, and a retry acts only on the failed items after the user chooses a
    destination again.
+9. Replace Clear with `Cancel` during copying. After activation, show disabled
+   `Cancelling...` until the cancel command and worker cleanup both finish.
+   Cancel preserves completed final files and picks, removes only the owned
+   current temporary file, and restores the exact pre-attempt drawer copy state,
+   including a previous partial result. The only cancellation feedback is a
+   fading `Copy cancelled` toast whose whole lifetime is at most one second.
+   It does not replace the drawer's prior copy message or remembered destination.
+10. If the destination disappears, stop the remaining batch after cleaning the
+    owned temporary entry and report `The destination folder no longer exists.`
+    Never recreate the missing directory or remove completed final files.
 
-Only one copy operation may run at a time. Removing or clearing picks while a
-copy is running changes the saved list but not the immutable batch already in
-progress.
+Only one copy operation may run at a time. Clear is disabled while choosing a
+destination and unavailable during copying or cancellation. Adding or removing
+a pick changes the saved list but not an immutable batch already in progress.
+`Added to picks` appears with the optimistic add. Every add restarts its short
+toast's visible phase, including an add during the previous toast's fade. The
+whole visible-plus-exiting lifetime is at most one second; reduced motion
+disables its transition. The five-second Clear Undo deadline is independent.
 
 ## Hosted behaviour
 
@@ -212,8 +234,10 @@ review sequence matches the order in which photos were picked.
   original from being copied or downloaded.
 - Closing Mote during a desktop copy may interrupt the unfinished batch. Files
   already copied remain valid, and a later retry must never overwrite them.
-- A destination becoming unavailable produces a partial result rather than
-  clearing picks or rolling back files that were copied successfully.
+- A destination that disappears stops the remaining batch with the bounded
+  missing-destination message. Cleanup removes only the owned temporary entry;
+  picks and completed final files are retained. Other per-item failures remain
+  visible as partial results.
 
 ## Verification
 
