@@ -1483,6 +1483,9 @@ impl GalleryEngine {
         request: DerivativeRequest,
         mode: HostedDerivativeRequestMode,
     ) -> Result<(), AppServiceError> {
+        if self.folder_jobs.is_shutdown() {
+            return Err(AppServiceError::DerivativeUnavailable);
+        }
         let assets = self.validate_derivative_request(selection, scope, &request)?;
 
         let runtime = self.runtime(selection);

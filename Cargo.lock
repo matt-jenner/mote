@@ -1074,6 +1074,7 @@ dependencies = [
  "photo-domain",
  "photo-indexer",
  "photo-metadata",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

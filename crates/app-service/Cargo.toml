@@ -22,6 +22,9 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[target.'cfg(any(target_vendor = "apple", target_os = "linux", target_os = "redox"))'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 blake3.workspace = true
 tempfile.workspace = true

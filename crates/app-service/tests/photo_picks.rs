@@ -392,3 +392,19 @@ async fn pick_derivatives_authorize_persisted_groups_with_subfolders() {
         Err(AppServiceError::InvalidLimit)
     ));
 }
+
+#[tokio::test]
+async fn service_shutdown_rejects_new_pick_derivative_work() {
+    let fixture = std::thread::spawn(Fixture::new).join().unwrap();
+    fixture.pick(0);
+
+    fixture.service.shutdown().await;
+
+    assert!(matches!(
+        fixture
+            .service
+            .request_pick_derivatives(fixture.request(vec![fixture.assets[0].clone()]))
+            .await,
+        Err(AppServiceError::DerivativeUnavailable)
+    ));
+}
