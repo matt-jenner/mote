@@ -257,7 +257,11 @@ export function createTauriPhotoService(
 				undefined,
 			),
 		cancelOriginalCopy: () =>
-			invokePhotoCommand<void>(invokeCommand, "cancel_original_copy", undefined),
+			invokePhotoCommand<void>(
+				invokeCommand,
+				"cancel_original_copy",
+				undefined,
+			),
 		getSavedFolders: () => cloneSavedFolders(saved),
 		watchSavedFolders: (listener) => {
 			listeners.add(listener);
