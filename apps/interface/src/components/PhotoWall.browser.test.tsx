@@ -673,7 +673,7 @@ describe("progressive photo wall", () => {
 						<PhotoTile
 							key={positioned.asset.id}
 							onTogglePick={() => undefined}
-							picked={false}
+							picked
 							positioned={positioned}
 							service={service}
 						/>
@@ -688,7 +688,7 @@ describe("progressive photo wall", () => {
 			);
 			const pick = screen
 				.getByRole("button", {
-					name: `Add ${positioned.asset.displayName} to picks`,
+					name: `Remove ${positioned.asset.displayName} from picks`,
 				})
 				.element();
 			const warning = tile?.querySelector<HTMLElement>("[role='img']");
@@ -763,6 +763,7 @@ describe("progressive photo wall", () => {
 						<PhotoTile
 							key={positioned.asset.id}
 							onTogglePick={() => undefined}
+							picked
 							positioned={positioned}
 							service={service}
 						/>
@@ -785,7 +786,7 @@ describe("progressive photo wall", () => {
 			)
 			.not.toBeNull();
 		const latePick = lateWarningScreen
-			.getByRole("button", { name: "Add Square.jpg to picks" })
+			.getByRole("button", { name: "Remove Square.jpg from picks" })
 			.element()
 			.getBoundingClientRect();
 		const lateWarning = squareTile
