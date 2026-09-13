@@ -442,7 +442,7 @@ impl AppService {
                 if !is_created_file(&temporary, &identity) {
                     return Err("copy_failed");
                 }
-                match fs::hard_link(&temporary, destination.join(&name)) {
+                match publish_no_replace(&temporary, &destination.join(&name)) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                     Err(_) => {
@@ -456,6 +456,10 @@ impl AppService {
                         hook("published");
                     }
                 });
+                self.check_copy_destination(destination, roots)?;
+                if !is_open_directory(destination, &directory_identity) {
+                    return Err("destination_missing");
+                }
                 return Ok(name);
             }
         });
@@ -549,6 +553,57 @@ fn candidate_name(original: &OsStr, suffix: u64) -> OsString {
     name
 }
 
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "redox"))]
+fn publish_no_replace(temporary: &Path, final_path: &Path) -> io::Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        temporary,
+        rustix::fs::CWD,
+        final_path,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(io::Error::from)
+}
+
+#[cfg(windows)]
+fn publish_no_replace(temporary: &Path, final_path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileW(existing: *const u16, new: *const u16) -> i32;
+    }
+
+    let existing = temporary
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let new = final_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both arguments are stable, null-terminated UTF-16 strings for
+    // the duration of the call. MoveFileW fails when the destination exists.
+    if unsafe { MoveFileW(existing.as_ptr(), new.as_ptr()) } != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "redox",
+    windows
+)))]
+fn publish_no_replace(temporary: &Path, final_path: &Path) -> io::Result<()> {
+    fs::hard_link(temporary, final_path)?;
+    fs::remove_file(temporary)
+}
+
 fn open_copy_directory(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -559,6 +614,26 @@ fn open_copy_directory(path: &Path) -> io::Result<File> {
         options.custom_flags(0x0200_0000);
     }
     options.open(path)
+}
+
+fn is_open_directory(target: &Path, directory: &File) -> bool {
+    let Ok(current) = fs::symlink_metadata(target) else {
+        return false;
+    };
+    if !current.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        directory
+            .metadata()
+            .is_ok_and(|opened| opened.dev() == current.dev() && opened.ino() == current.ino())
+    }
+    #[cfg(windows)]
+    {
+        same_file(directory, target)
+    }
 }
 
 /// Resolve the retained directory handle, including an external rename. This
@@ -648,12 +723,13 @@ fn same_file(left: &File, target: &Path) -> bool {
     use std::os::windows::io::AsRawHandle;
 
     const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     // Identity lookup must not require READ_DATA on a write-only output, and
     // must not follow a reparse point substituted after symlink_metadata.
     let Ok(right) = OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(target)
     else {
         return false;
@@ -857,6 +933,71 @@ mod tests {
         reader.join().unwrap();
         assert_eq!(
             fs::read(destination.join("first.jpg")).unwrap(),
+            vec![42; 4 * 1024 * 1024]
+        );
+    }
+
+    #[test]
+    fn publication_consumes_the_private_temporary_name() {
+        let (_temp, service, mut batch, destination) = controlled_fixture();
+        batch.items.truncate(1);
+        let folder = destination.clone();
+        COPY_STEP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |step| {
+                if step == "published" {
+                    let entries = fs::read_dir(&folder)
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .collect::<Vec<_>>();
+                    assert_eq!(entries.len(), 1);
+                    assert_eq!(entries[0].file_name(), OsStr::new("first.jpg"));
+                    assert_eq!(
+                        fs::read(entries[0].path()).unwrap(),
+                        vec![42; 4 * 1024 * 1024]
+                    );
+                }
+            }))
+        });
+
+        let result = service.copy_originals_with_control(
+            batch,
+            &destination,
+            &CopyCancellation::default(),
+            |_| {},
+        );
+        COPY_STEP.with(|hook| *hook.borrow_mut() = None);
+
+        assert!(matches!(result, Ok(OriginalCopyOutcome::Complete(_))));
+    }
+
+    #[test]
+    fn destination_replacement_after_publication_is_not_reported_or_remembered() {
+        let (temp, service, mut batch, destination) = controlled_fixture();
+        batch.items.truncate(1);
+        let moved = temp.path().join("moved-exports");
+        let folder = destination.clone();
+        COPY_STEP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |step| {
+                if step == "published" {
+                    fs::rename(&folder, &moved).unwrap();
+                    fs::create_dir(&folder).unwrap();
+                }
+            }))
+        });
+        let mut reports = 0;
+
+        let result = service.copy_originals_with_progress(batch, &destination, |_| reports += 1);
+        COPY_STEP.with(|hook| *hook.borrow_mut() = None);
+
+        assert!(matches!(
+            result,
+            Err(AppServiceError::CopyDestinationMissing)
+        ));
+        assert_eq!(reports, 0);
+        assert_eq!(service.last_copy_destination().unwrap(), None);
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+        assert_eq!(
+            fs::read(temp.path().join("moved-exports/first.jpg")).unwrap(),
             vec![42; 4 * 1024 * 1024]
         );
     }

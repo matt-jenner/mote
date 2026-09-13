@@ -1090,15 +1090,17 @@ impl AppService {
         Self::bootstrap_locked(&state)
     }
 
-    /// Retires desktop folder jobs without waiting for already-started blocking
-    /// source reads or admitted commits. Those owners retain their drain rules.
+    /// Retires desktop wall and Picks folder jobs without waiting for
+    /// already-started blocking source reads or admitted commits. Those owners
+    /// retain their drain rules.
     pub async fn shutdown(&self) {
-        let runtimes = {
+        let (runtimes, pick_runtimes) = {
             let _transition = self
                 .selection_transition
                 .lock()
                 .expect("selection transition poisoned");
             let runtimes = self.gallery.folder_jobs.shutdown();
+            let pick_runtimes = self.pick_gallery.folder_jobs.shutdown();
             if let Ok(mut state) = self.state() {
                 state.active_scan = None;
             }
@@ -1110,9 +1112,9 @@ impl AppService {
             {
                 bridge.abort.abort();
             }
-            runtimes
+            (runtimes, pick_runtimes)
         };
-        for runtime in runtimes {
+        for runtime in runtimes.into_iter().chain(pick_runtimes) {
             runtime.coordinator.close_folder().await;
         }
     }
