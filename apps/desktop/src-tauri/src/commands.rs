@@ -14,8 +14,19 @@ use crate::protocol::forward_wall_updates_for_service;
 use crate::state::{DesktopState, WallSubscriptionId};
 
 #[tauri::command]
-pub async fn cancel_original_copy() -> Result<(), CommandError> {
+pub async fn cancel_original_copy(state: State<'_, DesktopState>) -> Result<(), CommandError> {
+    await_copy_cancellation(&state.copy_registry).await;
     Ok(())
+}
+
+async fn await_copy_cancellation(registry: &crate::state::CopyOperationRegistry) {
+    if let Some(mut finished) = registry.cancel() {
+        while !*finished.borrow_and_update() {
+            if finished.changed().await.is_err() {
+                break;
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -64,9 +75,21 @@ where
         CommandError::new("copyInProgress", "An original copy is already in progress.")
     })?;
     let service = state.service.clone();
-    // Prepare every bounded batch before showing the dialog. Later pick changes
-    // cannot affect even the final chunk of a large operation.
-    let (batches, total, initial) = tauri::async_runtime::spawn_blocking(move || {
+    let initial = tauri::async_runtime::spawn_blocking(move || {
+        service
+            .last_copy_destination()
+            .map_err(map_service_error)
+            .map(|destination| destination.filter(|path| path.is_dir()))
+    })
+    .await
+    .map_err(|_| CommandError::internal())??;
+    let Some(destination) = pick_destination(initial).await? else {
+        return Ok(CopyResult::SelectionCancelled);
+    };
+    let operation = state.copy_registry.begin();
+    let service = state.service.clone();
+    // Freeze all authorized batches only after the user chooses a destination.
+    let (batches, total) = tauri::async_runtime::spawn_blocking(move || {
         let ids = match asset_ids {
             Some(ids) => ids,
             None => service
@@ -98,24 +121,23 @@ where
                     .map_err(map_service_error)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let initial = service
-            .last_copy_destination()
-            .map_err(map_service_error)?
-            .filter(|path| path.is_dir());
-        Ok((batches, total, initial))
+        Ok((batches, total))
     })
     .await
     .map_err(|_| CommandError::internal())??;
-    let Some(destination) = pick_destination(initial).await? else {
-        return Ok(CopyResult::SelectionCancelled);
-    };
     let service = state.service.clone();
     let last_completed_destination = state.last_completed_copy_destination.clone();
     tauri::async_runtime::spawn_blocking(move || {
         // The worker owns the guard even if its awaiting command is dropped.
         let _guard = guard;
-        let destination = std::fs::canonicalize(destination)
-            .map_err(|_| map_service_error(AppServiceError::CopyDestinationUnavailable))?;
+        let operation = operation;
+        let destination = std::fs::canonicalize(destination).map_err(|error| {
+            map_service_error(if error.kind() == std::io::ErrorKind::NotFound {
+                AppServiceError::CopyDestinationMissing
+            } else {
+                AppServiceError::CopyDestinationUnavailable
+            })
+        })?;
         let mut aggregate = photo_app_service::OriginalCopyResult {
             items: vec![],
             copied_count: 0,
@@ -129,16 +151,27 @@ where
             item: None,
         });
         for (batch, ids) in batches {
-            let result = service.copy_originals_with_progress(batch, &destination, |item| {
-                completed += 1;
-                on_event(CopyProgress {
-                    completed,
-                    total,
-                    item: Some(item.clone()),
-                });
-            });
+            let result = service.copy_originals_with_control(
+                batch,
+                &destination,
+                &operation.cancellation,
+                |item| {
+                    completed += 1;
+                    on_event(CopyProgress {
+                        completed,
+                        total,
+                        item: Some(item.clone()),
+                    });
+                },
+            );
             let result = match result {
-                Ok(result) => result,
+                Ok(photo_app_service::OriginalCopyOutcome::Complete(result)) => result,
+                Ok(photo_app_service::OriginalCopyOutcome::Cancelled) => {
+                    return Ok(CopyResult::CopyCancelled);
+                }
+                Err(AppServiceError::CopyDestinationMissing) => {
+                    return Err(map_service_error(AppServiceError::CopyDestinationMissing));
+                }
                 Err(error) if aggregate.items.is_empty() => return Err(map_service_error(error)),
                 Err(error) => {
                     // A destination lost between chunks must not erase earlier successes.
@@ -178,6 +211,10 @@ where
                 aggregate.warning_code = result.warning_code;
             }
         }
+        if operation.cancellation.is_cancelled() {
+            return Ok(CopyResult::CopyCancelled);
+        }
+        service.remember_original_copy_destination(&destination, &mut aggregate);
         if aggregate.copied_count > 0 {
             *last_completed_destination
                 .lock()
@@ -376,6 +413,10 @@ fn map_service_error(error: AppServiceError) -> CommandError {
             "copyDestinationUnavailable",
             "The copy destination is unavailable.",
         ),
+        AppServiceError::CopyDestinationMissing => CommandError::new(
+            "copyDestinationMissing",
+            "The destination folder no longer exists.",
+        ),
         AppServiceError::CopyDestinationIsSource => CommandError::new(
             "copyDestinationIsSource",
             "Choose a destination outside your source folders.",
@@ -499,6 +540,7 @@ mod tests {
                     service,
                     wall_subscriptions: Default::default(),
                     copy_operation: Default::default(),
+                    copy_registry: Default::default(),
                     last_completed_copy_destination: Default::default(),
                 },
                 destination,
@@ -506,6 +548,106 @@ mod tests {
                 ids,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn picker_dismissal_precedes_even_invalid_or_empty_batch_preparation() {
+        let fixture = CopyFixture::new();
+        for ids in [Some(vec!["invalid-id".into()]), Some(vec![])] {
+            let result = super::run_original_copy(
+                &fixture.state,
+                ids,
+                |_| async { Ok(None) },
+                |_| panic!("silent dismissal"),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(result, crate::dto::CopyResult::SelectionCancelled));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_worker_retains_completed_files_and_picks_without_remembering_destination() {
+        for cancel_after in [0, 1] {
+            let fixture = CopyFixture::new();
+            let registry = fixture.state.copy_registry.clone();
+            let result = super::run_original_copy(
+                &fixture.state,
+                None,
+                |_| async { Ok(Some(fixture.destination.clone())) },
+                move |event| {
+                    if event.completed == cancel_after {
+                        let waiting = registry.cancel().unwrap();
+                        assert!(!*waiting.borrow(), "worker has not finished cleanup yet");
+                        registry.cancel();
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(result, crate::dto::CopyResult::CopyCancelled));
+            assert_eq!(
+                std::fs::read_dir(&fixture.destination).unwrap().count(),
+                cancel_after as usize
+            );
+            if cancel_after == 1 {
+                assert_eq!(
+                    std::fs::read(fixture.destination.join("one.jpg")).unwrap(),
+                    b"one.jpg"
+                );
+            }
+            assert_eq!(
+                fixture
+                    .state
+                    .service
+                    .list_photo_picks()
+                    .unwrap()
+                    .items
+                    .len(),
+                2
+            );
+            assert_eq!(fixture.state.service.last_copy_destination().unwrap(), None);
+            assert!(fixture.state.copy_registry.cancel().is_none());
+            super::await_copy_cancellation(&fixture.state.copy_registry).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn destination_loss_stops_worker_and_returns_bounded_error() {
+        let fixture = CopyFixture::new();
+        let folder = fixture.destination.clone();
+        let result = super::run_original_copy(
+            &fixture.state,
+            None,
+            |_| async { Ok(Some(fixture.destination.clone())) },
+            move |event| {
+                if event.completed == 1 {
+                    std::fs::remove_dir_all(&folder).unwrap();
+                }
+                assert!(event.completed <= 1);
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(result.code, "copyDestinationMissing");
+        assert_eq!(result.message, "The destination folder no longer exists.");
+        assert!(fixture.state.copy_registry.cancel().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_command_waits_for_captured_operation_cleanup_only() {
+        let registry = crate::state::CopyOperationRegistry::default();
+        let operation = registry.begin();
+        let pending_registry = registry.clone();
+        let waiting =
+            tokio::spawn(async move { super::await_copy_cancellation(&pending_registry).await });
+        tokio::task::yield_now().await;
+        assert!(operation.cancellation.is_cancelled());
+        assert!(!waiting.is_finished());
+        drop(operation);
+        let next = registry.begin();
+        waiting.await.unwrap();
+        assert!(!next.cancellation.is_cancelled());
     }
 
     // Catches a lost preference incorrectly sending Show folder to an older export.
@@ -536,19 +678,16 @@ mod tests {
         .unwrap();
     }
 
-    // Catches chunking after the picker, per-chunk dialogs, and resetting progress at 250.
+    // Catches per-chunk dialogs and resetting progress at 250.
     #[tokio::test]
-    async fn large_copy_prepares_every_chunk_before_picker_and_keeps_one_total() {
+    async fn large_copy_prepares_every_chunk_after_picker_and_keeps_one_total() {
         let fixture = CopyFixture::with_count(251);
         let events = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
         let received = events.clone();
         let result = super::run_original_copy(
             &fixture.state,
             None,
-            |_| async {
-                fixture.state.service.clear_photo_picks().unwrap();
-                Ok(Some(fixture.destination.clone()))
-            },
+            |_| async { Ok(Some(fixture.destination.clone())) },
             move |event| {
                 received
                     .lock()
@@ -571,14 +710,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_later_chunk_aborts_before_picker_or_copying() {
+    async fn invalid_later_chunk_aborts_after_picker_before_copying() {
         let fixture = CopyFixture::with_count(250);
         let mut ids = fixture.ids.clone();
         ids.push("not-an-asset-id".into());
         let error = super::run_original_copy(
             &fixture.state,
             Some(ids),
-            |_| async { panic!("invalid later chunk must abort before picker") },
+            |_| async { Ok(Some(fixture.destination.clone())) },
             |_| panic!("must not start copying"),
         )
         .await
@@ -630,9 +769,9 @@ mod tests {
         drop(guard);
     }
 
-    // Catches resolving source membership after picker/mutation and hiding determinate progress.
+    // Catches preparing before the picker and ignoring selection-time pick changes.
     #[tokio::test]
-    async fn copy_snapshots_before_picker_and_survives_remove_and_clear() {
+    async fn copy_snapshots_after_picker_and_includes_selection_time_changes() {
         let fixture = CopyFixture::new();
         let events = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
         let received = events.clone();
@@ -645,7 +784,6 @@ mod tests {
                     .service
                     .remove_photo_pick(&fixture.ids[0])
                     .unwrap();
-                fixture.state.service.clear_photo_picks().unwrap();
                 Ok(Some(fixture.destination.clone()))
             },
             move |event| received.lock().unwrap().push(event),
@@ -655,10 +793,10 @@ mod tests {
         let crate::dto::CopyResult::Complete { result } = result else {
             panic!("copy should complete")
         };
-        assert_eq!((result.copied_count, result.failed_count), (2, 0));
+        assert_eq!((result.copied_count, result.failed_count), (1, 0));
         assert_eq!(
-            std::fs::read(fixture.destination.join("one.jpg")).unwrap(),
-            b"one.jpg"
+            std::fs::read(fixture.destination.join("two.jpg")).unwrap(),
+            b"two.jpg"
         );
         assert!(
             fixture
@@ -667,7 +805,8 @@ mod tests {
                 .list_photo_picks()
                 .unwrap()
                 .items
-                .is_empty()
+                .len()
+                == 1
         );
         assert_eq!(
             events
@@ -676,11 +815,11 @@ mod tests {
                 .iter()
                 .map(|event| (event.completed, event.total))
                 .collect::<Vec<_>>(),
-            [(0, 2), (1, 2), (2, 2)]
+            [(0, 1), (1, 1)]
         );
         assert_eq!(
             events.lock().unwrap()[1].item.as_ref().unwrap().asset_id,
-            fixture.ids[0]
+            fixture.ids[1]
         );
         assert_eq!(
             fixture.state.service.last_copy_destination().unwrap(),
@@ -795,6 +934,10 @@ mod tests {
             (
                 AppServiceError::CopyDestinationUnavailable,
                 "copyDestinationUnavailable",
+            ),
+            (
+                AppServiceError::CopyDestinationMissing,
+                "copyDestinationMissing",
             ),
             (
                 AppServiceError::CopyDestinationIsSource,

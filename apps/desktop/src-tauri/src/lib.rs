@@ -63,6 +63,7 @@ pub fn run() {
                 service,
                 wall_subscriptions: Default::default(),
                 copy_operation: Default::default(),
+                copy_registry: Default::default(),
                 last_completed_copy_destination: Default::default(),
             });
             Ok(())
