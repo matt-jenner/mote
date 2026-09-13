@@ -6,6 +6,8 @@ Branch: `codex/release-final-native-safety`
 
 Implementation commit: `a21b691` (`fix: close pick jobs and harden copy publication`)
 
+Shutdown admission-race correction: `dc5718a` (`fix: fence pick admission against shutdown`)
+
 This correction closes the independent Picks gallery registry during `AppService::shutdown`, rejects derivative requests against a closed registry, replaces hard-link publication with atomic no-replace rename on supported native platforms, and verifies the retained destination identity after publication.
 
 ## Root causes
@@ -24,9 +26,12 @@ The following tests were added first and observed failing against `50e2629`:
 
 All three passed after the implementation.
 
+Review round 1 added a stronger deterministic race. `shutdown_between_pick_validation_and_runtime_admission_rejects_the_racing_request` pauses a real Picks request after validation, closes the registry, and then resumes it. The test initially returned success against `bcf1999`; after `dc5718a`, it resolves with `DerivativeUnavailable`, starts zero hosted attempts, retains zero Picks runtimes, and cannot strand its receiver.
+
 ## Implementation notes
 
 - Shutdown now retires and drains both registries. `GalleryEngine` rejects a derivative request once its registry is closed.
+- Runtime creation now finishes with the registry's `admits_binding` check. The registry lock orders this admission against shutdown, so a runtime created after shutdown is cancelled and rejected before enqueue.
 - Apple and Linux/Redox builds use `rustix::fs::renameat_with(..., RenameFlags::NOREPLACE)`. On macOS this maps to `renameatx_np(RENAME_EXCL)`; Windows uses no-replace `MoveFileW`.
 - Platforms without one of those native operations retain the collision-safe hard-link fallback. Mote's macOS build no longer uses that fallback.
 - After publication, the service revalidates the destination and compares the path's filesystem identity with the directory handle retained before copying. A replacement path cannot be counted or persisted as success.
@@ -37,7 +42,7 @@ Host: Darwin arm64, Rust 1.97.1.
 
 - `cargo test -p photo-app-service --lib original_copy::tests`: 14 passed.
 - `cargo test -p photo-app-service --test original_copy`: 17 passed.
-- `cargo test -p photo-app-service --test photo_picks`: 6 passed.
+- `cargo test -p photo-app-service --test photo_picks`: 7 passed.
 - `cargo test -p photo-app-service --lib shutdown_`: 3 passed.
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy -p photo-app-service --all-targets -- -D warnings`: passed.
