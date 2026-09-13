@@ -534,6 +534,8 @@ pub enum AppServiceError {
     CopyPreparationFailed,
     #[error("copy destination is unavailable")]
     CopyDestinationUnavailable,
+    #[error("copy destination no longer exists")]
+    CopyDestinationMissing,
     #[error("copy destination must be outside every source library")]
     CopyDestinationIsSource,
 }

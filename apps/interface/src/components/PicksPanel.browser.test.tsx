@@ -19,6 +19,7 @@ import type {
 import "../styles/global.css";
 import "../styles/tokens.css";
 import { AppShell } from "./AppShell";
+import { PickToast } from "./PickToast";
 
 const safeAreaProperties = [
 	"--safe-area-top",
@@ -120,6 +121,7 @@ async function renderPicksApp(
 		previewWarning?: boolean;
 		longWall?: boolean;
 		copy?: PhotoService["copyPickedOriginals"];
+		cancelCopy?: PhotoService["cancelOriginalCopy"];
 		showFolder?: () => Promise<void>;
 		originalAction?: "download" | "none";
 		duplicateFilenames?: boolean;
@@ -170,6 +172,7 @@ async function renderPicksApp(
 	if (options.copy) {
 		service.capabilities.originalAction = "copy";
 		service.copyPickedOriginals = options.copy;
+		service.cancelOriginalCopy = options.cancelCopy ?? (async () => {});
 		service.showLastCopyDestination = options.showFolder ?? (async () => {});
 	}
 	if (options.originalAction) {
@@ -256,6 +259,113 @@ async function renderControllablePicksApp(initial: PickListSnapshot): Promise<{
 }
 
 describe("responsive Picks panel", () => {
+	it("owns full-width copy progress and cancellation inside the drawer", async () => {
+		let progress!: (event: CopyProgress) => void;
+		let finish!: (result: CopyResult) => void;
+		let finishCancel!: () => void;
+		const { screen } = await renderPicksApp({
+			copy: (_ids, listener) => {
+				progress = listener;
+				return new Promise((resolve) => {
+					finish = resolve;
+				});
+			},
+			cancelCopy: () =>
+				new Promise((resolve) => {
+					finishCancel = resolve;
+				}),
+		});
+		const trigger = screen.getByRole("button", { name: "Picks, 2 picks" });
+		await trigger.click();
+		let panel = screen.getByRole("complementary", { name: "Picks" });
+		await panel.getByRole("button", { name: "Copy 2 originals…" }).click();
+		progress({ completed: 2, total: 6, item: null });
+		const bar = panel.getByRole("progressbar", { name: "Copy originals" });
+		await expect
+			.element(panel.getByText("2 of 6", { exact: true }))
+			.toBeVisible();
+		expect(trigger.element().textContent).toBe("Picks2");
+		expect(trigger.element().querySelector("progress")).toBeNull();
+		expect(panel.element().querySelectorAll("progress")).toHaveLength(1);
+		const row = bar.element().parentElement;
+		if (!row) throw new Error("copy progress row is missing");
+		const bounds = row.getBoundingClientRect();
+		const countBounds = panel
+			.getByText("2 of 6", { exact: true })
+			.element()
+			.getBoundingClientRect();
+		expect(getComputedStyle(row).display).toBe("grid");
+		expect(Math.abs(countBounds.right - bounds.right)).toBeLessThan(1);
+		expect(bar.element().getBoundingClientRect().width).toBeGreaterThan(
+			bounds.width * 0.65,
+		);
+		expect(
+			panel.getByRole("button", { name: "Clear picks" }).query(),
+		).toBeNull();
+		await panel.getByRole("button", { name: "Cancel", exact: true }).click();
+		await expect
+			.element(panel.getByRole("button", { name: "Cancelling..." }))
+			.toBeDisabled();
+		await panel.getByRole("button", { name: "Close picks" }).click();
+		await trigger.click();
+		panel = screen.getByRole("complementary", { name: "Picks" });
+		await expect
+			.element(panel.getByRole("button", { name: "Cancelling..." }))
+			.toBeDisabled();
+		finish({ kind: "copyCancelled" });
+		await expect
+			.element(panel.getByRole("button", { name: "Cancelling..." }))
+			.toBeDisabled();
+		finishCancel();
+		await expect
+			.element(panel.getByRole("button", { name: "Copy 2 originals…" }))
+			.toBeEnabled();
+		expect(panel.element().textContent).not.toContain("Copy cancelled");
+		await expect
+			.poll(() => document.querySelector("[data-toast-id]")?.textContent)
+			.toBe("Copy cancelled");
+	});
+
+	it("clearing completed copies removes messages and Show folder", async () => {
+		const { screen } = await renderPicksApp({
+			copy: async () => ({
+				kind: "complete",
+				copiedCount: 6,
+				failedCount: 0,
+				warningCode: null,
+				items: ["coast", "offline", "three", "four", "five", "six"].map(
+					(assetId) => ({
+						assetId,
+						status: "copied",
+						destinationName: `${assetId}.jpg`,
+						errorCode: null,
+					}),
+				),
+			}),
+		});
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		const panel = screen.getByRole("complementary", { name: "Picks" });
+		await panel.getByRole("button", { name: "Copy 2 originals…" }).click();
+		await expect.element(panel.getByText("Copied 6 originals")).toBeVisible();
+		await panel.getByRole("button", { name: "Clear picks" }).click();
+		expect(panel.element().textContent).not.toContain("Copied 6 originals");
+		expect(
+			panel.getByRole("button", { name: "Show folder" }).query(),
+		).toBeNull();
+		expect(panel.element().querySelectorAll("li")).toHaveLength(0);
+	});
+
+	it("removes toast motion when reduced motion is requested", async () => {
+		const screen = await render(
+			<PickToast
+				toast={{ id: 1, message: "Copy cancelled", phase: "exiting" }}
+			/>,
+		);
+		const toast = screen.getByText("Copy cancelled").element().parentElement;
+		if (!toast) throw new Error("toast container is missing");
+		expect(toast.getAttribute("data-phase")).toBe("exiting");
+		expect(getComputedStyle(toast).transitionDuration).toBe("0s");
+	});
 	for (const theme of ["light", "dark"] as const) {
 		for (const width of [1440, 768, 390]) {
 			it(`keeps Picks accessible at ${width}px in ${theme} appearance`, async () => {
@@ -450,7 +560,7 @@ describe("responsive Picks panel", () => {
 								},
 							],
 						}
-					: { kind: "cancelled" };
+					: { kind: "selectionCancelled" };
 			},
 		});
 		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
@@ -490,7 +600,7 @@ describe("responsive Picks panel", () => {
 								errorCode: "copy_failed",
 							})),
 						}
-					: { kind: "cancelled" };
+					: { kind: "selectionCancelled" };
 			},
 		});
 		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
@@ -516,7 +626,7 @@ describe("responsive Picks panel", () => {
 	it("preserves Undo through copy completion then shows the queued folder action without moving focus", async () => {
 		let finish!: (result: CopyResult) => void;
 		let shown = 0;
-		const { screen } = await renderPicksApp({
+		const { screen, service } = await renderPicksApp({
 			copy: () =>
 				new Promise((resolve) => {
 					finish = resolve;
@@ -527,11 +637,13 @@ describe("responsive Picks panel", () => {
 		});
 		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
 		const panel = screen.getByRole("complementary", { name: "Picks" });
-		await panel.getByRole("button", { name: "Copy 2 originals…" }).click();
+		const savedPicks = service.getPicks().items;
 		await panel.getByRole("button", { name: "Clear picks" }).click();
 		const toast = document.querySelector("[data-toast-id]");
+		await service.restorePicks(savedPicks);
+		await panel.getByRole("button", { name: "Copy 2 originals…" }).click();
 		await panel.getByRole("button", { name: "Close picks" }).click();
-		const trigger = screen.getByRole("button", { name: /Picks, 0 picks/ });
+		const trigger = screen.getByRole("button", { name: /Picks, 2 picks/ });
 		trigger.element().focus();
 		await new Promise<void>((resolve) => window.setTimeout(resolve, 1_000));
 		finish({
@@ -627,7 +739,7 @@ describe("responsive Picks panel", () => {
 			.toBeVisible();
 		expect(panel.element().textContent).not.toContain("/private/");
 	});
-	it("keeps native copy progress in the trigger after closing and clearing picks", async () => {
+	it("keeps the frozen copy running when the drawer closes and a pick is removed", async () => {
 		let progress!: (event: CopyProgress) => void;
 		let finish!: (result: CopyResult) => void;
 		const batches: Array<readonly string[] | null> = [];
@@ -653,7 +765,9 @@ describe("responsive Picks panel", () => {
 			.toHaveAttribute("value", "0");
 		await captureCopyState("progress");
 		await panel.getByRole("button", { name: "Remove DSC_8421.jpg" }).click();
-		await panel.getByRole("button", { name: "Clear picks" }).click();
+		expect(
+			panel.getByRole("button", { name: "Clear picks" }).query(),
+		).toBeNull();
 		await expect
 			.element(panel.getByRole("progressbar", { name: "Copy originals" }))
 			.toHaveAttribute("max", "2");
@@ -669,11 +783,9 @@ describe("responsive Picks panel", () => {
 			},
 		});
 		await expect
-			.element(
-				screen.getByRole("button", { name: /Picks, 0 picks, Copying 1 \/ 2/ }),
-			)
+			.element(screen.getByRole("button", { name: "Picks, 1 pick" }))
 			.toBeVisible();
-		expect(service.getPicks().items).toEqual([]);
+		expect(service.getPicks().items).toHaveLength(1);
 		expect(batches).toEqual([["coast", "offline"]]);
 		finish({
 			kind: "complete",
@@ -697,7 +809,7 @@ describe("responsive Picks panel", () => {
 		});
 		await expect
 			.poll(() => document.querySelector("[data-toast-id]")?.textContent)
-			.toContain("Picks cleared");
+			.toContain("Copied 2 originals");
 		await expect
 			.poll(() =>
 				[...document.querySelectorAll("[aria-live='polite']")]
@@ -734,7 +846,7 @@ describe("responsive Picks panel", () => {
 								},
 							],
 						}
-					: { kind: "cancelled" };
+					: { kind: "selectionCancelled" };
 			},
 			showFolder: async () => {
 				shown += 1;
@@ -766,7 +878,7 @@ describe("responsive Picks panel", () => {
 		const { screen } = await renderPicksApp({
 			copy: async () =>
 				++attempt === 1
-					? { kind: "cancelled" }
+					? { kind: "selectionCancelled" }
 					: {
 							kind: "complete",
 							copiedCount: 0,

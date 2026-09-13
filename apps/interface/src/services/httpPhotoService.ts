@@ -962,6 +962,7 @@ export function createHttpPhotoService(
 				"Copying originals is available in the desktop app.",
 			);
 		},
+		async cancelOriginalCopy() {},
 		async showLastCopyDestination() {
 			throw new PhotoServiceError(
 				"unsupportedCapability",

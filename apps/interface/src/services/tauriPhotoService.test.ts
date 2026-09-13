@@ -83,6 +83,24 @@ const recordingInvoke =
 	};
 
 describe("Tauri PhotoService", () => {
+	it("distinguishes selection dismissal from worker cancellation and forwards cancel", async () => {
+		const calls: Array<[string, Record<string, unknown> | undefined]> = [];
+		for (const kind of ["selectionCancelled", "copyCancelled"] as const) {
+			const service = createTauriPhotoService(
+				async <T>(command: string, args?: Record<string, unknown>) => {
+					calls.push([command, args]);
+					return { kind } as T;
+				},
+				undefined,
+				(listener) => new FakeChannel(listener),
+			);
+			expect(await service.copyPickedOriginals(null, () => {})).toEqual({
+				kind,
+			});
+			await service.cancelOriginalCopy();
+			expect(calls.at(-1)).toEqual(["cancel_original_copy", undefined]);
+		}
+	});
 	it("owns one pending copy globally and preserves partial state when retry is cancelled", async () => {
 		const memory = createInMemoryPhotoService();
 		let release!: (result: CopyResult) => void;
@@ -156,7 +174,7 @@ describe("Tauri PhotoService", () => {
 		expect(store.getState().announcement).toBe("Copied 1 of 2");
 		const retry = store.getState().copyOriginals();
 		expect(ids).toEqual([["one", "two"], ["two"]]);
-		release({ kind: "cancelled" });
+		release({ kind: "selectionCancelled" });
 		await retry;
 		expect(store.getState().copy).toMatchObject({
 			phase: "partial",
@@ -211,12 +229,12 @@ describe("Tauri PhotoService", () => {
 
 	it("preserves picker cancellation and bounds copy errors without leaking native paths", async () => {
 		const cancelled = createTauriPhotoService(
-			async <T>() => ({ kind: "cancelled" }) as T,
+			async <T>() => ({ kind: "selectionCancelled" }) as T,
 			undefined,
 			(listener) => new FakeChannel(listener),
 		);
 		expect(await cancelled.copyPickedOriginals(null, () => {})).toEqual({
-			kind: "cancelled",
+			kind: "selectionCancelled",
 		});
 		for (const [code, message] of [
 			["copyInProgress", "An original copy is already in progress."],
@@ -225,6 +243,7 @@ describe("Tauri PhotoService", () => {
 				"Choose a destination outside your source folders.",
 			],
 			["copyDestinationUnavailable", "The copy destination is unavailable."],
+			["copyDestinationMissing", "The destination folder no longer exists."],
 			["copyPreparationFailed", "Mote could not prepare these originals."],
 		] as const) {
 			const service = createTauriPhotoService(

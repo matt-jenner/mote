@@ -13,7 +13,8 @@ pub struct CopyProgress {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum CopyResult {
-    Cancelled,
+    SelectionCancelled,
+    CopyCancelled,
     Complete {
         #[serde(flatten)]
         result: photo_app_service::OriginalCopyResult,

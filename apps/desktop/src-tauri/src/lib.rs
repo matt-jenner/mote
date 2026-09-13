@@ -63,6 +63,7 @@ pub fn run() {
                 service,
                 wall_subscriptions: Default::default(),
                 copy_operation: Default::default(),
+                copy_registry: Default::default(),
                 last_completed_copy_destination: Default::default(),
             });
             Ok(())
@@ -76,6 +77,7 @@ pub fn run() {
             commands::restore_photo_picks,
             commands::request_pick_derivatives,
             commands::copy_picked_originals,
+            commands::cancel_original_copy,
             commands::show_last_copy_destination,
             commands::choose_folder,
             commands::rename_saved_folder,
