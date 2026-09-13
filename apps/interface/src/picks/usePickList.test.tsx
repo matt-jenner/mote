@@ -156,6 +156,37 @@ describe("pick list controller", () => {
 		},
 	);
 
+	it("defers a thrown copy error behind active Undo, then shows it for five seconds", async () => {
+		vi.useFakeTimers();
+		const { store, stop, memory } = await copyFixture(async () => {
+			throw new PhotoServiceError(
+				"copyDestinationMissing",
+				"The destination folder no longer exists.",
+			);
+		});
+		await store.getState().clear();
+		await memory.addPick(reference(asset("later")));
+		const undoToast = store.getState().toast;
+
+		await store.getState().copyOriginals();
+
+		expect(store.getState().toast).toBe(undoToast);
+		expect(store.getState().toast?.action?.label).toBe("Undo");
+		expect(store.getState().announcement).toBe(
+			"The destination folder no longer exists.",
+		);
+		vi.advanceTimersByTime(5_000);
+		expect(store.getState().toast).toMatchObject({
+			message: "The destination folder no longer exists.",
+			phase: "visible",
+		});
+		vi.advanceTimersByTime(4_800);
+		expect(store.getState().toast?.phase).toBe("exiting");
+		vi.advanceTimersByTime(200);
+		expect(store.getState().toast).toBeNull();
+		stop();
+	});
+
 	it("retries Cancel after its first native cancellation command rejects", async () => {
 		const worker = deferred<CopyResult>();
 		const firstCommand = deferred<void>();

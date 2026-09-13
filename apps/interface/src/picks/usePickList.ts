@@ -324,13 +324,10 @@ class PickListStoreImplementation implements PickListStore {
 					this.cancelCommand = null;
 					if (this.copy.phase === "cancelling")
 						this.copy = { ...this.copy, phase: "copying" };
-					this.publishMessage(
+					this.publishCopyFailure(
 						error instanceof PhotoServiceError
 							? error.message
 							: "Couldn't cancel the copy",
-						true,
-						false,
-						copyFailureDurationMs,
 					);
 				});
 			this.cancelCommand = command;
@@ -439,13 +436,10 @@ class PickListStoreImplementation implements PickListStore {
 				if (this.cancelCommand === command) break;
 			}
 			this.copy = previous;
-			this.publishMessage(
+			this.publishCopyFailure(
 				error instanceof PhotoServiceError
 					? error.message
 					: "Couldn't copy originals",
-				true,
-				false,
-				copyFailureDurationMs,
 			);
 		} finally {
 			if (this.activeCopyId === copyId) this.activeCopyId = null;
@@ -457,13 +451,10 @@ class PickListStoreImplementation implements PickListStore {
 		try {
 			await this.service.showLastCopyDestination();
 		} catch (error) {
-			this.publishMessage(
+			this.publishCopyFailure(
 				error instanceof PhotoServiceError
 					? error.message
 					: "Couldn't open the copy destination",
-				true,
-				false,
-				copyFailureDurationMs,
 			);
 		}
 	};
@@ -502,13 +493,30 @@ class PickListStoreImplementation implements PickListStore {
 		message: string,
 		temporary = true,
 		interruptUndo = false,
-		durationMs = confirmationDurationMs,
 	): void {
 		this.announcement = message;
 		this.announcementId += 1;
 		if (!this.undo || interruptUndo) {
 			this.toast = { id: ++this.toastId, message, phase: "visible" };
-			if (temporary) this.scheduleToastDismissal(durationMs);
+			if (temporary) this.scheduleToastDismissal(confirmationDurationMs);
+		}
+		this.publish();
+	}
+
+	private publishCopyFailure(message: string): void {
+		this.announcement = message;
+		this.announcementId += 1;
+		const failureToast = {
+			id: ++this.toastId,
+			message,
+			phase: "visible" as const,
+		};
+		if (this.undo && Date.now() < this.undo.expiresAt) {
+			this.deferredCopyToast = failureToast;
+			this.deferredCopyToastDurationMs = copyFailureDurationMs;
+		} else {
+			this.toast = failureToast;
+			this.scheduleToastDismissal(copyFailureDurationMs);
 		}
 		this.publish();
 	}

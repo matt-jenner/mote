@@ -37,3 +37,18 @@ The first sandboxed browser run could not bind its loopback port (`EPERM`). The 
 ## Concerns
 
 Cancellation is observed before the first preparation call, between 250-item chunks, and after each preparation call. `prepare_original_copy` itself has no cancellation parameter, so a cancellation that arrives during one in-flight preparation call takes effect immediately after that call returns and never proceeds to copying.
+
+## Fix round 1
+
+Re-review found that newer-generation replacement still depended on `nextCursor` being null. `usePhotoWall` reads settlement through a 100-item page, so an authoritative generation with more than 100 photos has a non-null next cursor even though the scan generation itself is complete.
+
+The regression uses 150 loaded old assets and a newer generation with a 100-item first page, logical total 120, and `new-page-2`. Before the fix, all 150 old assets remained, the total stayed 150, and pagination stayed exhausted. After the fix, the wall contains exactly the new first page, reports total 120, points at `new-page-2`, and marks pagination nonterminal. The same-generation settlement regression still preserves its loaded later page and conservative total.
+
+A second RED regression reproduced the review Minor: a native copy error during active Clear/Undo updated the live announcement but disappeared when Undo expired because no toast had been queued. Copy failures now deliberately defer behind the Undo toast, retain the original Undo deadline and action, then display for five seconds with the existing final fade.
+
+Fix-round verification:
+
+- Focused wall, Picks controller, and Tauri service unit tests: 3 files, 118 tests passed.
+- Interface typecheck: passed.
+- Biome on the four fix-round interface files: passed.
+- `git diff --check`: passed.

@@ -1160,11 +1160,17 @@ describe("wallReducer", () => {
 		expect(reloaded.totalCount).toBe(2);
 	});
 
-	it("lets a newer complete settled generation remove absent assets and lower total", () => {
+	it("replaces the loaded wall from a newer complete generation whose query is paged", () => {
+		const previous = Array.from({ length: 150 }, (_, index) =>
+			wallAsset(`old-${index}`, 1, index + 1),
+		);
+		const nextFirstPage = Array.from({ length: 100 }, (_, index) =>
+			wallAsset(`new-${index}`, 1, index + 1),
+		);
 		const current = {
 			...activeState(),
-			items: [wallAsset("removed", 1, 1), wallAsset("retained", 1, 2)],
-			totalCount: 2,
+			items: previous,
+			totalCount: 150,
 			cursor: null,
 			pagesExhausted: true,
 			orderState: "settled" as const,
@@ -1178,19 +1184,22 @@ describe("wallReducer", () => {
 		});
 		const replaced = reduce(requested, {
 			type: "metadataSettled",
-			assets: [wallAsset("retained", 1, 2)],
-			totalCount: 1,
-			nextCursor: null,
+			assets: nextFirstPage,
+			totalCount: 120,
+			nextCursor: "new-page-2",
 			requestEpoch: current.scrollEpoch,
 			requestCursor: null,
 			requestId: "new-complete-generation",
 			generation: 5,
 		});
 
-		expect(replaced.items.map(({ id }) => id)).toEqual(["retained"]);
-		expect(replaced.totalCount).toBe(1);
+		expect(replaced.items.map(({ id }) => id)).toEqual(
+			nextFirstPage.map(({ id }) => id),
+		);
+		expect(replaced.totalCount).toBe(120);
 		expect(replaced.settledGeneration).toBe(5);
-		expect(replaced.pagesExhausted).toBe(true);
+		expect(replaced.cursor).toBe("new-page-2");
+		expect(replaced.pagesExhausted).toBe(false);
 	});
 
 	it("keeps an advanced nonterminal cursor when settlement covers only earlier items", () => {

@@ -883,8 +883,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			const replacesCompleteGeneration =
 				state.settledGeneration !== null &&
 				generation > state.settledGeneration &&
-				action.requestCursor === null &&
-				action.nextCursor === null;
+				action.requestCursor === null;
 			const merged = replacesCompleteGeneration
 				? mergeSettledAssets([], replacementPage)
 				: mergeSettledAssets(state.items, replacementPage);
@@ -895,7 +894,8 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				!replacesCompleteGeneration &&
 				state.items.some((current) => !settledIds.has(current.id));
 			const preservePagination =
-				state.pagesExhausted || preservesLoadedRemainder;
+				!replacesCompleteGeneration &&
+				(state.pagesExhausted || preservesLoadedRemainder);
 			return {
 				...state,
 				items,
