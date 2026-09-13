@@ -12,6 +12,53 @@ import { WallToolbar } from "./WallToolbar";
 
 const labels = ["Include subfolders", "Oldest first", "Newest first"] as const;
 
+const toolbarAsset: WallAsset = {
+	id: "coast",
+	displayName: "Coast.jpg",
+	mediaKind: "jpeg",
+	provisionalOrder: 1,
+	capturedAtUtc: "2025-01-01T12:00:00Z",
+	dateState: "settled",
+	width: 1200,
+	height: 800,
+	representativeRgb: 0x3d536b,
+	shapeState: "ready",
+	availability: "available",
+	warning: null,
+	wallThumbnail: {
+		assetId: "coast",
+		kind: "wallThumbnail",
+		key: "coast-wall",
+	},
+	screenPreview: null,
+	rating: null,
+};
+
+function narrowShellService() {
+	return createInMemoryPhotoService({
+		selectedFolderName: "A folder name that must truncate",
+		wallAssets: [
+			{ ...toolbarAsset, wallThumbnailUrl: "/demo-photos/coast.jpg" },
+		],
+	});
+}
+
+function renderShell(service: ReturnType<typeof narrowShellService>) {
+	const queryClient = new QueryClient({
+		defaultOptions: {
+			mutations: { retry: false },
+			queries: { retry: false },
+		},
+	});
+	return render(
+		<QueryClientProvider client={queryClient}>
+			<PhotoServiceProvider service={service}>
+				<AppShell />
+			</PhotoServiceProvider>
+		</QueryClientProvider>,
+	);
+}
+
 function tooltipStyle(control: Element) {
 	return getComputedStyle(control, "::after");
 }
@@ -100,46 +147,8 @@ describe("desktop wall toolbar", () => {
 
 	it("uses compact view options without overflowing the 900px shell when Picks is open", async () => {
 		await page.viewport(900, 768);
-		const toolbarAsset: WallAsset = {
-			id: "coast",
-			displayName: "Coast.jpg",
-			mediaKind: "jpeg",
-			provisionalOrder: 1,
-			capturedAtUtc: "2025-01-01T12:00:00Z",
-			dateState: "settled",
-			width: 1200,
-			height: 800,
-			representativeRgb: 0x3d536b,
-			shapeState: "ready",
-			availability: "available",
-			warning: null,
-			wallThumbnail: {
-				assetId: "coast",
-				kind: "wallThumbnail",
-				key: "coast-wall",
-			},
-			screenPreview: null,
-			rating: null,
-		};
-		const service = createInMemoryPhotoService({
-			selectedFolderName: "A folder name that must truncate",
-			wallAssets: [
-				{ ...toolbarAsset, wallThumbnailUrl: "/demo-photos/coast.jpg" },
-			],
-		});
-		const queryClient = new QueryClient({
-			defaultOptions: {
-				mutations: { retry: false },
-				queries: { retry: false },
-			},
-		});
-		const screen = await render(
-			<QueryClientProvider client={queryClient}>
-				<PhotoServiceProvider service={service}>
-					<AppShell />
-				</PhotoServiceProvider>
-			</QueryClientProvider>,
-		);
+		const service = narrowShellService();
+		const screen = await renderShell(service);
 		await screen.getByRole("button", { name: "Choose Folder" }).click();
 		await service.finishFixtureScan();
 		await screen.getByRole("button", { name: "Picks, 0 picks" }).click();
@@ -170,5 +179,44 @@ describe("desktop wall toolbar", () => {
 		await expect
 			.element(menu.getByRole("button", { name: "Newest first" }))
 			.toBeVisible();
+	});
+
+	it("keeps retry and compact view options inside the 900px shell with Picks open", async () => {
+		await page.viewport(900, 768);
+		const service = narrowShellService();
+		service.queryWall = async () => {
+			throw new Error("Wall temporarily unavailable");
+		};
+		const screen = await renderShell(service);
+		await screen.getByRole("button", { name: "Choose Folder" }).click();
+		const retry = screen.getByRole("button", { name: "Retry" });
+		await expect.element(retry).toBeVisible();
+		await screen.getByRole("button", { name: "Picks, 0 picks" }).click();
+		await expect
+			.element(screen.getByRole("complementary", { name: "Picks" }))
+			.toBeVisible();
+
+		const workspace = screen
+			.getByRole("region", { name: "Photo workspace" })
+			.element();
+		const header = workspace.querySelector<HTMLElement>("header");
+		if (!header) throw new Error("Missing workspace header");
+		expect(header.scrollWidth).toBeLessThanOrEqual(header.clientWidth);
+		const viewOptions = screen.getByRole("button", { name: "View options" });
+		const headerBounds = header.getBoundingClientRect();
+		for (const control of [
+			retry.element(),
+			viewOptions.element(),
+			screen.getByRole("button", { name: "Picks, 0 picks" }).element(),
+			screen.getByRole("button", { name: "Appearance" }).element(),
+		]) {
+			const bounds = control.getBoundingClientRect();
+			expect(bounds.left).toBeGreaterThanOrEqual(headerBounds.left);
+			expect(bounds.right).toBeLessThanOrEqual(headerBounds.right);
+		}
+		expect(
+			retry.element().getBoundingClientRect().height,
+		).toBeGreaterThanOrEqual(44);
+		await expect.element(viewOptions).toBeVisible();
 	});
 });
