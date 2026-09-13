@@ -867,7 +867,7 @@ describe("progressive photo wall", () => {
 			.querySelector<HTMLElement>("[data-asset-id='coast']");
 		await expect
 			.element(screen.getByRole("status"))
-			.toHaveTextContent("Preparing previews · 0 of 6");
+			.toHaveTextContent("Indexing");
 		expect(tile).not.toBeNull();
 		if (!tile) return;
 		const before = tile.getBoundingClientRect().toJSON();
@@ -1119,7 +1119,7 @@ describe("progressive photo wall", () => {
 		screen.unmount();
 	});
 
-	it("defers the provisional remainder until settlement and promotes settled viewport first", async () => {
+	it("keeps loaded order when settlement returns the same photos reordered", async () => {
 		await page.viewport(1440, 520);
 		const idleCallbacks: Array<() => void> = [];
 		Object.defineProperty(window, "requestIdleCallback", {
@@ -1160,81 +1160,13 @@ describe("progressive photo wall", () => {
 		});
 		await expect.poll(() => service.queryRequests.length).toBe(2);
 		service.releaseQuery(1, pageOf([...provisional].reverse(), "settled"));
-		const settledStart = service.derivativeRequests.length;
 		await expect
-			.poll(() => service.derivativeRequests.length)
-			.toBeGreaterThan(settledStart);
-		const settledRows = [
-			...wall
-				.element()
-				.querySelectorAll<HTMLElement>("[data-testid^='photo-row-']"),
-		];
-		const wallRect = wall.element().getBoundingClientRect();
-		const visibleRows = settledRows
-			.map((row, index) => {
-				const top =
-					row.getBoundingClientRect().top -
-					wallRect.top +
-					wall.element().scrollTop;
-				const bottom = top + row.getBoundingClientRect().height;
-				return top < wall.element().scrollTop + wall.element().clientHeight &&
-					bottom > wall.element().scrollTop
-					? index
-					: -1;
-			})
-			.filter((index) => index >= 0);
-		const lastVisible = visibleRows.at(-1) ?? 0;
-		const nearRows = [lastVisible + 1, lastVisible + 2].filter(
-			(index) => index < settledRows.length,
-		);
-		const idsInRows = (indices: readonly number[]) =>
-			indices.flatMap((index) =>
-				[
-					...(settledRows[index]?.querySelectorAll<HTMLElement>(
-						"[data-asset-id]",
-					) ?? []),
-				].map((tile) => tile.dataset.assetId ?? ""),
-			);
-		const settledVisibleIds = idsInRows(visibleRows);
-		const settledNearIds = idsInRows(nearRows);
-		const settledRemainingIds = idsInRows(
-			settledRows
-				.map((_row, index) => index)
-				.filter(
-					(index) => !visibleRows.includes(index) && !nearRows.includes(index),
-				),
-		);
-		const previouslyRequested = new Set(
-			service.derivativeRequests
-				.slice(0, settledStart)
-				.flatMap((request) => request.assetIds),
-		);
-		const expectedIdleIds = settledRemainingIds.filter(
-			(id) => !previouslyRequested.has(id),
-		);
-		expect(service.derivativeRequests[settledStart]).toEqual({
-			assetIds: settledVisibleIds,
-			priority: "visible",
-			kind: "wallThumbnail",
-		});
-		expect(service.derivativeRequests[settledStart + 1]).toEqual({
-			assetIds: settledNearIds,
-			priority: "nearViewport",
-			kind: "wallThumbnail",
-		});
-		const settledIdle = idleCallbacks.splice(0);
-		expect(settledIdle.length).toBeGreaterThan(0);
-		for (const callback of settledIdle) callback();
-		while (idleCallbacks.length > 0)
-			for (const callback of idleCallbacks.splice(0)) callback();
-		await expect
-			.poll(() => service.derivativeRequests.length)
-			.toBeGreaterThan(settledStart + 1);
-		expect(
-			service.derivativeRequests
-				.slice(settledStart + 2)
-				.flatMap((request) => request.assetIds),
-		).toEqual(expectedIdleIds);
+			.poll(
+				() =>
+					wall.element().querySelector<HTMLElement>("[data-asset-id]")?.dataset
+						.assetId,
+			)
+			.toBe("provisional-0");
 		screen.unmount();
 	});
 
@@ -3139,6 +3071,41 @@ describe("progressive photo wall", () => {
 		);
 	});
 
+	it("keeps active indexing status ahead of preview warnings", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.emit({
+			kind: "progress",
+			selectionId: "source-a",
+			generation: 1,
+			progress: {
+				discovered: 2_056,
+				shaped: 501,
+				enriched: 400,
+				total: 2_056,
+			},
+		});
+		service.releaseQuery(
+			0,
+			pageOf([asset("warned", "Warned", 1)], "provisional", null, [], 2_056),
+		);
+		service.emit({
+			kind: "warning",
+			selectionId: "source-a",
+			sourceId: "source-a",
+			assetId: "warned",
+			warning: { code: "derivativeUnavailable", retryable: true },
+		});
+
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("Indexing - 501 of 2056");
+		expect(screen.getByRole("status").element()).not.toHaveTextContent(
+			"Some previews need attention",
+		);
+	});
+
 	it("keeps the collection total independent from the first wall page", async () => {
 		const service = new ControlledWallService();
 		const screen = await renderWall(service);
@@ -3150,10 +3117,9 @@ describe("progressive photo wall", () => {
 
 		await expect
 			.element(screen.getByRole("status"))
-			.toHaveTextContent("Preparing previews · 0 of 469");
-		expect(screen.getByRole("progressbar").element()).toHaveAttribute(
+			.toHaveTextContent("Indexing");
+		expect(screen.getByRole("progressbar").element()).not.toHaveAttribute(
 			"max",
-			"469",
 		);
 	});
 
@@ -3208,7 +3174,7 @@ describe("progressive photo wall", () => {
 		service.releaseQuery(0, pageOf([], "provisional", null, [], 154));
 		await expect
 			.element(screen.getByRole("status"))
-			.toHaveTextContent("154 indexed of 2,092");
+			.toHaveTextContent("Indexing - 154 of 2092");
 		service.emit({
 			kind: "catalogBatch",
 			selectionId: "source-a",
@@ -3225,7 +3191,7 @@ describe("progressive photo wall", () => {
 		});
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		expect(screen.getByRole("status").element()).toHaveTextContent(
-			"154 indexed of 2,092",
+			"Indexing - 154 of 2092",
 		);
 
 		const toggle = screen.getByRole("button", { name: "Include subfolders" });
@@ -3234,14 +3200,14 @@ describe("progressive photo wall", () => {
 		service.releaseQuery(1, pageOf([], "provisional", null, [], 154));
 		await expect
 			.element(screen.getByRole("status"))
-			.toHaveTextContent("154 indexed of 300");
+			.toHaveTextContent("Indexing - 154 of 300");
 
 		await toggle.click();
 		await expect.poll(() => service.queryRequests.length).toBe(3);
 		service.releaseQuery(2, pageOf([], "provisional", null, [], 154));
 		await expect
 			.element(screen.getByRole("status"))
-			.toHaveTextContent("154 indexed of 2,092");
+			.toHaveTextContent("Indexing - 154 of 2092");
 	});
 
 	it("fences overlapping sort queries and shows newest first after resetting scroll", async () => {
@@ -3621,7 +3587,7 @@ describe("progressive photo wall", () => {
 		service.releaseQuery(0, pageOf([]));
 		await expect
 			.element(screen.getByRole("status"))
-			.toHaveTextContent("Indexing photos");
+			.toHaveTextContent("Indexing");
 		expect(
 			screen
 				.getByRole("region", { name: "Photos" })
