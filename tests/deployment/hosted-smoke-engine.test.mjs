@@ -22,6 +22,8 @@ test("hosted smoke gives standalone browser fixtures an isolated web root", () =
 		/with-ephemeral-interface-assets\.sh["']? \\\n\s+npm run web:build -- --outDir/,
 	);
 	assert.match(script, /PHOTO_VIEWER_WEB_ROOT="\$browser_web_root"/);
+	assert.match(script, /CARGO_TARGET_DIR="\$temporary_root\/cargo-target"/);
+	assert.match(script, /export CARGO_TARGET_DIR/);
 });
 
 test("hosted smoke validates the selected container engine", () => {

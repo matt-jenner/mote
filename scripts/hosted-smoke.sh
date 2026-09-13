@@ -14,6 +14,8 @@ image_name="localhost/mote-smoke:${run_id}"
 asset_label="io.github.matt-jenner.mote.asset=hosted-smoke"
 owner_label="io.github.matt-jenner.mote.owner-pid=$$"
 temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/${run_id}.XXXXXX")
+CARGO_TARGET_DIR="$temporary_root/cargo-target"
+export CARGO_TARGET_DIR
 runtime_root="${project_dir}/runtime/${run_id}"
 source_dir="${temporary_root}/photos"
 state_dir="${temporary_root}/browser-state"
