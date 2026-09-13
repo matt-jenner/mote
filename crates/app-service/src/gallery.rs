@@ -1207,6 +1207,9 @@ impl GalleryEngine {
         &self,
         selection: &GallerySelection,
     ) -> Result<(), AppServiceError> {
+        if self.folder_jobs.is_shutdown() {
+            return Ok(());
+        }
         let runtime = self.runtime(selection);
         if self.shared_coordinator.is_some() && runtime.prepare_desktop_refresh(selection.epoch) {
             runtime.coordinator.invalidate_background().await;

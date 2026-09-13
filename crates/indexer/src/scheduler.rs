@@ -166,6 +166,34 @@ mod folder_admission_tests {
     }
 
     #[test]
+    fn foreground_does_not_yield_idle_capacity_to_a_blocked_background_turn() {
+        let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig {
+            idle_workers: 4,
+            active_workers: 1,
+        }));
+        let a = folder();
+        let b = folder();
+        let c = folder();
+        scheduler.set_foreground_folder(Some(a));
+        let held_a = scheduler.try_admit_folder_work(a).unwrap();
+        scheduler.set_foreground_folder(Some(b));
+        assert!(scheduler.try_admit_folder_work(c).is_none());
+        for _ in 0..3 {
+            drop(scheduler.try_admit_folder_work(b).unwrap());
+        }
+        let fourth_b = scheduler
+            .try_admit_folder_work(b)
+            .expect("foreground must use idle capacity while A blocks C's background turn");
+        drop(fourth_b);
+        drop(held_a);
+        assert!(
+            scheduler.try_admit_folder_work(b).is_none(),
+            "C gets its owed turn once it can run"
+        );
+        assert!(scheduler.try_admit_folder_work(c).is_some());
+    }
+
+    #[test]
     fn derivative_folder_permit_releases_capacity_on_drop() {
         let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig {
             idle_workers: 1,
@@ -536,17 +564,20 @@ impl IndexScheduler {
                 .iter()
                 .find(|key| **key != foreground)
                 .copied();
+            let active_background: usize = folders
+                .active
+                .iter()
+                .filter(|(key, _)| **key != foreground)
+                .map(|(_, count)| *count)
+                .sum();
             if folder == foreground {
-                if next_background.is_some() && folders.foreground_burst >= 3 {
+                if next_background.is_some()
+                    && active_background == 0
+                    && folders.foreground_burst >= 3
+                {
                     return false;
                 }
             } else {
-                let active_background: usize = folders
-                    .active
-                    .iter()
-                    .filter(|(key, _)| **key != foreground)
-                    .map(|(_, count)| *count)
-                    .sum();
                 if active_background >= 1 || next_background != Some(folder) {
                     return false;
                 }

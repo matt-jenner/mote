@@ -5,6 +5,7 @@ use crate::hosted_runtime::SelectionRuntime;
 use photo_domain::{FolderGroupId, LibraryId};
 use photo_indexer::IndexScheduler;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 pub(crate) type FolderJobKey = (LibraryId, FolderGroupId);
@@ -19,6 +20,7 @@ pub(crate) struct FolderJobRegistry {
     pub(crate) runtimes: Mutex<HashMap<FolderJobKey, Weak<SelectionRuntime>>>,
     foreground: Mutex<Option<FolderJobKey>>,
     scheduler: Arc<IndexScheduler>,
+    closed: AtomicBool,
 }
 
 impl FolderJobRegistry {
@@ -27,6 +29,7 @@ impl FolderJobRegistry {
             runtimes: Mutex::new(HashMap::new()),
             foreground: Mutex::new(None),
             scheduler,
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -41,13 +44,40 @@ impl FolderJobRegistry {
             return runtime;
         }
         let runtime = create();
+        if self.is_shutdown() {
+            runtime.cancel_folder_work();
+            return runtime;
+        }
         runtimes.insert(key, Arc::downgrade(&runtime));
         runtime
     }
 
     pub(crate) fn set_foreground(&self, key: Option<FolderJobKey>) {
+        let key = key.filter(|_| !self.is_shutdown());
         *self.foreground.lock().expect("folder jobs poisoned") = key;
         self.scheduler.set_foreground_folder(key);
+    }
+
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn shutdown(&self) -> Vec<Arc<SelectionRuntime>> {
+        let mut runtimes = self.runtimes.lock().expect("folder jobs poisoned");
+        self.closed.store(true, Ordering::Release);
+        let retired = runtimes
+            .drain()
+            .filter_map(|(key, runtime)| {
+                drop(self.scheduler.folder_work_scope(key));
+                runtime.upgrade()
+            })
+            .collect::<Vec<_>>();
+        for runtime in &retired {
+            runtime.cancel_folder_work();
+        }
+        drop(runtimes);
+        self.set_foreground(None);
+        retired
     }
 
     pub(crate) fn priority(&self, key: FolderJobKey) -> FolderJobPriority {

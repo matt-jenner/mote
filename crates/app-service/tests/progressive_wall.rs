@@ -1838,6 +1838,72 @@ async fn switching_folders_removing_background_folder_cancels_its_unadmitted_der
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn switching_folders_return_syncs_scope_for_visible_child_derivatives() {
+    let fixture = ProgressiveFixture::new(1);
+    let child = fixture.source.join("child");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::copy(
+        fixture.source.join("photo-000.jpg"),
+        child.join("child.jpg"),
+    )
+    .unwrap();
+    let other = fixture.temp.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    let service =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
+            .unwrap();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    service
+        .update_gallery_scope(GalleryScope::CurrentFolder)
+        .await
+        .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    let a = service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    assert_eq!(
+        service
+            .query_wall(query(SortDirection::OldestFirst))
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    service.start_scan(&other).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    service
+        .update_gallery_scope(GalleryScope::IncludeSubfolders)
+        .await
+        .unwrap();
+    service
+        .activate_saved_folder(a.saved_folders.active_entry_id.as_ref().unwrap())
+        .await
+        .unwrap();
+    let wall = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    assert_eq!(wall.items.len(), 2);
+    let child = wall
+        .items
+        .into_iter()
+        .find(|asset| asset.display_name == "child.jpg")
+        .unwrap();
+    service
+        .request_derivatives(DerivativeRequest::visible(vec![child.id]))
+        .await
+        .expect("returning A must use the current recursive scope for the visible child");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn switching_folders_overlapping_parent_and_child_retain_collection_membership() {
     let fixture = ProgressiveFixture::new(2);
     let child = fixture.source.join("child");

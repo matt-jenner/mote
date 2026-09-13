@@ -543,9 +543,17 @@ impl AppService {
             drop(state);
             token
         };
-        self.gallery
-            .folder_jobs
-            .set_foreground(Some((token.library_id, token.group_id)));
+        #[cfg(test)]
+        {
+            let gate = self.saved_activation_test_gate.lock().await.take();
+            if let Some(gate) = gate {
+                let release = gate.release.notified();
+                tokio::pin!(release);
+                release.as_mut().enable();
+                gate.entered.notify_one();
+                release.await;
+            }
+        }
         self.start_selected_scan(token).await?;
         Ok(Some(self.bootstrap()?))
     }
@@ -555,6 +563,58 @@ impl AppService {
 mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicUsize};
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_saved_activation_cannot_replace_newer_foreground_priority() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let service = AppService::open(crate::AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let a_entry = service
+            .start_scan(&a)
+            .await
+            .unwrap()
+            .saved_folders
+            .active_entry_id
+            .unwrap();
+        let b_entry = service
+            .start_scan(&b)
+            .await
+            .unwrap()
+            .saved_folders
+            .active_entry_id
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *service.saved_activation_test_gate.lock().await =
+            Some(crate::service::CollectionTestGate {
+                entered: entered.clone(),
+                release: release.clone(),
+            });
+        let older_service = service.clone();
+        let older =
+            tokio::spawn(async move { older_service.activate_saved_folder(&a_entry).await });
+        entered.notified().await;
+        service.activate_saved_folder(&b_entry).await.unwrap();
+        let current = service.active_selection_token().unwrap();
+        release.notify_waiters();
+        older.await.unwrap().unwrap();
+        assert_eq!(service.active_selection_token().unwrap(), current);
+        assert_eq!(
+            service
+                .gallery
+                .folder_jobs
+                .priority((current.library_id, current.group_id)),
+            crate::folder_jobs::FolderJobPriority::Foreground,
+            "stale A must not demote active B after B commits its transition"
+        );
+    }
+
     #[tokio::test]
     async fn desktop_bootstrap_verification_cannot_start_a_replacement_selection() {
         let temp = tempfile::tempdir().unwrap();

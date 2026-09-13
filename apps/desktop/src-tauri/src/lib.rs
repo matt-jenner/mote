@@ -91,6 +91,31 @@ pub fn run() {
             commands::watch_wall_updates,
             commands::unwatch_wall_updates
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Mote");
+        .build(tauri::generate_context!())
+        .expect("error while building Mote")
+        .run(|app, event| {
+            on_run_event(&event, || {
+                if let Some(state) = app.try_state::<DesktopState>() {
+                    tauri::async_runtime::block_on(state.service.shutdown());
+                }
+            });
+        });
+}
+
+fn on_run_event(event: &tauri::RunEvent, shutdown: impl FnOnce()) {
+    if matches!(event, tauri::RunEvent::Exit) {
+        shutdown();
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    #[test]
+    fn native_exit_invokes_shutdown_only_for_the_final_exit_event() {
+        let mut shutdowns = 0;
+        super::on_run_event(&tauri::RunEvent::Ready, || shutdowns += 1);
+        assert_eq!(shutdowns, 0);
+        super::on_run_event(&tauri::RunEvent::Exit, || shutdowns += 1);
+        assert_eq!(shutdowns, 1);
+    }
 }

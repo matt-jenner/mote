@@ -444,7 +444,9 @@ pub struct AppService {
     pub(crate) protected_groups: ProtectedGroups,
     pub(crate) derivative_driver: Arc<tokio::sync::Mutex<()>>,
     pub(crate) collection_driver: Arc<CollectionDriverControl>,
-    gallery_scope_update: Arc<TokioMutex<()>>,
+    pub(crate) gallery_scope_update: Arc<TokioMutex<()>>,
+    #[cfg(test)]
+    pub(crate) saved_activation_test_gate: Arc<TokioMutex<Option<CollectionTestGate>>>,
     #[cfg(any(test, debug_assertions))]
     pub(crate) derivative_test_gate: Arc<TokioMutex<Option<DerivativeTestGate>>>,
     #[cfg(any(test, debug_assertions))]
@@ -606,6 +608,8 @@ impl AppService {
             derivative_driver: Arc::new(tokio::sync::Mutex::new(())),
             collection_driver: Arc::new(CollectionDriverControl::new()),
             gallery_scope_update: Arc::new(TokioMutex::new(())),
+            #[cfg(test)]
+            saved_activation_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]
             derivative_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(any(test, debug_assertions))]
@@ -1068,6 +1072,33 @@ impl AppService {
         }
         let state = self.state()?;
         Self::bootstrap_locked(&state)
+    }
+
+    /// Retires desktop folder jobs without waiting for already-started blocking
+    /// source reads or admitted commits. Those owners retain their drain rules.
+    pub async fn shutdown(&self) {
+        let runtimes = {
+            let _transition = self
+                .selection_transition
+                .lock()
+                .expect("selection transition poisoned");
+            let runtimes = self.gallery.folder_jobs.shutdown();
+            if let Ok(mut state) = self.state() {
+                state.active_scan = None;
+            }
+            for (_, bridge) in self
+                .desktop_bridges
+                .lock()
+                .expect("desktop bridges poisoned")
+                .drain()
+            {
+                bridge.abort.abort();
+            }
+            runtimes
+        };
+        for runtime in runtimes {
+            runtime.coordinator.close_folder().await;
+        }
     }
 }
 
@@ -1614,6 +1645,134 @@ mod tests {
                 .is_err(),
             "a stale scan token must not install a bridge or forward updates"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn returning_live_folder_scope_invalidates_only_its_old_collection_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        ImageBuffer::from_pixel(2, 2, Rgb([10_u8, 20, 30]))
+            .save(a.join("photo.jpg"))
+            .unwrap();
+        let reader_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let service = AppService::open_with_reader(
+            AppConfig::new(temp.path().join("data"), temp.path().join("cache")),
+            Arc::new(BlockingReader(reader_gate.clone())),
+        )
+        .unwrap();
+        service
+            .update_gallery_scope(crate::GalleryScope::CurrentFolder)
+            .await
+            .unwrap();
+        let a_bootstrap = service.start_scan(&a).await.unwrap();
+        let bound_a = service.derivative_context().unwrap();
+        let a_generation = bound_a.coordinator.background_generation().await;
+        service.start_scan(&b).await.unwrap();
+        service
+            .update_gallery_scope(crate::GalleryScope::IncludeSubfolders)
+            .await
+            .unwrap();
+        let bound_b = service.derivative_context().unwrap();
+        let b_generation = bound_b.coordinator.background_generation().await;
+        service
+            .activate_saved_folder(a_bootstrap.saved_folders.active_entry_id.as_ref().unwrap())
+            .await
+            .unwrap();
+        let returned = service.derivative_context().unwrap();
+        let changed_generation = returned.coordinator.background_generation().await;
+        let (released, changed) = &*reader_gate;
+        *released.lock().unwrap() = true;
+        changed.notify_all();
+        assert!(Arc::ptr_eq(&returned.coordinator, &bound_a.coordinator));
+        assert!(
+            changed_generation > a_generation,
+            "returning live A with a new scope must invalidate its old collection generation"
+        );
+        assert_eq!(
+            bound_b.coordinator.background_generation().await,
+            b_generation
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn service_shutdown_retires_all_folder_jobs_and_rejects_new_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let reader_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let service = AppService::open_with_reader(
+            AppConfig::new(temp.path().join("data"), temp.path().join("cache")),
+            Arc::new(BlockingReader(reader_gate.clone())),
+        )
+        .unwrap();
+        let mut runtimes = Vec::new();
+        let mut waiters = Vec::new();
+        let mut last_folder = None;
+        for name in ["a", "b"] {
+            let folder = temp.path().join(name);
+            std::fs::create_dir(&folder).unwrap();
+            ImageBuffer::from_pixel(2, 2, Rgb([10_u8, 20, 30]))
+                .save(folder.join("photo.jpg"))
+                .unwrap();
+            service.start_scan(&folder).await.unwrap();
+            let token = service.active_selection_token().unwrap();
+            let bound = service
+                .gallery
+                .bind_desktop_derivatives(&service, token)
+                .unwrap();
+            let runtime = bound.derivative_runtime.unwrap();
+            assert_eq!(
+                *runtime.scan_lifecycle.borrow(),
+                crate::hosted_runtime::ScanLifecycle::Running
+            );
+            waiters.push(
+                runtime
+                    .coordinator
+                    .enqueue(
+                        crate::derivative_coordinator::WorkKey {
+                            selection: runtime.selection.token(),
+                            asset_id: photo_domain::AssetId::from_uuid(uuid::Uuid::new_v4()),
+                            class: crate::DerivativeClass::WallThumbnail,
+                            cache_key: format!("shutdown-{name}"),
+                            availability: photo_domain::Availability::Available,
+                            scope: crate::GalleryScope::IncludeSubfolders,
+                        },
+                        crate::derivative_coordinator::WorkLane::VisibleWall,
+                    )
+                    .await,
+            );
+            runtimes.push(runtime);
+            last_folder = Some(folder);
+        }
+        service.shutdown().await;
+        service.shutdown().await;
+        for runtime in &runtimes {
+            assert!(runtime.cancellation_requested());
+            assert_eq!(
+                *runtime.scan_lifecycle.borrow(),
+                crate::hosted_runtime::ScanLifecycle::Cancelled
+            );
+            assert_eq!(runtime.coordinator.pending_job_count().await, 0);
+        }
+        for waiter in waiters {
+            assert_eq!(waiter.await.unwrap(), None);
+        }
+        assert_eq!(service.runtime_count_for_test(), 0);
+        assert!(service.state().unwrap().active_scan.is_none());
+        assert!(service.desktop_bridges.lock().unwrap().is_empty());
+        service
+            .start_scan(last_folder.as_ref().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            service.runtime_count_for_test(),
+            0,
+            "shutdown must not admit a successor"
+        );
+        let (released, changed) = &*reader_gate;
+        *released.lock().unwrap() = true;
+        changed.notify_all();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -19,11 +19,12 @@ impl AppService {
         &self,
         selection_token: SelectionToken,
     ) -> Result<(), AppServiceError> {
+        let _scope_update = self.gallery_scope_update.lock().await;
         let selection = self.gallery.selection_from_token(selection_token)?;
         if !self.admit_desktop_scan(selection_token)? {
             return Ok(());
         }
-        {
+        let (bound, scope) = {
             // Keep bridge installation in the same transition critical section
             // as selection changes. A newer selection therefore cannot become
             // active between this check and the bridge subscription.
@@ -45,8 +46,35 @@ impl AppService {
                 .map(|state| state.gallery_scope)
                 .unwrap_or(GalleryScope::IncludeSubfolders);
             self.start_desktop_update_bridge(&selection, scope, selection_token);
+            (
+                self.gallery
+                    .bind_desktop_derivatives(self, selection_token)?,
+                scope,
+            )
+        };
+        let runtime = bound
+            .derivative_runtime
+            .as_ref()
+            .expect("captured desktop runtime");
+        let scope_changed = {
+            let mut previous = runtime
+                .desktop_scope
+                .lock()
+                .map_err(|_| AppServiceError::StatePoisoned)?;
+            let changed = *previous != scope;
+            *previous = scope;
+            changed
+        };
+        if scope_changed {
+            let runtime_selection = runtime.selection.token();
+            bound.coordinator.ensure_selection(runtime_selection).await;
+            bound.coordinator.invalidate_background().await;
+            bound
+                .coordinator
+                .reset_collection_for_scope(runtime_selection)
+                .await;
         }
-        self.wake_derivative_workers();
+        bound.wake_derivative_workers();
         let result = self.gallery.ensure_running(&selection).await;
         if result.is_err() {
             self.clear_desktop_scan(selection_token);
@@ -144,6 +172,9 @@ impl AppService {
             .selection_transition
             .lock()
             .map_err(|_| AppServiceError::StatePoisoned)?;
+        if self.gallery.folder_jobs.is_shutdown() {
+            return Ok(false);
+        }
         let mut state = self.state()?;
         let stored = state.libraries.catalog().load_app_state()?;
         let Some(active) = stored.active_selection else {

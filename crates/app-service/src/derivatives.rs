@@ -2794,6 +2794,9 @@ impl AppService {
     }
 
     pub(crate) fn derivative_context(&self) -> Result<Self, AppServiceError> {
+        if self.gallery.folder_jobs.is_shutdown() {
+            return Err(AppServiceError::DerivativeUnavailable);
+        }
         if self.derivative_runtime.is_some() {
             return Ok(self.clone());
         }
