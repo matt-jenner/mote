@@ -492,6 +492,8 @@ pub struct GalleryEngine {
     #[cfg(debug_assertions)]
     hosted_empty_authorization_test_gate: HostedAsyncTestGate,
     #[cfg(debug_assertions)]
+    hosted_post_validation_test_gate: HostedAsyncTestGate,
+    #[cfg(debug_assertions)]
     hosted_pre_enqueue_test_gate: HostedAsyncTestGate,
     #[cfg(debug_assertions)]
     hosted_scan_admission_test_gate: HostedAsyncTestGate,
@@ -758,6 +760,8 @@ impl GalleryEngine {
             #[cfg(debug_assertions)]
             hosted_empty_authorization_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]
+            hosted_post_validation_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
             hosted_pre_enqueue_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]
             hosted_scan_admission_test_gate: Arc::new(TokioMutex::new(None)),
@@ -831,6 +835,8 @@ impl GalleryEngine {
             hosted_encode_registration_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]
             hosted_empty_authorization_test_gate: Arc::new(TokioMutex::new(None)),
+            #[cfg(debug_assertions)]
+            hosted_post_validation_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]
             hosted_pre_enqueue_test_gate: Arc::new(TokioMutex::new(None)),
             #[cfg(debug_assertions)]
@@ -1487,8 +1493,20 @@ impl GalleryEngine {
             return Err(AppServiceError::DerivativeUnavailable);
         }
         let assets = self.validate_derivative_request(selection, scope, &request)?;
+        #[cfg(debug_assertions)]
+        if let Some((entered, release)) = self.hosted_post_validation_test_gate.lock().await.take()
+        {
+            let notified = release.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            entered.notify_one();
+            notified.await;
+        }
 
         let runtime = self.runtime(selection);
+        if !self.folder_jobs.admits_binding(&runtime) {
+            return Err(AppServiceError::DerivativeUnavailable);
+        }
         let _protected =
             ProtectedGroupGuard::new(self.protected_groups.clone(), selection.group_id)
                 .map_err(|_| AppServiceError::DerivativeFailed)?;
@@ -2804,6 +2822,16 @@ impl GalleryEngine {
         release: Arc<Notify>,
     ) {
         *self.hosted_pre_enqueue_test_gate.lock().await = Some((entered, release));
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_hosted_post_validation_test_gate(
+        &self,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    ) {
+        *self.hosted_post_validation_test_gate.lock().await = Some((entered, release));
     }
 
     #[cfg(debug_assertions)]

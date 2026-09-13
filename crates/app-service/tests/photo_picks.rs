@@ -408,3 +408,36 @@ async fn service_shutdown_rejects_new_pick_derivative_work() {
         Err(AppServiceError::DerivativeUnavailable)
     ));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_between_pick_validation_and_runtime_admission_rejects_the_racing_request() {
+    let fixture = std::thread::spawn(Fixture::new).join().unwrap();
+    fixture.pick(0);
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    fixture
+        .service
+        .install_pick_post_validation_test_gate(entered.clone(), release.clone())
+        .await;
+    let service = fixture.service.clone();
+    let request = fixture.request(vec![fixture.assets[0].clone()]);
+    let racing = tokio::spawn(async move { service.request_pick_derivatives(request).await });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("Picks request did not reach the post-validation boundary");
+    fixture.service.shutdown().await;
+    assert_eq!(fixture.service.pick_runtime_count_for_test(), 0);
+    release.notify_waiters();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), racing)
+        .await
+        .expect("shutdown stranded the racing Picks derivative request")
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(AppServiceError::DerivativeUnavailable)
+    ));
+    assert_eq!(fixture.service.pick_derivative_attempts_for_test(), 0);
+    assert_eq!(fixture.service.pick_runtime_count_for_test(), 0);
+}
