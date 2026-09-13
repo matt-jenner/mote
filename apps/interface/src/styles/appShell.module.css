@@ -27,6 +27,8 @@
 	gap: var(--space-3);
 	min-width: 0;
 	padding: 0 32px;
+	container-name: workspace-toolbar;
+	container-type: inline-size;
 	background: color-mix(in srgb, var(--canvas-elevated) 94%, var(--canvas));
 	border-bottom: 1px solid var(--separator);
 }

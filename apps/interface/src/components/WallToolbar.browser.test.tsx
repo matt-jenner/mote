@@ -1,8 +1,13 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { page } from "vitest/browser";
 import { render } from "vitest-browser-react";
+import { PhotoServiceProvider } from "../app/PhotoServiceContext";
+import { createInMemoryPhotoService } from "../services/inMemoryPhotoService";
+import type { WallAsset } from "../services/photoService";
 import "../styles/tokens.css";
 import "../styles/global.css";
+import { AppShell } from "./AppShell";
 import { WallToolbar } from "./WallToolbar";
 
 const labels = ["Include subfolders", "Oldest first", "Newest first"] as const;
@@ -92,4 +97,78 @@ describe("desktop wall toolbar", () => {
 				).toBeGreaterThan(screen.getByRole("status").element().clientWidth);
 		},
 	);
+
+	it("uses compact view options without overflowing the 900px shell when Picks is open", async () => {
+		await page.viewport(900, 768);
+		const toolbarAsset: WallAsset = {
+			id: "coast",
+			displayName: "Coast.jpg",
+			mediaKind: "jpeg",
+			provisionalOrder: 1,
+			capturedAtUtc: "2025-01-01T12:00:00Z",
+			dateState: "settled",
+			width: 1200,
+			height: 800,
+			representativeRgb: 0x3d536b,
+			shapeState: "ready",
+			availability: "available",
+			warning: null,
+			wallThumbnail: {
+				assetId: "coast",
+				kind: "wallThumbnail",
+				key: "coast-wall",
+			},
+			screenPreview: null,
+			rating: null,
+		};
+		const service = createInMemoryPhotoService({
+			selectedFolderName: "A folder name that must truncate",
+			wallAssets: [
+				{ ...toolbarAsset, wallThumbnailUrl: "/demo-photos/coast.jpg" },
+			],
+		});
+		const queryClient = new QueryClient({
+			defaultOptions: {
+				mutations: { retry: false },
+				queries: { retry: false },
+			},
+		});
+		const screen = await render(
+			<QueryClientProvider client={queryClient}>
+				<PhotoServiceProvider service={service}>
+					<AppShell />
+				</PhotoServiceProvider>
+			</QueryClientProvider>,
+		);
+		await screen.getByRole("button", { name: "Choose Folder" }).click();
+		await service.finishFixtureScan();
+		await screen.getByRole("button", { name: "Picks, 0 picks" }).click();
+		await expect
+			.element(screen.getByRole("complementary", { name: "Picks" }))
+			.toBeVisible();
+
+		const workspace = screen
+			.getByRole("region", { name: "Photo workspace" })
+			.element();
+		const header = workspace.querySelector<HTMLElement>("header");
+		if (!header) throw new Error("Missing workspace header");
+		expect(header.scrollWidth).toBeLessThanOrEqual(header.clientWidth);
+		const viewOptions = screen.getByRole("button", { name: "View options" });
+		await expect.element(viewOptions).toBeVisible();
+		const viewOptionsBounds = viewOptions.element().getBoundingClientRect();
+		const headerBounds = header.getBoundingClientRect();
+		expect(viewOptionsBounds.width).toBeGreaterThanOrEqual(44);
+		expect(viewOptionsBounds.height).toBeGreaterThanOrEqual(44);
+		expect(viewOptionsBounds.left).toBeGreaterThanOrEqual(headerBounds.left);
+		expect(viewOptionsBounds.right).toBeLessThanOrEqual(headerBounds.right);
+
+		await viewOptions.click();
+		const menu = screen.getByRole("dialog", { name: "View options" });
+		await expect
+			.element(menu.getByRole("button", { name: "Include subfolders" }))
+			.toBeVisible();
+		await expect
+			.element(menu.getByRole("button", { name: "Newest first" }))
+			.toBeVisible();
+	});
 });
