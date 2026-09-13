@@ -312,17 +312,24 @@ class PickListStoreImplementation implements PickListStore {
 		if (this.copy.phase !== "copying" && this.copy.phase !== "cancelling")
 			return Promise.resolve();
 		if (!this.cancelCommand) {
+			const copyId = this.activeCopyId;
 			this.copy = { ...this.copy, phase: "cancelling" };
+			const command: Promise<void> = this.service
+				.cancelOriginalCopy()
+				.catch((error) => {
+					if (this.activeCopyId !== copyId || this.cancelCommand !== command)
+						return;
+					this.cancelCommand = null;
+					if (this.copy.phase === "cancelling")
+						this.copy = { ...this.copy, phase: "copying" };
+					this.publishMessage(
+						error instanceof PhotoServiceError
+							? error.message
+							: "Couldn't cancel the copy",
+					);
+				});
+			this.cancelCommand = command;
 			this.publish();
-			this.cancelCommand = this.service.cancelOriginalCopy().catch((error) => {
-				if (this.copy.phase === "cancelling")
-					this.copy = { ...this.copy, phase: "copying" };
-				this.publishMessage(
-					error instanceof PhotoServiceError
-						? error.message
-						: "Couldn't cancel the copy",
-				);
-			});
 		}
 		return Promise.all([this.cancelCommand, this.copyPromise]).then(() => {});
 	};
@@ -357,11 +364,17 @@ class PickListStoreImplementation implements PickListStore {
 					this.publish();
 				},
 			);
+			// Stay in this continuation when settling, so a newly accepted retry
+			// cannot appear between draining cancellation and publishing completion.
+			while (this.cancelCommand) {
+				const command = this.cancelCommand;
+				await command;
+				if (this.cancelCommand === command) break;
+			}
 			if (
 				result.kind === "selectionCancelled" ||
 				result.kind === "copyCancelled"
 			) {
-				if (result.kind === "copyCancelled") await this.cancelCommand;
 				this.copy = previous;
 				if (result.kind === "copyCancelled")
 					this.publishMessage("Copy cancelled", true, true);
@@ -407,6 +420,11 @@ class PickListStoreImplementation implements PickListStore {
 			}
 			this.publish();
 		} catch (error) {
+			while (this.cancelCommand) {
+				const command = this.cancelCommand;
+				await command;
+				if (this.cancelCommand === command) break;
+			}
 			this.copy = previous;
 			this.publishMessage(
 				error instanceof PhotoServiceError

@@ -74,6 +74,7 @@ const partialCopy: CopyResult = {
 
 async function copyFixture(
 	copyPickedOriginals: PhotoService["copyPickedOriginals"],
+	cancelOriginalCopy?: PhotoService["cancelOriginalCopy"],
 ) {
 	const memory = createInMemoryPhotoService({
 		wallAssets: [asset("first"), asset("second"), asset("later")],
@@ -84,6 +85,7 @@ async function copyFixture(
 	const store = createPickListStore({
 		...memory,
 		copyPickedOriginals,
+		cancelOriginalCopy: cancelOriginalCopy ?? memory.cancelOriginalCopy,
 		showLastCopyDestination: async () => {
 			shown += 1;
 		},
@@ -108,6 +110,133 @@ afterEach(() => {
 });
 
 describe("pick list controller", () => {
+	it("retries Cancel after its first native cancellation command rejects", async () => {
+		const worker = deferred<CopyResult>();
+		const firstCommand = deferred<void>();
+		const retryCommand = deferred<void>();
+		let calls = 0;
+		const { store, stop } = await copyFixture(
+			(_ids, progress) => {
+				progress({ completed: 0, total: 2, item: null });
+				return worker.promise;
+			},
+			() => (++calls === 1 ? firstCommand.promise : retryCommand.promise),
+		);
+		const operation = store.getState().copyOriginals();
+		const firstCancel = store.getState().cancelCopy();
+		firstCommand.reject(new Error("native cancellation unavailable"));
+		await Promise.resolve();
+		expect(store.getState().copy.phase).toBe("copying");
+		expect(store.getState().toast?.message).toBe("Couldn't cancel the copy");
+		const retryCancel = store.getState().cancelCopy();
+		expect(calls).toBe(2);
+		expect(store.getState().copy.phase).toBe("cancelling");
+		retryCommand.resolve();
+		worker.resolve({ kind: "copyCancelled" });
+		await Promise.all([operation, firstCancel, retryCancel]);
+		expect(store.getState().copy.phase).toBe("idle");
+		stop();
+	});
+
+	it.each(["complete", "error"] as const)(
+		"keeps cancellation ownership when worker %s arrives before the cancel command settles",
+		async (terminal) => {
+			const worker = deferred<CopyResult>();
+			const cancellation = deferred<void>();
+			let attempts = 0;
+			const { store, stop } = await copyFixture(
+				(_ids, progress) => {
+					attempts++;
+					progress({ completed: 0, total: 2, item: null });
+					return worker.promise;
+				},
+				() => cancellation.promise,
+			);
+			const initial = store.getState().copy;
+			const operation = store.getState().copyOriginals();
+			const cancel = store.getState().cancelCopy();
+			let settled = false;
+			void operation.then(() => {
+				settled = true;
+			});
+			if (terminal === "error") worker.reject(new Error("worker failed"));
+			else
+				worker.resolve({
+					kind: "complete",
+					copiedCount: 2,
+					failedCount: 0,
+					warningCode: null,
+					items: ["first", "second"].map((assetId) => ({
+						assetId,
+						status: "copied",
+						destinationName: `${assetId}.jpg`,
+						errorCode: null,
+					})),
+				});
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			expect(store.getState().copy.phase).toBe("cancelling");
+			expect(settled).toBe(false);
+			expect(store.getState().toast).toBeNull();
+			const duplicate = store.getState().copyOriginals();
+			expect(duplicate).toBe(operation);
+			expect(attempts).toBe(1);
+			await store.getState().clear();
+			expect(store.getState().count).toBe(2);
+			cancellation.resolve();
+			await Promise.all([operation, cancel, duplicate]);
+			expect(settled).toBe(true);
+			if (terminal === "error") {
+				expect(store.getState().copy).toBe(initial);
+				expect(store.getState().toast?.message).toBe("Couldn't copy originals");
+			} else expect(store.getState().copy.phase).toBe("complete");
+			stop();
+		},
+	);
+
+	it("retains ownership when a failed cancellation is retried as the worker settles", async () => {
+		const worker = deferred<CopyResult>();
+		const firstCommand = deferred<void>();
+		const retryCommand = deferred<void>();
+		let calls = 0;
+		const { store, stop } = await copyFixture(
+			(_ids, progress) => {
+				progress({ completed: 0, total: 2, item: null });
+				return worker.promise;
+			},
+			() => (++calls === 1 ? firstCommand.promise : retryCommand.promise),
+		);
+		let retryScheduled = false;
+		const unsubscribe = store.subscribe(() => {
+			if (
+				calls === 1 &&
+				store.getState().copy.phase === "copying" &&
+				!retryScheduled
+			) {
+				retryScheduled = true;
+				queueMicrotask(() =>
+					queueMicrotask(() => {
+						void store.getState().cancelCopy();
+					}),
+				);
+			}
+		});
+		const operation = store.getState().copyOriginals();
+		const cancelling = store.getState().cancelCopy();
+		worker.resolve(partialCopy);
+		await Promise.resolve();
+		firstCommand.reject(new Error("first cancel failed"));
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		// A retry arriving after terminal publication can be ignored. If it was
+		// accepted, the operation must still own its pending cancellation command.
+		expect(store.getState().copy.phase).toBe(
+			calls === 2 ? "cancelling" : "partial",
+		);
+		retryCommand.resolve();
+		await Promise.all([operation, cancelling]);
+		expect(store.getState().copy.phase).toBe("partial");
+		unsubscribe();
+		stop();
+	});
 	it("publishes optimistic add immediately and resets its final fade within one second", async () => {
 		vi.useFakeTimers();
 		const memory = createInMemoryPhotoService({
