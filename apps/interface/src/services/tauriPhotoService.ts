@@ -32,6 +32,7 @@ const nativeErrorMessages: Readonly<Record<string, string>> = {
 	copyInProgress: "An original copy is already in progress.",
 	copyDestinationIsSource: "Choose a destination outside your source folders.",
 	copyDestinationUnavailable: "The copy destination is unavailable.",
+	copyDestinationMissing: "The destination folder no longer exists.",
 	copyPreparationFailed: "Mote could not prepare these originals.",
 	folderUnavailable: "The selected folder is unavailable.",
 	folderNotDirectory: "Choose a folder, not a file.",
@@ -253,6 +254,12 @@ export function createTauriPhotoService(
 			invokePhotoCommand<void>(
 				invokeCommand,
 				"show_last_copy_destination",
+				undefined,
+			),
+		cancelOriginalCopy: () =>
+			invokePhotoCommand<void>(
+				invokeCommand,
+				"cancel_original_copy",
 				undefined,
 			),
 		getSavedFolders: () => cloneSavedFolders(saved),

@@ -369,38 +369,30 @@ fn unreadable_source_fails_without_changing_permissions_or_preference() {
     assert_eq!(fixture.remembered(), None);
 }
 
-// Catches retry loops recreating lost directories or losing completed-item results.
+// Catches retry loops recreating lost directories or starting remaining items.
 #[test]
-fn destination_loss_mid_batch_reports_remaining_failures_and_keeps_completed_copy() {
+fn destination_loss_mid_batch_stops_and_keeps_completed_copy() {
     let fixture = Fixture::new(&["first.jpg", "second.jpg", "third.jpg"]);
     let moved = fixture.temp.path().join("unmounted");
     let mut reports = 0;
-    let result = fixture
-        .service
-        .copy_originals_with_progress(
-            fixture.service.prepare_original_copy(&fixture.ids).unwrap(),
-            &fixture.destination,
-            |_| {
-                reports += 1;
-                if reports == 1 {
-                    fs::rename(&fixture.destination, &moved).unwrap();
-                }
-            },
-        )
-        .unwrap();
-    assert_eq!((result.copied_count, result.failed_count), (1, 2));
-    assert_eq!(reports, 3);
+    let result = fixture.service.copy_originals_with_progress(
+        fixture.service.prepare_original_copy(&fixture.ids).unwrap(),
+        &fixture.destination,
+        |_| {
+            reports += 1;
+            if reports == 1 {
+                fs::rename(&fixture.destination, &moved).unwrap();
+            }
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(AppServiceError::CopyDestinationMissing)
+    ));
+    assert_eq!(reports, 1);
     assert_eq!(names(&moved), ["first.jpg"]);
     assert!(!fixture.destination.exists());
-    assert_eq!(
-        result.items[1].error_code.as_deref(),
-        Some("destination_unavailable")
-    );
-    assert_eq!(
-        result.items[2].error_code.as_deref(),
-        Some("destination_unavailable")
-    );
-    assert!(fixture.remembered().is_some());
+    assert!(fixture.remembered().is_none());
 }
 
 // Catches stale destination scans overwriting files that appear during an operation.
@@ -587,6 +579,22 @@ fn filesystem_write_failure_removes_unreadable_partial_output_and_preserves_sour
     const CHILD_ID: &str = "PHOTO_COPY_WRITE_FAILURE_CHILD_ID";
     if let Some(root) = std::env::var_os(CHILD_ROOT) {
         let root = PathBuf::from(root);
+        let service =
+            AppService::open(AppConfig::new(root.join("data"), root.join("cache"))).unwrap();
+        let batch = service
+            .prepare_original_copy(&[std::env::var(CHILD_ID).unwrap()])
+            .unwrap();
+        // Constrain only copy and its permission probe, not catalog startup.
+        // SAFETY: this branch runs in a dedicated child process with one test.
+        unsafe {
+            assert_ne!(libc::signal(libc::SIGXFSZ, libc::SIG_IGN), libc::SIG_ERR);
+            let limit = libc::rlimit {
+                rlim_cur: 16 * 1024,
+                rlim_max: 16 * 1024,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+            libc::umask(0o444);
+        }
         let probe = root.join("exports/write-only-probe");
         fs::OpenOptions::new()
             .write(true)
@@ -598,11 +606,6 @@ fn filesystem_write_failure_removes_unreadable_partial_output_and_preserves_sour
             "restrictive umask must deny data reads"
         );
         fs::remove_file(probe).unwrap();
-        let service =
-            AppService::open(AppConfig::new(root.join("data"), root.join("cache"))).unwrap();
-        let batch = service
-            .prepare_original_copy(&[std::env::var(CHILD_ID).unwrap()])
-            .unwrap();
         let result = service
             .copy_originals(batch, &root.join("exports"))
             .unwrap();
@@ -616,13 +619,14 @@ fn filesystem_write_failure_removes_unreadable_partial_output_and_preserves_sour
     fs::write(&fixture.sources[0], &bytes).unwrap();
     let before = fs::metadata(&fixture.sources[0]).unwrap();
     fs::write(fixture.destination.join("existing.jpg"), b"keep existing").unwrap();
-    let child = std::process::Command::new("/bin/sh")
-        .args([
-            "-c",
-            "trap '' XFSZ; ulimit -f 32; umask 0444; exec \"$@\"",
-            "copy-write-failure",
-        ])
-        .arg(std::env::current_exe().unwrap())
+    // Force startup to update the catalog regardless of the wall-clock second.
+    // The copy failure injection must not also constrain that setup write.
+    let group = FolderGroupId::from_uuid(uuid::Uuid::parse_str(&fixture.groups[0]).unwrap());
+    Catalog::open(&fixture.config.catalog_path())
+        .unwrap()
+        .touch_folder_group(group, 0)
+        .unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "filesystem_write_failure_removes_unreadable_partial_output_and_preserves_source",

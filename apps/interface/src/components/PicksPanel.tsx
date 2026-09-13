@@ -46,7 +46,6 @@ export function PicksTrigger({
 	onClick,
 	className,
 	triggerRef,
-	copy,
 	controlsId,
 	inert = false,
 }: {
@@ -59,18 +58,12 @@ export function PicksTrigger({
 	controlsId: string;
 	inert?: boolean;
 }) {
-	const progress =
-		copy?.phase === "copying"
-			? `Copying ${copy.completed} / ${copy.total}`
-			: copy?.phase === "choosing"
-				? "Choosing destination…"
-				: "";
 	return (
 		<button
 			aria-controls={controlsId}
 			aria-expanded={expanded}
 			aria-hidden={inert}
-			aria-label={`Picks, ${pickCountLabel(count)}${progress ? `, ${progress}` : ""}`}
+			aria-label={`Picks, ${pickCountLabel(count)}`}
 			className={className}
 			onClick={(event) => {
 				onClick();
@@ -83,7 +76,6 @@ export function PicksTrigger({
 			<Bookmark aria-hidden="true" size={18} strokeWidth={1.8} />
 			<span>Picks</span>
 			<span className={styles.triggerCount}>{count}</span>
-			{progress ? <span>{progress}</span> : null}
 		</button>
 	);
 }
@@ -138,13 +130,17 @@ export function PicksPanel({
 	const items = picks.snapshot.items;
 	const hasItems = items.length > 0;
 	const copying =
-		picks.copy.phase === "choosing" || picks.copy.phase === "copying";
+		picks.copy.phase === "choosing" ||
+		picks.copy.phase === "copying" ||
+		picks.copy.phase === "cancelling";
+	const canCancel =
+		picks.copy.phase === "copying" || picks.copy.phase === "cancelling";
 	const showCopyActions = hasItems || picks.copy.phase !== "idle";
 	const copyLabel =
 		picks.copy.phase === "choosing"
 			? "Choosing destination…"
-			: picks.copy.phase === "copying"
-				? `Copying ${picks.copy.completed} / ${picks.copy.total}`
+			: canCancel
+				? "Copying..."
 				: picks.copy.phase === "partial"
 					? `Retry ${picks.copy.failedAssetIds.length} originals…`
 					: `Copy ${picks.count} ${picks.count === 1 ? "original" : "originals"}…`;
@@ -324,12 +320,17 @@ export function PicksPanel({
 						</p>
 					) : null}
 					<div className={styles.actions} data-testid="picks-actions">
-						{picks.copy.phase === "copying" ? (
-							<progress
-								aria-label="Copy originals"
-								value={picks.copy.completed}
-								max={picks.copy.total}
-							/>
+						{canCancel ? (
+							<div className={styles.copyProgress}>
+								<progress
+									aria-label="Copy originals"
+									value={picks.copy.completed}
+									max={picks.copy.total}
+								/>
+								<span>
+									{picks.copy.completed} of {picks.copy.total}
+								</span>
+							</div>
 						) : null}
 						{!copying && picks.copy.message ? (
 							<p>{picks.copy.message}</p>
@@ -371,9 +372,19 @@ export function PicksPanel({
 								Show folder
 							</button>
 						) : null}
-						{hasItems ? (
+						{canCancel ? (
 							<button
 								className={styles.clearButton}
+								disabled={picks.copy.phase === "cancelling"}
+								onClick={() => void picks.cancelCopy()}
+								type="button"
+							>
+								{picks.copy.phase === "cancelling" ? "Cancelling..." : "Cancel"}
+							</button>
+						) : hasItems ? (
+							<button
+								className={styles.clearButton}
+								disabled={copying}
 								onClick={() => void picks.clear().catch(() => {})}
 								type="button"
 							>

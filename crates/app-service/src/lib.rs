@@ -3,6 +3,7 @@ pub(crate) mod derivative_coordinator;
 mod derivatives;
 mod dto;
 mod folder_access;
+mod folder_jobs;
 mod gallery;
 mod hosted_runtime;
 mod original_copy;
@@ -34,7 +35,10 @@ pub use gallery::{
 };
 pub use hosted_runtime::SelectionEventSubscription;
 pub use hosted_runtime::SequencedWallUpdate;
-pub use original_copy::{CopyItemResult, CopyItemStatus, OriginalCopyBatch, OriginalCopyResult};
+pub use original_copy::{
+    CopyCancellation, CopyItemResult, CopyItemStatus, OriginalCopyBatch, OriginalCopyOutcome,
+    OriginalCopyResult,
+};
 pub use photo_domain::GalleryScope;
 pub use photo_indexer::MetadataReader;
 pub use service::{AppService, AppServiceError};

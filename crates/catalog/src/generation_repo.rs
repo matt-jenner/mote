@@ -302,11 +302,6 @@ impl Catalog {
             })?;
         let marked_missing = if source_online != 0 {
             transaction.execute(
-                "UPDATE assets SET availability = 'available' \
-                 WHERE library_id = ?1 AND last_seen_generation = ?2",
-                params![library.as_uuid().as_bytes(), generation],
-            )?;
-            transaction.execute(
                 "UPDATE assets SET availability = 'missing'
                  WHERE library_id = ?1 AND last_seen_generation <> ?2
                    AND availability <> 'missing'",

@@ -221,7 +221,16 @@ function delayedPaginationService() {
 	const service = serviceWithReadyPhotos(false, 120);
 	const queryRequests: WallQueryRequest[] = [];
 	const queryWall = service.queryWall.bind(service);
+	const watchWallUpdates = service.watchWallUpdates.bind(service);
 	let heldPage: PageGate | null = null;
+	service.watchWallUpdates = (listener) =>
+		watchWallUpdates((update) => {
+			listener(
+				update.kind === "catalogBatch"
+					? { ...update, assets: update.assets.slice(0, 100) }
+					: update,
+			);
+		});
 	service.queryWall = (request) => {
 		queryRequests.push(request);
 		if (request.cursor === "100" && heldPage === null) {
@@ -4157,13 +4166,54 @@ describe("immersive photo viewer checkpoint", () => {
 		}
 	});
 
-	it("announces the current position and loads more when pagination remains", async () => {
-		const { view } = await openManyAsset("Coast");
+	it("keeps catalog-loaded photos when a later settlement page is shorter", async () => {
+		const service = serviceWithReadyPhotos(false, 99);
+		let queryCount = 0;
+		const queryWall = service.queryWall.bind(service);
+		service.queryWall = (request) => {
+			queryCount += 1;
+			return queryWall(request);
+		};
+		const view = await renderViewerWall(service);
+		await view.getByRole("button", { name: "Choose Folder" }).click();
+		await service.finishFixtureScan();
+		await expect
+			.element(view.getByRole("status"))
+			.toHaveTextContent("Photos ready · preparing larger previews · 0 of 100");
+		const settledQueryCount = queryCount;
+		const remainder = Array.from({ length: 21 }, (_, index) => ({
+			...asset(`loaded-${index + 100}`, `Loaded ${index + 100}`, index + 101),
+			wallThumbnail: null,
+		}));
+		service.emitForTest({
+			kind: "catalogBatch",
+			selectionId: "memory-selection-1",
+			sourceId: "memory-source",
+			assets: remainder,
+			orderState: "settled",
+			generation: 2,
+			progress: {
+				discovered: 121,
+				shaped: 121,
+				enriched: 100,
+				total: 121,
+			},
+		});
+		await expect
+			.element(view.getByRole("status"))
+			.toHaveTextContent("Preparing previews · 100 of 121");
+		service.emitForTest({
+			kind: "metadataSettled",
+			selectionId: "memory-selection-1",
+			sourceId: "memory-source",
+			generation: 2,
+		});
+		await expect.poll(() => queryCount).toBe(settledQueryCount + 1);
 		const tile = view.getByRole("button", { name: "Open Coast", exact: true });
 		(tile.element() as HTMLButtonElement).click();
 		await expect
 			.element(view.getByTestId("viewer-status"))
-			.toHaveTextContent("Coast, photo 1 of 100, Fit loaded");
+			.toHaveTextContent("Coast, photo 1 of 121");
 	});
 
 	it("uses quiet mouse timers and toggles touch controls with the stage", async () => {

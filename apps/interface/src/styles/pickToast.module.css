@@ -1,0 +1,15 @@
+.toast {
+	opacity: 1;
+	transition: opacity 200ms ease;
+}
+
+.toast[data-phase="exiting"] {
+	opacity: 0;
+	pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.toast {
+		transition: none;
+	}
+}

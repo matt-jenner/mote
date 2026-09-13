@@ -157,6 +157,23 @@
 	border-top: 1px solid var(--separator);
 }
 
+.copyProgress {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	align-items: center;
+	gap: var(--space-3);
+	width: 100%;
+}
+
+.copyProgress progress {
+	width: 100%;
+}
+
+.copyProgress span {
+	text-align: right;
+	font-variant-numeric: tabular-nums;
+}
+
 .reviewButton,
 .copyButton,
 .clearButton {

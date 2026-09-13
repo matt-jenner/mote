@@ -87,18 +87,29 @@ Clearing site data removes the hosted list; a different browser has its own
 list. If storage is unavailable, Picks remain usable in the current tab and a
 warning explains that they cannot be saved.
 
-Remove a row to drop one pick. **Clear picks** empties the list immediately and
-offers **Undo** in the notification. Undo restores the cleared sequence ahead of
+Remove a row to drop one pick. When no copy attempt is active, **Clear picks**
+empties the list immediately and offers **Undo** for five seconds. Undo restores the cleared sequence ahead of
 photos added since Clear, without duplicates. Closing Picks, reviewing photos,
 copying, and downloading do not clear the list.
 
-On desktop, **Copy originals…** asks for a destination. Existing files are never
-overwritten: name collisions receive a numbered suffix. Mote remembers the
+On desktop, **Copy originals…** opens the destination picker before preparing
+the batch. Dismissing the picker is silent. Each original is written to a private
+temporary file in the destination, then published under its final name only
+after all bytes are complete. Existing files are never overwritten; name
+collisions receive a numbered suffix. Mote remembers the
 destination for the next picker after a successful copy. **Show folder** opens
 the completed copy's destination. Partial failures remain visible on their
-rows; Retry opens the picker again and retries only failed originals. Changes
-to Picks during a copy do not change the batch already running. Source photos
-remain untouched.
+rows; Retry opens the picker again and retries only failed originals.
+
+Copy progress appears only in the Picks drawer. **Cancel** replaces Clear while
+copying, and **Cancelling...** remains disabled until cleanup finishes. Cancel
+keeps completed files and picks, removes the current temporary file, restores
+the drawer's previous copy state, and shows only a fading **Copy cancelled**
+toast lasting at most one second. Closing the drawer leaves the copy running.
+If the destination disappears, the batch stops with **The destination folder
+no longer exists.** Mote does not remove completed copies. Adding or removing a
+pick does not change a batch already running. Source photos remain untouched.
+After a completed attempt, Clear also removes copy messages and row errors.
 
 Hosted sites offer a **Download original** link on each available row only when
 the administrator enables `PHOTO_VIEWER_ALLOW_ORIGINAL_DOWNLOADS=true` and

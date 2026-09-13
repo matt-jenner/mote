@@ -13,6 +13,55 @@ fn id(value: &str) -> Result<uuid::Uuid, AppServiceError> {
     uuid::Uuid::parse_str(value).map_err(|_| invalid())
 }
 
+fn natural_order(left: &str, right: &str) -> std::cmp::Ordering {
+    let left = left.to_lowercase();
+    let right = right.to_lowercase();
+    let mut a = left.chars().peekable();
+    let mut b = right.chars().peekable();
+    loop {
+        match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let mut x = String::new();
+                let mut y = String::new();
+                while a.peek().is_some_and(char::is_ascii_digit) {
+                    x.push(a.next().unwrap());
+                }
+                while b.peek().is_some_and(char::is_ascii_digit) {
+                    y.push(b.next().unwrap());
+                }
+                let x = x.trim_start_matches('0');
+                let y = y.trim_start_matches('0');
+                let order = x.len().cmp(&y.len()).then_with(|| x.cmp(y));
+                if !order.is_eq() {
+                    return order;
+                }
+            }
+            _ => {
+                let order = a.next().cmp(&b.next());
+                if !order.is_eq() {
+                    return order;
+                }
+                if a.peek().is_none() && b.peek().is_none() {
+                    return order;
+                }
+            }
+        }
+    }
+}
+
+fn saved_folder_order(left: &SavedFolder, right: &SavedFolder) -> std::cmp::Ordering {
+    natural_order(
+        left.custom_label.as_deref().unwrap_or(&left.name),
+        right.custom_label.as_deref().unwrap_or(&right.name),
+    )
+    .then_with(|| {
+        left.display_path
+            .encode_utf16()
+            .cmp(right.display_path.encode_utf16())
+    })
+    .then_with(|| left.id.encode_utf16().cmp(right.id.encode_utf16()))
+}
+
 impl AppService {
     pub(crate) fn saved_folders_locked(
         state: &ServiceState,
@@ -107,11 +156,17 @@ impl AppService {
     }
 
     async fn check_saved_folder(&self, entry: &str) -> Result<AccessReply, AppServiceError> {
+        let selection = self.active_selection_token().ok();
         let (group, target) = self.saved_target(entry)?;
         let library = target.key.library_id;
-        let root_selection = target.key.relative.as_bytes().is_empty();
+        let root_selection = target
+            .key
+            .relative
+            .to_path_buf()
+            .is_ok_and(|path| path.as_os_str().is_empty());
         let reply = self.folder_access.check_with_root(target).await;
         let access = FolderAccess::from_reply(group.as_uuid().to_string(), &reply);
+        let mut inaccessible = None;
         let mut state = self.state()?;
         if state
             .libraries
@@ -124,15 +179,43 @@ impl AppService {
                 AccessReply::Complete {
                     outcome,
                     ..
-                } if !matches!(outcome, FolderProbeOutcome::Available(_))
+                } if matches!(outcome, FolderProbeOutcome::Missing | FolderProbeOutcome::Unreadable | FolderProbeOutcome::RootOffline)
             ) {
-                if root_selection {
+                if root_selection
+                    || matches!(
+                        &reply,
+                        AccessReply::Complete {
+                            outcome: FolderProbeOutcome::RootOffline,
+                            ..
+                        }
+                    )
+                {
                     state.libraries.catalog_mut().mark_root_offline(library)?;
+                    inaccessible = Some(None);
                 } else {
                     state
                         .libraries
                         .catalog_mut()
                         .mark_group_offline(library, group)?;
+                    inaccessible = Some(Some(group));
+                }
+                if let Some(selection) = selection
+                    && selection.library_id == library
+                    && state.selection_epoch == selection.epoch
+                    && (selection.group_id == group
+                        || root_selection
+                        || matches!(
+                            &reply,
+                            AccessReply::Complete {
+                                outcome: FolderProbeOutcome::RootOffline,
+                                ..
+                            }
+                        ))
+                {
+                    let _ = self.updates.send(crate::WallUpdate::SourceUnavailable {
+                        selection_id: selection.selection_id(),
+                        source_id: library.as_uuid().to_string(),
+                    });
                 }
             }
             let old = state.folder_status.get(&access.folder_id);
@@ -140,6 +223,10 @@ impl AppService {
                 state.folder_revision += 1;
                 state.folder_status.insert(access.folder_id.clone(), access);
             }
+        }
+        drop(state);
+        if let Some(group) = inaccessible {
+            self.gallery.folder_jobs.cancel_inaccessible(library, group);
         }
         Ok(reply)
     }
@@ -161,25 +248,86 @@ impl AppService {
         Ok(self.bootstrap()?.saved_folders)
     }
 
-    pub async fn checked_bootstrap(&self) -> Result<BootstrapState, AppServiceError> {
-        let sequence = self.selection_request_sequence.load(Ordering::SeqCst);
-        let before = self.bootstrap()?;
-        if let Some(entry) = &before.saved_folders.active_entry_id {
-            let reply = self.check_saved_folder(entry).await?;
-            if !matches!(
-                reply,
-                AccessReply::Complete {
+    pub async fn desktop_bootstrap(&self) -> Result<BootstrapState, AppServiceError> {
+        let (bootstrap, verification) = {
+            let _transition = self
+                .selection_transition
+                .lock()
+                .map_err(|_| AppServiceError::StatePoisoned)?;
+            let mut state = self.state()?;
+            let saved = Self::saved_folders_locked(&state)?;
+            if let Some(first) = saved.entries.iter().min_by(|a, b| saved_folder_order(a, b)) {
+                let group = photo_domain::FolderGroupId::from_uuid(id(&first.folder_id)?);
+                self.invalidate_folder_selection(&mut state)?;
+                state
+                    .libraries
+                    .catalog_mut()
+                    .save_and_activate_folder(group)?;
+                self.protected_groups.protect(group)?;
+                state.protected_group = Some(group);
+                state.folder_revision += 1;
+            }
+            (
+                Self::bootstrap_locked(&state)?,
+                Self::restore_verification_locked(&state)?,
+            )
+        };
+        self.spawn_restore_verification(verification);
+        Ok(bootstrap)
+    }
+
+    pub(crate) fn restore_verification_locked(
+        state: &ServiceState,
+    ) -> Result<Option<(String, SelectionToken)>, AppServiceError> {
+        let snapshot = Self::saved_folders_locked(state)?;
+        let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| Some(&entry.id) == snapshot.active_entry_id.as_ref())
+        else {
+            return Ok(None);
+        };
+        let group = state
+            .libraries
+            .catalog()
+            .folder_group(photo_domain::FolderGroupId::from_uuid(
+                id(&entry.folder_id)?,
+            ))?
+            .ok_or_else(invalid)?;
+        Ok(Some((
+            entry.id.clone(),
+            SelectionToken {
+                library_id: group.library_id,
+                group_id: group.id,
+                epoch: state.selection_epoch,
+            },
+        )))
+    }
+
+    pub(crate) fn spawn_restore_verification(
+        &self,
+        verification: Option<(String, SelectionToken)>,
+    ) {
+        let Some((entry, selection)) = verification else {
+            return;
+        };
+        let service = self.clone();
+        tokio::spawn(async move {
+            let available = matches!(
+                service.check_saved_folder(&entry).await,
+                Ok(AccessReply::Complete {
                     outcome: FolderProbeOutcome::Available(_),
                     ..
-                }
-            ) {
-                return self.clear_active_folder_if(Some((
-                    sequence,
-                    before.active_source.map(|s| s.selection_id),
-                )));
+                })
+            );
+            if available {
+                let _ = service.start_selected_scan(selection).await;
             }
-        }
-        self.bootstrap()
+        });
+    }
+
+    pub async fn checked_bootstrap(&self) -> Result<BootstrapState, AppServiceError> {
+        self.desktop_bootstrap().await
     }
 
     pub fn rename_saved_folder(
@@ -232,21 +380,27 @@ impl AppService {
             .lock()
             .map_err(|_| AppServiceError::StatePoisoned)?;
         let mut state = self.state()?;
+        let removed_group = match state.libraries.catalog().find_saved_folder(id(entry)?)? {
+            Some(saved) => state
+                .libraries
+                .catalog()
+                .folder_group(saved.folder_group_id)?
+                .map(|group| (group.library_id, group.id)),
+            None => None,
+        };
         let active = state
             .libraries
             .catalog_mut()
             .remove_saved_folder(id(entry)?)?;
         state.folder_revision += 1;
-        let cancelled = if active {
+        if active {
             self.invalidate_folder_selection(&mut state)?;
-            state.active_scan.take()
-        } else {
-            None
-        };
+            state.active_scan = None;
+        }
         let bootstrap = Self::bootstrap_locked(&state)?;
         drop(state);
-        if let Some(scan) = cancelled {
-            self.gallery.cancel_runtime_scan(scan.selection.group_id);
+        if let Some(key) = removed_group {
+            self.gallery.folder_jobs.cancel_removed(key);
         }
         Ok(bootstrap)
     }
@@ -279,12 +433,10 @@ impl AppService {
         state.libraries.catalog_mut().set_active_selection(None)?;
         state.folder_revision += 1;
         self.invalidate_folder_selection(&mut state)?;
-        let cancelled = state.active_scan.take();
+        state.active_scan = None;
         let bootstrap = Self::bootstrap_locked(&state)?;
         drop(state);
-        if let Some(scan) = cancelled {
-            self.gallery.cancel_runtime_scan(scan.selection.group_id);
-        }
+        self.gallery.folder_jobs.set_foreground(None);
         Ok(bootstrap)
     }
 
@@ -379,7 +531,7 @@ impl AppService {
             if let Some(previous) = previous.filter(|old| *old != group.id) {
                 self.protected_groups.unprotect(previous)?;
             }
-            let old_scan = state.active_scan.take();
+            state.active_scan = None;
             state.selection_epoch = state.selection_epoch.wrapping_add(1).max(1);
             state.published_wall_cache_warning = None;
             state.published_screen_cache_warning = None;
@@ -389,12 +541,19 @@ impl AppService {
                 epoch: state.selection_epoch,
             };
             drop(state);
-            if let Some(old) = old_scan {
-                self.gallery.cancel_runtime_scan(old.selection.group_id);
-            }
             token
         };
-        self.coordinator.reset_selection(token).await;
+        #[cfg(test)]
+        {
+            let gate = self.saved_activation_test_gate.lock().await.take();
+            if let Some(gate) = gate {
+                let release = gate.release.notified();
+                tokio::pin!(release);
+                release.as_mut().enable();
+                gate.entered.notify_one();
+                release.await;
+            }
+        }
         self.start_selected_scan(token).await?;
         Ok(Some(self.bootstrap()?))
     }
@@ -404,6 +563,328 @@ impl AppService {
 mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicUsize};
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stale_saved_activation_cannot_replace_newer_foreground_priority() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let service = AppService::open(crate::AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let a_entry = service
+            .start_scan(&a)
+            .await
+            .unwrap()
+            .saved_folders
+            .active_entry_id
+            .unwrap();
+        let b_entry = service
+            .start_scan(&b)
+            .await
+            .unwrap()
+            .saved_folders
+            .active_entry_id
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *service.saved_activation_test_gate.lock().await =
+            Some(crate::service::CollectionTestGate {
+                entered: entered.clone(),
+                release: release.clone(),
+            });
+        let older_service = service.clone();
+        let older =
+            tokio::spawn(async move { older_service.activate_saved_folder(&a_entry).await });
+        entered.notified().await;
+        service.activate_saved_folder(&b_entry).await.unwrap();
+        let current = service.active_selection_token().unwrap();
+        release.notify_waiters();
+        older.await.unwrap().unwrap();
+        assert_eq!(service.active_selection_token().unwrap(), current);
+        assert_eq!(
+            service
+                .gallery
+                .folder_jobs
+                .priority((current.library_id, current.group_id)),
+            crate::folder_jobs::FolderJobPriority::Foreground,
+            "stale A must not demote active B after B commits its transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_bootstrap_verification_cannot_start_a_replacement_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = AppService::open(crate::AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let mut original = String::new();
+        let mut captured = None;
+        for name in ["a", "b"] {
+            let path = temp.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            image::ImageBuffer::from_pixel(12, 8, image::Rgb([10_u8, 20, 30]))
+                .save(path.join("photo.jpg"))
+                .unwrap();
+            let (bootstrap, token) = service.select_recent(&path).unwrap();
+            if name == "a" {
+                original = bootstrap.saved_folders.active_entry_id.unwrap();
+                captured = Some(token);
+            }
+        }
+        let captured = captured.unwrap();
+        let mut updates = service.subscribe_wall_updates();
+        service.spawn_restore_verification(Some((original.clone(), captured)));
+        service.check_saved_folders(&[original]).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), updates.recv())
+                .await
+                .is_err(),
+            "verification for A must not scan the replacement B"
+        );
+        assert_eq!(
+            service
+                .bootstrap()
+                .unwrap()
+                .active_source
+                .unwrap()
+                .display_name,
+            "b"
+        );
+    }
+    #[test]
+    fn desktop_bootstrap_order_matches_sidebar_for_duplicate_and_non_ascii_labels() {
+        let mut folders = [
+            ("two", "Photos", "/photos/2"),
+            ("ten", "Photos", "/photos/10"),
+            ("accent10", "éclair 10", "/photos/e10"),
+            ("accent2", "Éclair 2", "/photos/e2"),
+            ("zebra", "Zebra", "/photos/z"),
+        ]
+        .map(|(id, name, path)| SavedFolder {
+            id: id.into(),
+            folder_id: id.into(),
+            name: name.into(),
+            display_path: path.into(),
+            custom_label: None,
+        });
+        folders.sort_by(saved_folder_order);
+        assert_eq!(
+            folders.map(|f| f.id),
+            ["ten", "two", "zebra", "accent2", "accent10"]
+        );
+    }
+    #[tokio::test]
+    async fn root_first_unreadable_root_skips_both_children_and_asset_readers() {
+        struct RootProbe {
+            root: Arc<AtomicUsize>,
+            child: Arc<AtomicUsize>,
+        }
+        impl crate::FolderProbe for RootProbe {
+            fn probe(&self, target: &FolderAccessTarget) -> FolderProbeOutcome {
+                if target
+                    .key
+                    .relative
+                    .to_path_buf()
+                    .unwrap()
+                    .as_os_str()
+                    .is_empty()
+                {
+                    self.root.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    self.child.fetch_add(1, Ordering::SeqCst);
+                }
+                FolderProbeOutcome::Unreadable
+            }
+        }
+        struct AssetReader(Arc<AtomicUsize>);
+        impl photo_indexer::MetadataReader for AssetReader {
+            fn read(
+                &self,
+                _: &std::path::Path,
+                _: Option<&std::path::Path>,
+            ) -> Result<photo_metadata::MetadataBundle, photo_metadata::MetadataReadWarning>
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(photo_metadata::MetadataBundle::default())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let photos = temp.path().join("photos");
+        std::fs::create_dir(&photos).unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let root = Arc::new(AtomicUsize::new(0));
+        let child = Arc::new(AtomicUsize::new(0));
+        let mut service = AppService::open_with_reader(
+            crate::AppConfig::new(temp.path().join("data"), temp.path().join("cache")),
+            Arc::new(AssetReader(reads.clone())),
+        )
+        .unwrap();
+        service.select_recent(&photos).unwrap();
+        let mut entries = Vec::new();
+        for name in ["a", "b"] {
+            let path = photos.join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("photo.jpg"), b"photo").unwrap();
+            entries.push(
+                service
+                    .select_recent(&path)
+                    .unwrap()
+                    .0
+                    .saved_folders
+                    .active_entry_id
+                    .unwrap(),
+            );
+        }
+        service.folder_access = crate::FolderAccessCoordinator::new(Arc::new(RootProbe {
+            root: root.clone(),
+            child: child.clone(),
+        }));
+        for entry in entries {
+            assert!(
+                service
+                    .activate_saved_folder(&entry)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(root.load(Ordering::SeqCst), 1);
+        assert_eq!(child.load(Ordering::SeqCst), 0);
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn desktop_bootstrap_order_compares_text_after_equal_numbers() {
+        assert!(natural_order("album 2b", "album 2a").is_gt());
+        assert!(natural_order("Album 10", "album 2").is_gt());
+    }
+    #[tokio::test]
+    async fn desktop_bootstrap_indeterminate_probe_keeps_availability() {
+        struct Indeterminate(FolderProbeOutcome);
+        impl crate::FolderProbe for Indeterminate {
+            fn probe(&self, _: &FolderAccessTarget) -> FolderProbeOutcome {
+                self.0.clone()
+            }
+        }
+        for outcome in [FolderProbeOutcome::Failed, FolderProbeOutcome::Invalid] {
+            let temp = tempfile::tempdir().unwrap();
+            let photos = temp.path().join("photos");
+            std::fs::create_dir(&photos).unwrap();
+            let mut service = AppService::open(crate::AppConfig::new(
+                temp.path().join("data"),
+                temp.path().join("cache"),
+            ))
+            .unwrap();
+            let saved = service.open_recent(&photos).unwrap();
+            let token = service.active_selection_token().unwrap();
+            let before = service
+                .state()
+                .unwrap()
+                .libraries
+                .catalog()
+                .folder_group_recovery_state(token.library_id, token.group_id)
+                .unwrap();
+            service.folder_access =
+                crate::FolderAccessCoordinator::new(Arc::new(Indeterminate(outcome)));
+            service
+                .check_saved_folders(&[saved.saved_folders.active_entry_id.unwrap()])
+                .await
+                .unwrap();
+            let after = service
+                .state()
+                .unwrap()
+                .libraries
+                .catalog()
+                .folder_group_recovery_state(token.library_id, token.group_id)
+                .unwrap();
+            assert_eq!(
+                after.requested, before.requested,
+                "indeterminate access must not request offline recovery"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn desktop_bootstrap_returns_while_access_probe_is_blocked() {
+        struct Blocked(std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+        impl crate::FolderProbe for Blocked {
+            fn probe(&self, _: &FolderAccessTarget) -> FolderProbeOutcome {
+                let _ = self.0.lock().unwrap().recv();
+                FolderProbeOutcome::Missing
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let photos = temp.path().join("photos");
+        std::fs::create_dir(&photos).unwrap();
+        image::ImageBuffer::from_pixel(12, 8, image::Rgb([40_u8, 20, 5]))
+            .save(photos.join("photo.jpg"))
+            .unwrap();
+        let mut service = AppService::open(crate::AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let mut updates = service.subscribe_wall_updates();
+        let saved = service.start_scan(&photos).await.unwrap();
+        while !matches!(
+            updates.recv().await.unwrap(),
+            crate::WallUpdate::MetadataSettled { .. }
+        ) {}
+        let query = crate::WallQueryRequest {
+            cursor: None,
+            limit: 100,
+            direction: crate::SortDirection::OldestFirst,
+        };
+        let ids = service
+            .query_wall(query.clone())
+            .await
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        service
+            .request_derivatives(crate::DerivativeRequest::visible(ids))
+            .await
+            .unwrap();
+        loop {
+            let page = service.query_wall(query.clone()).await.unwrap();
+            if page.items.len() == 1 && page.items[0].wall_thumbnail.is_some() {
+                break;
+            }
+            updates.recv().await.unwrap();
+        }
+        let (release, blocked) = std::sync::mpsc::channel();
+        service.folder_access =
+            crate::FolderAccessCoordinator::new(Arc::new(Blocked(std::sync::Mutex::new(blocked))));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            service.desktop_bootstrap(),
+        )
+        .await;
+        let bootstrap = result
+            .expect("bootstrap must not await the access probe")
+            .unwrap();
+        assert_eq!(
+            bootstrap.saved_folders.active_entry_id,
+            saved.saved_folders.active_entry_id
+        );
+        let page = service.query_wall(query.clone()).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(page.items[0].wall_thumbnail.is_some());
+        drop(release);
+        service
+            .check_saved_folders(&[bootstrap.saved_folders.active_entry_id.unwrap()])
+            .await
+            .unwrap();
+        let page = service.query_wall(query).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(page.items[0].wall_thumbnail.is_some());
+    }
     struct Missing(Arc<AtomicUsize>);
     impl crate::FolderProbe for Missing {
         fn probe(&self, _: &FolderAccessTarget) -> FolderProbeOutcome {

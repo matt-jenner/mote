@@ -818,7 +818,7 @@ describe("wallReducer", () => {
 		expect(replayed.items[0]?.availability).toBe("rootOffline");
 	});
 
-	it("merges idempotently, refines in place, and resets once at settlement", () => {
+	it("merges idempotently, refines in place, and settles without reordering", () => {
 		const provisional = reduce(initialWallState, {
 			type: "catalogBatch",
 			assets: [
@@ -854,7 +854,7 @@ describe("wallReducer", () => {
 			requestCursor: null,
 			requestId: "settle-1",
 		});
-		expect(settled.items.map((item) => item.id)).toEqual(["a", "b"]);
+		expect(settled.items.map((item) => item.id)).toEqual(["b", "a"]);
 		const repeatedRequest = reduce(settled, {
 			type: "pageRequestStarted",
 			requestId: "settle-2",
@@ -877,11 +877,11 @@ describe("wallReducer", () => {
 			direction: "newestFirst",
 		});
 		expect(reversed).toMatchObject({
-			items: refined.items,
 			cursor: null,
 			scrollEpoch: settled.scrollEpoch + 1,
 			direction: "newestFirst",
 		});
+		expect(reversed.items).toEqual(refined.items);
 	});
 
 	it("keeps the first provisional order for duplicate IDs and merges only changed fields", () => {
@@ -970,7 +970,7 @@ describe("wallReducer", () => {
 		expect(terminalPage.items.map((item) => item.id)).toEqual(["a", "b"]);
 	});
 
-	it("atomically settles the ordered first page and replaces its provisional cursor", () => {
+	it("settles the ordered first page without removing a loaded provisional item", () => {
 		const provisionalRequest = reduce(initialWallState, {
 			type: "pageRequestStarted",
 			requestId: "provisional",
@@ -1001,12 +1001,377 @@ describe("wallReducer", () => {
 			requestId: "settled",
 		});
 
-		expect(provisional.items.map((item) => item.id)).toEqual(["b", "a"]);
-		expect(provisional.cursor).toBe("settled-next");
+		expect(provisional.items.map((item) => item.id)).toEqual([
+			"provisional",
+			"b",
+			"a",
+		]);
+		expect(provisional.cursor).toBe("provisional-next");
 		expect(provisional.pagesExhausted).toBe(false);
 		expect(provisional.scanComplete).toBe(true);
 		expect(provisional.orderState).toBe("settled");
 		expect(provisional.settledGeneration).toBe(1);
+	});
+
+	it("patches settled metadata without dropping loaded pages or regressing pagination", () => {
+		const loaded = Array.from({ length: 150 }, (_, index) => ({
+			...wallAsset(`asset-${index}`, 1, index + 1),
+			displayName: `Provisional ${index}`,
+		}));
+		const loadedIds = loaded.map(({ id }) => id);
+		const current = {
+			...activeState(),
+			items: loaded,
+			cursor: null,
+			pagesExhausted: true,
+		};
+		const requested = reduce(current, {
+			type: "pageRequestStarted",
+			requestId: "settle-loaded-pages",
+			requestCursor: null,
+			requestEpoch: current.scrollEpoch,
+		});
+		const settlement = loaded
+			.slice(0, 100)
+			.reverse()
+			.map((item) => ({
+				...item,
+				displayName: `Settled ${item.id}`,
+				dateState: "settled" as const,
+				wallThumbnail: thumbnail(item.id),
+			}));
+
+		const settled = reduce(requested, {
+			type: "metadataSettled",
+			assets: settlement,
+			totalCount: 150,
+			nextCursor: "settlement-page-2",
+			requestEpoch: current.scrollEpoch,
+			requestCursor: null,
+			requestId: "settle-loaded-pages",
+		});
+
+		expect(settled.items).toHaveLength(150);
+		expect(settled.items.map(({ id }) => id)).toEqual(loadedIds);
+		expect(settled.items.slice(0, 100)).toEqual(
+			expect.arrayContaining(
+				loaded.slice(0, 100).map((item) =>
+					expect.objectContaining({
+						id: item.id,
+						displayName: `Settled ${item.id}`,
+						dateState: "settled",
+						wallThumbnail: thumbnail(item.id),
+					}),
+				),
+			),
+		);
+		expect(settled.items.slice(100)).toEqual(loaded.slice(100));
+		expect(settled.cursor).toBeNull();
+		expect(settled.pagesExhausted).toBe(true);
+	});
+
+	it("patches the same settled generation without dropping unloaded pages", () => {
+		const firstPage = wallAsset("first-page", 1, 1);
+		const unloadedPage = wallAsset("unloaded-page", 1, 2);
+		const loaded = [firstPage, unloadedPage];
+		const current = {
+			...activeState(),
+			items: loaded,
+			totalCount: 2,
+			cursor: null,
+			pagesExhausted: true,
+			orderState: "settled" as const,
+			settledGeneration: 4,
+		};
+		const requested = reduce(current, {
+			type: "pageRequestStarted",
+			requestId: "same-generation",
+			requestCursor: null,
+			requestEpoch: current.scrollEpoch,
+		});
+		const patched = reduce(requested, {
+			type: "metadataSettled",
+			assets: [
+				{
+					...firstPage,
+					displayName: "Updated first page.jpg",
+					wallThumbnail: thumbnail("first-page"),
+				},
+			],
+			totalCount: 1,
+			nextCursor: null,
+			requestEpoch: current.scrollEpoch,
+			requestCursor: null,
+			requestId: "same-generation",
+			generation: 4,
+		});
+
+		expect(patched.items.map(({ id }) => id)).toEqual([
+			"first-page",
+			"unloaded-page",
+		]);
+		expect(patched.items[0]).toMatchObject({
+			displayName: "Updated first page.jpg",
+			wallThumbnail: thumbnail("first-page"),
+		});
+		expect(patched.totalCount).toBe(2);
+	});
+
+	it("keeps later loaded pages when the current settled generation reloads page one", () => {
+		const firstPage = wallAsset("first-page", 1, 1);
+		const laterPage = wallAsset("later-page", 1, 2);
+		const loaded = [firstPage, laterPage];
+		const current = {
+			...activeState(),
+			items: loaded,
+			totalCount: 2,
+			cursor: null,
+			pagesExhausted: true,
+			orderState: "settled" as const,
+			settledGeneration: 4,
+		};
+		const requested = reduce(current, {
+			type: "pageRequestStarted",
+			requestId: "reload-current-page-one",
+			requestCursor: null,
+			requestEpoch: current.scrollEpoch,
+		});
+		const reloaded = reduce(requested, {
+			type: "pageLoaded",
+			assets: [
+				{
+					...firstPage,
+					displayName: "Reloaded first page.jpg",
+				},
+			],
+			totalCount: 1,
+			orderState: "settled",
+			nextCursor: null,
+			requestCursor: null,
+			requestEpoch: current.scrollEpoch,
+			requestId: "reload-current-page-one",
+		});
+
+		expect(reloaded.items.map(({ id }) => id)).toEqual([
+			"first-page",
+			"later-page",
+		]);
+		expect(reloaded.items[0]?.displayName).toBe("Reloaded first page.jpg");
+		expect(reloaded.totalCount).toBe(2);
+	});
+
+	it("replaces the loaded wall from a newer complete generation whose query is paged", () => {
+		const previous = Array.from({ length: 150 }, (_, index) =>
+			wallAsset(`old-${index}`, 1, index + 1),
+		);
+		const nextFirstPage = Array.from({ length: 100 }, (_, index) =>
+			wallAsset(`new-${index}`, 1, index + 1),
+		);
+		const current = {
+			...activeState(),
+			items: previous,
+			totalCount: 150,
+			cursor: null,
+			pagesExhausted: true,
+			orderState: "settled" as const,
+			settledGeneration: 4,
+		};
+		const requested = reduce(current, {
+			type: "pageRequestStarted",
+			requestId: "new-complete-generation",
+			requestCursor: null,
+			requestEpoch: current.scrollEpoch,
+		});
+		const replaced = reduce(requested, {
+			type: "metadataSettled",
+			assets: nextFirstPage,
+			totalCount: 120,
+			nextCursor: "new-page-2",
+			requestEpoch: current.scrollEpoch,
+			requestCursor: null,
+			requestId: "new-complete-generation",
+			generation: 5,
+		});
+
+		expect(replaced.items.map(({ id }) => id)).toEqual(
+			nextFirstPage.map(({ id }) => id),
+		);
+		expect(replaced.totalCount).toBe(120);
+		expect(replaced.settledGeneration).toBe(5);
+		expect(replaced.cursor).toBe("new-page-2");
+		expect(replaced.pagesExhausted).toBe(false);
+	});
+
+	it("retains only the remainder streamed by the newer generation when its first page settles", () => {
+		const retainedFirstPage = Array.from({ length: 100 }, (_, index) =>
+			wallAsset(`retained-${index}`, 1, index + 1),
+		);
+		const staleRemainder = Array.from({ length: 50 }, (_, index) =>
+			wallAsset(`stale-${index}`, 1, index + 101),
+		);
+		const oldItems = [...retainedFirstPage, ...staleRemainder];
+		const nextFirstPage = retainedFirstPage.map((asset) => ({ ...asset }));
+		const nextRemainder = Array.from({ length: 21 }, (_, index) =>
+			wallAsset(`new-${index}`, 1, index + 101),
+		);
+		const current = {
+			...activeState(),
+			items: oldItems,
+			totalCount: 150,
+			cursor: null,
+			pagesExhausted: true,
+			orderState: "settled" as const,
+			settledGeneration: 4,
+		};
+		const streamed = reduce(current, {
+			type: "catalogBatch",
+			assets: nextRemainder,
+			orderState: "settled",
+			selectionId: "selection-a",
+			generation: 5,
+			progress: { discovered: 121, shaped: 121, enriched: 100, total: 121 },
+		});
+		const requested = reduce(streamed, {
+			type: "pageRequestStarted",
+			requestId: "new-generation-with-streamed-remainder",
+			requestCursor: null,
+			requestEpoch: streamed.scrollEpoch,
+		});
+		const settled = reduce(requested, {
+			type: "metadataSettled",
+			assets: nextFirstPage,
+			totalCount: 121,
+			nextCursor: "new-page-2",
+			requestEpoch: streamed.scrollEpoch,
+			requestCursor: null,
+			requestId: "new-generation-with-streamed-remainder",
+			generation: 5,
+		});
+
+		expect(settled.items.map(({ id }) => id)).toEqual(
+			[...nextFirstPage, ...nextRemainder].map(({ id }) => id),
+		);
+		expect(settled.items[0]).toBe(streamed.items[0]);
+		expect(settled.items.some(({ id }) => id.startsWith("stale-"))).toBe(false);
+		expect(settled.totalCount).toBe(121);
+		expect(settled.cursor).toBe("new-page-2");
+		expect(settled.pagesExhausted).toBe(false);
+	});
+
+	it("preserves a newer streamed remainder across an older generation settlement", () => {
+		const retainedFirstPage = Array.from({ length: 100 }, (_, index) =>
+			wallAsset(`retained-${index}`, 1, index + 1),
+		);
+		const staleRemainder = Array.from({ length: 50 }, (_, index) =>
+			wallAsset(`stale-${index}`, 1, index + 101),
+		);
+		const generationSixRemainder = Array.from({ length: 21 }, (_, index) =>
+			wallAsset(`generation-six-${index}`, 1, index + 101),
+		);
+		const current = {
+			...activeState(),
+			items: [...retainedFirstPage, ...staleRemainder],
+			totalCount: 150,
+			cursor: null,
+			pagesExhausted: true,
+			orderState: "settled" as const,
+			settledGeneration: 4,
+		};
+		const streamed = reduce(current, {
+			type: "catalogBatch",
+			assets: generationSixRemainder,
+			orderState: "settled",
+			selectionId: "selection-a",
+			generation: 6,
+			progress: { discovered: 121, shaped: 121, enriched: 100, total: 121 },
+		});
+		const generationFiveRequested = reduce(streamed, {
+			type: "pageRequestStarted",
+			requestId: "generation-five-settlement",
+			requestCursor: null,
+			requestEpoch: streamed.scrollEpoch,
+		});
+		const generationFiveSettled = reduce(generationFiveRequested, {
+			type: "metadataSettled",
+			assets: retainedFirstPage,
+			totalCount: 140,
+			nextCursor: "generation-five-page-2",
+			requestEpoch: streamed.scrollEpoch,
+			requestCursor: null,
+			requestId: "generation-five-settlement",
+			generation: 5,
+		});
+
+		expect(generationFiveSettled.streamedAssetGeneration).toBe(6);
+		expect(Object.keys(generationFiveSettled.streamedAssetIds)).toEqual(
+			generationSixRemainder.map(({ id }) => id),
+		);
+		expect(
+			generationFiveSettled.items.filter(({ id }) =>
+				id.startsWith("generation-six-"),
+			),
+		).toHaveLength(21);
+
+		const generationSixRequested = reduce(generationFiveSettled, {
+			type: "pageRequestStarted",
+			requestId: "generation-six-settlement",
+			requestCursor: null,
+			requestEpoch: generationFiveSettled.scrollEpoch,
+		});
+		const generationSixSettled = reduce(generationSixRequested, {
+			type: "metadataSettled",
+			assets: retainedFirstPage,
+			totalCount: 121,
+			nextCursor: "generation-six-page-2",
+			requestEpoch: generationFiveSettled.scrollEpoch,
+			requestCursor: null,
+			requestId: "generation-six-settlement",
+			generation: 6,
+		});
+
+		expect(generationSixSettled.items.map(({ id }) => id)).toEqual(
+			[...retainedFirstPage, ...generationSixRemainder].map(({ id }) => id),
+		);
+		expect(
+			generationSixSettled.items.some(({ id }) => id.startsWith("stale-")),
+		).toBe(false);
+		expect(generationSixSettled.totalCount).toBe(121);
+		expect(generationSixSettled.cursor).toBe("generation-six-page-2");
+		expect(generationSixSettled.streamedAssetIds).toEqual({});
+	});
+
+	it("keeps an advanced nonterminal cursor when settlement covers only earlier items", () => {
+		const loaded = Array.from({ length: 150 }, (_, index) =>
+			wallAsset(`asset-${index}`, 1, index + 1),
+		);
+		const current = {
+			...activeState(),
+			items: loaded,
+			cursor: "page-3",
+			pagesExhausted: false,
+		};
+		const requested = reduce(current, {
+			type: "pageRequestStarted",
+			requestId: "settle-earlier-page",
+			requestCursor: null,
+			requestEpoch: current.scrollEpoch,
+		});
+
+		const settled = reduce(requested, {
+			type: "metadataSettled",
+			assets: loaded.slice(0, 100),
+			totalCount: 150,
+			nextCursor: "page-2",
+			requestEpoch: current.scrollEpoch,
+			requestCursor: null,
+			requestId: "settle-earlier-page",
+		});
+
+		expect(settled.items.map((item) => item.id)).toEqual(
+			loaded.map((item) => item.id),
+		);
+		expect(settled.cursor).toBe("page-3");
+		expect(settled.pagesExhausted).toBe(false);
 	});
 
 	it("starts settled from a cached nonterminal page and preserves server order", () => {
@@ -1433,7 +1798,7 @@ describe("wallReducer", () => {
 		expect(paged.items.map((item) => item.id)).toEqual(["b", "a", "c", "d"]);
 	});
 
-	it("accepts one atomic replacement for each newer scan generation", () => {
+	it("replaces each newer complete scan generation and patches the current one", () => {
 		const firstRequest = reduce(initialWallState, {
 			type: "pageRequestStarted",
 			requestId: "generation-1",
@@ -1481,7 +1846,7 @@ describe("wallReducer", () => {
 			requestCursor: null,
 			requestId: "generation-2-duplicate",
 		});
-		expect(duplicate.items.map((item) => item.id)).toEqual(["second"]);
+		expect(duplicate.items.map((item) => item.id)).toEqual(["second", "stale"]);
 
 		const staleRequest = reduce(second, {
 			type: "pageRequestStarted",

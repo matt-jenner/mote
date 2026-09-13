@@ -27,6 +27,8 @@
 	gap: var(--space-3);
 	min-width: 0;
 	padding: 0 32px;
+	container-name: workspace-toolbar;
+	container-type: inline-size;
 	background: color-mix(in srgb, var(--canvas-elevated) 94%, var(--canvas));
 	border-bottom: 1px solid var(--separator);
 }
@@ -167,6 +169,11 @@
 
 	.primaryButton:not(:disabled):hover {
 		background: color-mix(in srgb, var(--primary-control) 86%, #000000);
+	}
+
+	.welcomePrimaryButton:not(:disabled):hover {
+		background: var(--primary-control);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--focus-ring) 48%, transparent);
 	}
 }
 

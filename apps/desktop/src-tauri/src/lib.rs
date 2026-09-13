@@ -63,6 +63,7 @@ pub fn run() {
                 service,
                 wall_subscriptions: Default::default(),
                 copy_operation: Default::default(),
+                copy_registry: Default::default(),
                 last_completed_copy_destination: Default::default(),
             });
             Ok(())
@@ -76,6 +77,7 @@ pub fn run() {
             commands::restore_photo_picks,
             commands::request_pick_derivatives,
             commands::copy_picked_originals,
+            commands::cancel_original_copy,
             commands::show_last_copy_destination,
             commands::choose_folder,
             commands::rename_saved_folder,
@@ -91,6 +93,31 @@ pub fn run() {
             commands::watch_wall_updates,
             commands::unwatch_wall_updates
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Mote");
+        .build(tauri::generate_context!())
+        .expect("error while building Mote")
+        .run(|app, event| {
+            on_run_event(&event, || {
+                if let Some(state) = app.try_state::<DesktopState>() {
+                    tauri::async_runtime::block_on(state.service.shutdown());
+                }
+            });
+        });
+}
+
+fn on_run_event(event: &tauri::RunEvent, shutdown: impl FnOnce()) {
+    if matches!(event, tauri::RunEvent::Exit) {
+        shutdown();
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    #[test]
+    fn native_exit_invokes_shutdown_only_for_the_final_exit_event() {
+        let mut shutdowns = 0;
+        super::on_run_event(&tauri::RunEvent::Ready, || shutdowns += 1);
+        assert_eq!(shutdowns, 0);
+        super::on_run_event(&tauri::RunEvent::Exit, || shutdowns += 1);
+        assert_eq!(shutdowns, 1);
+    }
 }

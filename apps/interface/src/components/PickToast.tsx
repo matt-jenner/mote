@@ -1,5 +1,6 @@
 import type { PickToastAction, PickToastState } from "../picks/usePickList";
 import styles from "../styles/appShell.module.css";
+import toastStyles from "../styles/pickToast.module.css";
 
 export async function consumePickToastAction(
 	action: PickToastAction,
@@ -23,7 +24,12 @@ export function PickToast({
 			? { label: "View", run: onViewPicks }
 			: undefined);
 	return (
-		<div className={styles.pickToast} data-toast-id={toast.id}>
+		<div
+			key={toast.id}
+			className={`${styles.pickToast} ${toastStyles.toast}`}
+			data-toast-id={toast.id}
+			data-phase={toast.phase}
+		>
 			<span>{toast.message}</span>
 			{action ? (
 				<button

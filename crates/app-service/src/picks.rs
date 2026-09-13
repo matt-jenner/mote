@@ -107,6 +107,30 @@ fn snapshot(catalog: &Catalog) -> Result<PickListSnapshot, AppServiceError> {
 }
 
 impl AppService {
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn install_pick_post_validation_test_gate(
+        &self,
+        entered: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        self.pick_gallery
+            .install_hosted_post_validation_test_gate(entered, release)
+            .await;
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn pick_derivative_attempts_for_test(&self) -> usize {
+        self.pick_gallery.hosted_derivative_attempts_for_test()
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn pick_runtime_count_for_test(&self) -> usize {
+        self.pick_gallery.runtime_count_for_test()
+    }
+
     pub fn list_photo_picks(&self) -> Result<PickListSnapshot, AppServiceError> {
         snapshot(self.state()?.libraries.catalog())
     }

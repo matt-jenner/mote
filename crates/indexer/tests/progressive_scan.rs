@@ -18,6 +18,174 @@ use photo_metadata::{
 #[derive(Clone, Default)]
 struct NoopMetadataReader;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn root_first_unreadable_file_is_an_asset_warning_and_scan_continues() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("unreadable.jpg");
+    std::fs::write(&path, b"unreadable").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::write(temp.path().join("readable.jpg"), b"invalid image data").unwrap();
+    let indexer = Indexer::new(
+        NoopMetadataReader,
+        FolderPolicyEngine::new(Vec::new()).unwrap(),
+    );
+    let mut handle = indexer.start(ScanRequest::new(temp.path())).unwrap();
+    let mut warnings = Vec::new();
+    while let Some(event) = handle.events.recv().await {
+        if let IndexEvent::Warning { asset_id, code, .. } = event {
+            warnings.push((asset_id, code));
+        }
+    }
+    let summary = handle.join().await.unwrap();
+    assert_eq!(summary.discovered, 2);
+    assert!(
+        warnings
+            .iter()
+            .any(|(asset, code)| asset.is_some() && *code == "source_unreadable")
+    );
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|(_, code)| *code == "source_unreadable")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn root_first_source_warning_updates_only_the_current_asset_generation() {
+    use photo_domain::Availability;
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured("photos", Path::new("/photos")))
+        .unwrap();
+    let generation = catalog.begin_generation(library.id).unwrap();
+    let asset = NewAsset::minimal(
+        library.id,
+        RelativePathKey::from_relative_path(Path::new("one.jpg")).unwrap(),
+        "one.jpg",
+        MediaKind::Jpeg,
+        12,
+    );
+    CatalogWriter::new(&mut catalog, library.id, generation)
+        .apply_batch(&[
+            IndexEvent::Discovered {
+                asset: asset.clone(),
+            },
+            IndexEvent::Warning {
+                asset_id: Some(asset.id),
+                code: "source_unreadable",
+                message: "Cannot read source photo".into(),
+            },
+        ])
+        .unwrap();
+    assert_eq!(
+        catalog.find_asset(asset.id).unwrap().unwrap().availability,
+        Availability::Unreadable
+    );
+    catalog.complete_generation(library.id, generation).unwrap();
+    assert_eq!(
+        catalog.find_asset(asset.id).unwrap().unwrap().availability,
+        Availability::Unreadable,
+        "scan completion must preserve confirmed file access failures"
+    );
+    let next = catalog.begin_generation(library.id).unwrap();
+    CatalogWriter::new(&mut catalog, library.id, next)
+        .apply_batch(&[IndexEvent::Discovered {
+            asset: asset.clone(),
+        }])
+        .unwrap();
+    CatalogWriter::new(&mut catalog, library.id, generation)
+        .apply_batch(&[IndexEvent::Warning {
+            asset_id: Some(asset.id),
+            code: "source_missing",
+            message: "Source photo is missing".into(),
+        }])
+        .unwrap();
+    assert_eq!(
+        catalog.find_asset(asset.id).unwrap().unwrap().availability,
+        Availability::Available,
+        "old access events must not downgrade a newer observation"
+    );
+    CatalogWriter::new(&mut catalog, library.id, next)
+        .apply_batch(&[IndexEvent::Warning {
+            asset_id: Some(asset.id),
+            code: "shape_failed",
+            message: "Cannot decode photo".into(),
+        }])
+        .unwrap();
+    assert_eq!(
+        catalog.find_asset(asset.id).unwrap().unwrap().availability,
+        Availability::Available,
+        "decode failures are not access failures"
+    );
+    catalog.complete_generation(library.id, next).unwrap();
+    let third = catalog.begin_generation(library.id).unwrap();
+    CatalogWriter::new(&mut catalog, library.id, third)
+        .apply_batch(&[IndexEvent::Warning {
+            asset_id: Some(asset.id),
+            code: "source_unreadable",
+            message: "Source metadata cannot be read".into(),
+        }])
+        .unwrap();
+    catalog.complete_generation(library.id, third).unwrap();
+    assert_eq!(
+        catalog.find_asset(asset.id).unwrap().unwrap().availability,
+        Availability::Unreadable,
+        "an inaccessible cached file was observed even without a new metadata record"
+    );
+}
+
+#[test]
+fn root_first_indeterminate_access_to_an_uncatalogued_file_does_not_abort_the_batch() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured("photos", Path::new("/photos")))
+        .unwrap();
+    let generation = catalog.begin_generation(library.id).unwrap();
+    let asset = NewAsset::minimal(
+        library.id,
+        RelativePathKey::from_relative_path(Path::new("good.jpg")).unwrap(),
+        "good.jpg",
+        MediaKind::Jpeg,
+        12,
+    );
+    let unknown = photo_domain::AssetId::for_path(
+        library.id,
+        &RelativePathKey::from_relative_path(Path::new("unknown.jpg")).unwrap(),
+    );
+    CatalogWriter::new(&mut catalog, library.id, generation)
+        .apply_batch(&[
+            IndexEvent::Warning {
+                asset_id: Some(unknown),
+                code: "source_check_failed",
+                message: "File metadata check failed".into(),
+            },
+            IndexEvent::Discovered {
+                asset: asset.clone(),
+            },
+        ])
+        .expect("one indeterminate file must not roll back siblings");
+    assert!(catalog.find_asset(asset.id).unwrap().is_some());
+    catalog.complete_generation(library.id, generation).unwrap();
+    let next = catalog.begin_generation(library.id).unwrap();
+    CatalogWriter::new(&mut catalog, library.id, next)
+        .apply_batch(&[IndexEvent::Warning {
+            asset_id: Some(asset.id),
+            code: "source_check_failed",
+            message: "File metadata check failed".into(),
+        }])
+        .unwrap();
+    catalog.complete_generation(library.id, next).unwrap();
+    assert_eq!(
+        catalog.find_asset(asset.id).unwrap().unwrap().availability,
+        photo_domain::Availability::Available,
+        "indeterminate checks must preserve cached availability"
+    );
+}
+
 impl MetadataReader for NoopMetadataReader {
     fn read(
         &self,

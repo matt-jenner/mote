@@ -305,6 +305,7 @@ export function PhotoTile({
 		phase === "interactive" &&
 		Boolean(thumbnail) &&
 		!previewFailed;
+	const canTogglePick = picked || phase === "interactive";
 
 	return (
 		<figure
@@ -322,7 +323,7 @@ export function PhotoTile({
 		>
 			{layers}
 			{sourceUnavailable ? <SourceWarningBadge /> : null}
-			{onTogglePick && asset.mediaKind !== "video" ? (
+			{onTogglePick && asset.mediaKind !== "video" && canTogglePick ? (
 				<button
 					aria-label={
 						picked

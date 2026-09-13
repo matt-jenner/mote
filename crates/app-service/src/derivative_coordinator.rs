@@ -474,6 +474,7 @@ struct TicketState {
 
 struct CoordinatorState {
     selection: Option<SelectionToken>,
+    closed: bool,
     background_generation: u64,
     next_job_id: u64,
     next_attempt: u64,
@@ -494,6 +495,7 @@ impl Default for CoordinatorState {
     fn default() -> Self {
         Self {
             selection: None,
+            closed: false,
             background_generation: 0,
             next_job_id: 1,
             next_attempt: 1,
@@ -548,7 +550,7 @@ impl DerivativeCoordinator {
         Self {
             state: Arc::new(Mutex::new(CoordinatorState::default())),
             scheduler,
-            owner_prefix: SCHEDULER_OWNER_PREFIX.to_owned(),
+            owner_prefix: format!("{SCHEDULER_OWNER_PREFIX}desktop-{}:", uuid::Uuid::new_v4()),
             wake: Arc::new(Notify::new()),
             change_generation: Arc::new(AtomicU64::new(0)),
             commit_completion_generation: Arc::new(AtomicU64::new(0)),
@@ -742,6 +744,9 @@ impl DerivativeCoordinator {
         let mut capacity_exceeded = false;
         {
             let mut state = self.state.lock().await;
+            if state.closed {
+                immediate_none = true;
+            }
             if guards.collection_token.is_some_and(|token| {
                 token.selection != key.selection || !Self::collection_token_matches(&state, token)
             }) {
@@ -884,11 +889,21 @@ impl DerivativeCoordinator {
     }
 
     pub(crate) async fn next_work(&self) -> Option<WorkTicket> {
+        self.next_work_for_folder_turn(false).await
+    }
+
+    pub(crate) async fn next_work_for_folder_turn(
+        &self,
+        priority_turn: bool,
+    ) -> Option<WorkTicket> {
         loop {
-            let job = self
-                .scheduler
-                .next_owned_in_family(&self.owner_prefix, SCHEDULER_OWNER_PREFIX)
-                .await?;
+            let job = if priority_turn {
+                self.scheduler.next_owned(&self.owner_prefix).await
+            } else {
+                self.scheduler
+                    .next_owned_in_family(&self.owner_prefix, SCHEDULER_OWNER_PREFIX)
+                    .await
+            }?;
             let result = {
                 let mut state = self.state.lock().await;
                 match state.job_names.get(job.name()).cloned() {
@@ -1629,6 +1644,34 @@ impl DerivativeCoordinator {
             self.abort_attempt_with_result(ticket, DerivativeResult::Failed)
                 .await;
         }
+    }
+
+    pub(crate) async fn close_folder(&self) {
+        let waiters = {
+            let mut state = self.state.lock().await;
+            state.closed = true;
+            let keys = state
+                .jobs
+                .iter()
+                .filter(|(_, work)| work.status != JobStatus::Committing)
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            let mut waiters = Vec::new();
+            for key in keys {
+                let work = state.jobs.remove(&key).expect("job was present");
+                state.job_names.remove(&work.job_name);
+                if let Some(ticket) = work.ticket {
+                    state.tickets.remove(&ticket);
+                }
+                waiters.extend(work.foreground_waiters);
+                waiters.extend(work.background_waiters);
+            }
+            waiters
+        };
+        for waiter in waiters {
+            let _ = waiter.sender.send(DerivativeResult::Unavailable);
+        }
+        self.notify_waiters();
     }
 
     async fn begin_commit_delivery(
@@ -3349,6 +3392,37 @@ mod tests {
         let _right_waiter = right.enqueue(right_key, WorkLane::VisibleWall).await;
         assert!(left.next_work().await.is_some());
         assert!(right.next_work().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn admitted_foreground_folder_bypasses_old_equal_priority_queue() {
+        let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig::default()));
+        let old_selection = selection(21);
+        let current_selection = selection(22);
+        let old = DerivativeCoordinator::with_selection(scheduler.clone(), old_selection);
+        let current = DerivativeCoordinator::with_selection(scheduler.clone(), current_selection);
+        let _old = old
+            .enqueue(
+                screen_key_for(old_selection, fixture_id(1), "old"),
+                WorkLane::VisibleWall,
+            )
+            .await;
+        let _current = current
+            .enqueue(
+                screen_key_for(current_selection, fixture_id(2), "current"),
+                WorkLane::VisibleWall,
+            )
+            .await;
+        let key = (current_selection.library_id, current_selection.group_id);
+        scheduler.set_foreground_folder(Some(key));
+        let permit = scheduler.try_admit_folder_work(key).unwrap();
+        assert!(
+            current
+                .next_work_for_folder_turn(permit.is_priority_turn())
+                .await
+                .is_some(),
+            "folder admission must not be contradicted by the older family's FIFO head"
+        );
     }
 
     #[tokio::test]
