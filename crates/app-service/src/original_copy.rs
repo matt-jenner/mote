@@ -198,8 +198,15 @@ impl AppService {
         }
         let canonical = self.validate_copy_destination(destination, &batch.source_roots)?;
         let mut reserved = HashSet::new();
-        scan_names(&canonical, &mut reserved)
-            .map_err(|_| AppServiceError::CopyDestinationUnavailable)?;
+        scan_names(&canonical, &mut reserved).map_err(|_| {
+            if self.check_copy_destination(&canonical, &batch.source_roots)
+                == Err("destination_missing")
+            {
+                AppServiceError::CopyDestinationMissing
+            } else {
+                AppServiceError::CopyDestinationUnavailable
+            }
+        })?;
         let mut result = OriginalCopyResult {
             items: Vec::with_capacity(batch.items.len()),
             copied_count: 0,
@@ -226,6 +233,16 @@ impl AppService {
                             )
                         })
                 });
+            let outcome = outcome.map_err(|code| {
+                if code != "cancelled"
+                    && self.check_copy_destination(&canonical, &batch.source_roots)
+                        == Err("destination_missing")
+                {
+                    "destination_missing"
+                } else {
+                    code
+                }
+            });
             let item_result = match outcome {
                 Err("cancelled") => return Ok(OriginalCopyOutcome::Cancelled),
                 Err("destination_missing") => return Err(AppServiceError::CopyDestinationMissing),
@@ -336,10 +353,19 @@ impl AppService {
         }
         let original_name = source.relative.file_name().ok_or("source_unavailable")?;
         self.check_copy_destination(destination, roots)?;
+        let directory_identity =
+            open_copy_directory(destination).map_err(|_| "destination_unavailable")?;
         let temporary = destination.join(format!(".mote-copy-{}", uuid::Uuid::new_v4()));
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        #[cfg(all(test, unix))]
+        tests::copy_failure("create").map_err(|_| "destination_unavailable")?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut output = options
             .open(&temporary)
             .map_err(|_| "destination_unavailable")?;
         // Keep an identity handle for cleanup after closing the writing stream.
@@ -363,6 +389,8 @@ impl AppService {
                 if cancellation.is_cancelled() {
                     return Err("cancelled");
                 }
+                #[cfg(all(test, unix))]
+                tests::copy_failure("write").map_err(|_| "copy_failed")?;
                 output
                     .write_all(&buffer[..read])
                     .map_err(|_| "copy_failed")?;
@@ -373,6 +401,8 @@ impl AppService {
                     }
                 });
             }
+            #[cfg(all(test, unix))]
+            tests::copy_failure("sync").map_err(|_| "copy_failed")?;
             output.sync_all().map_err(|_| "copy_failed")
         })();
         drop(output);
@@ -391,6 +421,8 @@ impl AppService {
                 }
                 // Earlier items already reserved their suffixes. Refresh external
                 // entries only once we have a candidate that might be available.
+                #[cfg(all(test, unix))]
+                tests::copy_failure("scan").map_err(|_| "destination_unavailable")?;
                 scan_names(destination, reserved).map_err(|_| "destination_unavailable")?;
                 if !reserved.insert(key) {
                     continue;
@@ -406,6 +438,9 @@ impl AppService {
                 self.check_copy_destination(destination, roots)?;
                 if cancellation.is_cancelled() {
                     return Err("cancelled");
+                }
+                if !is_created_file(&temporary, &identity) {
+                    return Err("copy_failed");
                 }
                 match fs::hard_link(&temporary, destination.join(&name)) {
                     Ok(()) => {}
@@ -425,8 +460,16 @@ impl AppService {
             }
         });
         // Never unlink a substituted entry or a file beneath a newly selected source.
-        if self.check_copy_destination(destination, roots).is_ok() {
-            remove_created_file(&temporary, &identity);
+        if let Some(current_directory) = copy_directory_path(&directory_identity) {
+            if self
+                .check_copy_destination(&current_directory, roots)
+                .is_ok()
+            {
+                remove_created_file(
+                    &current_directory.join(temporary.file_name().expect("generated filename")),
+                    &identity,
+                );
+            }
         }
         published
     }
@@ -507,12 +550,78 @@ fn candidate_name(original: &OsStr, suffix: u64) -> OsString {
     name
 }
 
-fn remove_created_file(target: &Path, output: &File) {
+fn open_copy_directory(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_BACKUP_SEMANTICS permits opening a directory handle.
+        options.custom_flags(0x0200_0000);
+    }
+    options.open(path)
+}
+
+/// Resolve the retained directory handle, including an external rename. This
+/// avoids searching directories and cannot mistake a replacement at the old path
+/// for the directory where the temporary file was created.
+fn copy_directory_path(directory: &File) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        unsafe extern "C" {
+            fn fcntl(fd: i32, command: i32, ...) -> i32;
+        }
+        let mut bytes = [0_u8; 1024];
+        // SAFETY: F_GETPATH writes at most MAXPATHLEN bytes to a valid buffer;
+        // the retained descriptor remains open throughout the call.
+        if unsafe { fcntl(directory.as_raw_fd(), 50, bytes.as_mut_ptr()) } == -1 {
+            return None;
+        }
+        let length = bytes.iter().position(|byte| *byte == 0)?;
+        Some(PathBuf::from(OsStr::from_bytes(&bytes[..length])))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        use std::os::fd::AsRawFd;
+        fs::read_link(format!("/proc/self/fd/{}", directory.as_raw_fd())).ok()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetFinalPathNameByHandleW(
+                handle: *mut std::ffi::c_void,
+                path: *mut u16,
+                length: u32,
+                flags: u32,
+            ) -> u32;
+        }
+        let mut buffer = vec![0_u16; 32768];
+        // SAFETY: the handle is retained and the buffer size matches its capacity.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(
+                directory.as_raw_handle(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                0,
+            )
+        } as usize;
+        if length == 0 || length >= buffer.len() {
+            return None;
+        }
+        Some(PathBuf::from(OsString::from_wide(&buffer[..length])))
+    }
+}
+
+fn is_created_file(target: &Path, output: &File) -> bool {
     let Ok(current) = fs::symlink_metadata(target) else {
-        return;
+        return false;
     };
     if !current.is_file() {
-        return;
+        return false;
     }
     #[cfg(unix)]
     let is_output = {
@@ -523,7 +632,11 @@ fn remove_created_file(target: &Path, output: &File) {
     };
     #[cfg(windows)]
     let is_output = same_file(output, target);
-    if is_output {
+    is_output
+}
+
+fn remove_created_file(target: &Path, output: &File) {
+    if is_created_file(target, output) {
         // Revalidation protects normal destination changes. An adversarial
         // rename between identity checking and unlink needs descriptor APIs.
         let _ = fs::remove_file(target);
@@ -591,9 +704,159 @@ fn same_file(left: &File, target: &Path) -> bool {
 mod tests {
     use super::*;
 
+    pub(super) fn copy_failure(step: &str) -> io::Result<()> {
+        COPY_FAILURE.with(|hook| match hook.borrow_mut().as_mut() {
+            Some(hook) => hook(step),
+            None => Ok(()),
+        })
+    }
+
     thread_local! {
         pub(super) static DIRECTORY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         pub(super) static COPY_STEP: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> = const { std::cell::RefCell::new(None) };
+        pub(super) static COPY_FAILURE: std::cell::RefCell<Option<Box<dyn FnMut(&str) -> io::Result<()>>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[test]
+    fn replaced_temporary_entry_is_never_published_as_an_original() {
+        let (_temp, service, mut batch, destination) = controlled_fixture();
+        batch.items.truncate(1);
+        let folder = destination.clone();
+        COPY_STEP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |step| {
+                if step == "publish" {
+                    let temporary = fs::read_dir(&folder)
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .find(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(".mote-copy-")
+                        })
+                        .unwrap()
+                        .path();
+                    fs::remove_file(&temporary).unwrap();
+                    fs::write(temporary, b"unrelated replacement").unwrap();
+                }
+            }))
+        });
+        let outcome = service
+            .copy_originals_with_control(batch, &destination, &CopyCancellation::default(), |_| {})
+            .unwrap();
+        COPY_STEP.with(|hook| *hook.borrow_mut() = None);
+        let OriginalCopyOutcome::Complete(result) = outcome else {
+            panic!("expected item failure");
+        };
+        assert_eq!((result.copied_count, result.failed_count), (0, 1));
+        assert!(!destination.join("first.jpg").exists());
+        let replacement = fs::read_dir(&destination)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(fs::read(replacement).unwrap(), b"unrelated replacement");
+    }
+
+    #[test]
+    fn renamed_destination_cleans_owned_temporary_file_on_cancel_or_loss() {
+        for cancel_after_rename in [false, true] {
+            let (temp, service, batch, destination) = controlled_fixture();
+            let moved = temp.path().join("renamed-exports");
+            let folder = destination.clone();
+            let new_folder = moved.clone();
+            let cancellation = CopyCancellation::default();
+            let trigger = cancellation.clone();
+            let mut renamed = false;
+            COPY_STEP.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |step| {
+                    if step == "chunk" && !renamed {
+                        fs::rename(&folder, &new_folder).unwrap();
+                        renamed = true;
+                        if cancel_after_rename {
+                            trigger.cancel();
+                        }
+                    }
+                }))
+            });
+            let result =
+                service.copy_originals_with_control(batch, &destination, &cancellation, |_| {
+                    panic!("remaining files must not start")
+                });
+            COPY_STEP.with(|hook| *hook.borrow_mut() = None);
+            assert!(matches!(
+                result,
+                Err(AppServiceError::CopyDestinationMissing) | Ok(OriginalCopyOutcome::Cancelled)
+            ));
+            assert_eq!(fs::read_dir(moved).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn destination_io_failures_on_last_item_are_promoted_to_missing() {
+        for boundary in ["create", "write", "sync", "scan"] {
+            let (_temp, service, mut batch, destination) = controlled_fixture();
+            batch.items.truncate(1);
+            let folder = destination.clone();
+            COPY_FAILURE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |step| {
+                    if step == boundary {
+                        fs::remove_dir_all(&folder).unwrap();
+                        Err(io::Error::other("destination disconnected"))
+                    } else {
+                        Ok(())
+                    }
+                }))
+            });
+            let mut reports = 0;
+            let outcome = service.copy_originals_with_control(
+                batch,
+                &destination,
+                &CopyCancellation::default(),
+                |_| reports += 1,
+            );
+            COPY_FAILURE.with(|hook| *hook.borrow_mut() = None);
+            assert!(
+                matches!(outcome, Err(AppServiceError::CopyDestinationMissing)),
+                "{boundary}: {outcome:?}"
+            );
+            assert_eq!(reports, 0);
+        }
+    }
+
+    #[test]
+    fn independent_reader_never_observes_incomplete_final_payload() {
+        let (_temp, service, mut batch, destination) = controlled_fixture();
+        batch.items.truncate(1);
+        let final_path = destination.join("first.jpg");
+        let done = Arc::new(AtomicBool::new(false));
+        let reader_done = done.clone();
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let reader_started = started.clone();
+        let reader = std::thread::spawn(move || {
+            assert!(!final_path.exists());
+            reader_started.wait();
+            loop {
+                if let Ok(bytes) = fs::read(&final_path) {
+                    assert_eq!(bytes, vec![42; 4 * 1024 * 1024]);
+                }
+                if reader_done.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        });
+        started.wait();
+        service
+            .copy_originals_with_control(batch, &destination, &CopyCancellation::default(), |_| {})
+            .unwrap();
+        done.store(true, Ordering::Release);
+        reader.join().unwrap();
+        assert_eq!(
+            fs::read(destination.join("first.jpg")).unwrap(),
+            vec![42; 4 * 1024 * 1024]
+        );
     }
 
     fn controlled_fixture() -> (tempfile::TempDir, AppService, OriginalCopyBatch, PathBuf) {
@@ -738,6 +1001,37 @@ mod tests {
         ));
         assert!(!destination.exists());
         assert_eq!(service.last_copy_destination().unwrap(), None);
+    }
+
+    #[test]
+    fn temporary_payload_is_private_until_publication() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, service, batch, destination) = controlled_fixture();
+        let folder = destination.clone();
+        COPY_STEP.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |step| {
+                if step == "chunk" {
+                    let temporary = fs::read_dir(&folder)
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .find(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(".mote-copy-")
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        temporary.metadata().unwrap().permissions().mode() & 0o077,
+                        0
+                    );
+                }
+            }))
+        });
+        service
+            .copy_originals_with_control(batch, &destination, &CopyCancellation::default(), |_| {})
+            .unwrap();
+        COPY_STEP.with(|hook| *hook.borrow_mut() = None);
     }
 
     // Catches rescanning for every suffix already reserved by earlier items.
