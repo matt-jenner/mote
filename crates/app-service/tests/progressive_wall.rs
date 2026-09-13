@@ -725,6 +725,9 @@ async fn completed_sibling_group_does_not_settle_a_new_child_selection() {
         matches!(event, WallUpdate::MetadataSettled { .. })
     })
     .await;
+    first.shutdown().await;
+    first.wait_for_collection_drivers_quiescent_test().await;
+    first.wait_for_derivative_tasks_quiescent_test().await;
     drop(first);
 
     let (reader, release) = BlockingReader::new();
@@ -894,7 +897,7 @@ async fn wall_cursor_is_rejected_after_switching_folder_groups() {
 }
 
 #[tokio::test]
-async fn unavailable_reopen_clears_the_view_and_preserves_the_cached_catalog() {
+async fn desktop_bootstrap_unavailable_reopen_preserves_the_view_and_cached_catalog() {
     let fixture = ProgressiveFixture::new(12);
     let (reader, release) = BlockingReader::new();
     let service = fixture.service(reader);
@@ -916,17 +919,18 @@ async fn unavailable_reopen_clears_the_view_and_preserves_the_cached_catalog() {
     let reopened =
         AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
             .unwrap();
-    let bootstrap = reopened.checked_bootstrap().await.unwrap();
-    assert!(bootstrap.active_source.is_none());
+    let bootstrap = reopened.desktop_bootstrap().await.unwrap();
+    assert!(bootstrap.active_source.is_some());
     assert_eq!(bootstrap.saved_folders.entries.len(), 1);
-    assert!(bootstrap.saved_folders.active_entry_id.is_none());
-    assert!(
+    assert!(bootstrap.saved_folders.active_entry_id.is_some());
+    assert_eq!(
         reopened
             .query_wall(query(SortDirection::NewestFirst))
             .await
             .unwrap()
             .items
-            .is_empty()
+            .len(),
+        12
     );
     let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
     let library = catalog.list_libraries().unwrap().remove(0);
@@ -939,7 +943,28 @@ async fn unavailable_reopen_clears_the_view_and_preserves_the_cached_catalog() {
 }
 
 #[tokio::test]
-async fn unavailable_selected_child_marks_only_its_group_offline() {
+async fn desktop_bootstrap_selects_naturally_first_saved_folder() {
+    let fixture = ProgressiveFixture::new(0);
+    let service = AppService::open(fixture.config.clone()).unwrap();
+    let mut first_id = String::new();
+    for name in ["Album 10", "album 2", "Zoo"] {
+        let path = fixture.temp.path().join(name);
+        std::fs::create_dir(&path).unwrap();
+        let bootstrap = service.open_recent(&path).unwrap();
+        if name == "album 2" {
+            first_id = bootstrap.saved_folders.active_entry_id.unwrap();
+        }
+    }
+    let bootstrap = service.desktop_bootstrap().await.unwrap();
+    assert_eq!(
+        bootstrap.saved_folders.active_entry_id.as_deref(),
+        Some(first_id.as_str())
+    );
+    assert_eq!(bootstrap.active_source.unwrap().display_name, "album 2");
+}
+
+#[tokio::test]
+async fn root_first_unavailable_selected_child_marks_only_its_group_offline() {
     let fixture = ProgressiveFixture::new(4);
     let child = fixture.source.join("child");
     std::fs::create_dir(&child).unwrap();
@@ -948,9 +973,9 @@ async fn unavailable_selected_child_marks_only_its_group_offline() {
         child.join("child.jpg"),
     )
     .unwrap();
+    let reader = CountingReader::default();
     let service =
-        AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
-            .unwrap();
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(reader.clone())).unwrap();
     let mut updates = service.subscribe_wall_updates();
     service.start_scan(&fixture.source).await.unwrap();
     recv_until(&mut updates, |event| {
@@ -963,6 +988,7 @@ async fn unavailable_selected_child_marks_only_its_group_offline() {
     })
     .await;
     let before = service.bootstrap().unwrap();
+    let reads_before_check = reader.count();
     let unavailable = fixture.source.join("child-offline");
     std::fs::rename(&child, &unavailable).unwrap();
     let ids: Vec<_> = before
@@ -986,6 +1012,21 @@ async fn unavailable_selected_child_marks_only_its_group_offline() {
     }
     let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
     let active = catalog.load_app_state().unwrap().active_selection.unwrap();
+    let assets = catalog.assets(active.library_id).unwrap();
+    assert_eq!(assets.len(), 5);
+    for asset in &assets {
+        let expected = if asset.display_path == "child/child.jpg" {
+            Availability::RootOffline
+        } else {
+            Availability::Available
+        };
+        assert_eq!(asset.availability, expected, "{}", asset.display_path);
+    }
+    assert_eq!(
+        reader.count(),
+        reads_before_check,
+        "folder access checks must not probe individual assets"
+    );
     let active_group = catalog
         .folder_group_for_path(active.library_id, &active.relative_folder)
         .unwrap()
@@ -1007,6 +1048,305 @@ async fn unavailable_selected_child_marks_only_its_group_offline() {
         1
     );
     std::fs::rename(unavailable, child).unwrap();
+}
+
+#[tokio::test]
+async fn root_first_offline_library_marks_sibling_assets_offline() {
+    let fixture = ProgressiveFixture::new(2);
+    let reader = CountingReader::default();
+    let service =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(reader.clone())).unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |e| {
+        matches!(e, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let mut child_entry = String::new();
+    for name in ["child-a", "child-b"] {
+        let child = fixture.source.join(name);
+        std::fs::create_dir(&child).unwrap();
+        std::fs::copy(
+            fixture.source.join("photo-000.jpg"),
+            child.join("photo.jpg"),
+        )
+        .unwrap();
+        let bootstrap = service.start_scan(&child).await.unwrap();
+        recv_until(&mut updates, |e| {
+            matches!(e, WallUpdate::MetadataSettled { .. })
+        })
+        .await;
+        child_entry = bootstrap.saved_folders.active_entry_id.unwrap();
+    }
+    let before = reader.count();
+    let offline = fixture.temp.path().join("offline");
+    std::fs::rename(&fixture.source, &offline).unwrap();
+    service.check_saved_folders(&[child_entry]).await.unwrap();
+    let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    let library = catalog.list_libraries().unwrap().remove(0);
+    let assets = catalog.assets(library.id).unwrap();
+    assert_eq!(assets.len(), 4);
+    assert!(
+        assets
+            .iter()
+            .all(|a| a.availability == Availability::RootOffline),
+        "root failure must cover sibling groups"
+    );
+    assert_eq!(
+        reader.count(),
+        before,
+        "failed prerequisites must not admit asset readers"
+    );
+    let event = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            let event = updates.recv().await.unwrap();
+            if matches!(event, WallUpdate::SourceUnavailable { .. }) {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("confirmed root failure must notify the selected view");
+    let WallUpdate::SourceUnavailable { selection_id, .. } = event else {
+        unreachable!()
+    };
+    assert_eq!(
+        selection_id,
+        service
+            .bootstrap()
+            .unwrap()
+            .active_source
+            .unwrap()
+            .selection_id
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn root_first_unreadable_asset_publishes_warning_and_keeps_sibling_available() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = ProgressiveFixture::new(2);
+    std::fs::set_permissions(
+        fixture.source.join("photo-000.jpg"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    let service = AppService::open(fixture.config.clone()).unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    let mut warnings = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let WallUpdate::Warning {
+            asset_id, warning, ..
+        } = &event
+        {
+            warnings.push((asset_id.clone(), warning.code.clone()));
+        }
+        if matches!(event, WallUpdate::MetadataSettled { .. }) {
+            break;
+        }
+    }
+    assert!(
+        warnings
+            .iter()
+            .any(|(id, code)| id.is_some() && code == "source_unreadable")
+    );
+    let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    let library = catalog.list_libraries().unwrap().remove(0);
+    let assets = catalog.assets(library.id).unwrap();
+    assert_eq!(
+        assets
+            .iter()
+            .filter(|a| a.availability == Availability::Unreadable)
+            .count(),
+        1
+    );
+    assert_eq!(
+        assets
+            .iter()
+            .filter(|a| a.availability == Availability::Available)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn root_first_missing_selected_root_marks_library_offline() {
+    let fixture = ProgressiveFixture::new(1);
+    let service = AppService::open(fixture.config.clone()).unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    let saved = service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    std::fs::rename(&fixture.source, fixture.temp.path().join("offline")).unwrap();
+    service
+        .check_saved_folders(&[saved.saved_folders.active_entry_id.unwrap()])
+        .await
+        .unwrap();
+    let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    assert_eq!(
+        catalog.list_libraries().unwrap()[0].availability,
+        Availability::RootOffline
+    );
+}
+
+#[tokio::test]
+async fn root_first_readable_folders_return_cached_rows_while_asset_metadata_is_blocked() {
+    let fixture = ProgressiveFixture::new(2);
+    let service = AppService::open(fixture.config.clone()).unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    service.wait_for_collection_drivers_quiescent_test().await;
+    service.wait_for_derivative_tasks_quiescent_test().await;
+    drop(service);
+    let (reader, release) = BlockingReader::new();
+    let reopened = fixture.service(reader);
+    let mut updates = reopened.subscribe_wall_updates();
+    reopened.desktop_bootstrap().await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::CatalogBatch { .. })
+    })
+    .await;
+    let page = tokio::time::timeout(
+        Duration::from_millis(100),
+        reopened.query_wall(query(SortDirection::OldestFirst)),
+    )
+    .await
+    .expect("cached wall query must not wait for asset metadata")
+    .unwrap();
+    assert_eq!(page.items.len(), 2);
+    release.release();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn switching_folders_keeps_previous_indexing_alive() {
+    let fixture = ProgressiveFixture::new(8);
+    let other = fixture.temp.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    ImageBuffer::from_pixel(12, 8, Rgb([10_u8, 20, 30]))
+        .save(other.join("other.jpg"))
+        .unwrap();
+    let (reader, release) = BlockingReader::new();
+    let service = fixture.service(reader);
+    let mut updates = service.subscribe_wall_updates();
+    let first = service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::CatalogBatch { .. })
+    })
+    .await;
+    let first_entry = first
+        .saved_folders
+        .entries
+        .iter()
+        .find(|entry| Some(&entry.id) == first.saved_folders.active_entry_id.as_ref())
+        .unwrap();
+    let group = FolderGroupId::from_uuid(uuid::Uuid::parse_str(&first_entry.folder_id).unwrap());
+    let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    let library = catalog.folder_group(group).unwrap().unwrap().library_id;
+    service.start_scan(&other).await.unwrap();
+    release.release();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !catalog
+            .has_completed_generation_for_group(library, group)
+            .unwrap()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("folder A must finish after switching to B");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if catalog
+                .all_derivatives()
+                .unwrap()
+                .iter()
+                .filter(|record| record.folder_group_id == group && record.kind == "screen_preview")
+                .count()
+                == 8
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("A must finish its full collection derivatives without revisiting");
+    let returned = service
+        .activate_saved_folder(&first_entry.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        returned.active_source.unwrap().selection_id,
+        first.active_source.unwrap().selection_id
+    );
+    assert_eq!(
+        service
+            .query_wall(query(SortDirection::OldestFirst))
+            .await
+            .unwrap()
+            .items
+            .len(),
+        8
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn switching_folders_return_to_running_folder_reuses_generation_and_rebinds_events() {
+    let fixture = ProgressiveFixture::new(8);
+    let other = fixture.temp.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    let (reader, release) = BlockingReader::new();
+    let service = fixture.service(reader);
+    let mut updates = service.subscribe_wall_updates();
+    let first = service.start_scan(&fixture.source).await.unwrap();
+    let event = recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::CatalogBatch { .. })
+    })
+    .await;
+    let WallUpdate::CatalogBatch {
+        generation: original_generation,
+        ..
+    } = event
+    else {
+        unreachable!()
+    };
+    service.start_scan(&other).await.unwrap();
+    let returned = service
+        .activate_saved_folder(first.saved_folders.active_entry_id.as_ref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let current_id = returned.active_source.unwrap().selection_id;
+    while updates.try_recv().is_ok() {}
+    release.release();
+    let event = recv_until(&mut updates, |event| matches!(event, WallUpdate::MetadataSettled { selection_id, .. } if selection_id == &current_id)).await;
+    let WallUpdate::MetadataSettled { generation, .. } = event else {
+        unreachable!()
+    };
+    assert_eq!(
+        generation, original_generation,
+        "returning to a running folder must not start a second scan"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1317,6 +1657,327 @@ async fn prepare_wall_ready_fixture() -> (ProgressiveFixture, AppService, String
         .await
         .unwrap();
     (fixture, service, asset_id)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn switching_folders_preserves_captured_derivative_work_and_services_new_foreground() {
+    let (fixture, service, asset_a) = prepare_wall_ready_fixture().await;
+    service
+        .set_interaction(photo_app_service::InteractionState::Idle)
+        .await;
+    let starts = Arc::new(AtomicUsize::new(0));
+    let (background, _, release) =
+        begin_blocked_background_preview(&service, &asset_a, starts.clone()).await;
+    let other = fixture.temp.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    ImageBuffer::from_pixel(12, 8, Rgb([10_u8, 20, 30]))
+        .save(other.join("other.jpg"))
+        .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    let b = service
+        .start_scan(&other)
+        .await
+        .unwrap()
+        .active_source
+        .unwrap()
+        .selection_id;
+    recv_until(&mut updates, |event| matches!(event, WallUpdate::MetadataSettled { selection_id, .. } if selection_id == &b)).await;
+    let asset_b = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items[0]
+        .id
+        .clone();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        service.request_derivatives(DerivativeRequest::visible(vec![asset_b])),
+    )
+    .await
+    .expect("B visible work must not wait for A")
+    .unwrap();
+    release.notify_waiters();
+    background
+        .await
+        .unwrap()
+        .expect("switching view must retain A's captured derivative work");
+    let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    assert!(
+        catalog
+            .all_derivatives()
+            .unwrap()
+            .iter()
+            .any(|record| record.asset_id.as_uuid().to_string() == asset_a
+                && record.kind == "screen_preview")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn switching_folders_promotes_visible_work_past_old_visible_queue() {
+    let fixture = ProgressiveFixture::new(2);
+    let service =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
+            .unwrap();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    let other = fixture.temp.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    ImageBuffer::from_pixel(12, 8, Rgb([10_u8, 20, 30]))
+        .save(other.join("other.jpg"))
+        .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    let b = service.start_scan(&other).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let asset_b = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items[0]
+        .id
+        .clone();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let assets_a: Vec<_> = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|asset| asset.id)
+        .collect();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    service
+        .install_derivative_test_gate(
+            assets_a[0].clone(),
+            DerivativeClass::WallThumbnail,
+            entered.clone(),
+            release.clone(),
+        )
+        .await
+        .unwrap();
+    let background_service = service.clone();
+    let background = tokio::spawn(async move {
+        background_service
+            .request_derivatives(DerivativeRequest::visible(assets_a))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    service
+        .activate_saved_folder(b.saved_folders.active_entry_id.as_ref().unwrap())
+        .await
+        .unwrap();
+    service
+        .set_interaction(photo_app_service::InteractionState::Idle)
+        .await;
+    let deadline_reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let deadline_flag = deadline_reached.clone();
+    let deadline_release = release.clone();
+    // Use an independent deadline so a scheduler busy-loop cannot starve the timer.
+    let deadline = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        deadline_flag.store(true, Ordering::SeqCst);
+        deadline_release.notify_waiters();
+    });
+    service
+        .request_derivatives(DerivativeRequest::visible(vec![asset_b]))
+        .await
+        .unwrap();
+    let completed_before_release = !deadline_reached.load(Ordering::SeqCst);
+    release.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(2), background)
+        .await
+        .expect("old Visible batch must complete after release")
+        .unwrap()
+        .unwrap();
+    deadline.join().unwrap();
+    assert!(
+        completed_before_release,
+        "new foreground Visible work must bypass the old folder's queued Visible work"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn switching_folders_removing_background_folder_cancels_its_unadmitted_derivative() {
+    let (fixture, service, asset_a) = prepare_wall_ready_fixture().await;
+    let entry_a = service
+        .bootstrap()
+        .unwrap()
+        .saved_folders
+        .active_entry_id
+        .unwrap();
+    service
+        .set_interaction(photo_app_service::InteractionState::Idle)
+        .await;
+    let (background, _, release) =
+        begin_blocked_background_preview(&service, &asset_a, Arc::new(AtomicUsize::new(0))).await;
+    let other = fixture.temp.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    service.start_scan(&other).await.unwrap();
+    service.remove_saved_folder(&entry_a).unwrap();
+    release.notify_waiters();
+    assert!(
+        background.await.unwrap().is_err(),
+        "removed background folder must not commit queued work"
+    );
+    assert!(
+        !Catalog::open(&fixture.config.catalog_path())
+            .unwrap()
+            .all_derivatives()
+            .unwrap()
+            .iter()
+            .any(|record| record.asset_id.as_uuid().to_string() == asset_a
+                && record.kind == "screen_preview")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn switching_folders_return_syncs_scope_for_visible_child_derivatives() {
+    let fixture = ProgressiveFixture::new(1);
+    let child = fixture.source.join("child");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::copy(
+        fixture.source.join("photo-000.jpg"),
+        child.join("child.jpg"),
+    )
+    .unwrap();
+    let other = fixture.temp.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    let service =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
+            .unwrap();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    service
+        .update_gallery_scope(GalleryScope::CurrentFolder)
+        .await
+        .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    let a = service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    assert_eq!(
+        service
+            .query_wall(query(SortDirection::OldestFirst))
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    service.start_scan(&other).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    service
+        .update_gallery_scope(GalleryScope::IncludeSubfolders)
+        .await
+        .unwrap();
+    service
+        .activate_saved_folder(a.saved_folders.active_entry_id.as_ref().unwrap())
+        .await
+        .unwrap();
+    let wall = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    assert_eq!(wall.items.len(), 2);
+    let child = wall
+        .items
+        .into_iter()
+        .find(|asset| asset.display_name == "child.jpg")
+        .unwrap();
+    service
+        .request_derivatives(DerivativeRequest::visible(vec![child.id]))
+        .await
+        .expect("returning A must use the current recursive scope for the visible child");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn switching_folders_overlapping_parent_and_child_retain_collection_membership() {
+    let fixture = ProgressiveFixture::new(2);
+    let child = fixture.source.join("child");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::copy(
+        fixture.source.join("photo-000.jpg"),
+        child.join("child.jpg"),
+    )
+    .unwrap();
+    let (reader, release) = BlockingReader::new();
+    let service = fixture.service(reader);
+    let mut updates = service.subscribe_wall_updates();
+    let parent = service.start_scan(&fixture.source).await.unwrap();
+    let parent_group = FolderGroupId::from_uuid(
+        uuid::Uuid::parse_str(&parent.saved_folders.entries[0].folder_id).unwrap(),
+    );
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::CatalogBatch { .. })
+    })
+    .await;
+    service.start_scan(&child).await.unwrap();
+    release.release();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while catalog
+            .wall_preview_counts_scoped(parent_group, GalleryScope::IncludeSubfolders)
+            .unwrap()
+            .screen_ready
+            != 3
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("parent collection must retain the child asset after child's concurrent scan");
+    let mut catalog = catalog;
+    let parent_record = catalog.folder_group(parent_group).unwrap().unwrap();
+    // Restore the cached parent selection without admitting a new scan that
+    // could overwrite the asset's legacy primary-group field.
+    catalog
+        .set_active_selection(Some(&photo_catalog::StoredSourceSelection {
+            library_id: parent_record.library_id,
+            relative_folder: parent_record.relative_path,
+        }))
+        .unwrap();
+    let child_asset = catalog
+        .assets(parent_record.library_id)
+        .unwrap()
+        .into_iter()
+        .find(|asset| asset.display_path == "child/child.jpg")
+        .unwrap();
+    let screen = catalog
+        .all_derivatives()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.asset_id == child_asset.id && record.kind == "screen_preview")
+        .unwrap();
+    assert!(
+        !service
+            .read_derivative(
+                &child_asset.id.as_uuid().to_string(),
+                DerivativeClass::ScreenPreview,
+                &screen.cache_key
+            )
+            .expect("shared cached derivative must remain readable from its parent membership")
+            .is_empty()
+    );
 }
 
 async fn prepare_managed_cache_wall_ready_fixture() -> (ProgressiveFixture, AppService, String) {
@@ -3220,6 +3881,48 @@ async fn cancelled_screen_commit_waits_for_started_blocking_work() {
 
 #[cfg(debug_assertions)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_retains_an_admitted_blocking_commit_until_it_drains() {
+    let (fixture, service, asset_id) = prepare_unready_fixture().await;
+    let commit_started = Arc::new(tokio::sync::Notify::new());
+    let commit_release = Arc::new(AtomicBool::new(false));
+    service
+        .install_managed_commit_started_test_gate(commit_started.clone(), commit_release.clone())
+        .await;
+    let request_service = service.clone();
+    let request = tokio::spawn(async move {
+        request_service
+            .request_derivatives(DerivativeRequest::visible(vec![asset_id]))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), commit_started.notified())
+        .await
+        .expect("commit should be admitted and running");
+    service.shutdown().await;
+    assert!(
+        !request.is_finished(),
+        "shutdown must not settle a started blocking commit early"
+    );
+    commit_release.store(true, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .expect("admitted commit must drain after release")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        Catalog::open(&fixture.config.catalog_path())
+            .unwrap()
+            .all_derivatives()
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.kind == "wall_thumbnail")
+            .count(),
+        1
+    );
+    assert_eq!(service.runtime_count_for_test(), 0);
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_wall_commit_waits_for_started_blocking_work() {
     for _ in 0..20 {
         let (fixture, service, asset_id) = prepare_unready_fixture().await;
@@ -3841,7 +4544,7 @@ async fn second_identical_wall_request_reuses_cache_after_the_source_goes_offlin
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn offline_reopen_keeps_cached_references() {
+async fn desktop_bootstrap_offline_reopen_keeps_cached_references() {
     let fixture = ProgressiveFixture::new(4);
     let service = AppService::open_with_reader(
         fixture.config.clone(),
@@ -3874,12 +4577,29 @@ async fn offline_reopen_keeps_cached_references() {
     let reopened =
         AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
             .unwrap();
+    let bootstrap = reopened.desktop_bootstrap().await.unwrap();
     let page = reopened
         .query_wall(query(SortDirection::OldestFirst))
         .await
         .unwrap();
+    assert_eq!(page.items.len(), 4);
     assert!(
         page.items
+            .iter()
+            .all(|asset| asset.wall_thumbnail.is_some())
+    );
+    reopened
+        .check_saved_folders(&[bootstrap.saved_folders.active_entry_id.unwrap()])
+        .await
+        .unwrap();
+    let confirmed = reopened
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    assert_eq!(confirmed.items.len(), 4);
+    assert!(
+        confirmed
+            .items
             .iter()
             .all(|asset| asset.wall_thumbnail.is_some())
     );

@@ -19,11 +19,23 @@ impl AppService {
         &self,
         selection_token: SelectionToken,
     ) -> Result<(), AppServiceError> {
+        let _scope_update = self.gallery_scope_update.lock().await;
         let selection = self.gallery.selection_from_token(selection_token)?;
         if !self.admit_desktop_scan(selection_token)? {
             return Ok(());
         }
+        #[cfg(test)]
         {
+            let gate = self.scan_admission_test_gate.lock().await.take();
+            if let Some(gate) = gate {
+                let release = gate.release.notified();
+                tokio::pin!(release);
+                release.as_mut().enable();
+                gate.entered.notify_one();
+                release.await;
+            }
+        }
+        let (bound, scope) = {
             // Keep bridge installation in the same transition critical section
             // as selection changes. A newer selection therefore cannot become
             // active between this check and the bridge subscription.
@@ -35,6 +47,9 @@ impl AppService {
                 self.clear_desktop_scan(selection_token);
                 return Ok(());
             }
+            self.gallery
+                .folder_jobs
+                .set_foreground(Some((selection_token.library_id, selection_token.group_id)));
             let scope = self
                 .state()
                 .ok()
@@ -42,21 +57,41 @@ impl AppService {
                 .map(|state| state.gallery_scope)
                 .unwrap_or(GalleryScope::IncludeSubfolders);
             self.start_desktop_update_bridge(&selection, scope, selection_token);
+            (
+                self.gallery
+                    .bind_desktop_derivatives(self, selection_token)?,
+                scope,
+            )
+        };
+        let runtime = bound
+            .derivative_runtime
+            .as_ref()
+            .expect("captured desktop runtime");
+        let scope_changed = {
+            let mut previous = runtime
+                .desktop_scope
+                .lock()
+                .map_err(|_| AppServiceError::StatePoisoned)?;
+            let changed = *previous != scope;
+            *previous = scope;
+            changed
+        };
+        if scope_changed {
+            let runtime_selection = runtime.selection.token();
+            bound.coordinator.ensure_selection(runtime_selection).await;
+            bound.coordinator.invalidate_background().await;
+            bound
+                .coordinator
+                .reset_collection_for_scope(runtime_selection)
+                .await;
         }
-        self.wake_derivative_workers();
+        bound.wake_derivative_workers();
         let result = self.gallery.ensure_running(&selection).await;
         if result.is_err() {
             self.clear_desktop_scan(selection_token);
         }
         self.spawn_desktop_scan_cleanup(selection_token, selection);
         result
-    }
-
-    pub(crate) async fn reconcile_existing(&self) {
-        let Ok(selection_token) = self.active_selection_token() else {
-            return;
-        };
-        let _ = self.start_selected_scan(selection_token).await;
     }
 
     fn start_desktop_update_bridge(
@@ -83,7 +118,6 @@ impl AppService {
             tokio::task::yield_now().await;
             while let Some(event) = subscription.recv().await {
                 let update = event.update;
-                let settled = matches!(&update, WallUpdate::MetadataSettled { .. });
                 let terminal = matches!(
                     &update,
                     WallUpdate::MetadataSettled { .. } | WallUpdate::SourceUnavailable { .. }
@@ -94,11 +128,6 @@ impl AppService {
                 if terminal {
                     service.clear_desktop_scan(selection_token);
                     service.coordinator.wake();
-                }
-                if settled {
-                    service.prefetch_screen_previews(Vec::new()).await;
-                    #[cfg(test)]
-                    service.notify_scan_completion_wake_test_hook(selection_token);
                 }
                 if terminal {
                     break;
@@ -125,6 +154,9 @@ impl AppService {
                 .desktop_bridges
                 .lock()
                 .expect("desktop bridge registry poisoned");
+            for (_, old) in bridges.drain() {
+                old.abort.abort();
+            }
             bridges.insert(
                 selection_token,
                 crate::service::DesktopBridgeEntry {
@@ -151,6 +183,9 @@ impl AppService {
             .selection_transition
             .lock()
             .map_err(|_| AppServiceError::StatePoisoned)?;
+        if self.gallery.folder_jobs.is_shutdown() {
+            return Ok(false);
+        }
         let mut state = self.state()?;
         let stored = state.libraries.catalog().load_app_state()?;
         let Some(active) = stored.active_selection else {
@@ -181,6 +216,9 @@ impl AppService {
     }
 
     fn desktop_selection_is_current_locked(&self, selection: SelectionToken) -> bool {
+        if self.gallery.folder_jobs.is_shutdown() {
+            return false;
+        }
         let Ok(state) = self.state() else {
             return false;
         };
@@ -209,7 +247,7 @@ impl AppService {
         &self,
         selection: SelectionToken,
         bridge_id: u64,
-        update: WallUpdate,
+        mut update: WallUpdate,
     ) -> bool {
         let Ok(_transition) = self.selection_transition.lock() else {
             return false;
@@ -224,6 +262,18 @@ impl AppService {
         }
         if !self.desktop_selection_is_current_locked(selection) {
             return false;
+        }
+        match &mut update {
+            WallUpdate::CatalogBatch { selection_id, .. }
+            | WallUpdate::DerivativesReady { selection_id, .. }
+            | WallUpdate::MetadataSettled { selection_id, .. }
+            | WallUpdate::Progress { selection_id, .. }
+            | WallUpdate::SourceUnavailable { selection_id, .. }
+            | WallUpdate::Warning { selection_id, .. }
+            | WallUpdate::WarningCleared { selection_id, .. }
+            | WallUpdate::ResyncRequired { selection_id } => {
+                *selection_id = selection.selection_id();
+            }
         }
         let _ = self.updates.send(update);
         true
@@ -245,14 +295,28 @@ impl AppService {
         selection: crate::GallerySelection,
     ) {
         let service = self.clone();
+        // Keep the runtime alive across scan settlement and collection-driver
+        // admission, even after the old view bridge has been disconnected.
+        let bound = self
+            .gallery
+            .bind_desktop_derivatives(self, selection_token)
+            .ok();
         tokio::spawn(async move {
             loop {
                 let Some(mut lifecycle) = service.gallery.runtime_scan_state(&selection) else {
                     service.clear_desktop_scan(selection_token);
                     return;
                 };
-                if lifecycle.borrow().is_terminal() {
+                let terminal = *lifecycle.borrow();
+                if terminal.is_terminal() {
                     service.clear_desktop_scan(selection_token);
+                    if terminal == crate::hosted_runtime::ScanLifecycle::Completed {
+                        if let Some(bound) = &bound {
+                            bound.prefetch_screen_previews(Vec::new()).await;
+                        }
+                        #[cfg(test)]
+                        service.notify_scan_completion_wake_test_hook(selection_token);
+                    }
                     return;
                 }
                 if lifecycle.changed().await.is_err() {

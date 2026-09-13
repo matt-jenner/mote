@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
@@ -93,6 +93,163 @@ pub struct IndexScheduler {
     active_enrichment: AtomicUsize,
     change_generation: AtomicUsize,
     wake: Notify,
+    folders: std::sync::Mutex<FolderAdmission>,
+}
+
+type FolderKey = (photo_domain::LibraryId, photo_domain::FolderGroupId);
+
+#[derive(Default)]
+struct FolderAdmission {
+    desktop: bool,
+    foreground: Option<FolderKey>,
+    waiting: VecDeque<FolderKey>,
+    active: HashMap<FolderKey, usize>,
+    foreground_burst: usize,
+}
+
+pub struct FolderWorkPermit {
+    scheduler: Arc<IndexScheduler>,
+    folder: FolderKey,
+    priority_turn: bool,
+}
+
+pub struct FolderWorkScope {
+    scheduler: Arc<IndexScheduler>,
+    folder: FolderKey,
+}
+
+impl Drop for FolderWorkScope {
+    fn drop(&mut self) {
+        self.scheduler.finish_folder_enrichment(Some(self.folder));
+    }
+}
+
+impl FolderWorkPermit {
+    pub fn is_priority_turn(&self) -> bool {
+        self.priority_turn
+    }
+}
+
+impl Drop for FolderWorkPermit {
+    fn drop(&mut self) {
+        self.scheduler.release_folder_enrichment(Some(self.folder));
+    }
+}
+
+#[cfg(test)]
+mod folder_admission_tests {
+    use super::*;
+    use photo_domain::{FolderGroupId, LibraryId};
+
+    fn folder() -> (LibraryId, FolderGroupId) {
+        (LibraryId::new(), FolderGroupId::new())
+    }
+
+    #[test]
+    fn foreground_keeps_responsive_capacity_while_old_folder_is_bounded() {
+        let scheduler = IndexScheduler::new(SchedulerConfig {
+            idle_workers: 4,
+            active_workers: 1,
+        });
+        let a = folder();
+        let b = folder();
+        scheduler.set_foreground_folder(Some(a));
+        assert!(scheduler.try_admit_folder_enrichment(Some(a)));
+        scheduler.set_foreground_folder(Some(b));
+        assert!(
+            !scheduler.try_admit_folder_enrichment(Some(a)),
+            "background has only one admitted file"
+        );
+        assert!(scheduler.try_admit_folder_enrichment(Some(b)));
+        scheduler.release_folder_enrichment(Some(a));
+        scheduler.release_folder_enrichment(Some(b));
+    }
+
+    #[test]
+    fn foreground_does_not_yield_idle_capacity_to_a_blocked_background_turn() {
+        let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig {
+            idle_workers: 4,
+            active_workers: 1,
+        }));
+        let a = folder();
+        let b = folder();
+        let c = folder();
+        scheduler.set_foreground_folder(Some(a));
+        let held_a = scheduler.try_admit_folder_work(a).unwrap();
+        scheduler.set_foreground_folder(Some(b));
+        assert!(scheduler.try_admit_folder_work(c).is_none());
+        for _ in 0..3 {
+            drop(scheduler.try_admit_folder_work(b).unwrap());
+        }
+        let fourth_b = scheduler
+            .try_admit_folder_work(b)
+            .expect("foreground must use idle capacity while A blocks C's background turn");
+        drop(fourth_b);
+        drop(held_a);
+        assert!(
+            scheduler.try_admit_folder_work(b).is_none(),
+            "C gets its owed turn once it can run"
+        );
+        assert!(scheduler.try_admit_folder_work(c).is_some());
+    }
+
+    #[test]
+    fn derivative_folder_permit_releases_capacity_on_drop() {
+        let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig {
+            idle_workers: 1,
+            active_workers: 1,
+        }));
+        let a = folder();
+        scheduler.set_foreground_folder(Some(a));
+        let permit = scheduler.try_admit_folder_work(a).unwrap();
+        assert!(scheduler.try_admit_folder_work(a).is_none());
+        drop(permit);
+        assert!(scheduler.try_admit_folder_work(a).is_some());
+    }
+
+    #[test]
+    fn cleared_desktop_focus_keeps_all_folders_in_the_bounded_background_lane() {
+        let scheduler = Arc::new(IndexScheduler::new(SchedulerConfig::default()));
+        scheduler.set_foreground_folder(None);
+        let permit = scheduler.try_admit_folder_work(folder()).unwrap();
+        assert!(scheduler.try_admit_folder_work(folder()).is_none());
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn three_background_folders_take_round_robin_turns_without_starvation() {
+        let scheduler = IndexScheduler::new(SchedulerConfig {
+            idle_workers: 4,
+            active_workers: 1,
+        });
+        scheduler
+            .set_interaction_mode(InteractionMode::Active)
+            .await;
+        let foreground = folder();
+        let backgrounds = [folder(), folder(), folder()];
+        scheduler.set_foreground_folder(Some(foreground));
+        assert!(scheduler.try_admit_folder_enrichment(Some(foreground)));
+        for background in backgrounds {
+            assert!(!scheduler.try_admit_folder_enrichment(Some(background)));
+        }
+        scheduler.release_folder_enrichment(Some(foreground));
+        for expected in backgrounds {
+            // Foreground wins at most three admissions before a waiting
+            // background folder gets its next turn, even with one permit.
+            for _ in 0..2 {
+                assert!(scheduler.try_admit_folder_enrichment(Some(foreground)));
+                scheduler.release_folder_enrichment(Some(foreground));
+            }
+            assert!(!scheduler.try_admit_folder_enrichment(Some(foreground)));
+            for other in backgrounds.into_iter().filter(|folder| *folder != expected) {
+                assert!(!scheduler.try_admit_folder_enrichment(Some(other)));
+            }
+            assert!(scheduler.try_admit_folder_enrichment(Some(expected)));
+            scheduler.release_folder_enrichment(Some(expected));
+            assert!(scheduler.try_admit_folder_enrichment(Some(foreground)));
+            scheduler.release_folder_enrichment(Some(foreground));
+        }
+    }
 }
 
 #[derive(Default)]
@@ -137,6 +294,7 @@ impl IndexScheduler {
             active_enrichment: AtomicUsize::new(0),
             change_generation: AtomicUsize::new(0),
             wake: Notify::new(),
+            folders: std::sync::Mutex::new(FolderAdmission::default()),
             config,
         }
     }
@@ -378,6 +536,124 @@ impl IndexScheduler {
 
     pub(crate) fn release_enrichment(&self) {
         self.active_enrichment.fetch_sub(1, AtomicOrdering::AcqRel);
+    }
+
+    /// Desktop focus affects admission, never ownership of an existing scan.
+    /// Hosted callers leave focus unset and retain the shared global budget.
+    pub fn set_foreground_folder(&self, folder: Option<FolderKey>) {
+        let mut folders = self.folders.lock().expect("folder admission poisoned");
+        folders.desktop = true;
+        if folders.foreground != folder {
+            folders.foreground = folder;
+            folders.foreground_burst = 0;
+        }
+        self.notify_change();
+    }
+
+    pub(crate) fn try_admit_folder_enrichment(&self, folder: Option<FolderKey>) -> bool {
+        let Some(folder) = folder else {
+            return self.try_admit_enrichment();
+        };
+        let mut folders = self.folders.lock().expect("folder admission poisoned");
+        if !folders.waiting.contains(&folder) {
+            folders.waiting.push_back(folder);
+        }
+        if let Some(foreground) = folders.foreground {
+            let next_background = folders
+                .waiting
+                .iter()
+                .find(|key| **key != foreground)
+                .copied();
+            let active_background: usize = folders
+                .active
+                .iter()
+                .filter(|(key, _)| **key != foreground)
+                .map(|(_, count)| *count)
+                .sum();
+            if folder == foreground {
+                if next_background.is_some()
+                    && active_background == 0
+                    && folders.foreground_burst >= 3
+                {
+                    return false;
+                }
+            } else {
+                if active_background >= 1 || next_background != Some(folder) {
+                    return false;
+                }
+                if folders.waiting.contains(&foreground)
+                    && folders.foreground_burst < 3
+                    && (self.available_background_permits() <= 1
+                        || !folders.active.contains_key(&foreground))
+                {
+                    return false;
+                }
+            }
+        } else if folders.desktop
+            && (folders.active.values().sum::<usize>() >= 1
+                || folders.waiting.front() != Some(&folder))
+        {
+            return false;
+        }
+        if !self.try_admit_enrichment() {
+            return false;
+        }
+        folders.waiting.retain(|key| *key != folder);
+        *folders.active.entry(folder).or_default() += 1;
+        if folders.foreground == Some(folder) {
+            folders.foreground_burst += 1;
+        } else {
+            folders.foreground_burst = 0;
+        }
+        true
+    }
+
+    pub(crate) fn release_folder_enrichment(&self, folder: Option<FolderKey>) {
+        if let Some(folder) = folder {
+            let mut folders = self.folders.lock().expect("folder admission poisoned");
+            if let Some(count) = folders.active.get_mut(&folder) {
+                *count -= 1;
+                if *count == 0 {
+                    folders.active.remove(&folder);
+                }
+            }
+        }
+        self.release_enrichment();
+        self.notify_change();
+    }
+
+    pub fn try_admit_folder_work(self: &Arc<Self>, folder: FolderKey) -> Option<FolderWorkPermit> {
+        let priority_turn = {
+            let folders = self.folders.lock().expect("folder admission poisoned");
+            // Desktop folder admission already arbitrates foreground priority
+            // and bounded background turns. A second family-wide FIFO barrier
+            // would contradict that admission and can strand another folder.
+            folders.desktop
+        };
+        self.try_admit_folder_enrichment(Some(folder))
+            .then(|| FolderWorkPermit {
+                scheduler: self.clone(),
+                folder,
+                priority_turn,
+            })
+    }
+
+    pub fn folder_work_scope(self: &Arc<Self>, folder: FolderKey) -> FolderWorkScope {
+        FolderWorkScope {
+            scheduler: self.clone(),
+            folder,
+        }
+    }
+
+    pub(crate) fn finish_folder_enrichment(&self, folder: Option<FolderKey>) {
+        if let Some(folder) = folder {
+            self.folders
+                .lock()
+                .expect("folder admission poisoned")
+                .waiting
+                .retain(|key| *key != folder);
+        }
+        self.notify_change();
     }
 
     pub async fn cancel_below(&self, minimum: JobPriority) {

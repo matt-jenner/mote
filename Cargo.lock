@@ -1067,6 +1067,7 @@ dependencies = [
  "blake3",
  "chrono",
  "image",
+ "libc",
  "photo-cache",
  "photo-catalog",
  "photo-core",

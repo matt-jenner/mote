@@ -43,18 +43,36 @@ export const folderLabel = (entry: SavedFolder): string =>
 	entry.customLabel ?? entry.name;
 export const normalizeFolderLabel = (value: string | null): string | null =>
 	value?.trim() || null;
-const collator = new Intl.Collator(undefined, {
-	numeric: true,
-	sensitivity: "base",
-});
 const compare = (left: string, right: string) =>
 	left < right ? -1 : left > right ? 1 : 0;
+
+// Match desktop restoration independently of the host's locale. Labels use
+// lowercase Unicode scalar order with numeric ASCII runs; path and ID ties
+// use raw UTF-16 string order.
+function compareLabels(left: string, right: string): number {
+	const a = left.toLowerCase().match(/[0-9]+|[^0-9]/gu) ?? [];
+	const b = right.toLowerCase().match(/[0-9]+|[^0-9]/gu) ?? [];
+	for (let i = 0; i < Math.min(a.length, b.length); i++) {
+		const x = a[i] ?? "";
+		const y = b[i] ?? "";
+		if (/^[0-9]/u.test(x) && /^[0-9]/u.test(y)) {
+			const nx = x.replace(/^0+/u, "");
+			const ny = y.replace(/^0+/u, "");
+			const order = nx.length - ny.length || compare(nx, ny);
+			if (order) return order;
+		} else {
+			const order = (x.codePointAt(0) ?? 0) - (y.codePointAt(0) ?? 0);
+			if (order) return order;
+		}
+	}
+	return a.length - b.length;
+}
 export function sortSavedFolders(
 	entries: readonly SavedFolder[],
 ): SavedFolder[] {
 	return [...entries].sort(
 		(left, right) =>
-			collator.compare(folderLabel(left), folderLabel(right)) ||
+			compareLabels(folderLabel(left), folderLabel(right)) ||
 			compare(left.displayPath, right.displayPath) ||
 			compare(left.id, right.id),
 	);

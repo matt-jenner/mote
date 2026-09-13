@@ -18,7 +18,8 @@ pub use reconcile::{
 };
 pub use scanner::{Indexer, MetadataReader, ScanHandle, ScanRequest};
 pub use scheduler::{
-    CancellationToken, IndexJob, IndexScheduler, InteractionMode, JobPriority, SchedulerConfig,
+    CancellationToken, FolderWorkPermit, FolderWorkScope, IndexJob, IndexScheduler,
+    InteractionMode, JobPriority, SchedulerConfig,
 };
 use thiserror::Error;
 pub use watch::{ChangeHint, WatchService};

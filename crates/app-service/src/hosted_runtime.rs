@@ -76,6 +76,10 @@ pub(crate) struct SelectionRuntime {
     scan_cancel: Mutex<ScanControl>,
     pub(crate) scan_lifecycle: watch::Sender<ScanLifecycle>,
     pub(crate) coordinator: Arc<crate::derivative_coordinator::DerivativeCoordinator>,
+    pub(crate) desktop_controls: std::sync::OnceLock<DesktopDerivativeControls>,
+    pub(crate) desktop_scope: Mutex<GalleryScope>,
+    desktop_view_epoch: AtomicU64,
+    folder_removed: std::sync::atomic::AtomicBool,
     pub(crate) updates: broadcast::Sender<SequencedWallUpdate>,
     pub(crate) publication: Mutex<()>,
     pub(crate) history: Mutex<VecDeque<SequencedWallUpdate>>,
@@ -93,6 +97,11 @@ pub(crate) struct SelectionRuntime {
     pub(crate) cancel_attempt_test_hook: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
     pub(crate) lifecycle_publish_test_gate: Mutex<Option<LifecyclePublishTestGate>>,
+}
+
+pub(crate) struct DesktopDerivativeControls {
+    pub(crate) worker: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) collection: Arc<crate::service::CollectionDriverControl>,
 }
 
 #[derive(Clone)]
@@ -167,6 +176,10 @@ impl SelectionRuntime {
             )),
             scan_lifecycle,
             coordinator,
+            desktop_controls: std::sync::OnceLock::new(),
+            desktop_scope: Mutex::new(GalleryScope::IncludeSubfolders),
+            desktop_view_epoch: AtomicU64::new(0),
+            folder_removed: std::sync::atomic::AtomicBool::new(false),
             updates,
             publication: Mutex::new(()),
             history: Mutex::new(VecDeque::with_capacity(256)),
@@ -250,6 +263,23 @@ impl SelectionRuntime {
         reconciled_recovery_token: u64,
     ) -> Option<ScanAdmission> {
         self.admit_scan_from(recovery_token, reconciled_recovery_token, false)
+    }
+
+    pub(crate) fn prepare_desktop_refresh(&self, view_epoch: u64) -> bool {
+        let mut control = self.scan_cancel.lock().expect("scan control poisoned");
+        if self
+            .desktop_view_epoch
+            .fetch_max(view_epoch, Ordering::AcqRel)
+            >= view_epoch
+            || control.worker_owner.is_some()
+            || control.state != ScanLifecycle::Completed
+        {
+            return false;
+        }
+        control.state = ScanLifecycle::Idle;
+        self.settled.store(false, Ordering::Release);
+        self.scan_lifecycle.send_replace(ScanLifecycle::Idle);
+        true
     }
 
     pub(crate) fn admit_recovery_scan(
@@ -504,8 +534,17 @@ impl SelectionRuntime {
     }
 
     pub(crate) fn cancellation_requested(&self) -> bool {
+        if self.folder_removed.load(Ordering::Acquire) {
+            return true;
+        }
         let control = self.scan_cancel.lock().expect("scan control poisoned");
         control.cancel_requested || control.state == ScanLifecycle::Cancelled
+    }
+
+    pub(crate) fn cancel_folder_work(&self) {
+        self.folder_removed.store(true, Ordering::Release);
+        self.request_cancel();
+        self.coordinator.wake();
     }
 
     fn publish_locked(&self, update: WallUpdate) -> SequencedWallUpdate {

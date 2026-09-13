@@ -22,6 +22,17 @@ struct PhotoInventory {
     recursive: u64,
 }
 
+struct FolderAdmissionGuard {
+    scheduler: Arc<IndexScheduler>,
+    folder: Option<(LibraryId, FolderGroupId)>,
+}
+
+impl Drop for FolderAdmissionGuard {
+    fn drop(&mut self) {
+        self.scheduler.finish_folder_enrichment(self.folder);
+    }
+}
+
 pub trait MetadataReader: Send + Sync + 'static {
     fn read(
         &self,
@@ -125,6 +136,30 @@ impl<R: MetadataReader> Indexer<R> {
     }
 
     pub fn start(&self, request: ScanRequest) -> Result<ScanHandle, IndexError> {
+        self.start_with_discovery(request, discover_all)
+    }
+
+    fn start_with_discovery<F>(
+        &self,
+        request: ScanRequest,
+        discover: F,
+    ) -> Result<ScanHandle, IndexError>
+    where
+        F: FnOnce(
+                &Path,
+                &Path,
+                LibraryId,
+                Option<FolderGroupId>,
+                mpsc::Sender<DiscoveredAsset>,
+                watch::Receiver<bool>,
+                &FolderPolicyEngine,
+                &mpsc::Sender<IndexEvent>,
+                &AtomicU64,
+                &AtomicU64,
+            ) -> Result<(), IndexError>
+            + Send
+            + 'static,
+    {
         if !request.root.is_dir() {
             return Err(IndexError::RootUnavailable(request.root));
         }
@@ -149,8 +184,14 @@ impl<R: MetadataReader> Indexer<R> {
         let inventory_cancel = cancel_rx.clone();
         let library_id = request.library_id;
         let folder_group_id = request.folder_group_id;
+        let folder_key = folder_group_id.map(|group| (library_id, group));
+        let discovery_failures = Arc::new(AtomicU64::new(0));
+        let failed_photos = Arc::new(AtomicU64::new(0));
+        let discovery_events = events_tx.clone();
+        let discovery_failure_count = discovery_failures.clone();
+        let discovery_photo_failures = failed_photos.clone();
         let discovery = tokio::task::spawn_blocking(move || {
-            discover_all(
+            discover(
                 &discovery_root,
                 &library_root,
                 library_id,
@@ -158,12 +199,19 @@ impl<R: MetadataReader> Indexer<R> {
                 discovered_tx,
                 discovery_cancel,
                 &policy_engine,
+                &discovery_events,
+                &discovery_failure_count,
+                &discovery_photo_failures,
             )
         });
         let inventory = tokio::task::spawn_blocking(move || {
             count_photo_inventory(&inventory_root, &inventory_cancel)
         });
         let join = tokio::spawn(async move {
+            let _admission = FolderAdmissionGuard {
+                scheduler: scheduler.clone(),
+                folder: folder_key,
+            };
             let summary = Arc::new(Mutex::new(ScanSummary::default()));
             let progress = Arc::new((AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)));
             let inventory_total = Arc::new(AtomicU64::new(INVENTORY_TOTAL_UNKNOWN));
@@ -251,11 +299,12 @@ impl<R: MetadataReader> Indexer<R> {
                                 asset: item.asset.clone(),
                             })
                             .await;
-                        if !admit_enrichment(&cancel, &scheduler).await {
+                        if !admit_enrichment(&cancel, &scheduler, folder_key).await {
                             break;
                         }
                         let path = item.source_path.clone();
                         let shape_result = tokio::task::spawn_blocking(move || {
+                            check_asset_access(&path)?;
                             let shape = MediaProbe::shape(&path)?;
                             let orientation = EmbeddedExifReader::read(&path)
                                 .ok()
@@ -269,7 +318,7 @@ impl<R: MetadataReader> Indexer<R> {
                             ))
                         })
                         .await;
-                        scheduler.release_enrichment();
+                        scheduler.release_folder_enrichment(folder_key);
                         match shape_result {
                             Ok(Ok((width, height, orientation))) => {
                                 let _ = events
@@ -299,6 +348,8 @@ impl<R: MetadataReader> Indexer<R> {
                                 }
                             }
                             Ok(Err(w)) => {
+                                let inaccessible =
+                                    matches!(w.code, "source_missing" | "source_unreadable");
                                 summary.lock().await.failed += 1;
                                 let _ = events
                                     .send(IndexEvent::ShapeFallback {
@@ -333,6 +384,9 @@ impl<R: MetadataReader> Indexer<R> {
                                             .await;
                                     }
                                 }
+                                if inaccessible {
+                                    continue;
+                                }
                             }
                             Err(_) => {}
                         }
@@ -366,7 +420,7 @@ impl<R: MetadataReader> Indexer<R> {
                         }
                         let id = item.asset.id;
                         let counts_as_photo = item.asset.media_kind != MediaKind::Video;
-                        if !admit_enrichment(&cancel, &scheduler).await {
+                        if !admit_enrichment(&cancel, &scheduler, folder_key).await {
                             break;
                         }
                         let reader = reader.clone();
@@ -385,7 +439,7 @@ impl<R: MetadataReader> Indexer<R> {
                             },
                         };
                         let Some(result) = result else {
-                            scheduler.release_enrichment();
+                            scheduler.release_folder_enrichment(folder_key);
                             break;
                         };
                         match result {
@@ -452,7 +506,7 @@ impl<R: MetadataReader> Indexer<R> {
                             }
                             Err(_) => {}
                         }
-                        scheduler.release_enrichment();
+                        scheduler.release_folder_enrichment(folder_key);
                     }
                 }));
             }
@@ -472,13 +526,17 @@ impl<R: MetadataReader> Indexer<R> {
                 Err(error) => return Err(IndexError::TaskJoin(error.to_string())),
             }
             let _ = inventory_publisher.await;
+            summary.failed += discovery_failures.load(Ordering::Relaxed);
+            summary.discovered += discovery_failures.load(Ordering::Relaxed);
+            let discovered =
+                progress.0.load(Ordering::Relaxed) + failed_photos.load(Ordering::Relaxed);
             if !summary.cancelled {
                 validate_completed_inventory(
-                    progress.0.load(Ordering::Relaxed),
+                    discovered,
+                    failed_photos.load(Ordering::Relaxed),
                     known_inventory(&direct_inventory_total, &inventory_total),
                 )?;
             }
-            let discovered = progress.0.load(Ordering::Relaxed);
             let _ = events_tx
                 .send(IndexEvent::Progress(ScanProgress {
                     stage: ScanStage::Completed,
@@ -516,10 +574,14 @@ fn known_inventory(direct: &AtomicU64, recursive: &AtomicU64) -> Option<PhotoInv
 
 fn validate_completed_inventory(
     discovered: u64,
+    failed_photos: u64,
     inventory: Option<PhotoInventory>,
 ) -> Result<(), IndexError> {
+    // Independent walks may disagree about entries whose discovery metadata
+    // failed. Only those observed failures can explain a smaller inventory.
     if let Some(inventory) = inventory
-        && discovered != inventory.recursive
+        && (inventory.recursive < discovered.saturating_sub(failed_photos)
+            || inventory.recursive > discovered)
     {
         return Err(IndexError::InventoryMismatch {
             expected: inventory.recursive,
@@ -553,12 +615,16 @@ fn count_photo_inventory(
     Ok(Some(PhotoInventory { direct, recursive }))
 }
 
-async fn admit_enrichment(cancel: &watch::Receiver<bool>, scheduler: &IndexScheduler) -> bool {
+async fn admit_enrichment(
+    cancel: &watch::Receiver<bool>,
+    scheduler: &IndexScheduler,
+    folder: Option<(LibraryId, FolderGroupId)>,
+) -> bool {
     loop {
         if *cancel.borrow() {
             return false;
         }
-        if scheduler.try_admit_enrichment() {
+        if scheduler.try_admit_folder_enrichment(folder) {
             return true;
         }
         tokio::task::yield_now().await;
@@ -575,6 +641,7 @@ fn process_asset<R: MetadataReader>(
     reader: Arc<R>,
     item: DiscoveredAsset,
 ) -> Result<ProcessedAsset, MetadataReadWarning> {
+    check_asset_access(&item.source_path)?;
     let colour = MediaProbe::representative_rgb(&item.source_path);
     let metadata = reader.read(&item.source_path, item.sidecar_path.as_deref())?;
     Ok(ProcessedAsset {
@@ -582,6 +649,22 @@ fn process_asset<R: MetadataReader>(
         colour_warning: colour.err(),
         metadata,
     })
+}
+
+fn check_asset_access(path: &Path) -> Result<(), MetadataReadWarning> {
+    std::fs::File::open(path)
+        .and_then(|file| file.metadata())
+        .map(|_| ())
+        .map_err(source_access_warning)
+}
+
+fn source_access_warning(error: std::io::Error) -> MetadataReadWarning {
+    let code = match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => "source_missing",
+        std::io::ErrorKind::PermissionDenied => "source_unreadable",
+        _ => "source_check_failed",
+    };
+    MetadataReadWarning::new(code, error.to_string())
 }
 
 fn discover_all(
@@ -592,6 +675,9 @@ fn discover_all(
     sender: mpsc::Sender<DiscoveredAsset>,
     cancel: watch::Receiver<bool>,
     policy_engine: &FolderPolicyEngine,
+    events: &mpsc::Sender<IndexEvent>,
+    failures: &AtomicU64,
+    failed_photos: &AtomicU64,
 ) -> Result<(), IndexError> {
     let children = std::fs::read_dir(root)?
         .filter_map(Result::ok)
@@ -608,8 +694,15 @@ fn discover_all(
             continue;
         }
         let sidecar = sidecars.find(entry.path())?;
-        let Some(mut asset) =
-            discover_asset_with_sidecar(library_root, entry.path(), library_id, sidecar)?
+        let Some(mut asset) = discover_for_scan(
+            library_root,
+            entry.path(),
+            library_id,
+            sidecar,
+            events,
+            failures,
+            failed_photos,
+        )?
         else {
             continue;
         };
@@ -639,15 +732,199 @@ fn discover_all(
     Ok(())
 }
 
+fn discover_for_scan(
+    root: &Path,
+    path: &Path,
+    library: LibraryId,
+    sidecar: Option<PathBuf>,
+    events: &mpsc::Sender<IndexEvent>,
+    failures: &AtomicU64,
+    failed_photos: &AtomicU64,
+) -> Result<Option<DiscoveredAsset>, IndexError> {
+    match discover_asset_with_sidecar(root, path, library, sidecar) {
+        Err(IndexError::Io(error)) => {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| IndexError::PathOutsideRoot(path.to_owned()))?;
+            let relative = photo_domain::RelativePathKey::from_relative_path(relative)
+                .map_err(|e| IndexError::InvalidRelativePath(e.to_string()))?;
+            let warning = source_access_warning(error);
+            let _ = events.blocking_send(IndexEvent::Warning {
+                asset_id: Some(photo_domain::AssetId::for_path(library, &relative)),
+                code: warning.code,
+                message: warning.message,
+            });
+            failures.fetch_add(1, Ordering::Relaxed);
+            if MediaKind::from_path(path).is_some_and(|kind| kind != MediaKind::Video) {
+                failed_photos.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(None)
+        }
+        result => result,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PhotoInventory, validate_completed_inventory};
     use crate::{IndexError, IndexScheduler, InteractionMode, SchedulerConfig};
 
+    #[tokio::test]
+    async fn disappeared_discovery_joins_and_settles_surviving_assets() {
+        use crate::{CatalogWriter, DefaultMetadataReader, IndexEvent, Indexer, ScanRequest};
+        use photo_catalog::{Catalog, NewAsset, NewLibrary};
+        use photo_domain::{Availability, MediaKind, RelativePathKey};
+
+        let temp = tempfile::tempdir().unwrap();
+        image::RgbImage::new(8, 6)
+            .save(temp.path().join("survivor.jpg"))
+            .unwrap();
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let library = catalog
+            .add_library(&NewLibrary::configured("photos", temp.path()))
+            .unwrap();
+        let missing = NewAsset::minimal(
+            library.id,
+            RelativePathKey::from_relative_path(std::path::Path::new("vanished.jpg")).unwrap(),
+            "vanished.jpg",
+            MediaKind::Jpeg,
+            12,
+        );
+        catalog.upsert_asset(&missing).unwrap();
+        let generation = catalog.begin_generation(library.id).unwrap();
+        let indexer = Indexer::new(
+            DefaultMetadataReader,
+            photo_core::FolderPolicyEngine::new(Vec::new()).unwrap(),
+        );
+        let mut scan = indexer
+            .start_with_discovery(
+                ScanRequest::new(temp.path()).for_library(library.id),
+                |root,
+                 library_root,
+                 library_id,
+                 group,
+                 sender,
+                 cancel,
+                 policy,
+                 events,
+                 failures,
+                 photos| {
+                    // Discovery already observed this directory entry; its metadata lookup
+                    // now fails. The independent real inventory never sees the entry.
+                    assert!(
+                        super::discover_for_scan(
+                            library_root,
+                            &root.join("vanished.jpg"),
+                            library_id,
+                            None,
+                            events,
+                            failures,
+                            photos
+                        )?
+                        .is_none()
+                    );
+                    super::discover_all(
+                        root,
+                        library_root,
+                        library_id,
+                        group,
+                        sender,
+                        cancel,
+                        policy,
+                        events,
+                        failures,
+                        photos,
+                    )
+                },
+            )
+            .unwrap();
+        let mut completed = false;
+        while let Some(event) = scan.events.recv().await {
+            completed |= matches!(event, IndexEvent::Completed(_));
+            CatalogWriter::new(&mut catalog, library.id, generation)
+                .apply_batch(&[event])
+                .unwrap();
+        }
+        let summary = scan
+            .join()
+            .await
+            .expect("observed file disappearance must not abort completion");
+        assert!(completed);
+        assert_eq!(summary.discovered, 2);
+        assert_eq!(summary.failed, 1);
+        catalog.complete_generation(library.id, generation).unwrap();
+        let assets = catalog.assets(library.id).unwrap();
+        assert_eq!(assets.len(), 2);
+        assert_eq!(
+            catalog
+                .find_asset(missing.id)
+                .unwrap()
+                .unwrap()
+                .availability,
+            Availability::Missing
+        );
+        assert_eq!(
+            assets
+                .iter()
+                .find(|asset| asset.id != missing.id)
+                .unwrap()
+                .availability,
+            Availability::Available
+        );
+    }
+
+    #[test]
+    fn root_first_disappeared_file_does_not_abort_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = photo_domain::LibraryId::new();
+        let missing = temp.path().join("gone.jpg");
+        let (events, mut received) = tokio::sync::mpsc::channel(4);
+        let failures = std::sync::atomic::AtomicU64::new(0);
+        let photos = std::sync::atomic::AtomicU64::new(0);
+        let result = super::discover_for_scan(
+            temp.path(),
+            &missing,
+            library,
+            None,
+            &events,
+            &failures,
+            &photos,
+        );
+        assert!(
+            matches!(result, Ok(None)),
+            "a vanished file must be an asset outcome, not a scan error"
+        );
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            crate::IndexEvent::Warning {
+                asset_id: Some(_),
+                code: "source_missing",
+                ..
+            }
+        ));
+        assert_eq!(photos.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let readable = temp.path().join("next.jpg");
+        std::fs::write(&readable, b"photo").unwrap();
+        assert!(
+            super::discover_for_scan(
+                temp.path(),
+                &readable,
+                library,
+                None,
+                &events,
+                &failures,
+                &photos
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
     #[test]
     fn completion_rejects_a_partial_discovery_against_the_inventory() {
         let error = validate_completed_inventory(
             154,
+            0,
             Some(PhotoInventory {
                 direct: 2_092,
                 recursive: 2_092,

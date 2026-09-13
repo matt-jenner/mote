@@ -21,6 +21,24 @@ const entry = (
 });
 
 describe("saved folder labels", () => {
+	it("matches desktop ordering for duplicate and non-ASCII labels", () => {
+		const rows = (
+			[
+				["two", "Photos", "/photos/2"],
+				["ten", "Photos", "/photos/10"],
+				["accent10", "éclair 10", "/photos/e10"],
+				["accent2", "Éclair 2", "/photos/e2"],
+				["zebra", "Zebra", "/photos/z"],
+			] as const
+		).map(([id, name, displayPath]) => ({ ...entry(id, name), displayPath }));
+		expect(sortSavedFolders(rows).map((row) => row.id)).toEqual([
+			"ten",
+			"two",
+			"zebra",
+			"accent2",
+			"accent10",
+		]);
+	});
 	it("sorts custom or default labels naturally and leaves caller order intact", () => {
 		const rows = [
 			entry("a", "Z", "album 10"),

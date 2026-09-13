@@ -2,7 +2,6 @@ use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "server-internal-prevalidated-source")]
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
-#[cfg(any(test, debug_assertions))]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -441,12 +440,13 @@ pub struct FolderBreadcrumb {
 pub struct GalleryEngine {
     pub(crate) state: Arc<Mutex<ServiceState>>,
     pub(crate) scheduler: Arc<photo_indexer::IndexScheduler>,
-    pub(crate) runtimes: Arc<Mutex<HashMap<FolderGroupId, Weak<SelectionRuntime>>>>,
+    pub(crate) folder_jobs: Arc<crate::folder_jobs::FolderJobRegistry>,
     pub(crate) metadata_reader: ReaderAdapter,
     hosted_library_id: Option<LibraryId>,
     folder_access: crate::FolderAccessCoordinator,
     pub(crate) shared_coordinator:
         Option<Arc<crate::derivative_coordinator::DerivativeCoordinator>>,
+    desktop_coordinator_claimed: Arc<AtomicBool>,
     pub(crate) cache_root: PathBuf,
     cache_writer: CacheWriter,
     pub(crate) catalog_path: PathBuf,
@@ -693,6 +693,7 @@ impl GalleryEngine {
         let cache_root = config.cache_dir().to_owned();
         let cache_writer = CacheWriter::new(&cache_root)?;
         let catalog_path = config.catalog_path();
+        let scheduler = Arc::new(photo_indexer::IndexScheduler::new(Default::default()));
         Ok(Self {
             state: Arc::new(Mutex::new(ServiceState {
                 libraries,
@@ -704,12 +705,15 @@ impl GalleryEngine {
                 published_wall_cache_warning: None,
                 published_screen_cache_warning: None,
             })),
-            scheduler: Arc::new(photo_indexer::IndexScheduler::new(Default::default())),
-            runtimes: Arc::new(Mutex::new(HashMap::new())),
+            folder_jobs: Arc::new(crate::folder_jobs::FolderJobRegistry::new(
+                scheduler.clone(),
+            )),
+            scheduler,
             metadata_reader: ReaderAdapter::new(reader),
             hosted_library_id: Some(hosted_library_id),
             folder_access: crate::FolderAccessCoordinator::default(),
             shared_coordinator: None,
+            desktop_coordinator_claimed: Arc::new(AtomicBool::new(false)),
             cache_root,
             cache_writer,
             catalog_path,
@@ -775,12 +779,15 @@ impl GalleryEngine {
         let cache_writer = CacheWriter::new(&cache_root).expect("managed cache root exists");
         Self {
             state,
+            folder_jobs: Arc::new(crate::folder_jobs::FolderJobRegistry::new(
+                scheduler.clone(),
+            )),
             scheduler,
-            runtimes: Arc::new(Mutex::new(HashMap::new())),
             metadata_reader,
             hosted_library_id: None,
             folder_access: crate::FolderAccessCoordinator::default(),
             shared_coordinator: Some(shared_coordinator),
+            desktop_coordinator_claimed: Arc::new(AtomicBool::new(false)),
             cache_root,
             cache_writer,
             catalog_path,
@@ -840,7 +847,9 @@ impl GalleryEngine {
         // per-group coordinators and runtimes so cross-folder requests cannot
         // reset or be rejected by the active wall's selection epoch.
         Self {
-            runtimes: Arc::new(Mutex::new(HashMap::new())),
+            folder_jobs: Arc::new(crate::folder_jobs::FolderJobRegistry::new(
+                self.scheduler.clone(),
+            )),
             shared_coordinator: None,
             protected_groups,
             ..self.clone()
@@ -1068,70 +1077,102 @@ impl GalleryEngine {
     }
 
     fn runtime(&self, selection: &GallerySelection) -> Arc<SelectionRuntime> {
-        let mut runtimes = self.runtimes.lock().expect("runtime registry poisoned");
-        runtimes.retain(|_, runtime| runtime.strong_count() > 0);
-        if let Some(runtime) = runtimes.get(&selection.group_id).and_then(Weak::upgrade) {
-            if runtime.selection == *selection {
-                return runtime;
-            }
-            // The desktop adapter advances its epoch when the same folder is
-            // selected again. A retained bridge may still keep the previous
-            // runtime alive, but it must not leak that stale selection ID into
-            // the new desktop stream.
-            if self.shared_coordinator.is_some() {
-                runtime.request_cancel();
-                runtimes.remove(&selection.group_id);
-            } else {
-                return runtime;
-            }
+        self.folder_jobs
+            .ensure((selection.library_id, selection.group_id), || {
+                // Cache-only derivative requests inherit durable settlement. Explicit
+                // desktop scan admission below separately requests a refresh.
+                let (settled, reconciled_recovery_token) = {
+                    self.state
+                        .lock()
+                        .ok()
+                        .and_then(|state| {
+                            let catalog = state.libraries.catalog();
+                            let settled = catalog
+                                .has_completed_generation_for_group(
+                                    selection.library_id,
+                                    selection.group_id,
+                                )
+                                .ok()?;
+                            let reconciled = if self.hosted_library_id == Some(selection.library_id)
+                            {
+                                catalog
+                                    .folder_group_recovery_state(
+                                        selection.library_id,
+                                        selection.group_id,
+                                    )
+                                    .ok()?
+                                    .reconciled
+                            } else {
+                                0
+                            };
+                            Some((settled, reconciled))
+                        })
+                        .unwrap_or((false, 0))
+                };
+                let initial_coordinator = self.shared_coordinator.as_ref().filter(|_| {
+                    !self
+                        .desktop_coordinator_claimed
+                        .swap(true, Ordering::AcqRel)
+                });
+                let runtime = match initial_coordinator {
+                    Some(coordinator) => SelectionRuntime::new_with_coordinator_at_recovery(
+                        selection.clone(),
+                        coordinator.clone(),
+                        settled,
+                        reconciled_recovery_token,
+                    ),
+                    None => SelectionRuntime::new_at_recovery(
+                        selection.clone(),
+                        self.scheduler.clone(),
+                        settled,
+                        reconciled_recovery_token,
+                    ),
+                };
+                if self.shared_coordinator.is_some()
+                    && let Ok(state) = self.state.lock()
+                    && let Ok(stored) = state.libraries.catalog().load_app_state()
+                {
+                    *runtime
+                        .desktop_scope
+                        .lock()
+                        .expect("desktop scope poisoned") = stored.gallery_scope;
+                }
+                runtime
+            })
+    }
+
+    /// Captures ownership once. Selection changes can only affect publication,
+    /// never redirect this adapter's catalog reads or derivative commits.
+    pub(crate) fn bind_desktop_derivatives(
+        &self,
+        service: &crate::AppService,
+        selection: crate::service::SelectionToken,
+    ) -> Result<crate::AppService, AppServiceError> {
+        let runtime = self.runtime(&self.selection_from_token(selection)?);
+        if !self.folder_jobs.admits_binding(&runtime) {
+            return Err(AppServiceError::DerivativeUnavailable);
         }
-        // A desktop `start_scan` is an explicit refresh even when the
-        // previous generation is complete. Hosted `ensure_running` keeps its
-        // restart-idempotent catalog settlement semantics at epoch zero.
-        let (settled, reconciled_recovery_token) = if self.shared_coordinator.is_some()
-            && selection.epoch != 0
-        {
-            (false, 0)
-        } else {
-            self.state
-                .lock()
-                .ok()
-                .and_then(|state| {
-                    let catalog = state.libraries.catalog();
-                    let settled = catalog
-                        .has_completed_generation_for_group(
-                            selection.library_id,
-                            selection.group_id,
-                        )
-                        .ok()?;
-                    let reconciled = if self.hosted_library_id == Some(selection.library_id) {
-                        catalog
-                            .folder_group_recovery_state(selection.library_id, selection.group_id)
-                            .ok()?
-                            .reconciled
-                    } else {
-                        0
-                    };
-                    Some((settled, reconciled))
-                })
-                .unwrap_or((false, 0))
-        };
-        let runtime = match &self.shared_coordinator {
-            Some(coordinator) => SelectionRuntime::new_with_coordinator_at_recovery(
-                selection.clone(),
-                coordinator.clone(),
-                settled,
-                reconciled_recovery_token,
-            ),
-            None => SelectionRuntime::new_at_recovery(
-                selection.clone(),
-                self.scheduler.clone(),
-                settled,
-                reconciled_recovery_token,
-            ),
-        };
-        runtimes.insert(selection.group_id, Arc::downgrade(&runtime));
-        runtime
+        let controls = runtime.desktop_controls.get_or_init(|| {
+            let first = Arc::ptr_eq(&runtime.coordinator, &service.coordinator);
+            crate::hosted_runtime::DesktopDerivativeControls {
+                worker: if first {
+                    service.derivative_driver.clone()
+                } else {
+                    Arc::new(TokioMutex::new(()))
+                },
+                collection: if first {
+                    service.collection_driver.clone()
+                } else {
+                    Arc::new(crate::service::CollectionDriverControl::new())
+                },
+            }
+        });
+        let mut bound = service.clone();
+        bound.coordinator = runtime.coordinator.clone();
+        bound.derivative_driver = controls.worker.clone();
+        bound.collection_driver = controls.collection.clone();
+        bound.derivative_runtime = Some(runtime);
+        Ok(bound)
     }
 
     pub(crate) fn remove_runtime_if_dead(
@@ -1139,25 +1180,20 @@ impl GalleryEngine {
         group_id: FolderGroupId,
         runtime: &Arc<SelectionRuntime>,
     ) {
-        let mut runtimes = self.runtimes.lock().expect("runtime registry poisoned");
-        let remove = runtimes.get(&group_id).is_some_and(|weak| {
-            weak.upgrade()
-                .is_none_or(|current| Arc::ptr_eq(&current, runtime))
-        });
-        if remove && Arc::strong_count(runtime) <= 1 {
-            runtimes.remove(&group_id);
-        }
+        self.folder_jobs
+            .finish((runtime.selection.library_id, group_id), runtime);
     }
 
     /// Requests cancellation of the admitted scan for a desktop selection.
     /// The runtime remains responsible for draining and persisting any events
     /// already in flight; this only replaces the old AppService-owned sender.
     pub(crate) fn cancel_runtime_scan(&self, group_id: FolderGroupId) {
-        let runtime = self
-            .runtimes
-            .lock()
-            .ok()
-            .and_then(|runtimes| runtimes.get(&group_id).and_then(Weak::upgrade));
+        let runtime = self.folder_jobs.runtimes.lock().ok().and_then(|runtimes| {
+            runtimes
+                .iter()
+                .find(|(key, _)| key.1 == group_id)
+                .and_then(|(_, runtime)| Weak::upgrade(runtime))
+        });
         let Some(runtime) = runtime else {
             return;
         };
@@ -1174,7 +1210,17 @@ impl GalleryEngine {
         &self,
         selection: &GallerySelection,
     ) -> Result<(), AppServiceError> {
+        if self.folder_jobs.is_shutdown() {
+            return Ok(());
+        }
         let runtime = self.runtime(selection);
+        if self.shared_coordinator.is_some() && runtime.prepare_desktop_refresh(selection.epoch) {
+            runtime.coordinator.invalidate_background().await;
+            runtime
+                .coordinator
+                .reset_collection_for_scope(runtime.selection.token())
+                .await;
+        }
         runtime.begin_scan(self.clone()).await
     }
 
@@ -1558,7 +1604,7 @@ impl GalleryEngine {
             .await
             .map_err(|_| AppServiceError::DerivativeFailed)?;
             if let Some(key) = existing {
-                self.clear_hosted_derivative_warning(runtime, batch.selection.token(), asset.id)
+                self.clear_hosted_derivative_warning(runtime, runtime.selection.token(), asset.id)
                     .await;
                 runtime
                     .publish(WallUpdate::DerivativesReady {
@@ -1596,7 +1642,7 @@ impl GalleryEngine {
                 .to_owned()
             });
             let work_key = WorkKey {
-                selection: batch.selection.token(),
+                selection: runtime.selection.token(),
                 asset_id: asset.id,
                 class: batch.class,
                 cache_key: key.as_str().to_owned(),
@@ -3104,6 +3150,7 @@ impl GalleryEngine {
 
     pub(crate) async fn refresh_scheduler_interaction(&self) {
         let active = self
+            .folder_jobs
             .runtimes
             .lock()
             .ok()
@@ -3414,6 +3461,7 @@ impl GalleryEngine {
             let _publication = self.hosted_publication_fence.lock().await;
             let runtimes = {
                 let runtimes = self
+                    .folder_jobs
                     .runtimes
                     .lock()
                     .map_err(|_| AppServiceError::StatePoisoned)?;
@@ -3457,7 +3505,8 @@ impl GalleryEngine {
 
     #[doc(hidden)]
     pub fn runtime_count_for_test(&self) -> usize {
-        self.runtimes
+        self.folder_jobs
+            .runtimes
             .lock()
             .expect("runtime registry poisoned")
             .values()
@@ -3466,9 +3515,16 @@ impl GalleryEngine {
     }
 
     pub(crate) fn current_event_id(&self, selection: &GallerySelection) -> u64 {
-        self.runtime(selection)
-            .next_event_id
-            .load(Ordering::Acquire)
+        self.folder_jobs
+            .runtimes
+            .lock()
+            .ok()
+            .and_then(|runtimes| {
+                runtimes
+                    .get(&(selection.library_id, selection.group_id))
+                    .and_then(Weak::upgrade)
+            })
+            .map_or(0, |runtime| runtime.next_event_id.load(Ordering::Acquire))
     }
 
     #[cfg(debug_assertions)]
@@ -3481,11 +3537,15 @@ impl GalleryEngine {
         &self,
         selection: &GallerySelection,
     ) -> Option<tokio::sync::watch::Receiver<crate::hosted_runtime::ScanLifecycle>> {
-        self.runtimes
+        self.folder_jobs
+            .runtimes
             .lock()
             .ok()
-            .and_then(|runtimes| runtimes.get(&selection.group_id).and_then(Weak::upgrade))
-            .filter(|runtime| runtime.selection == *selection)
+            .and_then(|runtimes| {
+                runtimes
+                    .get(&(selection.library_id, selection.group_id))
+                    .and_then(Weak::upgrade)
+            })
             .map(|runtime| runtime.lifecycle_receiver())
     }
 
@@ -3709,6 +3769,25 @@ impl GalleryEngine {
             });
             if let Some(update) = progress_update {
                 updates.push(update);
+            }
+            for event in events {
+                if let IndexEvent::Warning {
+                    asset_id: Some(asset_id),
+                    code,
+                    ..
+                } = event
+                    && matches!(*code, "source_missing" | "source_unreadable")
+                {
+                    updates.push(WallUpdate::Warning {
+                        selection_id: runtime.selection.id().to_owned(),
+                        source_id: runtime.selection.library_id.as_uuid().to_string(),
+                        asset_id: Some(asset_id.as_uuid().to_string()),
+                        warning: crate::WallWarningState {
+                            code: (*code).to_owned(),
+                            retryable: true,
+                        },
+                    });
+                }
             }
             if let Ok(records) = state.libraries.catalog().wall_records_for_assets_scoped(
                 runtime.selection.group_id,

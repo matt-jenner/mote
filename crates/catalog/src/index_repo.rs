@@ -233,6 +233,34 @@ fn apply_record(
             apply_metadata(connection, metadata)
         }
         CatalogIndexRecord::Warning(warning) => {
+            if let (Some(asset_id), Some((library, generation))) = (warning.asset_id, generation) {
+                let availability = match warning.code.as_str() {
+                    "source_missing" => Some("missing"),
+                    "source_unreadable" => Some("unreadable"),
+                    _ => None,
+                };
+                if availability.is_some() || warning.code == "source_check_failed" {
+                    let updated = connection.execute(
+                        "UPDATE assets SET availability = COALESCE(?4, availability), last_seen_generation = ?3 WHERE id = ?1 AND library_id = ?2
+                         AND last_seen_generation <= ?3 AND EXISTS (
+                           SELECT 1 FROM scan_generations WHERE library_id = ?2 AND generation = ?3
+                           AND completed_at IS NULL AND source_was_online = 1
+                         )",
+                        params![asset_id.as_uuid().as_bytes(), library.as_uuid().as_bytes(), generation, availability],
+                    )?;
+                    if updated == 0 {
+                        return Ok(());
+                    }
+                    connection.execute(
+                        "INSERT INTO folder_group_assets (folder_group_id, asset_id, last_seen_generation)
+                         SELECT folder_group_id, ?1, ?3 FROM scan_generations
+                         WHERE library_id = ?2 AND generation = ?3 AND folder_group_id IS NOT NULL
+                         ON CONFLICT(folder_group_id, asset_id) DO UPDATE
+                         SET last_seen_generation = MAX(folder_group_assets.last_seen_generation, excluded.last_seen_generation)",
+                        params![asset_id.as_uuid().as_bytes(), library.as_uuid().as_bytes(), generation],
+                    )?;
+                }
+            }
             if let Some(asset_id) = warning.asset_id {
                 ensure_asset_library(connection, asset_id, generation)?;
             }
