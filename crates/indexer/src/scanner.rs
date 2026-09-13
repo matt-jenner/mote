@@ -22,6 +22,17 @@ struct PhotoInventory {
     recursive: u64,
 }
 
+struct FolderAdmissionGuard {
+    scheduler: Arc<IndexScheduler>,
+    folder: Option<(LibraryId, FolderGroupId)>,
+}
+
+impl Drop for FolderAdmissionGuard {
+    fn drop(&mut self) {
+        self.scheduler.finish_folder_enrichment(self.folder);
+    }
+}
+
 pub trait MetadataReader: Send + Sync + 'static {
     fn read(
         &self,
@@ -173,6 +184,7 @@ impl<R: MetadataReader> Indexer<R> {
         let inventory_cancel = cancel_rx.clone();
         let library_id = request.library_id;
         let folder_group_id = request.folder_group_id;
+        let folder_key = folder_group_id.map(|group| (library_id, group));
         let discovery_failures = Arc::new(AtomicU64::new(0));
         let failed_photos = Arc::new(AtomicU64::new(0));
         let discovery_events = events_tx.clone();
@@ -196,6 +208,10 @@ impl<R: MetadataReader> Indexer<R> {
             count_photo_inventory(&inventory_root, &inventory_cancel)
         });
         let join = tokio::spawn(async move {
+            let _admission = FolderAdmissionGuard {
+                scheduler: scheduler.clone(),
+                folder: folder_key,
+            };
             let summary = Arc::new(Mutex::new(ScanSummary::default()));
             let progress = Arc::new((AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)));
             let inventory_total = Arc::new(AtomicU64::new(INVENTORY_TOTAL_UNKNOWN));
@@ -283,7 +299,7 @@ impl<R: MetadataReader> Indexer<R> {
                                 asset: item.asset.clone(),
                             })
                             .await;
-                        if !admit_enrichment(&cancel, &scheduler).await {
+                        if !admit_enrichment(&cancel, &scheduler, folder_key).await {
                             break;
                         }
                         let path = item.source_path.clone();
@@ -302,7 +318,7 @@ impl<R: MetadataReader> Indexer<R> {
                             ))
                         })
                         .await;
-                        scheduler.release_enrichment();
+                        scheduler.release_folder_enrichment(folder_key);
                         match shape_result {
                             Ok(Ok((width, height, orientation))) => {
                                 let _ = events
@@ -404,7 +420,7 @@ impl<R: MetadataReader> Indexer<R> {
                         }
                         let id = item.asset.id;
                         let counts_as_photo = item.asset.media_kind != MediaKind::Video;
-                        if !admit_enrichment(&cancel, &scheduler).await {
+                        if !admit_enrichment(&cancel, &scheduler, folder_key).await {
                             break;
                         }
                         let reader = reader.clone();
@@ -423,7 +439,7 @@ impl<R: MetadataReader> Indexer<R> {
                             },
                         };
                         let Some(result) = result else {
-                            scheduler.release_enrichment();
+                            scheduler.release_folder_enrichment(folder_key);
                             break;
                         };
                         match result {
@@ -490,7 +506,7 @@ impl<R: MetadataReader> Indexer<R> {
                             }
                             Err(_) => {}
                         }
-                        scheduler.release_enrichment();
+                        scheduler.release_folder_enrichment(folder_key);
                     }
                 }));
             }
@@ -599,12 +615,16 @@ fn count_photo_inventory(
     Ok(Some(PhotoInventory { direct, recursive }))
 }
 
-async fn admit_enrichment(cancel: &watch::Receiver<bool>, scheduler: &IndexScheduler) -> bool {
+async fn admit_enrichment(
+    cancel: &watch::Receiver<bool>,
+    scheduler: &IndexScheduler,
+    folder: Option<(LibraryId, FolderGroupId)>,
+) -> bool {
     loop {
         if *cancel.borrow() {
             return false;
         }
-        if scheduler.try_admit_enrichment() {
+        if scheduler.try_admit_folder_enrichment(folder) {
             return true;
         }
         tokio::task::yield_now().await;

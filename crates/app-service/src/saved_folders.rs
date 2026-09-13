@@ -166,6 +166,7 @@ impl AppService {
             .is_ok_and(|path| path.as_os_str().is_empty());
         let reply = self.folder_access.check_with_root(target).await;
         let access = FolderAccess::from_reply(group.as_uuid().to_string(), &reply);
+        let mut inaccessible = None;
         let mut state = self.state()?;
         if state
             .libraries
@@ -190,11 +191,13 @@ impl AppService {
                     )
                 {
                     state.libraries.catalog_mut().mark_root_offline(library)?;
+                    inaccessible = Some(None);
                 } else {
                     state
                         .libraries
                         .catalog_mut()
                         .mark_group_offline(library, group)?;
+                    inaccessible = Some(Some(group));
                 }
                 if let Some(selection) = selection
                     && selection.library_id == library
@@ -220,6 +223,10 @@ impl AppService {
                 state.folder_revision += 1;
                 state.folder_status.insert(access.folder_id.clone(), access);
             }
+        }
+        drop(state);
+        if let Some(group) = inaccessible {
+            self.gallery.folder_jobs.cancel_inaccessible(library, group);
         }
         Ok(reply)
     }
@@ -373,21 +380,27 @@ impl AppService {
             .lock()
             .map_err(|_| AppServiceError::StatePoisoned)?;
         let mut state = self.state()?;
+        let removed_group = match state.libraries.catalog().find_saved_folder(id(entry)?)? {
+            Some(saved) => state
+                .libraries
+                .catalog()
+                .folder_group(saved.folder_group_id)?
+                .map(|group| (group.library_id, group.id)),
+            None => None,
+        };
         let active = state
             .libraries
             .catalog_mut()
             .remove_saved_folder(id(entry)?)?;
         state.folder_revision += 1;
-        let cancelled = if active {
+        if active {
             self.invalidate_folder_selection(&mut state)?;
-            state.active_scan.take()
-        } else {
-            None
-        };
+            state.active_scan = None;
+        }
         let bootstrap = Self::bootstrap_locked(&state)?;
         drop(state);
-        if let Some(scan) = cancelled {
-            self.gallery.cancel_runtime_scan(scan.selection.group_id);
+        if let Some(key) = removed_group {
+            self.gallery.folder_jobs.cancel_removed(key);
         }
         Ok(bootstrap)
     }
@@ -420,12 +433,10 @@ impl AppService {
         state.libraries.catalog_mut().set_active_selection(None)?;
         state.folder_revision += 1;
         self.invalidate_folder_selection(&mut state)?;
-        let cancelled = state.active_scan.take();
+        state.active_scan = None;
         let bootstrap = Self::bootstrap_locked(&state)?;
         drop(state);
-        if let Some(scan) = cancelled {
-            self.gallery.cancel_runtime_scan(scan.selection.group_id);
-        }
+        self.gallery.folder_jobs.set_foreground(None);
         Ok(bootstrap)
     }
 
@@ -520,7 +531,7 @@ impl AppService {
             if let Some(previous) = previous.filter(|old| *old != group.id) {
                 self.protected_groups.unprotect(previous)?;
             }
-            let old_scan = state.active_scan.take();
+            state.active_scan = None;
             state.selection_epoch = state.selection_epoch.wrapping_add(1).max(1);
             state.published_wall_cache_warning = None;
             state.published_screen_cache_warning = None;
@@ -530,12 +541,11 @@ impl AppService {
                 epoch: state.selection_epoch,
             };
             drop(state);
-            if let Some(old) = old_scan {
-                self.gallery.cancel_runtime_scan(old.selection.group_id);
-            }
             token
         };
-        self.coordinator.reset_selection(token).await;
+        self.gallery
+            .folder_jobs
+            .set_foreground(Some((token.library_id, token.group_id)));
         self.start_selected_scan(token).await?;
         Ok(Some(self.bootstrap()?))
     }

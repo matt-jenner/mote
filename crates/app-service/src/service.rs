@@ -436,6 +436,7 @@ pub struct AppService {
     pub(crate) scheduler: Arc<IndexScheduler>,
     #[allow(dead_code)]
     pub(crate) coordinator: Arc<crate::derivative_coordinator::DerivativeCoordinator>,
+    pub(crate) derivative_runtime: Option<Arc<crate::hosted_runtime::SelectionRuntime>>,
     pub(crate) updates: tokio::sync::broadcast::Sender<crate::WallUpdate>,
     pub(crate) catalog_path: PathBuf,
     pub(crate) cache_root: PathBuf,
@@ -596,6 +597,7 @@ impl AppService {
             state,
             scheduler,
             coordinator,
+            derivative_runtime: None,
             updates,
             catalog_path,
             cache_root,
@@ -852,7 +854,6 @@ impl AppService {
                 retry_after_ms: 0,
             },
         );
-        let cancelled_group = state.active_scan.map(|owner| owner.selection.group_id);
         state.active_scan = None;
         state.published_wall_cache_warning = None;
         state.published_screen_cache_warning = None;
@@ -870,15 +871,9 @@ impl AppService {
         };
         let bootstrap = Self::bootstrap_locked(&state)?;
         drop(state);
-        if let Some(group) = cancelled_group {
-            self.gallery.cancel_runtime_scan(group);
-        }
-        let coordinator = self.coordinator.clone();
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(async move {
-                coordinator.reset_selection(token).await;
-            });
-        }
+        self.gallery
+            .folder_jobs
+            .set_foreground(Some((token.library_id, token.group_id)));
         Ok((bootstrap, token))
     }
 
@@ -949,7 +944,9 @@ impl AppService {
             .catalog()
             .find_asset(asset_id)?
             .ok_or(AppServiceError::UnknownAsset)?;
-        if asset.library_id != selection.library_id || asset.folder_group_id != Some(group) {
+        if asset.library_id != selection.library_id
+            || !state.libraries.catalog().asset_is_member(group, asset_id)?
+        {
             return Err(AppServiceError::ForeignAsset);
         }
         let record = state
@@ -957,7 +954,11 @@ impl AppService {
             .catalog()
             .find_derivative(asset_id, kind, key)?
             .ok_or(AppServiceError::UnknownAsset)?;
-        if record.folder_group_id != group {
+        if !state
+            .libraries
+            .catalog()
+            .derivative_is_linked_to_group(record.id, group)?
+        {
             return Err(AppServiceError::ForeignAsset);
         }
         let relative_path = record.relative_cache_path.clone();
@@ -1006,7 +1007,11 @@ impl AppService {
     #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub async fn coordinator_test_snapshot(&self) -> crate::CoordinatorTestSnapshot {
-        self.coordinator.test_snapshot().await
+        self.derivative_context()
+            .unwrap_or_else(|_| self.clone())
+            .coordinator
+            .test_snapshot()
+            .await
     }
 
     pub fn update_appearance(
@@ -1033,6 +1038,7 @@ impl AppService {
             (changed, stored.active_selection.is_some())
         };
         if changed && has_selection {
+            let bound = self.derivative_context()?;
             let selection = self.active_selection_token()?;
             if let Ok(selection_value) = self.gallery.selection_from_token(selection) {
                 let _ = self
@@ -1045,10 +1051,20 @@ impl AppService {
                     )
                     .await?;
             }
-            self.coordinator.ensure_selection(selection).await;
-            self.coordinator.invalidate_background().await;
-            self.coordinator.reset_collection_for_scope(selection).await;
-            self.start_collection_driver(true, selection);
+            let runtime_selection = bound.active_selection_token()?;
+            if let Some(runtime) = &bound.derivative_runtime {
+                *runtime
+                    .desktop_scope
+                    .lock()
+                    .map_err(|_| AppServiceError::StatePoisoned)? = scope;
+            }
+            bound.coordinator.ensure_selection(runtime_selection).await;
+            bound.coordinator.invalidate_background().await;
+            bound
+                .coordinator
+                .reset_collection_for_scope(runtime_selection)
+                .await;
+            bound.start_collection_driver(true, runtime_selection);
         }
         let state = self.state()?;
         Self::bootstrap_locked(&state)
@@ -1601,7 +1617,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn cancelled_desktop_bridge_observes_terminal_lifecycle_and_drops_runtime() {
+    async fn removed_background_folder_bridge_observes_terminal_lifecycle_and_drops_runtime() {
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first");
         let second = temp.path().join("second");
@@ -1634,7 +1650,14 @@ mod tests {
         );
 
         let mut updates = service.subscribe_wall_updates();
+        let entry = service
+            .bootstrap()
+            .unwrap()
+            .saved_folders
+            .active_entry_id
+            .unwrap();
         service.select_recent(&second).unwrap();
+        service.remove_saved_folder(&entry).unwrap();
         let (released, changed) = &*reader_gate;
         *released.lock().unwrap() = true;
         changed.notify_all();

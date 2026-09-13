@@ -74,6 +74,23 @@ impl Catalog {
         Ok(removed == 1)
     }
 
+    pub fn asset_is_member(
+        &self,
+        group: FolderGroupId,
+        asset: AssetId,
+    ) -> Result<bool, CatalogError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM folder_group_assets m
+                JOIN folder_groups g ON g.id = m.folder_group_id
+                JOIN assets a ON a.id = m.asset_id AND a.library_id = g.library_id
+                WHERE m.folder_group_id = ?1 AND m.asset_id = ?2)",
+                params![group.as_uuid().as_bytes(), asset.as_uuid().as_bytes()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn derivative_has_other_group_links(
         &self,
         derivative: photo_domain::DerivativeId,
@@ -89,6 +106,18 @@ impl Catalog {
                 |row| row.get::<_, bool>(0),
             )
             .map_err(Into::into)
+    }
+
+    pub fn derivative_is_linked_to_group(
+        &self,
+        derivative: photo_domain::DerivativeId,
+        group: FolderGroupId,
+    ) -> Result<bool, CatalogError> {
+        self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM derivative_folder_groups WHERE derivative_id = ?1 AND folder_group_id = ?2)",
+            params![derivative.as_uuid().as_bytes(), group.as_uuid().as_bytes()],
+            |row| row.get(0),
+        ).map_err(Into::into)
     }
 
     pub fn finish_group_generation(

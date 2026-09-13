@@ -197,15 +197,38 @@ impl AppService {
                 crate::InteractionState::Active => InteractionMode::Active,
             })
             .await;
-        self.coordinator.wake();
+        let bound = self.derivative_context().unwrap_or_else(|_| self.clone());
+        bound.coordinator.wake();
         if state == crate::InteractionState::Idle {
-            self.start_derivative_driver();
+            bound.start_derivative_driver();
         }
-        let recent = self.coordinator.recent_ids().await;
-        self.schedule_screen_preview_prefetch(recent).await;
+        let recent = bound.coordinator.recent_ids().await;
+        bound.schedule_screen_preview_prefetch(recent).await;
     }
 
     pub async fn request_derivatives(
+        &self,
+        request: DerivativeRequest,
+    ) -> Result<(), AppServiceError> {
+        if request.asset_ids.len() > 250 {
+            return Err(AppServiceError::InvalidLimit);
+        }
+        if request.asset_ids.is_empty() {
+            let _ = self.updates.send(WallUpdate::DerivativesReady {
+                selection_id: self
+                    .active_selection_id()
+                    .unwrap_or_else(|| "selection-none".to_owned()),
+                derivatives: Vec::new(),
+                preview_counts: None,
+            });
+            return Ok(());
+        }
+        self.derivative_context()?
+            .request_derivatives_bound(request)
+            .await
+    }
+
+    async fn request_derivatives_bound(
         &self,
         request: DerivativeRequest,
     ) -> Result<(), AppServiceError> {
@@ -229,7 +252,7 @@ impl AppService {
         let ids = {
             let state = self.state()?;
             let catalog = state.libraries.catalog();
-            let stored = catalog.load_app_state()?;
+            let stored = self.derivative_app_state(catalog)?;
             let selected_folder = stored
                 .active_selection
                 .ok_or(AppServiceError::UnknownAsset)?
@@ -400,7 +423,7 @@ impl AppService {
         AppServiceError,
     > {
         let mut state = self.state()?;
-        let stored = state.libraries.catalog().load_app_state()?;
+        let stored = self.derivative_app_state(state.libraries.catalog())?;
         let selection = stored
             .active_selection
             .ok_or(AppServiceError::UnknownAsset)?;
@@ -416,7 +439,7 @@ impl AppService {
         let selection_token = SelectionToken {
             library_id: selection.library_id,
             group_id: group,
-            epoch: state.selection_epoch,
+            epoch: self.derivative_epoch(&state),
         };
         let completion_generation = self.coordinator.commit_completion_generation();
         let library = state
@@ -435,7 +458,7 @@ impl AppService {
                 .catalog()
                 .find_asset(id)?
                 .ok_or(AppServiceError::UnknownAsset)?;
-            if asset.folder_group_id != Some(group) {
+            if !state.libraries.catalog().asset_is_member(group, id)? {
                 return Err(AppServiceError::ForeignAsset);
             }
             if asset.media_kind != MediaKind::Video {
@@ -466,20 +489,16 @@ impl AppService {
             if class == DerivativeClass::ScreenPreview {
                 let wall_spec = derivative_spec(&asset, DerivativeClass::WallThumbnail);
                 let wall_key = DerivativeKey::compute(&wall_spec);
-                let wall_ready = prerequisite_records.iter().any(|record| {
-                    record.asset_id == id
-                        && record.folder_group_id == group
-                        && record.cache_key == wall_key.as_str()
-                });
+                let wall_ready = prerequisite_records
+                    .iter()
+                    .any(|record| record.asset_id == id && record.cache_key == wall_key.as_str());
                 if !wall_ready {
                     continue;
                 }
             }
-            let existing = records.iter().find(|record| {
-                record.asset_id == id
-                    && record.folder_group_id == group
-                    && record.cache_key == key.as_str()
-            });
+            let existing = records
+                .iter()
+                .find(|record| record.asset_id == id && record.cache_key == key.as_str());
             if existing.is_none()
                 && state
                     .libraries
@@ -491,6 +510,7 @@ impl AppService {
             }
             if let Some(existing) = existing {
                 let catalog = state.libraries.catalog_mut();
+                catalog.link_derivative_group(existing.id, group)?;
                 catalog.clear_terminal_derivative_failure(id, kind)?;
                 let _ = clear_terminal_warning_if_resolved(catalog, selection.library_id, id)?;
                 ready.push(reference(id, class, existing.cache_key.clone()));
@@ -504,9 +524,7 @@ impl AppService {
                     prerequisite_records
                         .iter()
                         .find(|record| {
-                            record.asset_id == id
-                                && record.folder_group_id == group
-                                && record.cache_key == screen_key.as_str()
+                            record.asset_id == id && record.cache_key == screen_key.as_str()
                         })
                         .map(|record| record.relative_cache_path.clone())
                 } else {
@@ -698,9 +716,49 @@ impl AppService {
     }
 
     async fn drive_derivative_worker(&self) {
+        let _scope = self.derivative_runtime.as_ref().map(|runtime| {
+            self.scheduler
+                .folder_work_scope((runtime.selection.library_id, runtime.selection.group_id))
+        });
         loop {
-            let Some(ticket) = self.coordinator.next_work().await else {
+            if self.coordinator.pending_job_count().await == 0 {
                 break;
+            }
+            let observed = self.scheduler.change_generation();
+            let observed_coordinator = self.coordinator.change_generation();
+            let permit = if let Some(runtime) = &self.derivative_runtime {
+                if runtime.cancellation_requested() {
+                    self.coordinator.abort_all_attempts().await;
+                    break;
+                }
+                match self.scheduler.try_admit_folder_work((
+                    runtime.selection.library_id,
+                    runtime.selection.group_id,
+                )) {
+                    Some(permit) => Some(permit),
+                    None => {
+                        self.scheduler.wait_for_change_since(observed).await;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let priority_turn = permit
+                .as_ref()
+                .is_some_and(|permit| permit.is_priority_turn());
+            let Some(ticket) = self
+                .coordinator
+                .next_work_for_folder_turn(priority_turn)
+                .await
+            else {
+                drop(permit);
+                let observed = self.scheduler.change_generation();
+                tokio::select! {
+                    _ = self.scheduler.wait_for_change_since(observed) => {}
+                    _ = self.coordinator.wait_for_change_since(observed_coordinator) => {}
+                }
+                continue;
             };
             let lane = self.coordinator.lane(ticket).await;
             let priority = crate::derivative_coordinator::scheduler_priority(lane);
@@ -1009,7 +1067,7 @@ impl AppService {
             DerivativeClass::WallThumbnail => {
                 let source = pending.source;
                 let cached_source = pending.cached_source.clone().or(self
-                    .cached_screen_preview_for_wall(id, group, &pending.spec)
+                    .cached_screen_preview_for_wall(id, &pending.spec)
                     .map_err(|error| GenerationFailure {
                         error,
                         permit: None,
@@ -1118,7 +1176,7 @@ impl AppService {
                         error: DerivativeWorkError::WorkerUnavailable,
                         permit: None,
                     })?
-                    .is_some_and(|record| record.folder_group_id == group);
+                    .is_some();
                 if !wall_ready {
                     return Err(GenerationFailure {
                         error: DerivativeWorkError::WallThumbnailRequired,
@@ -1238,10 +1296,8 @@ impl AppService {
         let state = self
             .state()
             .map_err(|_| DerivativeWorkError::WorkerUnavailable)?;
-        let stored = state
-            .libraries
-            .catalog()
-            .load_app_state()
+        let stored = self
+            .derivative_app_state(state.libraries.catalog())
             .map_err(|_| DerivativeWorkError::WorkerUnavailable)?;
         let selection = stored
             .active_selection
@@ -1256,7 +1312,7 @@ impl AppService {
             != (SelectionToken {
                 library_id: selection.library_id,
                 group_id: group,
-                epoch: state.selection_epoch,
+                epoch: self.derivative_epoch(&state),
             })
         {
             return Ok(None);
@@ -1267,7 +1323,13 @@ impl AppService {
             .find_asset(key.asset_id)
             .map_err(|_| DerivativeWorkError::WorkerUnavailable)?
             .ok_or(DerivativeWorkError::WorkerUnavailable)?;
-        if asset.folder_group_id != Some(group) || asset.media_kind == MediaKind::Video {
+        if !state
+            .libraries
+            .catalog()
+            .asset_is_member(group, key.asset_id)
+            .map_err(|_| DerivativeWorkError::WorkerUnavailable)?
+            || asset.media_kind == MediaKind::Video
+        {
             return Ok(None);
         }
         if asset.availability != key.availability {
@@ -1303,7 +1365,7 @@ impl AppService {
                     screen_key.as_str(),
                 )
                 .map_err(|_| DerivativeWorkError::WorkerUnavailable)?
-                .filter(|record| record.folder_group_id == group && record.asset_id == key.asset_id)
+                .filter(|record| record.asset_id == key.asset_id)
                 .map(|record| record.relative_cache_path)
         } else {
             None
@@ -1327,7 +1389,6 @@ impl AppService {
     fn cached_screen_preview_for_wall(
         &self,
         asset_id: AssetId,
-        group: FolderGroupId,
         wall_spec: &DerivativeSpec,
     ) -> Result<Option<PathBuf>, DerivativeWorkError> {
         let screen_spec = screen_spec_from(wall_spec);
@@ -1344,7 +1405,7 @@ impl AppService {
             .map_err(|_| DerivativeWorkError::WorkerUnavailable)
             .map(|record| {
                 record
-                    .filter(|record| record.folder_group_id == group)
+                    .filter(|record| record.asset_id == asset_id)
                     .map(|record| record.relative_cache_path)
             })
     }
@@ -1779,8 +1840,9 @@ impl AppService {
     }
 
     pub(crate) fn wake_derivative_workers(&self) {
-        self.coordinator.wake();
-        self.start_derivative_driver();
+        let bound = self.derivative_context().unwrap_or_else(|_| self.clone());
+        bound.coordinator.wake();
+        bound.start_derivative_driver();
     }
 
     async fn schedule_screen_preview_prefetch(&self, recent: Vec<AssetId>) {
@@ -1793,14 +1855,17 @@ impl AppService {
         recent: Vec<AssetId>,
         full_group: bool,
     ) {
-        let Ok(selection) = self.active_selection_token() else {
+        let Ok(bound) = self.derivative_context() else {
             return;
         };
-        self.coordinator.ensure_selection(selection).await;
+        let Ok(selection) = bound.active_selection_token() else {
+            return;
+        };
+        bound.coordinator.ensure_selection(selection).await;
         for id in recent.iter().copied() {
-            self.coordinator.note_recent(id).await;
+            bound.coordinator.note_recent(id).await;
         }
-        self.start_collection_driver(full_group, selection);
+        bound.start_collection_driver(full_group, selection);
     }
 
     pub(crate) fn start_collection_driver(&self, full_group: bool, selection: SelectionToken) {
@@ -1997,7 +2062,11 @@ impl AppService {
                         .ok()
                         .flatten()
                         .is_some_and(|asset| {
-                            asset.folder_group_id == Some(selection.group_id)
+                            state
+                                .libraries
+                                .catalog()
+                                .asset_is_member(selection.group_id, asset.id)
+                                .unwrap_or(false)
                                 && asset.media_kind != MediaKind::Video
                         })
                 })
@@ -2344,7 +2413,7 @@ impl AppService {
                     derivative_kind_name(DerivativeClass::ScreenPreview),
                     key.as_str(),
                 )?
-                .is_some_and(|record| record.folder_group_id == work.group)
+                .is_some()
             {
                 continue;
             }
@@ -2381,7 +2450,10 @@ impl AppService {
             let Some(asset) = state.libraries.catalog().find_asset(asset_id)? else {
                 return Ok(false);
             };
-            if asset.folder_group_id != Some(selection.group_id)
+            if !state
+                .libraries
+                .catalog()
+                .asset_is_member(selection.group_id, asset.id)?
                 || asset.media_kind == MediaKind::Video
             {
                 return Ok(true);
@@ -2438,7 +2510,11 @@ impl AppService {
                     .ok()
                     .flatten()
                     .filter(|asset| {
-                        asset.folder_group_id == Some(selection.group_id)
+                        state
+                            .libraries
+                            .catalog()
+                            .asset_is_member(selection.group_id, asset.id)
+                            .unwrap_or(false)
                             && asset.media_kind != MediaKind::Video
                             && asset.availability == availability
                     })
@@ -2452,10 +2528,20 @@ impl AppService {
 
     async fn preview_work_can_continue(&self, selection: SelectionToken) -> bool {
         if !self.selection_is_active(selection)
-            || self
-                .state()
-                .map(|state| state.active_scan.is_some())
-                .unwrap_or(true)
+            || self.derivative_runtime.as_ref().map_or_else(
+                || {
+                    self.state()
+                        .map(|state| state.active_scan.is_some())
+                        .unwrap_or(true)
+                },
+                |runtime| {
+                    matches!(
+                        *runtime.scan_lifecycle.borrow(),
+                        crate::hosted_runtime::ScanLifecycle::Starting
+                            | crate::hosted_runtime::ScanLifecycle::Running
+                    )
+                },
+            )
             || self.scheduler.available_background_permits() <= 1
         {
             return false;
@@ -2476,9 +2562,7 @@ impl AppService {
         expected_availability: Availability,
     ) -> bool {
         let result = self.state().and_then(|mut state| {
-            if state.selection_epoch != selection.epoch
-                || state.protected_group != Some(selection.group_id)
-            {
+            if !self.derivative_selection_matches(&state, selection) {
                 return Ok(false);
             }
             let asset = state
@@ -2486,7 +2570,7 @@ impl AppService {
                 .catalog()
                 .find_asset(asset_id)?
                 .filter(|asset| {
-                    asset.folder_group_id == Some(selection.group_id)
+                    state.libraries.catalog().asset_is_member(selection.group_id, asset.id).unwrap_or(false)
                         && asset.media_kind != MediaKind::Video
                 });
             let Some(asset) = asset else {
@@ -2530,7 +2614,7 @@ impl AppService {
                 },
             )?;
             if inserted {
-                let _ = self.updates.send(WallUpdate::Warning {
+                let _ = self.publish_derivative_update(&state, selection, WallUpdate::Warning {
                     selection_id: selection.selection_id(),
                     source_id: selection.library_id.as_uuid().hyphenated().to_string(),
                     asset_id: Some(asset_id.as_uuid().hyphenated().to_string()),
@@ -2626,7 +2710,7 @@ impl AppService {
         AppServiceError,
     > {
         let state = self.state()?;
-        let stored = state.libraries.catalog().load_app_state()?;
+        let stored = self.derivative_app_state(state.libraries.catalog())?;
         let selection = stored
             .active_selection
             .ok_or(AppServiceError::UnknownAsset)?;
@@ -2667,7 +2751,7 @@ impl AppService {
             SelectionToken {
                 library_id: selection.library_id,
                 group_id: group,
-                epoch: state.selection_epoch,
+                epoch: self.derivative_epoch(&state),
             },
             items,
             page.next,
@@ -2675,6 +2759,9 @@ impl AppService {
     }
 
     pub(crate) fn active_selection_token(&self) -> Result<SelectionToken, AppServiceError> {
+        if let Some(runtime) = &self.derivative_runtime {
+            return Ok(runtime.selection.token());
+        }
         let state = self.state()?;
         let selection = state
             .libraries
@@ -2695,12 +2782,86 @@ impl AppService {
     }
 
     fn selection_is_active(&self, selection: SelectionToken) -> bool {
+        if let Some(runtime) = &self.derivative_runtime {
+            return runtime.selection.token() == selection && !runtime.cancellation_requested();
+        }
         self.state()
             .map(|state| {
                 state.selection_epoch == selection.epoch
                     && state.protected_group == Some(selection.group_id)
             })
             .unwrap_or(false)
+    }
+
+    pub(crate) fn derivative_context(&self) -> Result<Self, AppServiceError> {
+        if self.derivative_runtime.is_some() {
+            return Ok(self.clone());
+        }
+        self.gallery
+            .bind_desktop_derivatives(self, self.active_selection_token()?)
+    }
+
+    fn derivative_app_state(
+        &self,
+        catalog: &Catalog,
+    ) -> Result<photo_catalog::AppStateRecord, photo_catalog::CatalogError> {
+        let mut stored = catalog.load_app_state()?;
+        if let Some(runtime) = &self.derivative_runtime {
+            stored.active_selection = Some(photo_catalog::StoredSourceSelection {
+                library_id: runtime.selection.library_id,
+                relative_folder: runtime.selection.relative_folder.clone(),
+            });
+            stored.gallery_scope = *runtime
+                .desktop_scope
+                .lock()
+                .expect("desktop scope poisoned");
+        }
+        Ok(stored)
+    }
+
+    fn derivative_epoch(&self, state: &crate::service::ServiceState) -> u64 {
+        self.derivative_runtime
+            .as_ref()
+            .map_or(state.selection_epoch, |runtime| runtime.selection.epoch)
+    }
+
+    fn derivative_selection_matches(
+        &self,
+        state: &crate::service::ServiceState,
+        selection: SelectionToken,
+    ) -> bool {
+        self.derivative_runtime.as_ref().map_or_else(
+            || {
+                state.selection_epoch == selection.epoch
+                    && state.protected_group == Some(selection.group_id)
+            },
+            |runtime| runtime.selection.token() == selection && !runtime.cancellation_requested(),
+        )
+    }
+
+    fn publish_derivative_update(
+        &self,
+        state: &crate::service::ServiceState,
+        selection: SelectionToken,
+        mut update: WallUpdate,
+    ) -> bool {
+        if state.protected_group != Some(selection.group_id)
+            || (self.derivative_runtime.is_none() && state.selection_epoch != selection.epoch)
+        {
+            return false;
+        }
+        let current = SelectionToken {
+            epoch: state.selection_epoch,
+            ..selection
+        }
+        .selection_id();
+        match &mut update {
+            WallUpdate::Warning { selection_id, .. }
+            | WallUpdate::WarningCleared { selection_id, .. }
+            | WallUpdate::DerivativesReady { selection_id, .. } => *selection_id = current,
+            _ => return false,
+        }
+        self.updates.send(update).is_ok()
     }
 
     fn publish_derivatives_if_active(
@@ -2711,8 +2872,8 @@ impl AppService {
         let Ok(state) = self.state.lock() else {
             return false;
         };
-        if state.selection_epoch != selection.epoch
-            || state.protected_group != Some(selection.group_id)
+        if state.protected_group != Some(selection.group_id)
+            || (self.derivative_runtime.is_none() && state.selection_epoch != selection.epoch)
         {
             return false;
         }
@@ -2733,7 +2894,11 @@ impl AppService {
             });
         let publication_started = std::time::Instant::now();
         let result = self.updates.send(WallUpdate::DerivativesReady {
-            selection_id: selection.selection_id(),
+            selection_id: SelectionToken {
+                epoch: state.selection_epoch,
+                ..selection
+            }
+            .selection_id(),
             derivatives,
             preview_counts,
         });
@@ -2767,9 +2932,7 @@ impl AppService {
             retryable: true,
         };
         let _ = self.state().and_then(|mut state| {
-            if state.selection_epoch != selection.epoch
-                || state.protected_group != Some(selection.group_id)
-            {
+            if !self.derivative_selection_matches(&state, selection) {
                 return Ok(());
             }
             let inserted = state.libraries.catalog_mut().record_warning_once(
@@ -2782,12 +2945,16 @@ impl AppService {
                 },
             )?;
             if inserted {
-                let _ = self.updates.send(WallUpdate::Warning {
-                    selection_id: selection.selection_id(),
-                    source_id: selection.library_id.as_uuid().hyphenated().to_string(),
-                    asset_id: Some(asset_id.as_uuid().hyphenated().to_string()),
-                    warning,
-                });
+                let _ = self.publish_derivative_update(
+                    &state,
+                    selection,
+                    WallUpdate::Warning {
+                        selection_id: selection.selection_id(),
+                        source_id: selection.library_id.as_uuid().hyphenated().to_string(),
+                        asset_id: Some(asset_id.as_uuid().hyphenated().to_string()),
+                        warning,
+                    },
+                );
             }
             Ok(())
         });
@@ -2800,9 +2967,7 @@ impl AppService {
             retryable: true,
         };
         let _ = self.state().and_then(|mut state| {
-            if state.selection_epoch != selection.epoch
-                || state.protected_group != Some(selection.group_id)
-            {
+            if !self.derivative_selection_matches(&state, selection) {
                 return Ok(());
             }
             let should_publish = match class {
@@ -2822,12 +2987,16 @@ impl AppService {
                         message: message.to_owned(),
                     },
                 )?;
-                let _ = self.updates.send(WallUpdate::Warning {
-                    selection_id: selection.selection_id(),
-                    source_id: selection.library_id.as_uuid().hyphenated().to_string(),
-                    asset_id: None,
-                    warning,
-                });
+                let _ = self.publish_derivative_update(
+                    &state,
+                    selection,
+                    WallUpdate::Warning {
+                        selection_id: selection.selection_id(),
+                        source_id: selection.library_id.as_uuid().hyphenated().to_string(),
+                        asset_id: None,
+                        warning,
+                    },
+                );
                 match class {
                     DerivativeClass::WallThumbnail => {
                         state.published_wall_cache_warning = Some(selection)
@@ -2849,9 +3018,7 @@ impl AppService {
     ) {
         let (catalog_code, public_code, _) = cache_warning_identity(class);
         let _ = self.state().and_then(|mut state| {
-            if state.selection_epoch != selection.epoch
-                || state.protected_group != Some(selection.group_id)
-            {
+            if !self.derivative_selection_matches(&state, selection) {
                 return Ok(());
             }
             let asset_warning_removed = state.libraries.catalog_mut().clear_warning(
@@ -2882,12 +3049,16 @@ impl AppService {
             let source_id = selection.library_id.as_uuid().hyphenated().to_string();
             if !has_current_terminal_failure && asset_warning_removed + terminal_warning_removed > 0
             {
-                let _ = self.updates.send(WallUpdate::WarningCleared {
-                    selection_id: selection.selection_id(),
-                    source_id: source_id.clone(),
-                    asset_id: Some(asset_id.as_uuid().hyphenated().to_string()),
-                    code: "derivativeUnavailable".to_owned(),
-                });
+                let _ = self.publish_derivative_update(
+                    &state,
+                    selection,
+                    WallUpdate::WarningCleared {
+                        selection_id: selection.selection_id(),
+                        source_id: source_id.clone(),
+                        asset_id: Some(asset_id.as_uuid().hyphenated().to_string()),
+                        code: "derivativeUnavailable".to_owned(),
+                    },
+                );
             }
             if cache_warning_removed > 0 {
                 match class {
@@ -2898,12 +3069,16 @@ impl AppService {
                         state.published_screen_cache_warning = None;
                     }
                 }
-                let _ = self.updates.send(WallUpdate::WarningCleared {
-                    selection_id: selection.selection_id(),
-                    source_id,
-                    asset_id: None,
-                    code: public_code.to_owned(),
-                });
+                let _ = self.publish_derivative_update(
+                    &state,
+                    selection,
+                    WallUpdate::WarningCleared {
+                        selection_id: selection.selection_id(),
+                        source_id,
+                        asset_id: None,
+                        code: public_code.to_owned(),
+                    },
+                );
             }
             Ok(())
         });
@@ -2998,7 +3173,7 @@ fn validate_requested_assets(
         let asset = catalog
             .find_asset(*id)?
             .ok_or(AppServiceError::UnknownAsset)?;
-        if asset.folder_group_id != Some(group) {
+        if !catalog.asset_is_member(group, *id)? {
             return Err(AppServiceError::ForeignAsset);
         }
         if asset.media_kind == MediaKind::Video {

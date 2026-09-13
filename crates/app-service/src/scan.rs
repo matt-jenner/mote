@@ -35,6 +35,9 @@ impl AppService {
                 self.clear_desktop_scan(selection_token);
                 return Ok(());
             }
+            self.gallery
+                .folder_jobs
+                .set_foreground(Some((selection_token.library_id, selection_token.group_id)));
             let scope = self
                 .state()
                 .ok()
@@ -76,7 +79,6 @@ impl AppService {
             tokio::task::yield_now().await;
             while let Some(event) = subscription.recv().await {
                 let update = event.update;
-                let settled = matches!(&update, WallUpdate::MetadataSettled { .. });
                 let terminal = matches!(
                     &update,
                     WallUpdate::MetadataSettled { .. } | WallUpdate::SourceUnavailable { .. }
@@ -87,11 +89,6 @@ impl AppService {
                 if terminal {
                     service.clear_desktop_scan(selection_token);
                     service.coordinator.wake();
-                }
-                if settled {
-                    service.prefetch_screen_previews(Vec::new()).await;
-                    #[cfg(test)]
-                    service.notify_scan_completion_wake_test_hook(selection_token);
                 }
                 if terminal {
                     break;
@@ -118,6 +115,9 @@ impl AppService {
                 .desktop_bridges
                 .lock()
                 .expect("desktop bridge registry poisoned");
+            for (_, old) in bridges.drain() {
+                old.abort.abort();
+            }
             bridges.insert(
                 selection_token,
                 crate::service::DesktopBridgeEntry {
@@ -202,7 +202,7 @@ impl AppService {
         &self,
         selection: SelectionToken,
         bridge_id: u64,
-        update: WallUpdate,
+        mut update: WallUpdate,
     ) -> bool {
         let Ok(_transition) = self.selection_transition.lock() else {
             return false;
@@ -217,6 +217,18 @@ impl AppService {
         }
         if !self.desktop_selection_is_current_locked(selection) {
             return false;
+        }
+        match &mut update {
+            WallUpdate::CatalogBatch { selection_id, .. }
+            | WallUpdate::DerivativesReady { selection_id, .. }
+            | WallUpdate::MetadataSettled { selection_id, .. }
+            | WallUpdate::Progress { selection_id, .. }
+            | WallUpdate::SourceUnavailable { selection_id, .. }
+            | WallUpdate::Warning { selection_id, .. }
+            | WallUpdate::WarningCleared { selection_id, .. }
+            | WallUpdate::ResyncRequired { selection_id } => {
+                *selection_id = selection.selection_id();
+            }
         }
         let _ = self.updates.send(update);
         true
@@ -238,14 +250,28 @@ impl AppService {
         selection: crate::GallerySelection,
     ) {
         let service = self.clone();
+        // Keep the runtime alive across scan settlement and collection-driver
+        // admission, even after the old view bridge has been disconnected.
+        let bound = self
+            .gallery
+            .bind_desktop_derivatives(self, selection_token)
+            .ok();
         tokio::spawn(async move {
             loop {
                 let Some(mut lifecycle) = service.gallery.runtime_scan_state(&selection) else {
                     service.clear_desktop_scan(selection_token);
                     return;
                 };
-                if lifecycle.borrow().is_terminal() {
+                let terminal = *lifecycle.borrow();
+                if terminal.is_terminal() {
                     service.clear_desktop_scan(selection_token);
+                    if terminal == crate::hosted_runtime::ScanLifecycle::Completed {
+                        if let Some(bound) = &bound {
+                            bound.prefetch_screen_previews(Vec::new()).await;
+                        }
+                        #[cfg(test)]
+                        service.notify_scan_completion_wake_test_hook(selection_token);
+                    }
                     return;
                 }
                 if lifecycle.changed().await.is_err() {

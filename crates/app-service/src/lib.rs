@@ -3,6 +3,7 @@ pub(crate) mod derivative_coordinator;
 mod derivatives;
 mod dto;
 mod folder_access;
+mod folder_jobs;
 mod gallery;
 mod hosted_runtime;
 mod original_copy;
