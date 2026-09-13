@@ -230,7 +230,9 @@ describe("open and return shell", () => {
 					.getByText("Iceland 2025"),
 			)
 			.toBeVisible();
-		await expect.element(screen.getByText("Folder ready")).toBeVisible();
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("Indexing");
 	});
 
 	it("presents the approved Mote identity in the empty library", async () => {

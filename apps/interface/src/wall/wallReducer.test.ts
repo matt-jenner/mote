@@ -818,7 +818,7 @@ describe("wallReducer", () => {
 		expect(replayed.items[0]?.availability).toBe("rootOffline");
 	});
 
-	it("merges idempotently, refines in place, and resets once at settlement", () => {
+	it("merges idempotently, refines in place, and settles without reordering", () => {
 		const provisional = reduce(initialWallState, {
 			type: "catalogBatch",
 			assets: [
@@ -854,7 +854,7 @@ describe("wallReducer", () => {
 			requestCursor: null,
 			requestId: "settle-1",
 		});
-		expect(settled.items.map((item) => item.id)).toEqual(["a", "b"]);
+		expect(settled.items.map((item) => item.id)).toEqual(["b", "a"]);
 		const repeatedRequest = reduce(settled, {
 			type: "pageRequestStarted",
 			requestId: "settle-2",
@@ -877,11 +877,11 @@ describe("wallReducer", () => {
 			direction: "newestFirst",
 		});
 		expect(reversed).toMatchObject({
-			items: refined.items,
 			cursor: null,
 			scrollEpoch: settled.scrollEpoch + 1,
 			direction: "newestFirst",
 		});
+		expect(reversed.items).toEqual(refined.items);
 	});
 
 	it("keeps the first provisional order for duplicate IDs and merges only changed fields", () => {
@@ -970,7 +970,7 @@ describe("wallReducer", () => {
 		expect(terminalPage.items.map((item) => item.id)).toEqual(["a", "b"]);
 	});
 
-	it("atomically settles the ordered first page and replaces its provisional cursor", () => {
+	it("settles the ordered first page without removing a loaded provisional item", () => {
 		const provisionalRequest = reduce(initialWallState, {
 			type: "pageRequestStarted",
 			requestId: "provisional",
@@ -1001,12 +1001,107 @@ describe("wallReducer", () => {
 			requestId: "settled",
 		});
 
-		expect(provisional.items.map((item) => item.id)).toEqual(["b", "a"]);
-		expect(provisional.cursor).toBe("settled-next");
+		expect(provisional.items.map((item) => item.id)).toEqual([
+			"provisional",
+			"b",
+			"a",
+		]);
+		expect(provisional.cursor).toBe("provisional-next");
 		expect(provisional.pagesExhausted).toBe(false);
 		expect(provisional.scanComplete).toBe(true);
 		expect(provisional.orderState).toBe("settled");
 		expect(provisional.settledGeneration).toBe(1);
+	});
+
+	it("patches settled metadata without dropping loaded pages or regressing pagination", () => {
+		const loaded = Array.from({ length: 150 }, (_, index) => ({
+			...wallAsset(`asset-${index}`, 1, index + 1),
+			displayName: `Provisional ${index}`,
+		}));
+		const loadedIds = loaded.map(({ id }) => id);
+		const current = {
+			...activeState(),
+			items: loaded,
+			cursor: null,
+			pagesExhausted: true,
+		};
+		const requested = reduce(current, {
+			type: "pageRequestStarted",
+			requestId: "settle-loaded-pages",
+			requestCursor: null,
+			requestEpoch: current.scrollEpoch,
+		});
+		const settlement = loaded
+			.slice(0, 100)
+			.reverse()
+			.map((item) => ({
+				...item,
+				displayName: `Settled ${item.id}`,
+				dateState: "settled" as const,
+				wallThumbnail: thumbnail(item.id),
+			}));
+
+		const settled = reduce(requested, {
+			type: "metadataSettled",
+			assets: settlement,
+			totalCount: 150,
+			nextCursor: "settlement-page-2",
+			requestEpoch: current.scrollEpoch,
+			requestCursor: null,
+			requestId: "settle-loaded-pages",
+		});
+
+		expect(settled.items).toHaveLength(150);
+		expect(settled.items.map(({ id }) => id)).toEqual(loadedIds);
+		expect(settled.items.slice(0, 100)).toEqual(
+			expect.arrayContaining(
+				loaded.slice(0, 100).map((item) =>
+					expect.objectContaining({
+						id: item.id,
+						displayName: `Settled ${item.id}`,
+						dateState: "settled",
+						wallThumbnail: thumbnail(item.id),
+					}),
+				),
+			),
+		);
+		expect(settled.items.slice(100)).toEqual(loaded.slice(100));
+		expect(settled.cursor).toBeNull();
+		expect(settled.pagesExhausted).toBe(true);
+	});
+
+	it("keeps an advanced nonterminal cursor when settlement covers only earlier items", () => {
+		const loaded = Array.from({ length: 150 }, (_, index) =>
+			wallAsset(`asset-${index}`, 1, index + 1),
+		);
+		const current = {
+			...activeState(),
+			items: loaded,
+			cursor: "page-3",
+			pagesExhausted: false,
+		};
+		const requested = reduce(current, {
+			type: "pageRequestStarted",
+			requestId: "settle-earlier-page",
+			requestCursor: null,
+			requestEpoch: current.scrollEpoch,
+		});
+
+		const settled = reduce(requested, {
+			type: "metadataSettled",
+			assets: loaded.slice(0, 100),
+			totalCount: 150,
+			nextCursor: "page-2",
+			requestEpoch: current.scrollEpoch,
+			requestCursor: null,
+			requestId: "settle-earlier-page",
+		});
+
+		expect(settled.items.map((item) => item.id)).toEqual(
+			loaded.map((item) => item.id),
+		);
+		expect(settled.cursor).toBe("page-3");
+		expect(settled.pagesExhausted).toBe(false);
 	});
 
 	it("starts settled from a cached nonterminal page and preserves server order", () => {
@@ -1433,7 +1528,7 @@ describe("wallReducer", () => {
 		expect(paged.items.map((item) => item.id)).toEqual(["b", "a", "c", "d"]);
 	});
 
-	it("accepts one atomic replacement for each newer scan generation", () => {
+	it("merges one settlement for each newer scan generation", () => {
 		const firstRequest = reduce(initialWallState, {
 			type: "pageRequestStarted",
 			requestId: "generation-1",
@@ -1464,7 +1559,7 @@ describe("wallReducer", () => {
 			requestCursor: null,
 			requestId: "generation-2",
 		});
-		expect(second.items.map((item) => item.id)).toEqual(["second"]);
+		expect(second.items.map((item) => item.id)).toEqual(["first", "second"]);
 
 		const duplicateRequest = reduce(second, {
 			type: "pageRequestStarted",
@@ -1481,7 +1576,7 @@ describe("wallReducer", () => {
 			requestCursor: null,
 			requestId: "generation-2-duplicate",
 		});
-		expect(duplicate.items.map((item) => item.id)).toEqual(["second"]);
+		expect(duplicate.items.map((item) => item.id)).toEqual(["first", "second"]);
 
 		const staleRequest = reduce(second, {
 			type: "pageRequestStarted",
@@ -1498,7 +1593,7 @@ describe("wallReducer", () => {
 			requestCursor: null,
 			requestId: "generation-1-stale",
 		});
-		expect(stale.items.map((item) => item.id)).toEqual(["second"]);
+		expect(stale.items.map((item) => item.id)).toEqual(["first", "second"]);
 	});
 
 	it("stores and clears source and asset warnings", () => {

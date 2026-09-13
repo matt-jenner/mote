@@ -345,6 +345,13 @@ function mergeAssets(
 	return { items: [...byId.values()], changed };
 }
 
+function mergeSettledAssets(
+	current: readonly WallAsset[],
+	settled: readonly WallAsset[],
+): MergeResult {
+	return mergeAssets(current, settled);
+}
+
 function preserveCatalogAvailability(
 	current: readonly WallAsset[],
 	incoming: readonly WallAsset[],
@@ -864,17 +871,29 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				remembered.assets,
 				state.activeRequest?.previewCountVersion !== state.previewCountVersion,
 			);
-			const merged = mergeAssets([], replacementPage);
+			const merged = mergeSettledAssets(state.items, replacementPage);
 			const previewCounts = pagePreviewCounts(state, action.previewCounts);
+			const settledIds = new Set(action.assets.map((asset) => asset.id));
+			const preservesLoadedRemainder = state.items.some(
+				(current) => !settledIds.has(current.id),
+			);
+			const preservePagination =
+				state.pagesExhausted || preservesLoadedRemainder;
 			return {
 				...state,
 				items: merged.items,
-				totalCount: action.totalCount ?? merged.items.length,
+				totalCount: Math.max(
+					state.totalCount ?? 0,
+					action.totalCount ?? 0,
+					merged.items.length,
+				),
 				previewCounts,
-				cursor: action.nextCursor,
+				cursor: preservePagination ? state.cursor : action.nextCursor,
 				orderState: "settled",
 				scanComplete: true,
-				pagesExhausted: action.nextCursor === null,
+				pagesExhausted: preservePagination
+					? state.pagesExhausted
+					: action.nextCursor === null,
 				settledGeneration: generation,
 				assetWarnings:
 					remembered.changed || recoveredWarnings !== state.assetWarnings

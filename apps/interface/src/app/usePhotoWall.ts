@@ -152,6 +152,22 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 	const missingScreen = total - screenReady;
 	const busy =
 		state.activeRequest !== null || missingWall > 0 || state.sortPending;
+	if (!state.scanComplete) {
+		const progress = state.scanProgress;
+		if (progress?.total !== null && progress?.total !== undefined)
+			return {
+				status: `Indexing - ${progress.shaped} of ${progress.total}`,
+				value: progress.shaped,
+				max: progress.total,
+				busy: true,
+			};
+		return {
+			status: "Indexing",
+			value: null,
+			max: null,
+			busy: true,
+		};
+	}
 	if (
 		Object.keys(state.sourceWarnings).length > 0 ||
 		state.items.some((item) => item.warning !== null)
@@ -169,23 +185,6 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 			max: total > 0 ? total : null,
 			busy: true,
 		};
-	if (
-		!state.scanComplete &&
-		state.scanProgress &&
-		state.scanProgress.total !== null
-	) {
-		const progress = state.scanProgress;
-		const suffix =
-			progress && progress.total !== null
-				? ` · ${countFormatter.format(progress.shaped)} indexed of ${countFormatter.format(progress.total)}`
-				: "";
-		return {
-			status: `${state.items.length === 0 ? "Folder ready · " : ""}Indexing photos${suffix}`,
-			value: progress?.total === null ? null : (progress?.shaped ?? null),
-			max: progress?.total ?? null,
-			busy,
-		};
-	}
 	if (missingWall > 0)
 		return {
 			status: `Preparing previews · ${countFormatter.format(wallReady)} of ${countFormatter.format(total)}`,
@@ -198,13 +197,6 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 			status: `Photos ready · preparing larger previews · ${countFormatter.format(screenReady)} of ${countFormatter.format(total)}`,
 			value: screenReady,
 			max: total > 0 ? total : null,
-			busy,
-		};
-	if (!state.scanComplete)
-		return {
-			status: `${state.items.length === 0 ? "Folder ready · " : ""}Indexing photos`,
-			value: null,
-			max: null,
 			busy,
 		};
 	if (known === 0 && state.pagesExhausted && !state.activeRequest)
