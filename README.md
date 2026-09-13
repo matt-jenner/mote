@@ -34,12 +34,15 @@ The checked-in `rust-toolchain.toml` selects Rust 1.97.1 with Rustfmt and Clippy
 Run the same checks used by CI:
 
 ```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+npm run rust:verify
 ```
 
 CI runs these checks, plus the 10,000-asset benchmark smoke test, on Ubuntu, macOS, and Windows.
+The managed local command shares one temporary Cargo target across the checks
+and removes it afterward, including after a failed or interrupted run. Direct
+Cargo commands can leave large `target/` trees; `npm run clean:build-assets`
+removes those known repository leftovers without touching retained packages or
+application data.
 
 ## Install and verify the interface
 
@@ -149,10 +152,58 @@ item has no in-viewer recovery path.
 To create an unsigned macOS application bundle:
 
 ```bash
-npm run desktop:build -- --bundles app
+npm run desktop:build
 ```
 
-The bundle is written to `apps/desktop/src-tauri/target/release/bundle/macos/Mote.app`. Because it is unsigned, macOS may require you to approve it through the normal local-app security flow before first launch.
+The bundle is written to `dist/macos/Mote.app`. A successful build replaces the
+previous repository copy only after the new bundle has been validated. All
+Cargo intermediates are then removed. Because it is unsigned, macOS may require
+you to approve it through the normal local-app security flow before first launch.
+
+To build one `.app` containing both Apple Silicon and Intel executables, run
+these commands on a Mac with the Xcode Command Line Tools installed:
+
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+npm ci
+npm run desktop:build:universal
+```
+
+The universal bundle also replaces `dist/macos/Mote.app` only after validation.
+The Intel executable supports the architecture used by 2019 MacBook Pro models.
+The bundle's deployment target is macOS 11.0, but the interface uses modern
+WebKit features and has not been verified on older macOS/Safari versions. Use
+an up-to-date macOS version supported by the destination Mac. Verify the
+bundle's architectures with:
+
+```bash
+lipo -archs dist/macos/Mote.app/Contents/MacOS/photo-viewer-desktop
+```
+
+The output must include both `x86_64` and `arm64`. To copy the app to another
+Mac while preserving the bundle's permissions and metadata, archive it first:
+
+```bash
+mkdir -p dist/macos
+ditto -c -k --sequesterRsrc --keepParent \
+  dist/macos/Mote.app \
+  dist/macos/Mote-universal-macos.zip
+```
+
+Unzip it on the destination Mac and move `Mote.app` into Applications. These
+builds are not Developer ID signed or notarized. If macOS blocks first launch,
+use its Privacy & Security settings to approve the app.
+
+The separate [macOS workflow](.github/workflows/build-macos.yml) runs on pushes,
+pull requests, and manual dispatch. It checks the desktop crate, builds both
+architectures, verifies them with `lipo`, and uploads `Mote-universal-macos.zip`
+as a downloadable Actions artifact. It runs independently of the Linux
+Flatpak release workflow. Local builds do not use GitHub Actions minutes.
+
+The permanent identifier `io.github.matt-jenner.mote` changes the macOS data
+and cache directories from those used by older `app.photoviewer.desktop`
+builds. Existing catalogs are not migrated automatically, so an upgrade from
+the old identifier initially opens a fresh catalog. The old data is retained.
 
 ## Build and run the Linux Flatpak
 

@@ -2,6 +2,7 @@
 set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$project_dir/scripts/hosted-smoke-assets.sh"
 container_engine=${CONTAINER_ENGINE:-podman}
 container_engine_name=${container_engine##*/}
 runtime_uid=$(id -u)
@@ -9,6 +10,9 @@ runtime_gid=$(id -g)
 run_id="photo-viewer-smoke-$(date +%s)-$$"
 container_name="${run_id}-app"
 network_name="${run_id}-network"
+image_name="localhost/mote-smoke:${run_id}"
+asset_label="io.github.matt-jenner.mote.asset=hosted-smoke"
+owner_label="io.github.matt-jenner.mote.owner-pid=$$"
 temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/${run_id}.XXXXXX")
 runtime_root="${project_dir}/runtime/${run_id}"
 source_dir="${temporary_root}/photos"
@@ -26,7 +30,7 @@ cleanup() {
 		return
 	fi
 	cleanup_started=true
-	trap - HUP INT TERM
+	trap - EXIT HUP INT TERM
 	if [ "$exit_status" -ne 0 ]; then
 		printf '%s\n' "hosted smoke failed; container log follows" >&2
 		"$container_engine" logs "$container_name" >&2 2>/dev/null || true
@@ -37,6 +41,10 @@ cleanup() {
 	fi
 	"$container_engine" rm --force "$container_name" >/dev/null 2>&1 || true
 	"$container_engine" network rm "$network_name" >/dev/null 2>&1 || true
+	if ! "$container_engine" image rm "$image_name" >/dev/null 2>&1; then
+		printf '%s\n' "retained smoke image still referenced by a container: $image_name" >&2
+		[ "$exit_status" -ne 0 ] || exit_status=1
+	fi
 	case "$temporary_root" in
 		"${TMPDIR:-/tmp}"/photo-viewer-smoke-*) rm -rf -- "$temporary_root" ;;
 		*) printf '%s\n' "refusing to remove unexpected path: $temporary_root" >&2 ;;
@@ -45,6 +53,7 @@ cleanup() {
 		"${project_dir}"/runtime/photo-viewer-smoke-*) rm -rf -- "$runtime_root" ;;
 		*) printf '%s\n' "refusing to remove unexpected path: $runtime_root" >&2 ;;
 	esac
+	exit "$exit_status"
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
@@ -129,6 +138,8 @@ start_container() {
 	"$container_engine" run --detach \
 		"$@" \
 		--name "$container_name" \
+		--label "$asset_label" \
+		--label "$owner_label" \
 		--network "$network_name" \
 		--user "${runtime_uid}:${runtime_gid}" \
 		--read-only \
@@ -141,7 +152,7 @@ start_container() {
 		--volume "${source_dir}:/photos:ro,Z" \
 		--volume "${data_dir}:/var/lib/photo-viewer:Z" \
 		--volume "${cache_dir}:/var/cache/photo-viewer:Z" \
-		localhost/photo-viewer:dev >/dev/null
+		"$image_name" >/dev/null
 	port_mapping=$("$container_engine" port "$container_name" 8080/tcp | sed -n '1p')
 	case "$port_mapping" in
 		127.0.0.1:*) ;;
@@ -167,7 +178,7 @@ assert_supported_engine() {
 
 assert_image_runtime_user() {
 	configured_user=$("$container_engine" image inspect \
-		--format '{{.Config.User}}' localhost/photo-viewer:dev)
+		--format '{{.Config.User}}' "$image_name")
 	if [ "$configured_user" != "10001:10001" ]; then
 		printf '%s\n' "unexpected image runtime user: $configured_user" >&2
 		exit 1
@@ -217,6 +228,7 @@ command -v "$container_engine" >/dev/null 2>&1 || { printf '%s\n' "$container_en
 command -v curl >/dev/null 2>&1 || { printf '%s\n' "curl is required" >&2; exit 1; }
 command -v node >/dev/null 2>&1 || { printf '%s\n' "node is required" >&2; exit 1; }
 assert_supported_engine
+mote_reap_stale_smoke_assets "$container_engine"
 
 mkdir -p \
 	"$source_dir/A/child" \
@@ -247,11 +259,22 @@ metadata_manifest "$baseline_metadata"
 hash_manifest "$baseline_hashes"
 
 cd "$project_dir"
-printf '%s\n' "building localhost/photo-viewer:dev with $container_engine"
-"$container_engine" build --tag localhost/photo-viewer:dev --file Containerfile .
+printf '%s\n' "building $image_name with $container_engine"
+set -- --rm --force-rm
+case "$container_engine_name" in
+	podman | podman-remote) set -- "$@" --layers=false ;;
+esac
+"$container_engine" build "$@" \
+	--label "$asset_label" \
+	--label "$owner_label" \
+	--tag "$image_name" \
+	--file Containerfile .
 assert_image_runtime_user
 
-"$container_engine" network create "$network_name" >/dev/null
+"$container_engine" network create \
+	--label "$asset_label" \
+	--label "$owner_label" \
+	"$network_name" >/dev/null
 
 mapped_port=$(start_container)
 base_url="http://127.0.0.1:${mapped_port}"

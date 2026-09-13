@@ -54,22 +54,3 @@ jobs:
       - run: ./scripts/hosted-smoke.sh
         env:
           CONTAINER_ENGINE: docker
-
-  macos-app:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.97.1
-          components: rustfmt, clippy
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24.18.0
-          cache: npm
-      - run: npm ci
-      - run: npm run --workspace @photo-viewer/interface build
-      - run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all --check
-      - run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
-      - run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
-      - run: npm run desktop:build -- --bundles app

@@ -9,3 +9,4 @@ runtime/
 .flatpak-builder/
 build/flatpak/
 dist/flatpak/
+dist/macos/

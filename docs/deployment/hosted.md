@@ -149,6 +149,12 @@ docker compose --env-file ./runtime/compose.env \
 
 For a permanent installation, keep the environment file in a protected host configuration directory rather than below `./runtime`. Use absolute paths in it, as shown above, so Compose provider differences cannot resolve a relative path below `deploy/`. `compose down` does not remove bind-mounted host data.
 
+To stop the Compose deployment and discard only its locally built image, use
+`compose down --rmi local` with the same environment file and Compose file.
+Do not add `--volumes`: the catalogue and derivative cache are retained host
+data. The repository hosted smoke test uses a uniquely labelled image for each
+run and removes that image, its container, and its network when the run ends.
+
 ## Health and logs
 
 Check the local endpoint:

@@ -2,10 +2,9 @@
 set -euo pipefail
 
 repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$repository_root/scripts/build-lifecycle.sh"
 app_id="io.github.matt_jenner.mote"
 manifest="$repository_root/packaging/flatpak/$app_id.yml"
-build_dir="${MOTE_FLATPAK_BUILD_DIR:-$repository_root/build/flatpak}"
-repo_dir="${MOTE_FLATPAK_REPO_DIR:-$repository_root/dist/flatpak/repo}"
 bundle_dir="${MOTE_FLATPAK_BUNDLE_DIR:-$repository_root/dist/flatpak}"
 
 usage() {
@@ -13,9 +12,7 @@ usage() {
 usage: scripts/flatpak.sh COMMAND
 
   check    validate tools, runtimes, manifest, and desktop metadata
-  build    build and export Mote to the repository-local Flatpak repository
-  bundle   create the single-file Flatpak bundle from that repository
-  package  run build followed by bundle
+  package  build one bundle and remove all intermediate assets
   install  install or update the bundle for the current user
   run      launch the installed Mote Flatpak
   inspect  show installed application metadata and sandbox permissions
@@ -70,20 +67,71 @@ check_requirements() {
   )
 }
 
-build() {
+package_bundle() {
   check_requirements
-  mkdir -p "$build_dir" "$repo_dir" "$bundle_dir"
-  flatpak-builder --force-clean --repo="$repo_dir" "$build_dir" "$manifest"
-}
+  mote_create_build_dir flatpak
+  build_dir="$MOTE_BUILD_DIR/build"
+  repo_dir="$MOTE_BUILD_DIR/repo"
+  state_dir="$MOTE_BUILD_DIR/state"
+  candidate_bundle="$MOTE_BUILD_DIR/$(basename "$(bundle_path)")"
+  staging_bundle="$bundle_dir/.Mote.flatpak.next.$$"
+  backup_dir="$bundle_dir/.Mote.flatpak.previous.$$"
+  promotion_complete=false
 
-bundle() {
-  require_command flatpak
-  require_command node
-  mkdir -p "$bundle_dir"
+  flatpak_cleanup_on_exit() {
+    command_status=$?
+    trap - EXIT HUP INT TERM
+    cleanup_status=0
+    if [[ -e "$staging_bundle" ]]; then
+      mote_remove_managed_path "$staging_bundle" "$bundle_dir" || cleanup_status=$?
+    fi
+    if [[ -d "$backup_dir" ]]; then
+      if [[ "$promotion_complete" = true ]]; then
+        mote_remove_managed_path "$backup_dir" "$bundle_dir" || cleanup_status=$?
+      else
+        for backed_up in "$backup_dir"/Mote-*.flatpak; do
+          [[ -f "$backed_up" ]] || continue
+          mv -- "$backed_up" "$bundle_dir/$(basename "$backed_up")" || cleanup_status=$?
+        done
+        mote_remove_managed_path "$backup_dir" "$bundle_dir" || cleanup_status=$?
+      fi
+    fi
+    mote_cleanup_build_dir || cleanup_status=$?
+    if [[ "$command_status" -ne 0 ]]; then
+      exit "$command_status"
+    fi
+    exit "$cleanup_status"
+  }
+
+  trap flatpak_cleanup_on_exit EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  mkdir -p "$build_dir" "$repo_dir" "$state_dir" "$bundle_dir"
+  flatpak-builder --force-clean --delete-build-dirs \
+    --state-dir="$state_dir" \
+    --repo="$repo_dir" \
+    "$build_dir" "$manifest"
   flatpak build-bundle \
     --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
     --arch="$(flatpak_arch)" \
-    "$repo_dir" "$(bundle_path)" "$app_id" stable
+    "$repo_dir" "$candidate_bundle" "$app_id" stable
+
+  [[ -f "$candidate_bundle" && -s "$candidate_bundle" ]] || {
+    echo "Flatpak bundle was not created: $candidate_bundle" >&2
+    return 1
+  }
+
+  mv -- "$candidate_bundle" "$staging_bundle"
+  mkdir -- "$backup_dir"
+  for existing_bundle in "$bundle_dir"/Mote-*.flatpak; do
+    [[ -f "$existing_bundle" ]] || continue
+    mv -- "$existing_bundle" "$backup_dir/$(basename "$existing_bundle")"
+  done
+  mv -- "$staging_bundle" "$(bundle_path)"
+  promotion_complete=true
+  mote_remove_managed_path "$backup_dir" "$bundle_dir"
   printf 'bundle: %s\n' "$(bundle_path)"
 }
 
@@ -94,9 +142,7 @@ install_bundle() {
 
 case "${1:-help}" in
   check) check_requirements ;;
-  build) build ;;
-  bundle) bundle ;;
-  package) build; bundle ;;
+  package) package_bundle ;;
   install) install_bundle ;;
   run) require_command flatpak; flatpak run "$app_id" ;;
   inspect)

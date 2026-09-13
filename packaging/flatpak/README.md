@@ -47,6 +47,10 @@ npm run flatpak -- run
 For version 0.1.0 on the acceptance architecture, the bundle is written as
 `dist/flatpak/Mote-0.1.0-x86_64.flatpak`. The helper derives later filenames
 from the Tauri version and `flatpak --default-arch`.
+Packaging keeps its builder directory and repository in a temporary Mote-owned
+location and removes them when the command succeeds, fails, or is interrupted.
+The previous bundle remains in place until its replacement is complete, and
+only the latest versioned bundle is retained.
 x86-64 is the current acceptance architecture; ARM builds and Flathub publication are deferred.
 Build commands have no network access; `flatpak-builder` fetches only the
 URL-and-checksum sources declared in the manifest before entering the build
