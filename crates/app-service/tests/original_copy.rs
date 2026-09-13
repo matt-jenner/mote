@@ -369,9 +369,9 @@ fn unreadable_source_fails_without_changing_permissions_or_preference() {
     assert_eq!(fixture.remembered(), None);
 }
 
-// Catches retry loops recreating lost directories or losing completed-item results.
+// Catches retry loops recreating lost directories or starting remaining items.
 #[test]
-fn destination_loss_mid_batch_reports_remaining_failures_and_keeps_completed_copy() {
+fn destination_loss_mid_batch_stops_and_keeps_completed_copy() {
     let fixture = Fixture::new(&["first.jpg", "second.jpg", "third.jpg"]);
     let moved = fixture.temp.path().join("unmounted");
     let mut reports = 0;
@@ -386,21 +386,12 @@ fn destination_loss_mid_batch_reports_remaining_failures_and_keeps_completed_cop
                     fs::rename(&fixture.destination, &moved).unwrap();
                 }
             },
-        )
-        .unwrap();
-    assert_eq!((result.copied_count, result.failed_count), (1, 2));
-    assert_eq!(reports, 3);
+        );
+    assert!(matches!(result, Err(AppServiceError::CopyDestinationMissing)));
+    assert_eq!(reports, 1);
     assert_eq!(names(&moved), ["first.jpg"]);
     assert!(!fixture.destination.exists());
-    assert_eq!(
-        result.items[1].error_code.as_deref(),
-        Some("destination_unavailable")
-    );
-    assert_eq!(
-        result.items[2].error_code.as_deref(),
-        Some("destination_unavailable")
-    );
-    assert!(fixture.remembered().is_some());
+    assert!(fixture.remembered().is_none());
 }
 
 // Catches stale destination scans overwriting files that appear during an operation.
