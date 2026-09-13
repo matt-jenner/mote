@@ -272,12 +272,12 @@ impl<R: MetadataReader> Indexer<R> {
                             break;
                         }
                         let asset_id = item.asset.id;
-                        let counts_as_photo = item.asset.media_kind != MediaKind::Video;
+                        let counts_as_viewable_photo = item.asset.media_kind.is_wall_viewable();
                         {
                             let mut s = summary.lock().await;
                             s.discovered += 1;
                         }
-                        if counts_as_photo {
+                        if counts_as_viewable_photo {
                             let discovered = progress.0.fetch_add(1, Ordering::Relaxed) + 1;
                             if discovered.is_multiple_of(32) {
                                 let _ = events
@@ -329,7 +329,7 @@ impl<R: MetadataReader> Indexer<R> {
                                         orientation,
                                     })
                                     .await;
-                                if counts_as_photo {
+                                if counts_as_viewable_photo {
                                     let shaped = progress.1.fetch_add(1, Ordering::Relaxed) + 1;
                                     if shaped.is_multiple_of(32) {
                                         let _ = events
@@ -367,7 +367,7 @@ impl<R: MetadataReader> Indexer<R> {
                                         message: w.message,
                                     })
                                     .await;
-                                if counts_as_photo {
+                                if counts_as_viewable_photo {
                                     let shaped = progress.1.fetch_add(1, Ordering::Relaxed) + 1;
                                     if shaped.is_multiple_of(32) {
                                         let _ = events
@@ -419,7 +419,7 @@ impl<R: MetadataReader> Indexer<R> {
                             break;
                         }
                         let id = item.asset.id;
-                        let counts_as_photo = item.asset.media_kind != MediaKind::Video;
+                        let counts_as_viewable_photo = item.asset.media_kind.is_wall_viewable();
                         if !admit_enrichment(&cancel, &scheduler, folder_key).await {
                             break;
                         }
@@ -476,7 +476,7 @@ impl<R: MetadataReader> Indexer<R> {
                                         metadata: MetadataResolver::resolve(p.metadata),
                                     })
                                     .await;
-                                if counts_as_photo {
+                                if counts_as_viewable_photo {
                                     let enriched = progress.2.fetch_add(1, Ordering::Relaxed) + 1;
                                     if enriched.is_multiple_of(32) {
                                         let _ = events
@@ -605,7 +605,7 @@ fn count_photo_inventory(
         if !entry.file_type().is_file() {
             continue;
         }
-        if MediaKind::from_path(entry.path()).is_some_and(|kind| kind != MediaKind::Video) {
+        if MediaKind::from_path(entry.path()).is_some_and(MediaKind::is_wall_viewable) {
             recursive = recursive.saturating_add(1);
             if entry.depth() == 1 {
                 direct = direct.saturating_add(1);
@@ -758,7 +758,7 @@ fn discover_for_scan(
                 message: warning.message,
             });
             failures.fetch_add(1, Ordering::Relaxed);
-            if MediaKind::from_path(path).is_some_and(|kind| kind != MediaKind::Video) {
+            if MediaKind::from_path(path).is_some_and(MediaKind::is_wall_viewable) {
                 failed_photos.fetch_add(1, Ordering::Relaxed);
             }
             Ok(None)

@@ -33,6 +33,7 @@ import {
 	nextPickAfterRemoval,
 } from "../viewer/pickSequence";
 import { initialViewerState, viewerReducer } from "../viewer/viewerReducer";
+import { hasVisibleIndexingWork } from "../wall/wallReducer";
 import { AppearanceMenu } from "./AppearanceMenu";
 import { HostedFolderBrowser } from "./HostedFolderBrowser";
 import { NavigationRail } from "./NavigationRail";
@@ -91,6 +92,7 @@ function AppShellContents({
 	const galleryScope =
 		controller.state?.settings.galleryScope ?? "includeSubfolders";
 	const wall = usePhotoWall(source?.selectionId ?? null, galleryScope);
+	const activeFolderIndexing = hasVisibleIndexingWork(wall.state);
 	const activeAccess = activeFolderAccess(
 		controller.state?.savedFolders ?? emptySavedFolders(),
 	);
@@ -412,7 +414,7 @@ function AppShellContents({
 				<NavigationRail
 					savedFolders={controller.state?.savedFolders}
 					activeFolderIndexing={
-						source !== null && !folderUnavailable && wall.state.scanActive
+						source !== null && !folderUnavailable && activeFolderIndexing
 					}
 					onActivate={async (id) => {
 						if (await controller.activateSavedFolder(id)) setDrawerOpen(false);
@@ -626,7 +628,7 @@ function AppShellContents({
 							<NavigationRail
 								savedFolders={controller.state?.savedFolders}
 								activeFolderIndexing={
-									source !== null && !folderUnavailable && wall.state.scanActive
+									source !== null && !folderUnavailable && activeFolderIndexing
 								}
 								onActivate={async (id) => {
 									if (await controller.activateSavedFolder(id))

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { WallAsset } from "../services/photoService";
 import {
+	hasVisibleIndexingWork,
 	initialWallState,
 	isWallLayoutComplete,
 	type WallAction,
@@ -60,6 +61,41 @@ function activeState() {
 }
 
 describe("wallReducer", () => {
+	it("keeps visible indexing active until an explicit total is complete", () => {
+		const state = {
+			...activeState(),
+			scanActive: true,
+			totalCount: 200,
+			indexedCount: 200,
+			scanProgress: {
+				discovered: 200,
+				shaped: 200,
+				enriched: 0,
+				indexedCount: 200,
+				total: null,
+			},
+		};
+
+		expect(hasVisibleIndexingWork(state)).toBe(true);
+		expect(
+			hasVisibleIndexingWork({
+				...state,
+				scanProgress: { ...state.scanProgress, total: 651 },
+			}),
+		).toBe(true);
+		expect(
+			hasVisibleIndexingWork({
+				...state,
+				indexedCount: 651,
+				scanProgress: {
+					...state.scanProgress,
+					indexedCount: 651,
+					total: 651,
+				},
+			}),
+		).toBe(false);
+	});
+
 	it("sorts known provisional dates immediately and keeps undated photos last", () => {
 		const old = {
 			...wallAsset("old", 1, 1),

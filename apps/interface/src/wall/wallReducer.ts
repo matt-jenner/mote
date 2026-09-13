@@ -181,6 +181,18 @@ export function isWallLayoutComplete(
 	return state.scanComplete && state.pagesExhausted;
 }
 
+export function hasVisibleIndexingWork(
+	state: Pick<
+		WallState,
+		"scanActive" | "scanProgress" | "indexedCount" | "items"
+	>,
+): boolean {
+	if (!state.scanActive) return false;
+	const total = state.scanProgress?.total;
+	if (total === null || total === undefined) return true;
+	return Math.max(state.indexedCount ?? 0, state.items.length) < total;
+}
+
 function mergePreviewCounts(
 	current: WallPreviewCounts | null,
 	incoming: WallPreviewCounts | null | undefined,

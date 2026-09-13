@@ -48,6 +48,10 @@ impl MediaKind {
             _ => None,
         }
     }
+
+    pub const fn is_wall_viewable(self) -> bool {
+        matches!(self, Self::Jpeg | Self::Png | Self::Tiff | Self::Webp)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

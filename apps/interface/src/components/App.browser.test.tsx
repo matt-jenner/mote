@@ -713,11 +713,10 @@ it("renames a saved entry and removing it clears the active folder", async () =>
 	expect(service.getSavedFolders().entries).toEqual([]);
 });
 
-it("keeps the active folder busy through scan settlement and scope changes", async () => {
+it("clears the active folder spinner when every viewable photo is indexed", async () => {
 	await page.viewport(1200, 800);
 	const memory = createInMemoryPhotoService({
 		selectedFolderName: "Iceland 2025",
-		metadataDelayMs: 50,
 	});
 	const service = { ...memory, startFixtureScan: undefined } as PhotoService;
 	const screen = await renderApp(service);
@@ -727,12 +726,36 @@ it("keeps the active folder busy through scan settlement and scope changes", asy
 	const activeFolder = screen
 		.getByRole("navigation", { name: "Sources" })
 		.getByRole("button", { name: "Iceland 2025", exact: true });
-	await memory.startFixtureScan();
+	const state = await memory.getBootstrapState();
+	if (!state.activeSource) throw new Error("expected an active source");
+	memory.emitForTest({
+		kind: "progress",
+		selectionId: state.activeSource.selectionId,
+		generation: 1,
+		progress: {
+			discovered: 1,
+			shaped: 1,
+			enriched: 0,
+			indexedCount: 1,
+			total: null,
+		},
+	});
+	await expect
+		.poll(() => screen.getByRole("status").element().textContent)
+		.toBe("Indexing");
 	await expect.element(activeFolder).toHaveAttribute("aria-busy", "true");
-
-	await memory.finishFixtureScan();
-	await expect.element(activeFolder).toHaveAttribute("aria-busy", "false");
-	await screen.getByRole("button", { name: "Include subfolders" }).click();
+	memory.emitForTest({
+		kind: "progress",
+		selectionId: state.activeSource.selectionId,
+		generation: 1,
+		progress: {
+			discovered: 1,
+			shaped: 1,
+			enriched: 0,
+			indexedCount: 1,
+			total: 1,
+		},
+	});
 	await expect.element(activeFolder).toHaveAttribute("aria-busy", "false");
 });
 

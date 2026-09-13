@@ -558,6 +558,39 @@ async fn inventory_reports_direct_and_recursive_photo_totals_in_one_pass() {
 }
 
 #[tokio::test]
+async fn inventory_total_counts_only_formats_the_wall_can_display() {
+    let fixture = tempfile::tempdir().unwrap();
+    write_png(&fixture.path().join("displayable.jpg"), [1, 2, 3]);
+    std::fs::write(fixture.path().join("camera-raw.dng"), b"raw fixture").unwrap();
+    std::fs::write(fixture.path().join("phone-photo.heic"), b"heif fixture").unwrap();
+
+    let indexer = Indexer::new(NoopMetadataReader, empty_policy_engine());
+    let mut scan = indexer.start(ScanRequest::new(fixture.path())).unwrap();
+    let (inventory_total, completed) = tokio::time::timeout(Duration::from_secs(1), async {
+        let mut inventory_total = None;
+        loop {
+            if let Some(IndexEvent::Progress(progress)) = scan.events.recv().await {
+                inventory_total = inventory_total.or(progress.total);
+                if progress.stage == ScanStage::Completed {
+                    break (inventory_total, progress);
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let summary = scan.join().await.unwrap();
+
+    assert_eq!(inventory_total, Some(1));
+    assert_eq!(completed.direct_total, Some(1));
+    assert_eq!(completed.total, Some(1));
+    assert_eq!(completed.discovered, 1);
+    assert_eq!(completed.shaped, 1);
+    assert_eq!(completed.enriched, 1);
+    assert_eq!(summary.discovered, 3);
+}
+
+#[tokio::test]
 async fn video_discovery_is_indexed_but_not_counted_in_photo_progress() {
     let fixture = tempfile::tempdir().unwrap();
     write_png(&fixture.path().join("a.jpg"), [255, 0, 0]);
