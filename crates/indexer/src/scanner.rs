@@ -149,6 +149,11 @@ impl<R: MetadataReader> Indexer<R> {
         let inventory_cancel = cancel_rx.clone();
         let library_id = request.library_id;
         let folder_group_id = request.folder_group_id;
+        let discovery_failures = Arc::new(AtomicU64::new(0));
+        let failed_photos = Arc::new(AtomicU64::new(0));
+        let discovery_events = events_tx.clone();
+        let discovery_failure_count = discovery_failures.clone();
+        let discovery_photo_failures = failed_photos.clone();
         let discovery = tokio::task::spawn_blocking(move || {
             discover_all(
                 &discovery_root,
@@ -158,6 +163,9 @@ impl<R: MetadataReader> Indexer<R> {
                 discovered_tx,
                 discovery_cancel,
                 &policy_engine,
+                &discovery_events,
+                &discovery_failure_count,
+                &discovery_photo_failures,
             )
         });
         let inventory = tokio::task::spawn_blocking(move || {
@@ -256,6 +264,7 @@ impl<R: MetadataReader> Indexer<R> {
                         }
                         let path = item.source_path.clone();
                         let shape_result = tokio::task::spawn_blocking(move || {
+                            check_asset_access(&path)?;
                             let shape = MediaProbe::shape(&path)?;
                             let orientation = EmbeddedExifReader::read(&path)
                                 .ok()
@@ -299,6 +308,8 @@ impl<R: MetadataReader> Indexer<R> {
                                 }
                             }
                             Ok(Err(w)) => {
+                                let inaccessible =
+                                    matches!(w.code, "source_missing" | "source_unreadable");
                                 summary.lock().await.failed += 1;
                                 let _ = events
                                     .send(IndexEvent::ShapeFallback {
@@ -332,6 +343,9 @@ impl<R: MetadataReader> Indexer<R> {
                                             }))
                                             .await;
                                     }
+                                }
+                                if inaccessible {
+                                    continue;
                                 }
                             }
                             Err(_) => {}
@@ -472,13 +486,16 @@ impl<R: MetadataReader> Indexer<R> {
                 Err(error) => return Err(IndexError::TaskJoin(error.to_string())),
             }
             let _ = inventory_publisher.await;
+            summary.failed += discovery_failures.load(Ordering::Relaxed);
+            summary.discovered += discovery_failures.load(Ordering::Relaxed);
+            let discovered =
+                progress.0.load(Ordering::Relaxed) + failed_photos.load(Ordering::Relaxed);
             if !summary.cancelled {
                 validate_completed_inventory(
-                    progress.0.load(Ordering::Relaxed),
+                    discovered,
                     known_inventory(&direct_inventory_total, &inventory_total),
                 )?;
             }
-            let discovered = progress.0.load(Ordering::Relaxed);
             let _ = events_tx
                 .send(IndexEvent::Progress(ScanProgress {
                     stage: ScanStage::Completed,
@@ -575,6 +592,7 @@ fn process_asset<R: MetadataReader>(
     reader: Arc<R>,
     item: DiscoveredAsset,
 ) -> Result<ProcessedAsset, MetadataReadWarning> {
+    check_asset_access(&item.source_path)?;
     let colour = MediaProbe::representative_rgb(&item.source_path);
     let metadata = reader.read(&item.source_path, item.sidecar_path.as_deref())?;
     Ok(ProcessedAsset {
@@ -582,6 +600,22 @@ fn process_asset<R: MetadataReader>(
         colour_warning: colour.err(),
         metadata,
     })
+}
+
+fn check_asset_access(path: &Path) -> Result<(), MetadataReadWarning> {
+    std::fs::File::open(path)
+        .and_then(|file| file.metadata())
+        .map(|_| ())
+        .map_err(source_access_warning)
+}
+
+fn source_access_warning(error: std::io::Error) -> MetadataReadWarning {
+    let code = match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => "source_missing",
+        std::io::ErrorKind::PermissionDenied => "source_unreadable",
+        _ => "source_check_failed",
+    };
+    MetadataReadWarning::new(code, error.to_string())
 }
 
 fn discover_all(
@@ -592,6 +626,9 @@ fn discover_all(
     sender: mpsc::Sender<DiscoveredAsset>,
     cancel: watch::Receiver<bool>,
     policy_engine: &FolderPolicyEngine,
+    events: &mpsc::Sender<IndexEvent>,
+    failures: &AtomicU64,
+    failed_photos: &AtomicU64,
 ) -> Result<(), IndexError> {
     let children = std::fs::read_dir(root)?
         .filter_map(Result::ok)
@@ -608,8 +645,15 @@ fn discover_all(
             continue;
         }
         let sidecar = sidecars.find(entry.path())?;
-        let Some(mut asset) =
-            discover_asset_with_sidecar(library_root, entry.path(), library_id, sidecar)?
+        let Some(mut asset) = discover_for_scan(
+            library_root,
+            entry.path(),
+            library_id,
+            sidecar,
+            events,
+            failures,
+            failed_photos,
+        )?
         else {
             continue;
         };
@@ -639,10 +683,89 @@ fn discover_all(
     Ok(())
 }
 
+fn discover_for_scan(
+    root: &Path,
+    path: &Path,
+    library: LibraryId,
+    sidecar: Option<PathBuf>,
+    events: &mpsc::Sender<IndexEvent>,
+    failures: &AtomicU64,
+    failed_photos: &AtomicU64,
+) -> Result<Option<DiscoveredAsset>, IndexError> {
+    match discover_asset_with_sidecar(root, path, library, sidecar) {
+        Err(IndexError::Io(error)) => {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|_| IndexError::PathOutsideRoot(path.to_owned()))?;
+            let relative = photo_domain::RelativePathKey::from_relative_path(relative)
+                .map_err(|e| IndexError::InvalidRelativePath(e.to_string()))?;
+            let warning = source_access_warning(error);
+            let _ = events.blocking_send(IndexEvent::Warning {
+                asset_id: Some(photo_domain::AssetId::for_path(library, &relative)),
+                code: warning.code,
+                message: warning.message,
+            });
+            failures.fetch_add(1, Ordering::Relaxed);
+            if MediaKind::from_path(path).is_some_and(|kind| kind != MediaKind::Video) {
+                failed_photos.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(None)
+        }
+        result => result,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PhotoInventory, validate_completed_inventory};
     use crate::{IndexError, IndexScheduler, InteractionMode, SchedulerConfig};
+
+    #[test]
+    fn root_first_disappeared_file_does_not_abort_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = photo_domain::LibraryId::new();
+        let missing = temp.path().join("gone.jpg");
+        let (events, mut received) = tokio::sync::mpsc::channel(4);
+        let failures = std::sync::atomic::AtomicU64::new(0);
+        let photos = std::sync::atomic::AtomicU64::new(0);
+        let result = super::discover_for_scan(
+            temp.path(),
+            &missing,
+            library,
+            None,
+            &events,
+            &failures,
+            &photos,
+        );
+        assert!(
+            matches!(result, Ok(None)),
+            "a vanished file must be an asset outcome, not a scan error"
+        );
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            crate::IndexEvent::Warning {
+                asset_id: Some(_),
+                code: "source_missing",
+                ..
+            }
+        ));
+        assert_eq!(photos.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let readable = temp.path().join("next.jpg");
+        std::fs::write(&readable, b"photo").unwrap();
+        assert!(
+            super::discover_for_scan(
+                temp.path(),
+                &readable,
+                library,
+                None,
+                &events,
+                &failures,
+                &photos
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
 
     #[test]
     fn completion_rejects_a_partial_discovery_against_the_inventory() {

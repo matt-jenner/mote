@@ -156,9 +156,14 @@ impl AppService {
     }
 
     async fn check_saved_folder(&self, entry: &str) -> Result<AccessReply, AppServiceError> {
+        let selection = self.active_selection_token().ok();
         let (group, target) = self.saved_target(entry)?;
         let library = target.key.library_id;
-        let root_selection = target.key.relative.as_bytes().is_empty();
+        let root_selection = target
+            .key
+            .relative
+            .to_path_buf()
+            .is_ok_and(|path| path.as_os_str().is_empty());
         let reply = self.folder_access.check_with_root(target).await;
         let access = FolderAccess::from_reply(group.as_uuid().to_string(), &reply);
         let mut state = self.state()?;
@@ -175,13 +180,39 @@ impl AppService {
                     ..
                 } if matches!(outcome, FolderProbeOutcome::Missing | FolderProbeOutcome::Unreadable | FolderProbeOutcome::RootOffline)
             ) {
-                if root_selection {
+                if root_selection
+                    || matches!(
+                        &reply,
+                        AccessReply::Complete {
+                            outcome: FolderProbeOutcome::RootOffline,
+                            ..
+                        }
+                    )
+                {
                     state.libraries.catalog_mut().mark_root_offline(library)?;
                 } else {
                     state
                         .libraries
                         .catalog_mut()
                         .mark_group_offline(library, group)?;
+                }
+                if let Some(selection) = selection
+                    && selection.library_id == library
+                    && state.selection_epoch == selection.epoch
+                    && (selection.group_id == group
+                        || root_selection
+                        || matches!(
+                            &reply,
+                            AccessReply::Complete {
+                                outcome: FolderProbeOutcome::RootOffline,
+                                ..
+                            }
+                        ))
+                {
+                    let _ = self.updates.send(crate::WallUpdate::SourceUnavailable {
+                        selection_id: selection.selection_id(),
+                        source_id: library.as_uuid().to_string(),
+                    });
                 }
             }
             let old = state.folder_status.get(&access.folder_id);
@@ -577,6 +608,85 @@ mod tests {
             folders.map(|f| f.id),
             ["ten", "two", "zebra", "accent2", "accent10"]
         );
+    }
+    #[tokio::test]
+    async fn root_first_unreadable_root_skips_both_children_and_asset_readers() {
+        struct RootProbe {
+            root: Arc<AtomicUsize>,
+            child: Arc<AtomicUsize>,
+        }
+        impl crate::FolderProbe for RootProbe {
+            fn probe(&self, target: &FolderAccessTarget) -> FolderProbeOutcome {
+                if target
+                    .key
+                    .relative
+                    .to_path_buf()
+                    .unwrap()
+                    .as_os_str()
+                    .is_empty()
+                {
+                    self.root.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    self.child.fetch_add(1, Ordering::SeqCst);
+                }
+                FolderProbeOutcome::Unreadable
+            }
+        }
+        struct AssetReader(Arc<AtomicUsize>);
+        impl photo_indexer::MetadataReader for AssetReader {
+            fn read(
+                &self,
+                _: &std::path::Path,
+                _: Option<&std::path::Path>,
+            ) -> Result<photo_metadata::MetadataBundle, photo_metadata::MetadataReadWarning>
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(photo_metadata::MetadataBundle::default())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let photos = temp.path().join("photos");
+        std::fs::create_dir(&photos).unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let root = Arc::new(AtomicUsize::new(0));
+        let child = Arc::new(AtomicUsize::new(0));
+        let mut service = AppService::open_with_reader(
+            crate::AppConfig::new(temp.path().join("data"), temp.path().join("cache")),
+            Arc::new(AssetReader(reads.clone())),
+        )
+        .unwrap();
+        service.select_recent(&photos).unwrap();
+        let mut entries = Vec::new();
+        for name in ["a", "b"] {
+            let path = photos.join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("photo.jpg"), b"photo").unwrap();
+            entries.push(
+                service
+                    .select_recent(&path)
+                    .unwrap()
+                    .0
+                    .saved_folders
+                    .active_entry_id
+                    .unwrap(),
+            );
+        }
+        service.folder_access = crate::FolderAccessCoordinator::new(Arc::new(RootProbe {
+            root: root.clone(),
+            child: child.clone(),
+        }));
+        for entry in entries {
+            assert!(
+                service
+                    .activate_saved_folder(&entry)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(root.load(Ordering::SeqCst), 1);
+        assert_eq!(child.load(Ordering::SeqCst), 0);
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
     }
     #[test]
     fn desktop_bootstrap_order_compares_text_after_equal_numbers() {

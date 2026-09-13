@@ -152,14 +152,6 @@ impl Catalog {
                  WHERE folder_group_id = ?1 AND last_seen_generation < ?2",
                 params![group.as_uuid().as_bytes(), generation],
             )?;
-            transaction.execute(
-                "UPDATE assets SET availability = 'available'
-                 WHERE id IN (
-                   SELECT asset_id FROM folder_group_assets
-                   WHERE folder_group_id = ?1 AND last_seen_generation = ?2
-                 )",
-                params![group.as_uuid().as_bytes(), generation],
-            )?;
             marked_missing = transaction.execute(
                 "UPDATE assets SET availability = 'missing'
                  WHERE library_id = ?1 AND availability <> 'missing'

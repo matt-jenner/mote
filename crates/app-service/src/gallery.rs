@@ -3710,6 +3710,25 @@ impl GalleryEngine {
             if let Some(update) = progress_update {
                 updates.push(update);
             }
+            for event in events {
+                if let IndexEvent::Warning {
+                    asset_id: Some(asset_id),
+                    code,
+                    ..
+                } = event
+                    && matches!(*code, "source_missing" | "source_unreadable")
+                {
+                    updates.push(WallUpdate::Warning {
+                        selection_id: runtime.selection.id().to_owned(),
+                        source_id: runtime.selection.library_id.as_uuid().to_string(),
+                        asset_id: Some(asset_id.as_uuid().to_string()),
+                        warning: crate::WallWarningState {
+                            code: (*code).to_owned(),
+                            retryable: true,
+                        },
+                    });
+                }
+            }
             if let Ok(records) = state.libraries.catalog().wall_records_for_assets_scoped(
                 runtime.selection.group_id,
                 GalleryScope::IncludeSubfolders,

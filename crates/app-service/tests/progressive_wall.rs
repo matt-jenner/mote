@@ -961,7 +961,7 @@ async fn desktop_bootstrap_selects_naturally_first_saved_folder() {
 }
 
 #[tokio::test]
-async fn unavailable_selected_child_marks_only_its_group_offline() {
+async fn root_first_unavailable_selected_child_marks_only_its_group_offline() {
     let fixture = ProgressiveFixture::new(4);
     let child = fixture.source.join("child");
     std::fs::create_dir(&child).unwrap();
@@ -1029,6 +1029,188 @@ async fn unavailable_selected_child_marks_only_its_group_offline() {
         1
     );
     std::fs::rename(unavailable, child).unwrap();
+}
+
+#[tokio::test]
+async fn root_first_offline_library_marks_sibling_assets_offline() {
+    let fixture = ProgressiveFixture::new(2);
+    let reader = CountingReader::default();
+    let service =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(reader.clone())).unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |e| {
+        matches!(e, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let mut child_entry = String::new();
+    for name in ["child-a", "child-b"] {
+        let child = fixture.source.join(name);
+        std::fs::create_dir(&child).unwrap();
+        std::fs::copy(
+            fixture.source.join("photo-000.jpg"),
+            child.join("photo.jpg"),
+        )
+        .unwrap();
+        let bootstrap = service.start_scan(&child).await.unwrap();
+        recv_until(&mut updates, |e| {
+            matches!(e, WallUpdate::MetadataSettled { .. })
+        })
+        .await;
+        child_entry = bootstrap.saved_folders.active_entry_id.unwrap();
+    }
+    let before = reader.count();
+    let offline = fixture.temp.path().join("offline");
+    std::fs::rename(&fixture.source, &offline).unwrap();
+    service.check_saved_folders(&[child_entry]).await.unwrap();
+    let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    let library = catalog.list_libraries().unwrap().remove(0);
+    let assets = catalog.assets(library.id).unwrap();
+    assert_eq!(assets.len(), 4);
+    assert!(
+        assets
+            .iter()
+            .all(|a| a.availability == Availability::RootOffline),
+        "root failure must cover sibling groups"
+    );
+    assert_eq!(
+        reader.count(),
+        before,
+        "failed prerequisites must not admit asset readers"
+    );
+    let event = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            let event = updates.recv().await.unwrap();
+            if matches!(event, WallUpdate::SourceUnavailable { .. }) {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("confirmed root failure must notify the selected view");
+    let WallUpdate::SourceUnavailable { selection_id, .. } = event else {
+        unreachable!()
+    };
+    assert_eq!(
+        selection_id,
+        service
+            .bootstrap()
+            .unwrap()
+            .active_source
+            .unwrap()
+            .selection_id
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn root_first_unreadable_asset_publishes_warning_and_keeps_sibling_available() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = ProgressiveFixture::new(2);
+    std::fs::set_permissions(
+        fixture.source.join("photo-000.jpg"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    let service = AppService::open(fixture.config.clone()).unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    let mut warnings = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let WallUpdate::Warning {
+            asset_id, warning, ..
+        } = &event
+        {
+            warnings.push((asset_id.clone(), warning.code.clone()));
+        }
+        if matches!(event, WallUpdate::MetadataSettled { .. }) {
+            break;
+        }
+    }
+    assert!(
+        warnings
+            .iter()
+            .any(|(id, code)| id.is_some() && code == "source_unreadable")
+    );
+    let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    let library = catalog.list_libraries().unwrap().remove(0);
+    let assets = catalog.assets(library.id).unwrap();
+    assert_eq!(
+        assets
+            .iter()
+            .filter(|a| a.availability == Availability::Unreadable)
+            .count(),
+        1
+    );
+    assert_eq!(
+        assets
+            .iter()
+            .filter(|a| a.availability == Availability::Available)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn root_first_missing_selected_root_marks_library_offline() {
+    let fixture = ProgressiveFixture::new(1);
+    let service = AppService::open(fixture.config.clone()).unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    let saved = service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    std::fs::rename(&fixture.source, fixture.temp.path().join("offline")).unwrap();
+    service
+        .check_saved_folders(&[saved.saved_folders.active_entry_id.unwrap()])
+        .await
+        .unwrap();
+    let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    assert_eq!(
+        catalog.list_libraries().unwrap()[0].availability,
+        Availability::RootOffline
+    );
+}
+
+#[tokio::test]
+async fn root_first_readable_folders_return_cached_rows_while_asset_metadata_is_blocked() {
+    let fixture = ProgressiveFixture::new(2);
+    let service = AppService::open(fixture.config.clone()).unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    service.wait_for_collection_drivers_quiescent_test().await;
+    service.wait_for_derivative_tasks_quiescent_test().await;
+    drop(service);
+    let (reader, release) = BlockingReader::new();
+    let reopened = fixture.service(reader);
+    let mut updates = reopened.subscribe_wall_updates();
+    reopened.desktop_bootstrap().await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::CatalogBatch { .. })
+    })
+    .await;
+    let page = tokio::time::timeout(
+        Duration::from_millis(100),
+        reopened.query_wall(query(SortDirection::OldestFirst)),
+    )
+    .await
+    .expect("cached wall query must not wait for asset metadata")
+    .unwrap();
+    assert_eq!(page.items.len(), 2);
+    release.release();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
