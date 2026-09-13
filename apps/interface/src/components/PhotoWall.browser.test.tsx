@@ -152,6 +152,7 @@ class ControlledWallService implements PhotoService {
 	copyPickedOriginals: PhotoService["copyPickedOriginals"] = async () => {
 		throw new Error("Copying is not supported by this wall fixture");
 	};
+	cancelOriginalCopy = async () => {};
 	showLastCopyDestination = async () => {
 		throw new Error("No copy destination in this wall fixture");
 	};

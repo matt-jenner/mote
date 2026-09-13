@@ -69,7 +69,8 @@ export interface CopyProgress {
 }
 
 export type CopyResult =
-	| { kind: "cancelled" }
+	| { kind: "selectionCancelled" }
+	| { kind: "copyCancelled" }
 	| {
 			kind: "complete";
 			items: CopyItemResult[];
@@ -231,6 +232,7 @@ export interface PhotoService {
 		listener: (progress: CopyProgress) => void,
 	): Promise<CopyResult>;
 	showLastCopyDestination(): Promise<void>;
+	cancelOriginalCopy(): Promise<void>;
 	getSavedFolders(): SavedFolderSnapshot;
 	watchSavedFolders(
 		listener: (snapshot: SavedFolderSnapshot) => void,

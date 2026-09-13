@@ -304,7 +304,7 @@ class PickListStoreImplementation implements PickListStore {
 					this.publish();
 				},
 			);
-			if (result.kind === "cancelled") {
+			if (result.kind === "selectionCancelled" || result.kind === "copyCancelled") {
 				this.copy = previous;
 				this.publish();
 				return;

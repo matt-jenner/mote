@@ -112,7 +112,7 @@ describe("pick list controller", () => {
 		const batches: Array<readonly string[] | null> = [];
 		const { store, stop } = await copyFixture(async (ids) => {
 			batches.push(ids);
-			return batches.length === 1 ? partialCopy : { kind: "cancelled" };
+			return batches.length === 1 ? partialCopy : { kind: "selectionCancelled" };
 		});
 		await store.getState().copyOriginals();
 		await store.getState().remove("second");
@@ -132,7 +132,7 @@ describe("pick list controller", () => {
 		const batches: Array<readonly string[] | null> = [];
 		const { store, stop } = await copyFixture(async (ids) => {
 			batches.push(ids);
-			return batches.length === 1 ? partialCopy : { kind: "cancelled" };
+			return batches.length === 1 ? partialCopy : { kind: "selectionCancelled" };
 		});
 		await store.getState().copyOriginals();
 		await store.getState().toggle(asset("later"), origin);
@@ -158,7 +158,7 @@ describe("pick list controller", () => {
 		const active = store.getState().copy;
 		await store.getState().remove("second");
 		expect(store.getState().copy).toBe(active);
-		retry.resolve({ kind: "cancelled" });
+		retry.resolve({ kind: "selectionCancelled" });
 		await copying;
 		expect(store.getState().copy).toMatchObject({
 			phase: "complete",

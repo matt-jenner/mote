@@ -14,6 +14,11 @@ use crate::protocol::forward_wall_updates_for_service;
 use crate::state::{DesktopState, WallSubscriptionId};
 
 #[tauri::command]
+pub async fn cancel_original_copy() -> Result<(), CommandError> {
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn copy_picked_originals(
     app: AppHandle,
     asset_ids: Option<Vec<String>>,
@@ -102,7 +107,7 @@ where
     .await
     .map_err(|_| CommandError::internal())??;
     let Some(destination) = pick_destination(initial).await? else {
-        return Ok(CopyResult::Cancelled);
+        return Ok(CopyResult::SelectionCancelled);
     };
     let service = state.service.clone();
     let last_completed_destination = state.last_completed_copy_destination.clone();
@@ -597,7 +602,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(result, crate::dto::CopyResult::Cancelled));
+        assert!(matches!(result, crate::dto::CopyResult::SelectionCancelled));
         assert!(
             fixture
                 .state

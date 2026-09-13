@@ -445,7 +445,7 @@ describe("responsive Picks panel", () => {
 								},
 							],
 						}
-					: { kind: "cancelled" };
+					: { kind: "selectionCancelled" };
 			},
 		});
 		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
@@ -485,7 +485,7 @@ describe("responsive Picks panel", () => {
 								errorCode: "copy_failed",
 							})),
 						}
-					: { kind: "cancelled" };
+					: { kind: "selectionCancelled" };
 			},
 		});
 		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
@@ -729,7 +729,7 @@ describe("responsive Picks panel", () => {
 								},
 							],
 						}
-					: { kind: "cancelled" };
+					: { kind: "selectionCancelled" };
 			},
 			showFolder: async () => {
 				shown += 1;
@@ -761,7 +761,7 @@ describe("responsive Picks panel", () => {
 		const { screen } = await renderPicksApp({
 			copy: async () =>
 				++attempt === 1
-					? { kind: "cancelled" }
+					? { kind: "selectionCancelled" }
 					: {
 							kind: "complete",
 							copiedCount: 0,
