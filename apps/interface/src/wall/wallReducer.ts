@@ -955,14 +955,16 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				generation > state.settledGeneration &&
 				action.requestCursor === null;
 			const settledIds = new Set(action.assets.map((asset) => asset.id));
-			const streamedRemainder =
+			const protectsTrackedStream =
 				replacesCompleteGeneration &&
-				state.streamedAssetGeneration === generation
-					? state.items.filter(
-							(item) =>
-								state.streamedAssetIds[item.id] && !settledIds.has(item.id),
-						)
-					: [];
+				state.streamedAssetGeneration !== null &&
+				state.streamedAssetGeneration >= generation;
+			const streamedRemainder = protectsTrackedStream
+				? state.items.filter(
+						(item) =>
+							state.streamedAssetIds[item.id] && !settledIds.has(item.id),
+					)
+				: [];
 			const merged = replacesCompleteGeneration
 				? replaceSettledAssets(state.items, [
 						...replacementPage,
@@ -977,6 +979,9 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			const preservePagination =
 				!replacesCompleteGeneration &&
 				(state.pagesExhausted || preservesLoadedRemainder);
+			const preservesNewerStream =
+				state.streamedAssetGeneration !== null &&
+				state.streamedAssetGeneration > generation;
 			return {
 				...state,
 				items,
@@ -995,8 +1000,10 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 					? state.pagesExhausted
 					: action.nextCursor === null,
 				settledGeneration: Math.max(state.settledGeneration ?? 0, generation),
-				streamedAssetGeneration: generation,
-				streamedAssetIds: {},
+				streamedAssetGeneration: preservesNewerStream
+					? state.streamedAssetGeneration
+					: generation,
+				streamedAssetIds: preservesNewerStream ? state.streamedAssetIds : {},
 				assetWarnings:
 					remembered.changed || recoveredWarnings !== state.assetWarnings
 						? remembered.warnings

@@ -68,3 +68,17 @@ Fix-round-2 verification:
 - Interface typecheck: passed.
 - Biome on the two changed wall files: passed.
 - `git diff --check`: passed.
+
+## Fix round 3
+
+Re-review identified an event-order race: a generation-6 catalog batch can arrive before a delayed generation-5 metadata settlement. The older settlement previously replaced `streamedAssetGeneration` with 5 and cleared generation 6's tracked IDs, so the later paged generation-6 settlement could no longer retain its already-streamed remainder.
+
+The RED reducer test interleaves those events deterministically and initially observed generation 5 where generation 6 was required. Settlement now treats an equal-or-newer tracked stream as protected wall content, and only clears stream tracking when the settlement is for that generation or a newer one. The test proves generation 6's 21 assets and tracking survive generation 5, then generation 6 retains those assets while pruning 50 stale assets and adopting its authoritative total and cursor.
+
+Fix-round-3 verification:
+
+- Focused wall reducer unit test: 60 tests passed.
+- Focused PhotoViewer browser run: 2 tests passed, including the unchanged “keeps catalog-loaded photos when a later settlement page is shorter” expectation.
+- Interface typecheck: passed.
+- Biome on the two changed wall files: passed.
+- `git diff --check`: passed.
