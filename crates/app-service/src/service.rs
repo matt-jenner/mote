@@ -1134,6 +1134,7 @@ fn empty_page() -> crate::WallPage {
         order_state: crate::OrderState::Provisional,
         source_warnings: Vec::new(),
         total_count: 0,
+        indexed_count: 0,
         preview_counts: crate::WallPreviewCounts::default(),
     }
 }

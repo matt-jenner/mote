@@ -395,6 +395,7 @@ export function createInMemoryPhotoService(
 				orderState: settled ? "settled" : "provisional",
 				sourceWarnings: clone(sourceWarnings),
 				totalCount: ordered.length,
+				indexedCount: ordered.length,
 				previewCounts: {
 					wallReady: ordered.filter((item) => item.wallThumbnail !== null)
 						.length,

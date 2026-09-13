@@ -138,6 +138,10 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 		};
 	const known = state.items.length;
 	const total = Math.max(known, state.totalCount ?? 0);
+	const indexed = Math.min(
+		total,
+		Math.max(state.indexedCount ?? 0, state.scanProgress?.shaped ?? 0),
+	);
 	const wallReady = Math.min(
 		total,
 		state.previewCounts?.wallReady ??
@@ -154,13 +158,22 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 		state.activeRequest !== null || missingWall > 0 || state.sortPending;
 	if (!state.scanComplete) {
 		const progress = state.scanProgress;
-		if (progress?.total !== null && progress?.total !== undefined)
+		const indexingTotal = Math.max(total, progress?.total ?? 0);
+		if (indexed > 0 && indexed >= indexingTotal)
 			return {
-				status: `Indexing - ${progress.shaped} of ${progress.total}`,
-				value: progress.shaped,
+				status: "",
+				value: null,
+				max: null,
+				busy: true,
+			};
+		if (progress?.total !== null && progress?.total !== undefined) {
+			return {
+				status: `Indexing - ${indexed} of ${progress.total}`,
+				value: indexed,
 				max: progress.total,
 				busy: true,
 			};
+		}
 		return {
 			status: "Indexing",
 			value: null,
@@ -319,6 +332,7 @@ export function usePhotoWall(
 							type: "metadataSettled",
 							assets: page.items,
 							totalCount: page.totalCount,
+							indexedCount: page.indexedCount,
 							previewCounts: page.previewCounts,
 							nextCursor: page.nextCursor,
 							sourceWarnings: page.sourceWarnings,
@@ -333,6 +347,7 @@ export function usePhotoWall(
 							type: "pageLoaded",
 							assets: page.items,
 							totalCount: page.totalCount,
+							indexedCount: page.indexedCount,
 							previewCounts: page.previewCounts,
 							orderState: page.orderState,
 							nextCursor: page.nextCursor,

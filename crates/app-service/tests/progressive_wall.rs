@@ -4583,6 +4583,8 @@ async fn desktop_bootstrap_offline_reopen_keeps_cached_references() {
         .await
         .unwrap();
     assert_eq!(page.items.len(), 4);
+    assert_eq!(page.indexed_count, 4);
+    assert_eq!(page.total_count, 4);
     assert!(
         page.items
             .iter()
@@ -5105,6 +5107,7 @@ fn wall_dtos_never_serialize_native_paths() {
         order_state: OrderState::Settled,
         source_warnings: Vec::new(),
         total_count: 1,
+        indexed_count: 1,
         preview_counts: photo_app_service::WallPreviewCounts::default(),
     };
     let json = serde_json::to_string(&page).unwrap();

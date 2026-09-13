@@ -11,6 +11,7 @@ import type {
 export interface WallState {
 	items: WallAsset[];
 	totalCount: number | null;
+	indexedCount: number | null;
 	previewCounts: WallPreviewCounts | null;
 	previewCountVersion: number;
 	cursor: string | null;
@@ -58,6 +59,7 @@ export type WallAction =
 			type: "pageLoaded";
 			assets: readonly WallAsset[];
 			totalCount?: number;
+			indexedCount?: number;
 			previewCounts?: WallPreviewCounts;
 			orderState: OrderState;
 			nextCursor: string | null;
@@ -110,6 +112,7 @@ export type WallAction =
 			type: "metadataSettled";
 			assets: readonly WallAsset[];
 			totalCount?: number;
+			indexedCount?: number;
 			previewCounts?: WallPreviewCounts;
 			nextCursor: string | null;
 			requestEpoch: number;
@@ -139,6 +142,7 @@ export type WallAction =
 export const initialWallState: WallState = {
 	items: [],
 	totalCount: null,
+	indexedCount: null,
 	previewCounts: null,
 	previewCountVersion: 0,
 	cursor: null,
@@ -654,9 +658,15 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 					? sortProgressive(merged.items, state.direction)
 					: merged.items;
 			const items = reuseSequence(state.items, sorted);
+			const indexedCount = Math.max(
+				state.indexedCount ?? 0,
+				action.progress?.shaped ?? 0,
+				merged.items.length,
+			);
 			return {
 				...state,
 				items,
+				indexedCount,
 				totalCount:
 					acceptsProgress && action.progress?.total !== null
 						? (action.progress?.total ?? state.totalCount)
@@ -691,6 +701,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				scanProgress: action.progress,
 				scanProgressGeneration: action.generation,
 				totalCount: action.progress.total ?? state.totalCount,
+				indexedCount: Math.max(state.indexedCount ?? 0, action.progress.shaped),
 				streamedAssetGeneration: startsNewStream
 					? action.generation
 					: state.streamedAssetGeneration,
@@ -773,12 +784,18 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 					action.totalCount ??
 					Math.max(state.totalCount ?? 0, merged.items.length));
 			const previewCounts = pagePreviewCounts(state, action.previewCounts);
+			const indexedCount = Math.max(
+				state.indexedCount ?? 0,
+				action.indexedCount ?? 0,
+				merged.items.length,
+			);
 			if (
 				!merged.changed &&
 				state.orderState === orderState &&
 				state.cursor === action.nextCursor &&
 				state.pagesExhausted === pagesExhausted &&
 				state.totalCount === totalCount &&
+				state.indexedCount === indexedCount &&
 				samePreviewCounts(state.previewCounts, previewCounts) &&
 				state.activeRequest === null &&
 				!remembered.changed &&
@@ -790,6 +807,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				...state,
 				items,
 				totalCount,
+				indexedCount,
 				previewCounts,
 				cursor: action.nextCursor,
 				orderState,
@@ -992,6 +1010,14 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 							action.totalCount ?? 0,
 							merged.items.length,
 						),
+				indexedCount: preservesNewerStream
+					? Math.max(
+							state.indexedCount ?? 0,
+							action.indexedCount ?? 0,
+							merged.items.length,
+						)
+					: (action.indexedCount ??
+						Math.max(state.indexedCount ?? 0, merged.items.length)),
 				previewCounts,
 				cursor: preservePagination ? state.cursor : action.nextCursor,
 				orderState: "settled",

@@ -1436,6 +1436,7 @@ impl GalleryEngine {
                 .map(|w| crate::service::map_source_warning_code(&w.code))
                 .collect(),
             total_count,
+            indexed_count: catalog_total_count,
             preview_counts: WallPreviewCounts {
                 wall_ready: preview_counts.wall_ready,
                 screen_ready: preview_counts.screen_ready,

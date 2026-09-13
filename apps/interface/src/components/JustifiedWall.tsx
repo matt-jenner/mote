@@ -2,6 +2,7 @@ import {
 	type RefObject,
 	useCallback,
 	useEffect,
+	useLayoutEffect,
 	useRef,
 	useState,
 } from "react";
@@ -38,8 +39,28 @@ interface ViewportRowPass {
 	nearIds: string[];
 }
 
+interface ViewportAnchor {
+	assetId: string;
+	offset: number;
+}
+
 const BACKGROUND_REQUEST_BATCH_SIZE = 50;
 const BACKGROUND_REQUEST_WINDOW_SIZE = 200;
+
+function viewportAnchor(root: HTMLElement): ViewportAnchor | null {
+	if (root.scrollTop <= 1) return null;
+	const rootRect = root.getBoundingClientRect();
+	const tile = [...root.querySelectorAll<HTMLElement>("[data-asset-id]")].find(
+		(candidate) => {
+			const bounds = candidate.getBoundingClientRect();
+			return bounds.bottom > rootRect.top && bounds.top < rootRect.bottom;
+		},
+	);
+	const assetId = tile?.dataset.assetId;
+	return tile && assetId
+		? { assetId, offset: tile.getBoundingClientRect().top - rootRect.top }
+		: null;
+}
 
 function getViewportRowPass(
 	root: HTMLElement,
@@ -103,12 +124,49 @@ export function JustifiedWall({
 		[forwardedRegionRef],
 	);
 	const sentinelRef = useRef<HTMLDivElement>(null);
+	const viewportAnchorRef = useRef<ViewportAnchor | null>(null);
+	const anchorEpochRef = useRef(scrollEpoch);
 	const missingWallIdsRef = useRef<Set<string>>(new Set());
 	missingWallIdsRef.current = new Set(
 		assets
 			.filter((asset) => asset.wallThumbnail === null)
 			.map((asset) => asset.id),
 	);
+
+	useEffect(() => {
+		if (!root) return;
+		const rememberAnchor = () => {
+			viewportAnchorRef.current = viewportAnchor(root);
+		};
+		rememberAnchor();
+		root.addEventListener("scroll", rememberAnchor, { passive: true });
+		return () => root.removeEventListener("scroll", rememberAnchor);
+	}, [root]);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: row geometry changes require anchor restoration after layout.
+	useLayoutEffect(() => {
+		if (!root) return;
+		if (anchorEpochRef.current !== scrollEpoch) {
+			anchorEpochRef.current = scrollEpoch;
+			viewportAnchorRef.current = viewportAnchor(root);
+			return;
+		}
+		const anchor = viewportAnchorRef.current;
+		if (anchor) {
+			const tile = [
+				...root.querySelectorAll<HTMLElement>("[data-asset-id]"),
+			].find((candidate) => candidate.dataset.assetId === anchor.assetId);
+			if (tile) {
+				const nextOffset =
+					tile.getBoundingClientRect().top - root.getBoundingClientRect().top;
+				const delta = nextOffset - anchor.offset;
+				if (Math.abs(delta) > 0.5) root.scrollTop += delta;
+				viewportAnchorRef.current = anchor;
+				return;
+			}
+		}
+		viewportAnchorRef.current = viewportAnchor(root);
+	}, [root, rows, scrollEpoch]);
 
 	useEffect(() => {
 		if (!root || rows.length === 0 || scrollEpoch < 0) return;
@@ -226,7 +284,10 @@ export function JustifiedWall({
 			(entries) => {
 				if (entries.some((entry) => entry.isIntersecting)) loadMore();
 			},
-			{ root, rootMargin: "480px 0px" },
+			{
+				root,
+				rootMargin: `480px 0px ${Math.max(480, root.clientHeight * 2)}px`,
+			},
 		);
 		loadObserver.observe(sentinel);
 

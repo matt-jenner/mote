@@ -344,6 +344,7 @@ function decodeWallPage(value: unknown): WallPage {
 		"orderState",
 		"sourceWarnings",
 		"totalCount",
+		"indexedCount",
 		"previewCounts",
 	]);
 	return {
@@ -352,6 +353,7 @@ function decodeWallPage(value: unknown): WallPage {
 		orderState: enumValue(page.orderState, ["provisional", "settled"]),
 		sourceWarnings: arrayValue(page.sourceWarnings, decodeWarning),
 		totalCount: integerValue(page.totalCount),
+		indexedCount: integerValue(page.indexedCount),
 		previewCounts: decodePreviewCounts(page.previewCounts),
 	};
 }

@@ -137,6 +137,7 @@ export interface WallPage {
 	orderState: OrderState;
 	sourceWarnings: WallWarningState[];
 	totalCount: number;
+	indexedCount: number;
 	previewCounts: WallPreviewCounts;
 }
 

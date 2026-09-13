@@ -122,6 +122,17 @@ class TestIntersectionObserver {
 		if (!target) return false;
 		return TestIntersectionObserver.isObservingElement(kind, root, target);
 	}
+	static sentinelRootMargin(root: Element): string {
+		const observer = [...TestIntersectionObserver.instances]
+			.reverse()
+			.find(
+				(candidate) =>
+					candidate.options?.root === root &&
+					(candidate.options.rootMargin ?? "").includes("480"),
+			);
+		if (!observer) throw new Error("Missing sentinel observer");
+		return observer.options?.rootMargin ?? "";
+	}
 	static isObservingElement(
 		kind: "visible" | "near",
 		root: Element,
@@ -378,8 +389,24 @@ const pageOf = (
 	nextCursor,
 	sourceWarnings: [...sourceWarnings],
 	totalCount,
+	indexedCount: orderState === "settled" ? totalCount : items.length,
 	previewCounts,
 });
+
+function firstVisibleTile(root: HTMLElement): {
+	id: string;
+	offset: number;
+} {
+	const rootTop = root.getBoundingClientRect().top;
+	const tile = [...root.querySelectorAll<HTMLElement>("[data-asset-id]")].find(
+		(candidate) => candidate.getBoundingClientRect().bottom > rootTop,
+	);
+	if (!tile?.dataset.assetId) throw new Error("expected a visible photo tile");
+	return {
+		id: tile.dataset.assetId,
+		offset: tile.getBoundingClientRect().top - rootTop,
+	};
+}
 
 function renderWall(service: PhotoService) {
 	const client = new QueryClient({
@@ -866,8 +893,8 @@ describe("progressive photo wall", () => {
 			.element()
 			.querySelector<HTMLElement>("[data-asset-id='coast']");
 		await expect
-			.element(screen.getByRole("status"))
-			.toHaveTextContent("Indexing");
+			.poll(() => screen.getByRole("status").element().textContent)
+			.toBe("");
 		expect(tile).not.toBeNull();
 		if (!tile) return;
 		const before = tile.getBoundingClientRect().toJSON();
@@ -924,7 +951,9 @@ describe("progressive photo wall", () => {
 		await expect
 			.poll(() => service.derivativeRequests.length)
 			.toBeGreaterThan(0);
-		const wall = screen.getByRole("region", { name: "Photos" }).element();
+		const wall = screen
+			.getByRole("region", { name: "Photos" })
+			.element() as HTMLElement;
 		const rowNodes = [
 			...wall.querySelectorAll<HTMLElement>("[data-testid^='photo-row-']"),
 		];
@@ -1308,6 +1337,89 @@ describe("progressive photo wall", () => {
 					.filter((request) => request.priority === "nearViewport")
 					.flatMap((request) => request.assetIds),
 			).not.toContain(id);
+		screen.unmount();
+	});
+
+	it("keeps the visible photo anchored when indexing inserts rows above it", async () => {
+		await page.viewport(900, 520);
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		const provisional = Array.from({ length: 60 }, (_, index) =>
+			asset(`anchor-${index}`, `Anchor ${index}`, index + 1),
+		);
+		service.releaseQuery(
+			0,
+			pageOf(provisional, "provisional", "cursor-2", [], 61),
+		);
+		const wall = screen
+			.getByRole("region", { name: "Photos" })
+			.element() as HTMLElement;
+		await expect
+			.poll(() => wall.scrollHeight)
+			.toBeGreaterThan(wall.clientHeight);
+		wall.scrollTop = Math.floor(wall.scrollHeight / 2);
+		wall.dispatchEvent(new Event("scroll"));
+		await new Promise((resolve) =>
+			window.requestAnimationFrame(() => resolve(undefined)),
+		);
+		const before = firstVisibleTile(wall);
+
+		service.emit({
+			kind: "catalogBatch",
+			selectionId: "source-a",
+			assets: [
+				asset("inserted-before", "Inserted before", 0, {
+					capturedAtUtc: "2023-01-01T12:00:00Z",
+				}),
+			],
+			orderState: "provisional",
+			generation: 1,
+			progress: {
+				discovered: 61,
+				shaped: 61,
+				enriched: 40,
+				total: 61,
+			},
+		});
+
+		await expect
+			.poll(() => wall.querySelector("[data-asset-id='inserted-before']"))
+			.not.toBeNull();
+		await expect
+			.poll(() => {
+				const anchoredTile = wall.querySelector<HTMLElement>(
+					`[data-asset-id='${before.id}']`,
+				);
+				if (!anchoredTile) return Number.NaN;
+				return (
+					anchoredTile.getBoundingClientRect().top -
+					wall.getBoundingClientRect().top
+				);
+			})
+			.toBeCloseTo(before.offset, 0);
+		screen.unmount();
+	});
+
+	it("prefetches the next page by at least two viewport heights", async () => {
+		await page.viewport(900, 520);
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(
+			0,
+			pageOf(
+				Array.from({ length: 30 }, (_, index) =>
+					asset(`prefetch-${index}`, `Prefetch ${index}`, index + 1),
+				),
+				"provisional",
+				"cursor-2",
+			),
+		);
+		const wall = screen.getByRole("region", { name: "Photos" }).element();
+		await expect
+			.poll(() => TestIntersectionObserver.sentinelRootMargin(wall))
+			.toBe(`480px 0px ${wall.clientHeight * 2}px`);
 		screen.unmount();
 	});
 
@@ -3153,6 +3265,92 @@ describe("progressive photo wall", () => {
 			.toHaveTextContent("Indexing - 501 of 2056");
 		expect(screen.getByRole("status").element()).not.toHaveTextContent(
 			"Some previews need attention",
+		);
+	});
+
+	it("hides indexing progress when every known photo is already indexed", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.emit({
+			kind: "progress",
+			selectionId: "source-a",
+			generation: 2,
+			progress: {
+				discovered: 19,
+				shaped: 19,
+				enriched: 12,
+				total: 881,
+			},
+		});
+		service.releaseQuery(0, {
+			...pageOf(
+				realFixtureAssets.slice(0, 4),
+				"provisional",
+				"cursor-2",
+				[],
+				881,
+			),
+			indexedCount: 881,
+		} as WallPage);
+
+		await expect
+			.poll(() => screen.getByRole("status").element().textContent)
+			.toBe("");
+		expect(screen.getByRole("progressbar").query()).toBeNull();
+	});
+
+	it("hides indexing before inventory progress arrives for a fully cached folder", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(0, {
+			...pageOf(realFixtureAssets.slice(0, 4), "provisional", null, [], 4),
+			indexedCount: 4,
+		} as WallPage);
+
+		await expect
+			.poll(() => screen.getByRole("status").element().textContent)
+			.toBe("");
+		expect(screen.getByRole("progressbar").query()).toBeNull();
+	});
+
+	it("includes cached photos in indexing progress during a rescan", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.emit({
+			kind: "progress",
+			selectionId: "source-a",
+			generation: 2,
+			progress: {
+				discovered: 19,
+				shaped: 19,
+				enriched: 12,
+				total: 881,
+			},
+		});
+		service.releaseQuery(0, {
+			...pageOf(
+				realFixtureAssets.slice(0, 4),
+				"provisional",
+				"cursor-2",
+				[],
+				881,
+			),
+			indexedCount: 600,
+		} as WallPage);
+
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("Indexing - 600 of 881");
+		expect(screen.getByRole("progressbar").element()).toHaveAttribute(
+			"value",
+			"600",
+		);
+		expect(screen.getByRole("progressbar").element()).toHaveAttribute(
+			"max",
+			"881",
 		);
 	});
 

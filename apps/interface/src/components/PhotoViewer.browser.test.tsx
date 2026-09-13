@@ -345,6 +345,7 @@ function previewService(
 			orderState: "settled",
 			sourceWarnings: [],
 			totalCount: 0,
+			indexedCount: 0,
 			previewCounts: { wallReady: 0, screenReady: 0 },
 		}),
 		requestDerivatives,

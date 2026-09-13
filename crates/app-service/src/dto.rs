@@ -141,6 +141,7 @@ pub struct WallPage {
     pub order_state: OrderState,
     pub source_warnings: Vec<WallWarningState>,
     pub total_count: u64,
+    pub indexed_count: u64,
     pub preview_counts: WallPreviewCounts,
 }
 
@@ -311,9 +312,11 @@ mod tests {
             order_state: OrderState::Settled,
             source_warnings: Vec::new(),
             total_count: 2092,
+            indexed_count: 2092,
             preview_counts: counts,
         };
         let page_value = serde_json::to_value(page).unwrap();
+        assert_eq!(page_value["indexedCount"], 2092);
         assert_eq!(page_value["previewCounts"]["wallReady"], 1033);
         assert_eq!(page_value["previewCounts"]["screenReady"], 149);
 
@@ -356,6 +359,7 @@ mod tests {
                 retryable: true,
             }],
             total_count: 0,
+            indexed_count: 0,
             preview_counts: WallPreviewCounts::default(),
         };
         let value = serde_json::to_value(page).unwrap();

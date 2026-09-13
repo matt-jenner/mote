@@ -161,6 +161,7 @@ const emptyWallPage = {
 	orderState: "settled",
 	sourceWarnings: [],
 	totalCount: 0,
+	indexedCount: 0,
 	previewCounts: { wallReady: 0, screenReady: 0 },
 };
 
@@ -1294,6 +1295,7 @@ describe("HTTP PhotoService", () => {
 					orderState: "settled",
 					sourceWarnings: [{ code: "sourceOffline", retryable: true }],
 					totalCount: 1,
+					indexedCount: 1,
 					previewCounts: { wallReady: 1, screenReady: 1 },
 				});
 			throw new Error(`unexpected request ${url}`);
@@ -1347,6 +1349,7 @@ describe("HTTP PhotoService", () => {
 			nextCursor: "cursor-a",
 			orderState: "settled",
 			totalCount: 1,
+			indexedCount: 1,
 			previewCounts: { wallReady: 1, screenReady: 1 },
 			sourceWarnings: [{ code: "sourceOffline", retryable: true }],
 		});
