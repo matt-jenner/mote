@@ -22,6 +22,7 @@ pub struct ServerConfig {
     bind: SocketAddr,
     source_root: PathBuf,
     accent_color: Option<String>,
+    allow_original_downloads: bool,
     #[cfg(unix)]
     source_startup: Arc<Mutex<Option<SourceStartupValidation>>>,
     web_root: StaticWebRoot,
@@ -49,6 +50,8 @@ pub enum ConfigError {
     InvalidEnvironment(&'static str),
     #[error("PHOTO_VIEWER_BIND is not a valid socket address: {0}")]
     InvalidBind(#[from] AddrParseError),
+    #[error("PHOTO_VIEWER_ALLOW_ORIGINAL_DOWNLOADS must be empty, 0, false, 1, or true")]
+    InvalidOriginalDownloads,
     #[error("catalog data and cache directories must not be inside a source root")]
     InsideSourceRoot,
     #[error("configured source root is not a directory")]
@@ -121,6 +124,7 @@ impl ServerConfig {
             bind: bind.unwrap_or("127.0.0.1:8080").parse()?,
             source_root,
             accent_color: None,
+            allow_original_downloads: false,
             #[cfg(unix)]
             source_startup: Arc::new(Mutex::new(Some(source_startup))),
             web_root,
@@ -145,10 +149,26 @@ impl ServerConfig {
                 return Err(ConfigError::InvalidEnvironment("PHOTO_VIEWER_WEB_ROOT"));
             }
         };
+        let allow_original_downloads = match env::var("PHOTO_VIEWER_ALLOW_ORIGINAL_DOWNLOADS") {
+            Ok(value)
+                if value.is_empty() || value == "0" || value.eq_ignore_ascii_case("false") =>
+            {
+                false
+            }
+            Ok(value) if value == "1" || value.eq_ignore_ascii_case("true") => true,
+            Ok(_) => return Err(ConfigError::InvalidOriginalDownloads),
+            Err(env::VarError::NotPresent) => false,
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(ConfigError::InvalidEnvironment(
+                    "PHOTO_VIEWER_ALLOW_ORIGINAL_DOWNLOADS",
+                ));
+            }
+        };
         let mut config = Self::new(data_dir, cache_dir, bind.as_deref(), source_root, web_root)?;
         config.accent_color = env::var("MOTE_ACCENT_COLOR")
             .ok()
             .and_then(|value| configured_accent_color(&value));
+        config.allow_original_downloads = allow_original_downloads;
         Ok(config)
     }
 
@@ -205,6 +225,16 @@ impl ServerConfig {
 
     pub const fn bind(&self) -> SocketAddr {
         self.bind
+    }
+
+    pub const fn allow_original_downloads(&self) -> bool {
+        self.allow_original_downloads
+    }
+
+    #[doc(hidden)]
+    pub fn with_allow_original_downloads(mut self, allow_original_downloads: bool) -> Self {
+        self.allow_original_downloads = allow_original_downloads;
+        self
     }
 
     pub fn source_root(&self) -> &Path {
@@ -264,6 +294,12 @@ impl SourceStartupValidation {
 
 #[cfg(unix)]
 impl SourceStartupLease {
+    pub(crate) fn clone_original_root(&self) -> Result<PinnedDirectory, ConfigError> {
+        self.operational
+            .try_clone()
+            .map_err(|_| ConfigError::SourceRootChanged)
+    }
+
     pub(crate) fn into_prevalidated_source(
         self,
         operational_path: PathBuf,

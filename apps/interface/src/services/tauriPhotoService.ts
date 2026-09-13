@@ -5,10 +5,17 @@ import {
 	type SavedFolderSnapshot,
 	sortSavedFolders,
 } from "../folders/savedFolders";
+import type {
+	PickItem,
+	PickListSnapshot,
+	PickReference,
+} from "../picks/pickList";
 import {
 	type Appearance,
 	type BootstrapState,
 	type ChooseFolderResult,
+	type CopyProgress,
+	type CopyResult,
 	type DerivativeReference,
 	type DerivativeRequest,
 	type GalleryScope,
@@ -22,6 +29,10 @@ import {
 const internalErrorMessage = "Mote could not complete that request.";
 
 const nativeErrorMessages: Readonly<Record<string, string>> = {
+	copyInProgress: "An original copy is already in progress.",
+	copyDestinationIsSource: "Choose a destination outside your source folders.",
+	copyDestinationUnavailable: "The copy destination is unavailable.",
+	copyPreparationFailed: "Mote could not prepare these originals.",
 	folderUnavailable: "The selected folder is unavailable.",
 	folderNotDirectory: "Choose a folder, not a file.",
 	folderOverlapsSource: "That folder overlaps an existing source.",
@@ -38,6 +49,7 @@ const internalError = () =>
 
 const wallWatchRetryDelayMs = 100;
 const maxWallWatchRetryDelayMs = 1_000;
+const maxPickBatchSize = 250;
 
 export type WallSubscriptionId = string;
 
@@ -55,15 +67,116 @@ export type ChannelFactory = (
 	listener: (update: WallUpdate) => void,
 ) => ServiceChannel<WallUpdate>;
 
+interface NativePickListSnapshot {
+	revision: number;
+	items: PickItem[];
+}
+
+const clonePicks = (snapshot: PickListSnapshot): PickListSnapshot =>
+	structuredClone(snapshot);
+
+const fromNativePicks = (
+	snapshot: NativePickListSnapshot,
+): PickListSnapshot => ({
+	revision: snapshot.revision,
+	items: structuredClone(snapshot.items),
+	persistenceError: null,
+});
+
 export function createTauriPhotoService(
 	invokeCommand: InvokeCommand = invoke,
 	channelFactory: ChannelFactory = (listener) => new Channel(listener),
+	copyChannelFactory: (
+		listener: (progress: CopyProgress) => void,
+	) => ServiceChannel<CopyProgress> = (listener) => new Channel(listener),
 ): PhotoService {
 	let sortDirection: SortDirection = "oldestFirst";
 
 	let saved = emptySavedFolders();
 	let lastState: BootstrapState | null = null;
 	const listeners = new Set<(snapshot: SavedFolderSnapshot) => void>();
+	let picks: PickListSnapshot = {
+		revision: 0,
+		items: [],
+		persistenceError: null,
+	};
+	const pickListeners = new Set<(snapshot: PickListSnapshot) => void>();
+	const publishPicks = (value: NativePickListSnapshot) => {
+		if (value.revision < picks.revision) return clonePicks(picks);
+		picks = fromNativePicks(value);
+		for (const listener of pickListeners) listener(clonePicks(picks));
+		return clonePicks(picks);
+	};
+	const invokePickCommand = (command: string, args?: Record<string, unknown>) =>
+		invokePhotoCommand<NativePickListSnapshot>(invokeCommand, command, args);
+	const pickCommand = async (command: string, args?: Record<string, unknown>) =>
+		publishPicks(await invokePickCommand(command, args));
+	const restorePicks = async (
+		references: readonly PickReference[],
+	): Promise<PickListSnapshot> => {
+		if (references.length <= maxPickBatchSize) {
+			return pickCommand("restore_photo_picks", {
+				references: references.map((reference) => ({ ...reference })),
+			});
+		}
+		const chunks: PickReference[][] = [];
+		for (
+			let offset = 0;
+			offset < references.length;
+			offset += maxPickBatchSize
+		) {
+			chunks.push(
+				references
+					.slice(offset, offset + maxPickBatchSize)
+					.map((reference) => ({ ...reference })),
+			);
+		}
+		let completedChunk = false;
+		let finalSnapshot: NativePickListSnapshot | null = null;
+		try {
+			for (const chunk of chunks.reverse()) {
+				finalSnapshot = await invokePickCommand("restore_photo_picks", {
+					references: chunk,
+				});
+				completedChunk = true;
+			}
+		} catch (error) {
+			if (completedChunk) {
+				try {
+					publishPicks(await invokePickCommand("list_photo_picks"));
+				} catch {
+					// Preserve the mutation failure if the recovery read also fails.
+				}
+			}
+			throw error;
+		}
+		if (finalSnapshot === null) throw internalError();
+		return publishPicks(finalSnapshot);
+	};
+	const requestPickDerivatives = async (
+		request: DerivativeRequest,
+	): Promise<void> => {
+		const chunks =
+			request.assetIds.length === 0
+				? [[]]
+				: Array.from(
+						{
+							length: Math.ceil(request.assetIds.length / maxPickBatchSize),
+						},
+						(_, index) =>
+							request.assetIds.slice(
+								index * maxPickBatchSize,
+								(index + 1) * maxPickBatchSize,
+							),
+					);
+		for (const assetIds of chunks) {
+			await invokePhotoCommand<void>(
+				invokeCommand,
+				"request_pick_derivatives",
+				{ request: { ...request, assetIds } },
+			);
+		}
+	};
 	const publish = (value: SavedFolderSnapshot) => {
 		if ((value.revision ?? 0) < (saved.revision ?? 0))
 			return cloneSavedFolders(saved);
@@ -104,6 +217,44 @@ export function createTauriPhotoService(
 		return result;
 	};
 	return {
+		getPicks: () => clonePicks(picks),
+		watchPicks(listener) {
+			pickListeners.add(listener);
+			return () => pickListeners.delete(listener);
+		},
+		loadPicks: () => pickCommand("list_photo_picks"),
+		addPick: (reference: PickReference) =>
+			pickCommand("add_photo_pick", {
+				assetId: reference.assetId,
+				sourceFolderId: reference.sourceFolderId,
+			}),
+		removePick: (assetId: string) =>
+			pickCommand("remove_photo_pick", { assetId }),
+		clearPicks: () => pickCommand("clear_photo_picks"),
+		restorePicks,
+		requestPickDerivatives,
+		originalDownloadUrl: () => null,
+		async copyPickedOriginals(assetIds, listener) {
+			const channel = copyChannelFactory(listener);
+			try {
+				return await invokePhotoCommand<CopyResult>(
+					invokeCommand,
+					"copy_picked_originals",
+					{
+						assetIds: assetIds === null ? null : [...assetIds],
+						onEvent: channel,
+					},
+				);
+			} finally {
+				channel.onmessage = () => {};
+			}
+		},
+		showLastCopyDestination: () =>
+			invokePhotoCommand<void>(
+				invokeCommand,
+				"show_last_copy_destination",
+				undefined,
+			),
 		getSavedFolders: () => cloneSavedFolders(saved),
 		watchSavedFolders: (listener) => {
 			listeners.add(listener);
@@ -128,6 +279,7 @@ export function createTauriPhotoService(
 			chooseFolder: true,
 			folderSelection: "native",
 			locateFolder: false,
+			originalAction: "copy",
 		},
 		getBootstrapState: () => stateCommand("get_bootstrap_state"),
 		chooseFolder: () => selectCommand("choose_folder"),

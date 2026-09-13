@@ -1,6 +1,9 @@
 import { Menu, X } from "lucide-react";
 import {
+	type Dispatch,
 	type KeyboardEvent,
+	type MutableRefObject,
+	type SetStateAction,
 	useCallback,
 	useEffect,
 	useLayoutEffect,
@@ -17,20 +20,43 @@ import {
 	emptySavedFolders,
 	sourceIsUnavailable,
 } from "../folders/savedFolders";
+import {
+	PickListProvider,
+	pickOriginFromSavedFolders,
+	usePickList,
+} from "../picks/PickListContext";
 import type { PhotoService } from "../services/photoService";
 import styles from "../styles/appShell.module.css";
+import picksPanelStyles from "../styles/picksPanel.module.css";
+import {
+	hydratePickSequence,
+	nextPickAfterRemoval,
+} from "../viewer/pickSequence";
 import { initialViewerState, viewerReducer } from "../viewer/viewerReducer";
 import { AppearanceMenu } from "./AppearanceMenu";
 import { HostedFolderBrowser } from "./HostedFolderBrowser";
 import { NavigationRail } from "./NavigationRail";
 import { PhotoViewerOverlay } from "./PhotoViewerOverlay";
+import { PicksPanel, PicksToolbarButton } from "./PicksPanel";
 import { SourceCanvas } from "./SourceCanvas";
 import { WallToolbar } from "./WallToolbar";
 
-export function AppShell() {
-	const controller = useAppController();
+function AppShellContents({
+	controller,
+	picksOpen,
+	setPicksOpen,
+	viewPicksActionRef,
+}: {
+	controller: ReturnType<typeof useAppController>;
+	picksOpen: boolean;
+	setPicksOpen: Dispatch<SetStateAction<boolean>>;
+	viewPicksActionRef: MutableRefObject<() => void>;
+}) {
 	const service = usePhotoService();
 	const [drawerOpen, setDrawerOpen] = useState(false);
+	const [isMobile, setIsMobile] = useState(
+		() => window.matchMedia("(max-width: 899px)").matches,
+	);
 	const [folderBrowserBreadcrumbs, setFolderBrowserBreadcrumbs] = useState<
 		ReturnType<PhotoService["folderBrowserState"]>["breadcrumbs"] | null
 	>(null);
@@ -44,8 +70,15 @@ export function AppShell() {
 	const wallRegionRef = useRef<HTMLElement>(null);
 	const closingAnchorRef = useRef(viewer.returnAnchor);
 	const closingFocusFallbackRef = useRef(false);
+	const closingReturnSurfaceRef = useRef(viewer.returnSurface);
+	const pickReviewFocusRef = useRef<{
+		element: HTMLElement;
+		assetId: string | null;
+	} | null>(null);
 	const drawerRef = useRef<HTMLElement>(null);
 	const drawerTriggerRef = useRef<HTMLButtonElement>(null);
+	const picksTriggerRef = useRef<HTMLButtonElement>(null);
+	const desktopPicksWasOpen = useRef(false);
 	const drawerCloseRef = useRef<HTMLButtonElement>(null);
 	const permanentFolderTriggerRef = useRef<HTMLButtonElement>(null);
 	const folderRestoreFocusRef = useRef<HTMLElement | null>(null);
@@ -53,6 +86,8 @@ export function AppShell() {
 	const restoreFolderFocusPendingRef = useRef(false);
 	const folderBrowserOpen = folderBrowserBreadcrumbs !== null;
 	const source = controller.state?.activeSource ?? null;
+	const picks = usePickList();
+	const pickAssets = hydratePickSequence(picks.snapshot.items);
 	const galleryScope =
 		controller.state?.settings.galleryScope ?? "includeSubfolders";
 	const wall = usePhotoWall(source?.selectionId ?? null, galleryScope);
@@ -107,26 +142,92 @@ export function AppShell() {
 		},
 		[wall.state.items, folderUnavailable],
 	);
+	const handleOpenPickReview = useCallback(
+		(assetId: string, launchTarget: HTMLElement) => {
+			if (!pickAssets.some((asset) => asset.id === assetId)) return;
+			pickReviewFocusRef.current = {
+				element: launchTarget,
+				assetId: launchTarget.dataset.pickReviewAssetId ?? null,
+			};
+			dispatchViewer({
+				type: "open",
+				assetId,
+				anchor: {
+					assetId: wall.state.items[0]?.id ?? assetId,
+					scrollTop: wallRegionRef.current?.scrollTop ?? 0,
+				},
+				sequence: "picks",
+				returnSurface: "picksPanel",
+			});
+		},
+		[pickAssets, wall.state.items],
+	);
 	const handleCloseViewer = useCallback(() => {
 		const anchor = viewer.returnAnchor;
+		const returningToPicks = viewer.returnSurface === "picksPanel";
 		closingAnchorRef.current = anchor
 			? {
 					...anchor,
-					assetId: viewer.currentAssetId ?? anchor.assetId,
+					assetId: returningToPicks
+						? anchor.assetId
+						: (viewer.currentAssetId ?? anchor.assetId),
 				}
 			: null;
+		closingReturnSurfaceRef.current = viewer.returnSurface;
 		closingFocusFallbackRef.current =
-			!viewer.currentAssetId ||
-			!wall.state.items.some((item) => item.id === viewer.currentAssetId);
+			!returningToPicks &&
+			(!viewer.currentAssetId ||
+				!wall.state.items.some((item) => item.id === viewer.currentAssetId));
 		dispatchViewer({ type: "close" });
-	}, [viewer.currentAssetId, viewer.returnAnchor, wall.state.items]);
+	}, [
+		viewer.currentAssetId,
+		viewer.returnAnchor,
+		viewer.returnSurface,
+		wall.state.items,
+	]);
 	const handleSelectViewerAsset = useCallback(
 		(assetId: string) => {
-			if (!wall.state.items.some((item) => item.id === assetId)) return;
+			const assets =
+				viewer.sequence === "picks" ? pickAssets : wall.state.items;
+			if (!assets.some((item) => item.id === assetId)) return;
 			dispatchViewer({ type: "select", assetId });
 		},
-		[wall.state.items],
+		[pickAssets, viewer.sequence, wall.state.items],
 	);
+	const handleRemovePick = useCallback(
+		(assetId: string) => {
+			if (
+				viewer.open &&
+				viewer.sequence === "picks" &&
+				viewer.currentAssetId === assetId
+			) {
+				const nextAssetId = nextPickAfterRemoval(picks.snapshot.items, assetId);
+				if (nextAssetId)
+					dispatchViewer({ type: "select", assetId: nextAssetId });
+				else handleCloseViewer();
+			}
+			void picks.remove(assetId).catch(() => {});
+		},
+		[
+			handleCloseViewer,
+			picks,
+			viewer.currentAssetId,
+			viewer.open,
+			viewer.sequence,
+		],
+	);
+
+	useLayoutEffect(() => {
+		viewPicksActionRef.current = () => {
+			if (viewer.open) {
+				closingAnchorRef.current = null;
+				closingReturnSurfaceRef.current = "wall";
+				closingFocusFallbackRef.current = false;
+				dispatchViewer({ type: "close" });
+			}
+			setPicksOpen(true);
+		};
+	}, [setPicksOpen, viewer.open, viewPicksActionRef]);
 
 	useLayoutEffect(() => {
 		if (viewer.open) {
@@ -137,6 +238,27 @@ export function AppShell() {
 		if (!closingAnchorRef.current) return;
 		const anchor = closingAnchorRef.current;
 		closingAnchorRef.current = null;
+		const returnSurface = closingReturnSurfaceRef.current;
+		closingReturnSurfaceRef.current = "wall";
+		if (returnSurface === "picksPanel") {
+			setPicksOpen(true);
+			const focusTarget = pickReviewFocusRef.current;
+			window.requestAnimationFrame(() => {
+				if (focusTarget?.element.isConnected)
+					focusTarget.element.focus({ preventScroll: true });
+				else
+					document
+						.querySelector<HTMLElement>(
+							focusTarget?.assetId
+								? `[data-pick-review-asset-id="${CSS.escape(focusTarget.assetId)}"]`
+								: "[data-picks-review]",
+						)
+						?.focus({ preventScroll: true });
+			});
+			if (wallRegionRef.current)
+				wallRegionRef.current.scrollTop = anchor.scrollTop;
+			return;
+		}
 		const focusWall = closingFocusFallbackRef.current;
 		closingFocusFallbackRef.current = false;
 		if (wallRegionRef.current)
@@ -156,11 +278,12 @@ export function AppShell() {
 		setHighlightedAssetId(anchor.assetId);
 		const timer = window.setTimeout(() => setHighlightedAssetId(null), 600);
 		return () => window.clearTimeout(timer);
-	}, [viewer.open, viewer.returnAnchor]);
+	}, [setPicksOpen, viewer.open, viewer.returnAnchor]);
 
 	useEffect(() => {
 		if (
 			!viewer.open ||
+			viewer.sequence !== "wall" ||
 			!viewer.currentAssetId ||
 			wall.state.items.some((item) => item.id === viewer.currentAssetId)
 		)
@@ -178,7 +301,31 @@ export function AppShell() {
 		viewer.currentAssetId,
 		viewer.open,
 		viewer.returnAnchor,
+		viewer.sequence,
 		wall.state.items,
+	]);
+
+	useEffect(() => {
+		if (
+			!viewer.open ||
+			viewer.sequence !== "picks" ||
+			!viewer.currentAssetId ||
+			pickAssets.some((asset) => asset.id === viewer.currentAssetId)
+		)
+			return;
+		const nextAssetId = nextPickAfterRemoval(
+			picks.snapshot.items,
+			viewer.currentAssetId,
+		);
+		if (nextAssetId) dispatchViewer({ type: "select", assetId: nextAssetId });
+		else handleCloseViewer();
+	}, [
+		handleCloseViewer,
+		pickAssets,
+		picks.snapshot.items,
+		viewer.currentAssetId,
+		viewer.open,
+		viewer.sequence,
 	]);
 
 	useEffect(() => {
@@ -194,6 +341,17 @@ export function AppShell() {
 	}, [drawerOpen, folderBrowserOpen]);
 
 	useLayoutEffect(() => {
+		if (isMobile) return;
+		if (picksOpen) {
+			desktopPicksWasOpen.current = true;
+			return;
+		}
+		if (!desktopPicksWasOpen.current) return;
+		desktopPicksWasOpen.current = false;
+		picksTriggerRef.current?.focus({ preventScroll: true });
+	}, [isMobile, picksOpen]);
+
+	useLayoutEffect(() => {
 		if (folderBrowserOpen || !restoreFolderFocusPendingRef.current) return;
 		restoreFolderFocusPendingRef.current = false;
 		const restoreFocus = folderRestoreFocusRef.current;
@@ -205,12 +363,16 @@ export function AppShell() {
 
 	useEffect(() => {
 		const phoneViewport = window.matchMedia("(max-width: 899px)");
+		const updateViewport = () => setIsMobile(phoneViewport.matches);
 		const closeDrawerAbovePhoneWidth = (event: MediaQueryListEvent) => {
 			if (!event.matches) setDrawerOpen(false);
 		};
 
+		updateViewport();
+		phoneViewport.addEventListener("change", updateViewport);
 		phoneViewport.addEventListener("change", closeDrawerAbovePhoneWidth);
 		return () => {
+			phoneViewport.removeEventListener("change", updateViewport);
 			phoneViewport.removeEventListener("change", closeDrawerAbovePhoneWidth);
 		};
 	}, []);
@@ -242,7 +404,11 @@ export function AppShell() {
 
 	return (
 		<SourceUnavailableContext value={folderUnavailable}>
-			<div className={styles.appShell}>
+			<div
+				className={`${styles.appShell} ${
+					picksOpen && !isMobile ? styles.appShellPicksOpen : ""
+				}`}
+			>
 				<NavigationRail
 					savedFolders={controller.state?.savedFolders}
 					onActivate={async (id) => {
@@ -255,13 +421,23 @@ export function AppShell() {
 					folderBrowserOpen={folderBrowserOpen}
 					folderButtonRef={permanentFolderTriggerRef}
 					folderSelection={controller.capabilities.folderSelection}
-					inert={drawerOpen || viewer.open || folderBrowserOpen}
+					inert={
+						drawerOpen ||
+						viewer.open ||
+						folderBrowserOpen ||
+						(picksOpen && isMobile)
+					}
 					onChooseFolder={chooseFolder}
 				/>
 				<section
 					aria-label="Photo workspace"
 					className={styles.workspace}
-					inert={drawerOpen || viewer.open || folderBrowserOpen}
+					inert={
+						drawerOpen ||
+						viewer.open ||
+						folderBrowserOpen ||
+						(picksOpen && isMobile)
+					}
 				>
 					<header className={styles.toolbar}>
 						<button
@@ -295,6 +471,15 @@ export function AppShell() {
 								retryable={Boolean(wall.state.error)}
 							/>
 						) : null}
+						{!isMobile ? (
+							<PicksToolbarButton
+								className={`${styles.picksToolbarTrigger} ${picksPanelStyles.toolbarTrigger}`}
+								expanded={picksOpen}
+								onClick={() => setPicksOpen((open) => !open)}
+								triggerRef={picksTriggerRef}
+								viewerOpen={viewer.open}
+							/>
+						) : null}
 						<AppearanceMenu
 							onChange={controller.updateAppearance}
 							value={appearance}
@@ -322,15 +507,43 @@ export function AppShell() {
 						/>
 					)}
 				</section>
+				{!isMobile ? (
+					<PicksPanel
+						mode="desktop"
+						onClose={() => setPicksOpen(false)}
+						onOpen={() => setPicksOpen(true)}
+						onOpenPick={handleOpenPickReview}
+						onRemovePick={handleRemovePick}
+						onReview={handleOpenPickReview}
+						open={picksOpen}
+						viewerOpen={viewer.open}
+					/>
+				) : (
+					<PicksPanel
+						mode="mobile"
+						onClose={() => setPicksOpen(false)}
+						onOpen={() => setPicksOpen(true)}
+						onOpenPick={handleOpenPickReview}
+						onRemovePick={handleRemovePick}
+						onReview={handleOpenPickReview}
+						open={picksOpen}
+						viewerOpen={viewer.open}
+					/>
+				)}
 				{viewer.open ? (
 					<PhotoViewerOverlay
-						assets={wall.state.items.filter(
-							(asset) =>
-								(!folderUnavailable && asset.availability === "available") ||
-								asset.wallThumbnail ||
-								asset.screenPreview ||
-								asset.id === viewer.currentAssetId,
-						)}
+						assets={
+							viewer.sequence === "picks"
+								? pickAssets
+								: wall.state.items.filter(
+										(asset) =>
+											(!folderUnavailable &&
+												asset.availability === "available") ||
+											asset.wallThumbnail ||
+											asset.screenPreview ||
+											asset.id === viewer.currentAssetId,
+									)
+						}
 						onClose={handleCloseViewer}
 						onSetInfoOpen={(open) =>
 							dispatchViewer({ type: "setInfoOpen", open })
@@ -342,14 +555,29 @@ export function AppShell() {
 						}
 						service={service}
 						state={viewer}
-						onLoadMore={wall.loadMore}
+						onLoadMore={viewer.sequence === "picks" ? () => {} : wall.loadMore}
 						onRequestNearViewportDerivatives={
-							wall.requestNearViewportDerivatives
+							viewer.sequence === "picks"
+								? (assetIds) =>
+										picks.requestDerivatives(assetIds, "wallThumbnail")
+								: wall.requestNearViewportDerivatives
 						}
+						onRequestPreviewDerivatives={
+							viewer.sequence === "picks"
+								? async (request) => {
+										picks.requestDerivatives(
+											request.assetIds,
+											request.kind,
+											request.priority,
+										);
+									}
+								: undefined
+						}
+						onRemovePick={handleRemovePick}
 						onSetWallInteraction={wall.setWallInteraction}
 						onSelectAsset={handleSelectViewerAsset}
 						loading={wall.loading}
-						nextCursor={wall.state.cursor}
+						nextCursor={viewer.sequence === "picks" ? null : wall.state.cursor}
 					/>
 				) : null}
 				{folderBrowserBreadcrumbs ? (
@@ -414,5 +642,25 @@ export function AppShell() {
 				) : null}
 			</div>
 		</SourceUnavailableContext>
+	);
+}
+
+export function AppShell() {
+	const controller = useAppController();
+	const [picksOpen, setPicksOpen] = useState(false);
+	const viewPicksActionRef = useRef<() => void>(() => setPicksOpen(true));
+	const pickOrigin = pickOriginFromSavedFolders(controller.state?.savedFolders);
+	return (
+		<PickListProvider
+			onViewPicks={() => viewPicksActionRef.current()}
+			origin={pickOrigin}
+		>
+			<AppShellContents
+				controller={controller}
+				picksOpen={picksOpen}
+				setPicksOpen={setPicksOpen}
+				viewPicksActionRef={viewPicksActionRef}
+			/>
+		</PickListProvider>
 	);
 }

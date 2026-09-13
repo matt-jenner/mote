@@ -2,11 +2,15 @@ mod derivative;
 mod error;
 mod events;
 mod gallery;
+mod original;
 mod types;
 
 pub(crate) use derivative::{derivative, request_derivatives};
 pub(crate) use events::events;
-pub(crate) use gallery::{create_selection, folder_access, interaction, selection_summary, wall};
+pub(crate) use gallery::{
+    create_selection, folder_access, interaction, resolve_assets, selection_summary, wall,
+};
+pub(crate) use original::original;
 
 use axum::Json;
 use axum::extract::{RawQuery, State};
@@ -114,6 +118,7 @@ pub(crate) async fn bootstrap(State(state): State<AppState>) -> impl IntoRespons
         capabilities: Capabilities {
             folder_browser: state.folder_root.is_some(),
             video: false,
+            original_downloads: state.allow_original_downloads,
         },
         source_available,
         accent_color: state.accent_color.clone(),

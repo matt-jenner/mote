@@ -6,6 +6,7 @@ import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { PhotoServiceProvider } from "../app/PhotoServiceContext";
 import { emptySavedFolders } from "../folders/savedFolders";
+import { PickListProvider } from "../picks/PickListContext";
 import {
 	createInMemoryPhotoService,
 	type InMemoryPhotoService,
@@ -311,6 +312,7 @@ function previewService(
 			chooseFolder: false,
 			folderSelection: "native",
 			locateFolder: false,
+			originalAction: "none",
 		},
 		getBootstrapState: async () => ({
 			savedFolders: emptySavedFolders(),
@@ -852,6 +854,8 @@ function InvalidGeometryViewerHarness() {
 				open: true,
 				currentAssetId: current.id,
 				returnAnchor: null,
+				sequence: "wall",
+				returnSurface: "wall",
 				infoOpen: false,
 				controlsVisible: true,
 				filmstripVisible: true,
@@ -1392,6 +1396,9 @@ describe("immersive photo viewer checkpoint", () => {
 				"[data-viewer-chrome] [aria-label='Back to photos']",
 			);
 			const info = dialog.querySelector<HTMLElement>("[data-viewer-info]");
+			const pick = dialog.querySelector<HTMLElement>(
+				"[data-viewer-chrome] [aria-label$='to picks']",
+			);
 			const zoom = dialog.querySelector<HTMLElement>(
 				"[data-viewer-zoom-controls]",
 			);
@@ -1404,6 +1411,7 @@ describe("immersive photo viewer checkpoint", () => {
 				!next ||
 				!back ||
 				!info ||
+				!pick ||
 				!zoom ||
 				!filmstrip
 			)
@@ -1433,6 +1441,7 @@ describe("immersive photo viewer checkpoint", () => {
 					["Next", next],
 					["Back", back],
 					["Info", info],
+					["Pick", pick],
 					["zoom controls", zoom],
 					["filmstrip", filmstrip],
 					["open drawer", drawer],
@@ -1458,6 +1467,77 @@ describe("immersive photo viewer checkpoint", () => {
 				if (value) root.style.setProperty(property, value);
 				else root.style.removeProperty(property);
 			}
+			await page.viewport(1440, 1024);
+		}
+	});
+
+	it("keeps short-landscape chrome clear of navigation and zoom controls", async () => {
+		try {
+			for (const width of [390, 568]) {
+				await page.viewport(width, 320);
+				const { view, tile } = await openAsset("Coast");
+				try {
+					(tile.element() as HTMLButtonElement).click();
+					await view.getByRole("button", { name: "Zoom in" }).click();
+					const dialog = view
+						.getByRole("dialog", { name: "Photo viewer" })
+						.element();
+					const controls = {
+						Back: dialog.querySelector<HTMLElement>(
+							"[aria-label='Back to photos']",
+						),
+						Info: dialog.querySelector<HTMLElement>("[data-viewer-info]"),
+						Pick: dialog.querySelector<HTMLElement>(
+							"[data-viewer-chrome] [aria-label$='to picks']",
+						),
+					};
+					const obstacles = {
+						Previous: dialog.querySelector<HTMLElement>(
+							"[data-viewer-controls] [aria-label='Previous photo']",
+						),
+						Next: dialog.querySelector<HTMLElement>(
+							"[data-viewer-controls] [aria-label='Next photo']",
+						),
+						"zoom controls": dialog.querySelector<HTMLElement>(
+							"[data-viewer-zoom-controls]",
+						),
+						Navigator: dialog.querySelector<HTMLElement>(
+							"[data-viewer-navigator]",
+						),
+					};
+					const boundsOverlap = (first: DOMRect, second: DOMRect) =>
+						first.left < second.right &&
+						first.right > second.left &&
+						first.top < second.bottom &&
+						first.bottom > second.top;
+					for (const [name, control] of Object.entries(controls)) {
+						if (!control)
+							throw new Error(`${name} was not rendered at ${width}px`);
+						const bounds = control.getBoundingClientRect();
+						expect(
+							bounds.width,
+							`${name} target width at ${width}px`,
+						).toBeGreaterThanOrEqual(44);
+						expect(
+							bounds.height,
+							`${name} target height at ${width}px`,
+						).toBeGreaterThanOrEqual(44);
+						for (const [obstacleName, obstacle] of Object.entries(obstacles)) {
+							if (!obstacle)
+								throw new Error(
+									`${obstacleName} was not rendered at ${width}px`,
+								);
+							expect(
+								boundsOverlap(bounds, obstacle.getBoundingClientRect()),
+								`${name} overlaps ${obstacleName} at ${width}px`,
+							).toBe(false);
+						}
+					}
+				} finally {
+					await view.unmount();
+				}
+			}
+		} finally {
 			await page.viewport(1440, 1024);
 		}
 	});
@@ -1948,6 +2028,84 @@ describe("immersive photo viewer checkpoint", () => {
 		await expect.element(tile).toHaveFocus();
 	});
 
+	it("keeps wall and viewer pick toggles synchronized through pending mutations", async () => {
+		const service = serviceWithReadyPhotos();
+		const addGate = gate<void>();
+		const removeGate = gate<void>();
+		const addPick = service.addPick.bind(service);
+		const removePick = service.removePick.bind(service);
+		service.addPick = async (reference) => {
+			await addGate.promise;
+			return addPick(reference);
+		};
+		service.removePick = async (assetId) => {
+			await removeGate.promise;
+			return removePick(assetId);
+		};
+		const view = await renderViewerWall(service);
+		await view.getByRole("button", { name: "Choose Folder" }).click();
+		await service.finishFixtureScan();
+
+		const wallPick = view.getByRole("button", {
+			name: "Add Coast to picks",
+			exact: true,
+		});
+		const open = view.getByRole("button", {
+			name: "Open Coast",
+			exact: true,
+		});
+		await wallPick.click();
+		await expect
+			.element(
+				view.getByRole("button", {
+					name: "Remove Coast from picks",
+					exact: true,
+				}),
+			)
+			.toHaveAttribute("aria-pressed", "true");
+		expect(
+			view.getByRole("dialog", { name: "Photo viewer" }).query(),
+		).toBeNull();
+
+		await open.click();
+		const viewerPick = view
+			.getByRole("button", {
+				name: "Remove Coast from picks",
+				exact: true,
+			})
+			.last();
+		await expect.element(viewerPick).toHaveAttribute("aria-pressed", "true");
+		expect(viewerPick.element().closest("[data-viewer-chrome]")).not.toBeNull();
+		expect(viewerPick.element().tabIndex).toBe(0);
+
+		addGate.resolve();
+		await expect.poll(() => service.getPicks().items).toHaveLength(1);
+		await viewerPick.click();
+		await expect
+			.element(
+				view
+					.getByRole("button", {
+						name: "Add Coast to picks",
+						exact: true,
+					})
+					.last(),
+			)
+			.toHaveAttribute("aria-pressed", "false");
+		await expect
+			.element(
+				view
+					.getByRole("button", {
+						name: "Add Coast to picks",
+						exact: true,
+					})
+					.first(),
+			)
+			.toHaveAttribute("aria-pressed", "false");
+
+		removeGate.resolve();
+		await expect.poll(() => service.getPicks().items).toHaveLength(0);
+	});
+
 	it("keeps indexed videos poster-only and non-openable", async () => {
 		const video = {
 			...asset("clip", "Clip", 1),
@@ -2435,11 +2593,7 @@ describe("immersive photo viewer checkpoint", () => {
 			expect(seriousViolations(await axe.run(document))).toEqual([]);
 		};
 		await runAxe();
-		(
-			view
-				.getByRole("button", { name: "Zoom in" })
-				.element() as HTMLButtonElement
-		).click();
+		await view.getByRole("button", { name: "Zoom in" }).click();
 		await expect
 			.element(view.getByTestId("viewer-stage"))
 			.toHaveAttribute("data-viewer-mode", "zoomed");
@@ -2529,7 +2683,11 @@ describe("immersive photo viewer checkpoint", () => {
 	it("keeps malformed geometry and zero-natural previews at Fit while navigation works", async () => {
 		const view = await render(
 			<PhotoServiceProvider service={invalidGeometryService}>
-				<InvalidGeometryViewerHarness />
+				<PickListProvider
+					origin={{ sourceFolderId: "test-folder", sourceLabel: "Test folder" }}
+				>
+					<InvalidGeometryViewerHarness />
+				</PickListProvider>
 			</PhotoServiceProvider>,
 		);
 		const stage = view.getByTestId("viewer-stage");
@@ -4821,6 +4979,10 @@ describe("immersive photo viewer checkpoint", () => {
 		(tile.element() as HTMLButtonElement).click();
 		const back = view.getByRole("button", { name: "Back to photos" });
 		await expect.element(back).toBeVisible();
+		const info = view.getByRole("button", { name: "Photo information" });
+		const pick = view
+			.getByRole("dialog", { name: "Photo viewer" })
+			.getByRole("button", { name: "Add Photo 1 to picks" });
 		const previous = view.getByRole("button", { name: "Previous photo" });
 		const next = view.getByRole("button", { name: "Next photo" });
 		const folders = view.getByRole("button", {
@@ -4832,6 +4994,10 @@ describe("immersive photo viewer checkpoint", () => {
 			.getByRole("button", { name: "Coast", exact: true });
 		await back.element().focus();
 		await userEvent.keyboard("{Tab}");
+		expect(document.activeElement).toBe(info.element());
+		await userEvent.keyboard("{Tab}");
+		expect(document.activeElement).toBe(pick.element());
+		await userEvent.keyboard("{Tab}");
 		expect(document.activeElement).toBe(previous.element());
 		await userEvent.keyboard("{Tab}");
 		expect(document.activeElement).toBe(next.element());
@@ -4842,6 +5008,10 @@ describe("immersive photo viewer checkpoint", () => {
 		expect(document.activeElement).toBe(next.element());
 		await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
 		expect(document.activeElement).toBe(previous.element());
+		await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
+		expect(document.activeElement).toBe(pick.element());
+		await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
+		expect(document.activeElement).toBe(info.element());
 		await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
 		expect(document.activeElement).toBe(back.element());
 	});
@@ -4957,6 +5127,101 @@ describe("immersive photo viewer checkpoint", () => {
 				.querySelector("button[aria-current='true']")
 				?.getAttribute("aria-label"),
 		).toBe("Coast");
+	});
+
+	it("labels an explicitly supplied pick-only viewer sequence", async () => {
+		const service = previewService(async () => undefined);
+		const view = await render(
+			<PhotoServiceProvider service={service}>
+				<PickListProvider
+					origin={{ sourceFolderId: "folder", sourceLabel: "Folder" }}
+				>
+					<PhotoViewerOverlay
+						assets={[asset("first", "First", 1), asset("second", "Second", 2)]}
+						loading={false}
+						nextCursor={null}
+						onClose={() => undefined}
+						onHideControls={() => undefined}
+						onLoadMore={() => undefined}
+						onRequestNearViewportDerivatives={() => undefined}
+						onSelectAsset={() => undefined}
+						onSetInfoOpen={() => undefined}
+						onShowControls={() => undefined}
+						onToggleTouchControls={() => undefined}
+						service={service}
+						state={{
+							open: true,
+							currentAssetId: "second",
+							returnAnchor: null,
+							sequence: "picks",
+							returnSurface: "picksPanel",
+							infoOpen: false,
+							controlsVisible: true,
+							filmstripVisible: true,
+							previewGeneration: 1,
+						}}
+					/>
+				</PickListProvider>
+			</PhotoServiceProvider>,
+		);
+
+		await expect
+			.element(view.getByTestId("viewer-status"))
+			.toHaveTextContent("Second, Picks · 2 of 2");
+		await expect
+			.element(view.getByRole("button", { name: "Add Second to picks" }))
+			.toHaveAttribute("aria-pressed", "false");
+		expect(seriousViolations(await axe.run(document))).toEqual([]);
+	});
+
+	it("uses the pick derivative request path for a pick review preview", async () => {
+		const service = previewService(async () => {
+			throw new Error("The wall request path must not run for a pick review");
+		});
+		const requests: DerivativeRequest[] = [];
+		const view = await render(
+			<PhotoServiceProvider service={service}>
+				<PickListProvider
+					origin={{ sourceFolderId: "folder", sourceLabel: "Folder" }}
+				>
+					<PhotoViewerOverlay
+						assets={[asset("picked", "Picked", 1)]}
+						loading={false}
+						nextCursor={null}
+						onClose={() => undefined}
+						onHideControls={() => undefined}
+						onLoadMore={() => undefined}
+						onRequestNearViewportDerivatives={() => undefined}
+						onRequestPreviewDerivatives={async (request) => {
+							requests.push(request);
+						}}
+						onSelectAsset={() => undefined}
+						onSetInfoOpen={() => undefined}
+						onShowControls={() => undefined}
+						onToggleTouchControls={() => undefined}
+						service={service}
+						state={{
+							open: true,
+							currentAssetId: "picked",
+							returnAnchor: null,
+							sequence: "picks",
+							returnSurface: "picksPanel",
+							infoOpen: false,
+							controlsVisible: true,
+							filmstripVisible: true,
+							previewGeneration: 1,
+						}}
+					/>
+				</PickListProvider>
+			</PhotoServiceProvider>,
+		);
+
+		await expect
+			.poll(() => requests)
+			.toEqual([
+				{ assetIds: ["picked"], kind: "screenPreview", priority: "visible" },
+			]);
+		await view.unmount();
 	});
 
 	it("holds the current photo while loading and then continues into the next page", async () => {

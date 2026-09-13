@@ -5,6 +5,8 @@ mod dto;
 mod folder_access;
 mod gallery;
 mod hosted_runtime;
+mod original_copy;
+mod picks;
 mod saved_folders;
 mod scan;
 mod service;
@@ -19,6 +21,7 @@ pub use dto::{
     OrderState, ScanProgressDto, SortDirection, WallAsset, WallMediaKind, WallPage,
     WallPreviewCounts, WallQueryRequest, WallShapeState, WallUpdate, WallWarningState,
 };
+pub use dto::{PickItem, PickListSnapshot, PickReference};
 pub use folder_access::{
     AccessReply, FolderAccessCoordinator, FolderAccessKey, FolderAccessTarget, FolderProbe,
     FolderProbeOutcome, ValidatedFolder,
@@ -31,6 +34,7 @@ pub use gallery::{
 };
 pub use hosted_runtime::SelectionEventSubscription;
 pub use hosted_runtime::SequencedWallUpdate;
+pub use original_copy::{CopyItemResult, CopyItemStatus, OriginalCopyBatch, OriginalCopyResult};
 pub use photo_domain::GalleryScope;
 pub use photo_indexer::MetadataReader;
 pub use service::{AppService, AppServiceError};

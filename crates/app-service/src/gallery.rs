@@ -835,6 +835,18 @@ impl GalleryEngine {
         }
     }
 
+    pub(crate) fn for_photo_picks(&self, protected_groups: photo_cache::ProtectedGroups) -> Self {
+        // Desktop wall work has one active coordinator. Picks need stable
+        // per-group coordinators and runtimes so cross-folder requests cannot
+        // reset or be rejected by the active wall's selection epoch.
+        Self {
+            runtimes: Arc::new(Mutex::new(HashMap::new())),
+            shared_coordinator: None,
+            protected_groups,
+            ..self.clone()
+        }
+    }
+
     pub fn root_id(&self) -> Option<String> {
         self.hosted_library_id.map(|id| id.as_uuid().to_string())
     }
@@ -1188,6 +1200,106 @@ impl GalleryEngine {
             .folder_group_recovery_state(runtime.selection.library_id, runtime.selection.group_id)
             .map(Some)
             .map_err(Into::into)
+    }
+
+    /// Resolves a catalog identity only within the configured hosted library.
+    /// The caller must open the relative key from its pinned source descriptor.
+    pub fn resolve_hosted_original(
+        &self,
+        asset_id: photo_domain::AssetId,
+    ) -> Result<(RelativePathKey, String, photo_domain::MediaKind), AppServiceError> {
+        let library_id = self
+            .hosted_library_id
+            .ok_or(AppServiceError::ForeignAsset)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| AppServiceError::StatePoisoned)?;
+        let catalog = state.libraries.catalog();
+        let asset = catalog
+            .find_asset(asset_id)?
+            .ok_or(AppServiceError::UnknownAsset)?;
+        if asset.library_id != library_id {
+            return Err(AppServiceError::ForeignAsset);
+        }
+        let library = catalog
+            .find_library(library_id)?
+            .ok_or(AppServiceError::UnknownAsset)?;
+        if asset.availability != photo_domain::Availability::Available
+            || library.availability != photo_domain::Availability::Available
+        {
+            return Err(AppServiceError::UnknownAsset);
+        }
+        let path = asset
+            .relative_path
+            .to_path_buf()
+            .map_err(|_| AppServiceError::UnknownAsset)?;
+        if path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(AppServiceError::UnknownAsset);
+        }
+        let filename = path
+            .file_name()
+            .ok_or(AppServiceError::UnknownAsset)?
+            .to_string_lossy()
+            .into_owned();
+        Ok((asset.relative_path, filename, asset.media_kind))
+    }
+
+    /// Resolves a bounded pick batch without opening a source or starting a scan.
+    pub fn resolve_assets(
+        &self,
+        selection: &GallerySelection,
+        asset_ids: &[String],
+    ) -> Result<Vec<Option<crate::WallAsset>>, AppServiceError> {
+        let ids = crate::picks::parse_pick_asset_ids(asset_ids)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| AppServiceError::StatePoisoned)?;
+        let catalog = state.libraries.catalog();
+        let group = catalog
+            .folder_group(selection.group_id)?
+            .ok_or(AppServiceError::UnknownAsset)?;
+        if group.library_id != selection.library_id
+            || group.relative_path != selection.relative_folder
+            || self
+                .hosted_library_id
+                .is_some_and(|library| library != group.library_id)
+        {
+            return Err(AppServiceError::ForeignAsset);
+        }
+        let records = catalog.wall_records_for_assets_scoped(
+            selection.group_id,
+            GalleryScope::IncludeSubfolders,
+            &ids,
+        )?;
+        for id in &ids {
+            if let Some(asset) = catalog.find_asset(*id)? {
+                if asset.library_id != selection.library_id
+                    || !records.iter().any(|record| record.id == *id)
+                {
+                    return Err(AppServiceError::ForeignAsset);
+                }
+            }
+        }
+        let order = if catalog
+            .has_completed_generation_for_group(selection.library_id, selection.group_id)?
+        {
+            OrderState::Settled
+        } else {
+            OrderState::Provisional
+        };
+        let assets = crate::service::wall_assets_with_derivatives(catalog, &records, order)?
+            .into_iter()
+            .map(|asset| (asset.id.clone(), asset))
+            .collect::<HashMap<_, _>>();
+        Ok(ids
+            .iter()
+            .map(|id| assets.get(&id.as_uuid().to_string()).cloned())
+            .collect())
     }
 
     pub async fn query_wall(

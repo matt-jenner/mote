@@ -1,0 +1,370 @@
+.desktopPanel {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+	min-height: 0;
+	overflow: hidden;
+	background: var(--canvas-elevated);
+	border-left: 1px solid var(--separator);
+}
+
+.panelHeader {
+	display: flex;
+	flex: 0 0 auto;
+	align-items: center;
+	justify-content: space-between;
+	gap: var(--space-3);
+	min-height: 88px;
+	padding: var(--space-4) var(--space-4) var(--space-3) var(--space-6);
+	border-bottom: 1px solid var(--separator);
+}
+
+.panelTitle,
+.panelCount,
+.emptyState {
+	margin: 0;
+}
+
+.panelTitle {
+	font-size: 21px;
+	font-weight: 650;
+	letter-spacing: -0.025em;
+}
+
+.panelCount,
+.sourceLabel {
+	color: var(--text-secondary);
+	font-size: 13px;
+}
+
+.panelCount {
+	margin-top: 3px;
+}
+
+.closeButton,
+.removeButton,
+.reviewButton,
+.copyButton,
+.clearButton,
+.mobileBar {
+	border: 0;
+	cursor: pointer;
+}
+
+.closeButton,
+.removeButton {
+	display: grid;
+	place-items: center;
+	flex: 0 0 auto;
+	width: 40px;
+	height: 40px;
+	padding: 0;
+	color: var(--text-primary);
+	background: transparent;
+	border-radius: var(--radius-small);
+}
+
+.pickList {
+	flex: 1 1 auto;
+	min-height: 0;
+	padding: 0 var(--space-4);
+	margin: 0;
+	overflow-y: auto;
+	list-style: none;
+}
+
+.pickRow {
+	display: grid;
+	grid-template-columns: 56px minmax(0, 1fr) auto;
+	align-items: center;
+	gap: var(--space-3);
+	min-height: 94px;
+	border-bottom: 1px solid var(--separator);
+}
+
+.thumbnail {
+	width: 56px;
+	height: 56px;
+	overflow: hidden;
+	background: var(--control);
+	border: 1px solid var(--separator);
+	border-radius: var(--radius-small);
+}
+
+.thumbnailButton {
+	padding: 0;
+	cursor: pointer;
+}
+
+.thumbnailButton:focus-visible {
+	outline: 2px solid var(--focus-ring);
+	outline-offset: 2px;
+}
+
+.thumbnail img {
+	display: block;
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+}
+
+.rowDetails {
+	display: grid;
+	gap: 4px;
+	min-width: 0;
+}
+
+.downloadLink {
+	color: var(--text-primary);
+	font-size: 13px;
+}
+
+.filename {
+	overflow: hidden;
+	font-size: 14px;
+	font-weight: 560;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.sourceLabel,
+.sourceWarning {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+
+.sourceWarning {
+	color: var(--text-secondary);
+	font-size: 12px;
+}
+
+.actions {
+	position: sticky;
+	bottom: 0;
+	z-index: 1;
+	display: grid;
+	gap: var(--space-2);
+	flex: 0 0 auto;
+	padding: var(--space-3) var(--space-4) var(--space-4);
+	background: var(--canvas-elevated);
+	border-top: 1px solid var(--separator);
+}
+
+.reviewButton,
+.copyButton,
+.clearButton {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: var(--space-2);
+	min-height: 42px;
+	padding: 0 var(--space-3);
+	font-size: 14px;
+	font-weight: 620;
+	border-radius: 9px;
+}
+
+.reviewButton {
+	color: var(--text-primary);
+	background: var(--control);
+	border: 1px solid var(--separator);
+}
+
+.copyButton {
+	color: var(--primary-control-text);
+	background: var(--primary-control);
+}
+
+.copyButton:disabled,
+.reviewButton:disabled {
+	color: var(--unavailable);
+	cursor: default;
+	background: var(--control);
+}
+
+.clearButton {
+	color: var(--text-secondary);
+	background: transparent;
+}
+
+.emptyState {
+	padding: 44px var(--space-6);
+	color: var(--text-secondary);
+	font-size: 14px;
+	line-height: 1.5;
+	text-align: center;
+}
+
+.toolbarTrigger,
+.mobileBar {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: var(--space-2);
+	min-height: 40px;
+	padding: 0 var(--space-3);
+	color: var(--text-primary);
+	font-size: 13px;
+	font-weight: 600;
+	background: transparent;
+	border: 1px solid var(--separator);
+	border-radius: 8px;
+}
+
+.toolbarTrigger[aria-expanded="true"] {
+	background: var(--selection);
+	border-color: color-mix(
+		in srgb,
+		var(--primary-control) 35%,
+		var(--separator)
+	);
+}
+
+.triggerCount {
+	color: var(--text-secondary);
+	font-variant-numeric: tabular-nums;
+}
+
+.mobileBar,
+.mobileBackdrop {
+	display: none;
+}
+
+@media (hover: hover) {
+	.closeButton:hover,
+	.removeButton:hover,
+	.clearButton:hover {
+		background: var(--control-hover);
+	}
+
+	.reviewButton:not(:disabled):hover {
+		background: var(--control-hover);
+	}
+
+	.copyButton:not(:disabled):hover {
+		background: color-mix(in srgb, var(--primary-control) 86%, #000000);
+	}
+}
+
+@media (max-width: 899px) {
+	.downloadLink {
+		display: inline-flex;
+		align-items: center;
+		min-height: 44px;
+	}
+	.mobileBar {
+		position: absolute;
+		right: 0;
+		bottom: 0;
+		left: 0;
+		display: flex;
+		justify-content: flex-start;
+		min-height: calc(56px + var(--safe-area-bottom));
+		padding: 0 var(--space-6) var(--safe-area-bottom);
+		color: var(--text-primary);
+		font-size: 18px;
+		background: var(--canvas-elevated);
+		border: 0;
+		border-top: 1px solid var(--separator);
+		border-radius: 0;
+	}
+
+	.mobileBar svg {
+		color: var(--primary-control);
+	}
+
+	.mobileBar .triggerCount {
+		margin-left: 3px;
+		font-size: 16px;
+	}
+
+	.mobileBackdrop {
+		position: fixed;
+		inset: 0;
+		z-index: 60;
+		display: block;
+		background: var(--overlay-scrim);
+	}
+
+	.dismissButton {
+		position: absolute;
+		inset: 0;
+		width: 100%;
+		height: 100%;
+		padding: 0;
+		background: transparent;
+		border: 0;
+	}
+
+	.mobileSheet {
+		position: absolute;
+		right: 0;
+		bottom: var(--safe-area-bottom);
+		left: 0;
+		display: flex;
+		flex-direction: column;
+		height: 84dvh;
+		min-height: 0;
+		overflow: hidden;
+		background: var(--canvas-elevated);
+		border: 1px solid var(--separator);
+		border-bottom: 0;
+		border-radius: 24px 24px 0 0;
+		box-shadow: var(--overlay-shadow);
+	}
+
+	.dragHandle {
+		display: grid;
+		place-items: center;
+		flex: 0 0 28px;
+		color: var(--text-secondary);
+		touch-action: none;
+	}
+
+	.mobileSheet .panelHeader {
+		min-height: 78px;
+		padding-top: var(--space-2);
+	}
+
+	.mobileSheet .panelTitle {
+		font-size: 29px;
+	}
+
+	.mobileSheet .pickList {
+		padding-inline: var(--space-4);
+	}
+
+	.mobileSheet .pickRow {
+		grid-template-columns: 68px minmax(0, 1fr) auto;
+		min-height: 112px;
+	}
+
+	.mobileSheet .thumbnail {
+		width: 68px;
+		height: 68px;
+	}
+
+	.mobileSheet .closeButton,
+	.mobileSheet .removeButton {
+		width: 44px;
+		height: 44px;
+	}
+
+	.mobileSheet .actions {
+		padding: var(--space-3) var(--space-6)
+			calc(var(--space-4) + var(--safe-area-bottom));
+	}
+
+	.mobileSheet .reviewButton,
+	.mobileSheet .copyButton,
+	.mobileSheet .clearButton {
+		min-height: 48px;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.mobileSheet {
+		transition: none;
+	}
+}

@@ -12,6 +12,7 @@ import { PhotoServiceError, type WallUpdate } from "./photoService";
 
 class MemoryStorage implements Storage {
 	private readonly values = new Map<string, string>();
+	readonly reads: string[] = [];
 	readonly writes: Array<[string, string]> = [];
 
 	get length(): number {
@@ -23,6 +24,11 @@ class MemoryStorage implements Storage {
 	}
 
 	getItem(key: string): string | null {
+		this.reads.push(key);
+		return this.values.get(key) ?? null;
+	}
+
+	peek(key: string): string | null {
 		return this.values.get(key) ?? null;
 	}
 
@@ -93,7 +99,11 @@ interface RecordedRequest {
 }
 
 const bootstrapResponse = {
-	capabilities: { folderBrowser: true, video: false },
+	capabilities: {
+		folderBrowser: true,
+		video: false,
+		originalDownloads: false,
+	},
 	sourceAvailable: true,
 };
 
@@ -204,9 +214,343 @@ function recordedState(request: RecordedRequest): unknown {
 
 afterEach(() => {
 	vi.useRealTimers();
+	vi.unstubAllGlobals();
 });
 
 describe("HTTP PhotoService", () => {
+	it("waits for bootstrap root identity before reading browser pick storage", async () => {
+		const localStorage = savedPreferences();
+		let releaseBootstrap!: (response: Response) => void;
+		let markRequested!: () => void;
+		const requested = new Promise<void>((resolve) => {
+			markRequested = resolve;
+		});
+		const service = createHttpPhotoService({
+			localStorage,
+			sessionStorage: new MemoryStorage(),
+			fetch: async () => {
+				markRequested();
+				return new Promise<Response>((resolve) => {
+					releaseBootstrap = resolve;
+				});
+			},
+			randomUuid: () => "client-a",
+		});
+
+		const loading = service.getBootstrapState();
+		await requested;
+		expect(
+			localStorage.reads.some((key) => key.startsWith("mote.picks.v1.")),
+		).toBe(false);
+		releaseBootstrap(json({ ...bootstrapResponse, rootId: "root-a" }));
+		await loading;
+		expect(localStorage.reads).toContain("mote.picks.v1.root-a");
+		service.dispose();
+	});
+
+	it("maps the bootstrap original-download capability without probing a download URL", async () => {
+		const fetch = vi.fn(async () =>
+			json({
+				capabilities: {
+					folderBrowser: true,
+					video: false,
+					originalDownloads: true,
+				},
+				sourceAvailable: true,
+			}),
+		);
+		const service = createHttpPhotoService({
+			localStorage: savedPreferences(),
+			sessionStorage: new MemoryStorage(),
+			fetch,
+			randomUuid: () => "client-a",
+		});
+
+		await service.getBootstrapState();
+
+		expect(service.capabilities.originalAction).toBe("download");
+		expect(fetch).toHaveBeenCalledOnce();
+		expect(fetch).toHaveBeenCalledWith("/api/v1/bootstrap", undefined);
+		service.dispose();
+	});
+
+	it("hydrates root-scoped picks by source folder without replacing the active selection", async () => {
+		const localStorage = savedPreferences();
+		const calls: RecordedRequest[] = [];
+		const assets = {
+			"asset-a": representativeAsset,
+			"asset-b": {
+				...representativeAsset,
+				id: "asset-b",
+				displayName: "Glacier.jpg",
+				wallThumbnail: null,
+				screenPreview: null,
+			},
+		};
+		const fetch = vi.fn(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = String(input);
+				calls.push({ url, init });
+				if (url === "/api/v1/bootstrap")
+					return json({ ...bootstrapResponse, rootId: "root-a" });
+				if (url === "/api/v1/selections")
+					return json(
+						{
+							...selectionSummary,
+							folderId: "active-folder",
+							sourceId: "root-a",
+						},
+						201,
+					);
+				if (url.endsWith("/assets")) {
+					const body = requestBody({ url, init }) as { assetIds: string[] };
+					return json(
+						body.assetIds.map((id) => assets[id as keyof typeof assets]),
+					);
+				}
+				if (url.endsWith("/derivatives")) return noContent();
+				if (url.includes("/wall?")) return json(emptyWallPage);
+				throw new Error(`unexpected request ${url}`);
+			},
+		);
+		const service = createHttpPhotoService({
+			localStorage,
+			sessionStorage: new MemoryStorage(),
+			fetch,
+			eventSourceFactory: (url) => new FakeEventSource(url),
+			randomUuid: () => "client-a",
+		});
+
+		expect(service.getPicks()).toEqual({
+			revision: 0,
+			items: [],
+			persistenceError: null,
+		});
+		expect(
+			localStorage.reads.some((key) => key.startsWith("mote.picks.v1.")),
+		).toBe(false);
+		expect(localStorage.peek("mote.picks.v1.root-a")).toBeNull();
+		await service.getBootstrapState();
+		expect(localStorage.reads).toContain("mote.picks.v1.root-a");
+		await service.selectFolder("Trips/Iceland");
+		await service.addPick({
+			assetId: "asset-a",
+			sourceFolderId: "folder-one",
+			sourceLabel: "Stored family label",
+		});
+		await service.addPick({
+			assetId: "asset-b",
+			sourceFolderId: "folder-two",
+			sourceLabel: "Stored trip label",
+		});
+		await expect
+			.poll(() => service.getPicks().items.map((item) => item.asset?.id))
+			.toEqual(["asset-a", "asset-b"]);
+		const snapshot = await service.loadPicks();
+		await service.requestPickDerivatives({
+			assetIds: ["asset-b", "asset-a"],
+			priority: "nearViewport",
+			kind: "wallThumbnail",
+		});
+		await service.queryWall({
+			cursor: null,
+			limit: 10,
+			direction: "oldestFirst",
+		});
+
+		expect(
+			snapshot.items.map(({ assetId, sourceLabel, asset }) => ({
+				assetId,
+				sourceLabel,
+				resolvedId: asset?.id,
+			})),
+		).toEqual([
+			{
+				assetId: "asset-a",
+				sourceLabel: "Stored family label",
+				resolvedId: "asset-a",
+			},
+			{
+				assetId: "asset-b",
+				sourceLabel: "Stored trip label",
+				resolvedId: "asset-b",
+			},
+		]);
+		const pickCalls = calls.filter(
+			(call) =>
+				call.url.endsWith("/assets") || call.url.endsWith("/derivatives"),
+		);
+		expect(
+			// Mutations now hydrate automatically as well as on an explicit refresh.
+			// Compare each distinct request contract, including its source and IDs.
+			[
+				...new Map(
+					pickCalls.map(({ url, init }) => {
+						const request = [url, requestBody({ url, init })];
+						return [JSON.stringify(request), request];
+					}),
+				).values(),
+			],
+		).toEqual([
+			[
+				"/api/v1/selections/selection-folder-one/assets",
+				{ assetIds: ["asset-a"] },
+			],
+			[
+				"/api/v1/selections/selection-folder-two/assets",
+				{ assetIds: ["asset-b"] },
+			],
+			[
+				"/api/v1/selections/selection-folder-two/derivatives",
+				{
+					scope: "includeSubfolders",
+					request: {
+						assetIds: ["asset-b"],
+						priority: "nearViewport",
+						kind: "wallThumbnail",
+					},
+				},
+			],
+			[
+				"/api/v1/selections/selection-folder-one/derivatives",
+				{
+					scope: "includeSubfolders",
+					request: {
+						assetIds: ["asset-a"],
+						priority: "nearViewport",
+						kind: "wallThumbnail",
+					},
+				},
+			],
+		]);
+		expect(calls.at(-1)?.url).toContain("/selections/selection-a/wall?");
+		expect(service.capabilities.originalAction).toBe("none");
+		expect(service.originalDownloadUrl("asset-a")).toBeNull();
+		service.dispose();
+	});
+
+	it("does not let an older hydration clear assets resolved for newer picks", async () => {
+		const localStorage = savedPreferences();
+		let resolveOlderRequest!: (response: Response) => void;
+		let markOlderRequestFinished!: () => void;
+		const olderRequest = new Promise<Response>((resolve) => {
+			resolveOlderRequest = resolve;
+		});
+		const olderRequestFinished = new Promise<void>((resolve) => {
+			markOlderRequestFinished = resolve;
+		});
+		let assetRequestCount = 0;
+		const secondAsset = {
+			...representativeAsset,
+			id: "asset-b",
+			displayName: "Glacier.jpg",
+		};
+		const fetch = vi.fn(
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = String(input);
+				if (url === "/api/v1/bootstrap")
+					return json({ ...bootstrapResponse, rootId: "root-a" });
+				if (url.endsWith("/assets")) {
+					assetRequestCount += 1;
+					if (assetRequestCount === 1) {
+						return olderRequest.then((response) => {
+							markOlderRequestFinished();
+							return response;
+						});
+					}
+					const body = requestBody({ url, init }) as { assetIds: string[] };
+					return json(
+						body.assetIds.map((id) =>
+							id === representativeAsset.id ? representativeAsset : secondAsset,
+						),
+					);
+				}
+				throw new Error(`unexpected request ${url}`);
+			},
+		);
+		const service = createHttpPhotoService({
+			localStorage,
+			sessionStorage: new MemoryStorage(),
+			fetch,
+			randomUuid: () => "client-a",
+		});
+
+		await service.getBootstrapState();
+		await service.addPick({
+			assetId: representativeAsset.id,
+			sourceFolderId: "folder-one",
+			sourceLabel: "Family",
+		});
+		await expect.poll(() => assetRequestCount).toBe(1);
+		await service.addPick({
+			assetId: secondAsset.id,
+			sourceFolderId: "folder-one",
+			sourceLabel: "Family",
+		});
+		await expect
+			.poll(() => service.getPicks().items.map((item) => item.asset?.id))
+			.toEqual(["asset-a", "asset-b"]);
+
+		resolveOlderRequest(json([representativeAsset]));
+		await olderRequestFinished;
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+		expect(service.getPicks().items.map((item) => item.asset?.id)).toEqual([
+			"asset-a",
+			"asset-b",
+		]);
+		service.dispose();
+	});
+
+	it("refreshes its pick snapshot when another tab writes the same root", async () => {
+		const localStorage = new MemoryStorage();
+		const storageListeners: Array<(event: StorageEvent) => void> = [];
+		vi.stubGlobal(
+			"addEventListener",
+			(type: string, listener: EventListener) => {
+				if (type === "storage")
+					storageListeners.push(
+						listener as unknown as (event: StorageEvent) => void,
+					);
+			},
+		);
+		vi.stubGlobal("removeEventListener", () => undefined);
+		const service = createHttpPhotoService({
+			localStorage,
+			sessionStorage: new MemoryStorage(),
+			fetch: async () => json({ ...bootstrapResponse, rootId: "root-a" }),
+			randomUuid: () => "client-a",
+		});
+		await service.getBootstrapState();
+		const revisions: number[] = [];
+		service.watchPicks((snapshot) => revisions.push(snapshot.revision));
+		localStorage.setItem(
+			"mote.picks.v1.root-a",
+			JSON.stringify({
+				revision: 7,
+				items: [
+					{
+						assetId: "asset-a",
+						sourceFolderId: "folder-a",
+						sourceLabel: "Family",
+					},
+				],
+			}),
+		);
+
+		for (const listener of storageListeners)
+			listener({
+				key: "mote.picks.v1.root-a",
+				storageArea: localStorage,
+			} as unknown as StorageEvent);
+
+		expect(service.getPicks()).toMatchObject({
+			revision: 7,
+			items: [{ assetId: "asset-a", sourceLabel: "Family", asset: null }],
+		});
+		expect(revisions).toEqual([7]);
+		service.dispose();
+	});
 	it("restores independent browser and tab state against one server", async () => {
 		const firstLocal = savedPreferences({
 			selectionId: "selection-a",
@@ -556,11 +900,26 @@ describe("HTTP PhotoService", () => {
 
 	it.each([
 		{
-			name: "malformed bootstrap",
+			name: "bootstrap without an original-download capability",
 			localStorage: savedPreferences(),
 			fetch: async () =>
 				json({
-					capabilities: { folderBrowser: "yes", video: false },
+					capabilities: { folderBrowser: true, video: false },
+					sourceAvailable: true,
+				}),
+			act: (service: ReturnType<typeof createHttpPhotoService>) =>
+				service.getBootstrapState(),
+		},
+		{
+			name: "bootstrap with a non-boolean original-download capability",
+			localStorage: savedPreferences(),
+			fetch: async () =>
+				json({
+					capabilities: {
+						folderBrowser: true,
+						video: false,
+						originalDownloads: "yes",
+					},
 					sourceAvailable: true,
 				}),
 			act: (service: ReturnType<typeof createHttpPhotoService>) =>

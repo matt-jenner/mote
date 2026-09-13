@@ -6,6 +6,14 @@ import {
 	type SavedFolderSnapshot,
 	sortSavedFolders,
 } from "../folders/savedFolders";
+import {
+	addPickReference,
+	clearPickReferences,
+	type PickListSnapshot,
+	type PickReference,
+	removePickReference,
+	restoreClearedPickReferences,
+} from "../picks/pickList";
 import type {
 	Appearance,
 	BootstrapState,
@@ -77,6 +85,9 @@ export function createInMemoryPhotoService(
 	let sourceWarnings: WallWarningState[] = [...(options.sourceWarnings ?? [])];
 	const derivativeRequests: DerivativeRequest[] = [];
 	const interactionCalls: boolean[] = [];
+	let pickReferences: PickReference[] = [];
+	let pickRevision = 0;
+	const pickListeners = new Set<(snapshot: PickListSnapshot) => void>();
 	let sortDirection: SortDirection = "oldestFirst";
 	const savedListeners = new Set<(snapshot: SavedFolderSnapshot) => void>();
 	let savedSequence = 0;
@@ -129,6 +140,32 @@ export function createInMemoryPhotoService(
 		if (update.selectionId !== selectionId) return;
 		for (const listener of listeners) listener(clone(update));
 	};
+	const pickSnapshot = (): PickListSnapshot => ({
+		revision: pickRevision,
+		items: pickReferences.map((reference) => {
+			const asset = assets.find(
+				(candidate) => candidate.id === reference.assetId,
+			);
+			return { ...clone(reference), asset: asset ? clone(asset) : null };
+		}),
+		persistenceError: null,
+	});
+	const publishPicks = () => {
+		const snapshot = pickSnapshot();
+		for (const listener of pickListeners) listener(clone(snapshot));
+		return snapshot;
+	};
+	const mutatePicks = (
+		change: (current: readonly PickReference[]) => PickReference[],
+	) => {
+		const next = change(pickReferences);
+		if (JSON.stringify(next) !== JSON.stringify(pickReferences)) {
+			pickReferences = next;
+			pickRevision += 1;
+			return publishPicks();
+		}
+		return pickSnapshot();
+	};
 	const progress = (enriched: number): ScanProgressDto => ({
 		discovered: fixtures.length,
 		shaped: fixtures.length,
@@ -144,6 +181,50 @@ export function createInMemoryPhotoService(
 		);
 
 	const service: InMemoryPhotoService = {
+		getPicks: () => clone(pickSnapshot()),
+		watchPicks(listener) {
+			pickListeners.add(listener);
+			return () => pickListeners.delete(listener);
+		},
+		async loadPicks() {
+			return clone(pickSnapshot());
+		},
+		async addPick(reference) {
+			return clone(
+				mutatePicks((current) => addPickReference(current, reference)),
+			);
+		},
+		async removePick(assetId) {
+			return clone(
+				mutatePicks((current) => removePickReference(current, assetId)),
+			);
+		},
+		async clearPicks() {
+			return clone(mutatePicks((current) => clearPickReferences(current)));
+		},
+		async restorePicks(cleared) {
+			return clone(
+				mutatePicks((current) =>
+					restoreClearedPickReferences(cleared, current),
+				),
+			);
+		},
+		async requestPickDerivatives(request) {
+			await service.requestDerivatives(request);
+		},
+		originalDownloadUrl: () => null,
+		async copyPickedOriginals() {
+			throw new PhotoServiceError(
+				"unsupportedCapability",
+				"Copying originals is available in the desktop app.",
+			);
+		},
+		async showLastCopyDestination() {
+			throw new PhotoServiceError(
+				"unsupportedCapability",
+				"Opening the copy destination is available in the desktop app.",
+			);
+		},
 		getSavedFolders: () => cloneSavedFolders(state.savedFolders),
 		watchSavedFolders(listener) {
 			savedListeners.add(listener);
@@ -213,6 +294,7 @@ export function createInMemoryPhotoService(
 			chooseFolder: true,
 			folderSelection: "native",
 			locateFolder: false,
+			originalAction: "none",
 		},
 		derivativeRequests,
 		interactionCalls,

@@ -1,5 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
-import { PhotoServiceError, type WallUpdate } from "./photoService";
+import { createPickListStore } from "../picks/usePickList";
+import { createInMemoryPhotoService } from "./inMemoryPhotoService";
+import {
+	type CopyProgress,
+	type CopyResult,
+	type DerivativeRequest,
+	PhotoServiceError,
+	type WallUpdate,
+} from "./photoService";
 import {
 	type ChannelFactory,
 	createTauriPhotoService,
@@ -75,6 +83,176 @@ const recordingInvoke =
 	};
 
 describe("Tauri PhotoService", () => {
+	it("owns one pending copy globally and preserves partial state when retry is cancelled", async () => {
+		const memory = createInMemoryPhotoService();
+		let release!: (result: CopyResult) => void;
+		let progress!: (event: CopyProgress) => void;
+		const ids: Array<readonly string[] | null> = [];
+		const store = createPickListStore({
+			...memory,
+			getPicks: () => ({
+				revision: 0,
+				persistenceError: null,
+				items: ["one", "two"].map((assetId) => ({
+					assetId,
+					sourceFolderId: "folder",
+					sourceLabel: "Folder",
+					asset: null,
+				})),
+			}),
+			copyPickedOriginals: (batch, listener) => {
+				ids.push(batch);
+				progress = listener;
+				return new Promise((resolve) => {
+					release = resolve;
+				});
+			},
+		});
+		const operation = store.getState().copyOriginals();
+		void store.getState().copyOriginals();
+		expect(ids).toEqual([["one", "two"]]);
+		expect(store.getState().copy.phase).toBe("choosing");
+		progress({
+			completed: 1,
+			total: 2,
+			item: {
+				assetId: "one",
+				status: "copied",
+				destinationName: "one.jpg",
+				errorCode: null,
+			},
+		});
+		expect(store.getState().copy).toMatchObject({
+			phase: "copying",
+			completed: 1,
+			total: 2,
+		});
+		release({
+			kind: "complete",
+			copiedCount: 1,
+			failedCount: 1,
+			warningCode: null,
+			items: [
+				{
+					assetId: "one",
+					status: "copied",
+					destinationName: "one.jpg",
+					errorCode: null,
+				},
+				{
+					assetId: "two",
+					status: "failed",
+					destinationName: null,
+					errorCode: "source_unavailable",
+				},
+			],
+		});
+		await operation;
+		expect(store.getState().copy).toMatchObject({
+			phase: "partial",
+			failedAssetIds: ["two"],
+			copiedCount: 1,
+		});
+		expect(store.getState().announcement).toBe("Copied 1 of 2");
+		const retry = store.getState().copyOriginals();
+		expect(ids).toEqual([["one", "two"], ["two"]]);
+		release({ kind: "cancelled" });
+		await retry;
+		expect(store.getState().copy).toMatchObject({
+			phase: "partial",
+			failedAssetIds: ["two"],
+			copiedCount: 1,
+		});
+	});
+	it("copies a frozen ID list with ordered channel progress and opens the last destination", async () => {
+		const calls: Array<[string, Record<string, unknown> | undefined]> = [];
+		const received: CopyProgress[] = [];
+		const item = {
+			assetId: "one",
+			status: "copied" as const,
+			destinationName: "one.jpg",
+			errorCode: null,
+		};
+		const result = {
+			kind: "complete",
+			items: [item],
+			copiedCount: 1,
+			failedCount: 0,
+			warningCode: null,
+		};
+		const service = createTauriPhotoService(
+			async <T>(command: string, args?: Record<string, unknown>) => {
+				calls.push([command, args]);
+				if (command === "copy_picked_originals") {
+					const channel = args?.onEvent as FakeChannel<CopyProgress>;
+					channel.emit({ completed: 0, total: 1, item: null });
+					channel.emit({ completed: 1, total: 1, item });
+					return result as T;
+				}
+				return undefined as T;
+			},
+			undefined,
+			(listener) => new FakeChannel(listener),
+		);
+		const ids = ["one"];
+		const copying = service.copyPickedOriginals(ids, (event) =>
+			received.push(event),
+		);
+		ids.push("later-pick");
+		expect(await copying).toEqual(result);
+		expect(calls[0]?.[1]?.assetIds).toEqual(["one"]);
+		expect(received).toEqual([
+			{ completed: 0, total: 1, item: null },
+			{ completed: 1, total: 1, item },
+		]);
+		await service.showLastCopyDestination();
+		expect(calls[1]).toEqual(["show_last_copy_destination", undefined]);
+	});
+
+	it("preserves picker cancellation and bounds copy errors without leaking native paths", async () => {
+		const cancelled = createTauriPhotoService(
+			async <T>() => ({ kind: "cancelled" }) as T,
+			undefined,
+			(listener) => new FakeChannel(listener),
+		);
+		expect(await cancelled.copyPickedOriginals(null, () => {})).toEqual({
+			kind: "cancelled",
+		});
+		for (const [code, message] of [
+			["copyInProgress", "An original copy is already in progress."],
+			[
+				"copyDestinationIsSource",
+				"Choose a destination outside your source folders.",
+			],
+			["copyDestinationUnavailable", "The copy destination is unavailable."],
+			["copyPreparationFailed", "Mote could not prepare these originals."],
+		] as const) {
+			const service = createTauriPhotoService(
+				async () => {
+					throw { code, message };
+				},
+				undefined,
+				(listener) => new FakeChannel(listener),
+			);
+			await expect(
+				service.copyPickedOriginals(null, () => {}),
+			).rejects.toMatchObject({ code, message });
+		}
+		const unsafe = createTauriPhotoService(
+			async () => {
+				throw {
+					code: "copyDestinationUnavailable",
+					message: "/private/secret",
+				};
+			},
+			undefined,
+			(listener) => new FakeChannel(listener),
+		);
+		await expect(unsafe.showLastCopyDestination()).rejects.toMatchObject({
+			code: "internal",
+			message: "Mote could not complete that request.",
+		});
+	});
 	it("keeps native folder selection isolated from hosted browser methods", async () => {
 		const service = createTauriPhotoService(recordingInvoke([]));
 
@@ -82,6 +260,7 @@ describe("Tauri PhotoService", () => {
 			chooseFolder: true,
 			folderSelection: "native",
 			locateFolder: false,
+			originalAction: "copy",
 		});
 		expect(service.folderBrowserState()).toEqual({
 			breadcrumbs: [],
@@ -142,6 +321,248 @@ describe("Tauri PhotoService", () => {
 			["update_appearance", { appearance: "dark" }],
 			["update_gallery_scope", { scope: "currentFolder" }],
 		]);
+	});
+
+	it("maps pick snapshots, mutations, and derivative requests to native commands", async () => {
+		const nativeSnapshots = [
+			{
+				revision: 4,
+				items: [
+					{
+						assetId: "asset-a",
+						sourceFolderId: "folder-a",
+						sourceLabel: "Family",
+						asset: null,
+					},
+				],
+			},
+			{ revision: 5, items: [] },
+			{ revision: 6, items: [] },
+			{ revision: 7, items: [] },
+			{ revision: 8, items: [] },
+			{ revision: 9, items: [] },
+		];
+		const calls: Array<[string, Record<string, unknown> | undefined]> = [];
+		const invoke: InvokeCommand = async <T>(
+			command: string,
+			args?: Record<string, unknown>,
+		) => {
+			calls.push([command, args]);
+			if (command === "request_pick_derivatives") return undefined as T;
+			return nativeSnapshots.shift() as T;
+		};
+		const service = createTauriPhotoService(invoke);
+		const revisions: number[] = [];
+		const stop = service.watchPicks((snapshot) => {
+			revisions.push(snapshot.revision);
+		});
+
+		await expect(service.loadPicks()).resolves.toMatchObject({
+			revision: 4,
+			persistenceError: null,
+		});
+		await service.addPick({
+			assetId: "asset-b",
+			sourceFolderId: "folder-b",
+			sourceLabel: "Trips",
+		});
+		await service.removePick("asset-a");
+		await service.clearPicks();
+		await service.restorePicks([
+			{
+				assetId: "asset-a",
+				sourceFolderId: "folder-a",
+				sourceLabel: "Family",
+			},
+		]);
+		await service.loadPicks();
+		await service.requestPickDerivatives({
+			assetIds: ["asset-a", "asset-b"],
+			priority: "visible",
+			kind: "screenPreview",
+		});
+		stop();
+
+		expect(service.getPicks()).toMatchObject({
+			revision: 9,
+			persistenceError: null,
+		});
+		expect(revisions).toEqual([4, 5, 6, 7, 8, 9]);
+		expect(calls).toEqual([
+			["list_photo_picks", undefined],
+			["add_photo_pick", { assetId: "asset-b", sourceFolderId: "folder-b" }],
+			["remove_photo_pick", { assetId: "asset-a" }],
+			["clear_photo_picks", undefined],
+			[
+				"restore_photo_picks",
+				{
+					references: [
+						{
+							assetId: "asset-a",
+							sourceFolderId: "folder-a",
+							sourceLabel: "Family",
+						},
+					],
+				},
+			],
+			["list_photo_picks", undefined],
+			[
+				"request_pick_derivatives",
+				{
+					request: {
+						assetIds: ["asset-a", "asset-b"],
+						priority: "visible",
+						kind: "screenPreview",
+					},
+				},
+			],
+		]);
+		expect(service.originalDownloadUrl("asset-a")).toBeNull();
+	});
+
+	it("restores more than 250 picks tail-first and publishes only the complete order", async () => {
+		const references = Array.from({ length: 501 }, (_, index) => ({
+			assetId: `asset-${index}`,
+			sourceFolderId: `folder-${index}`,
+			sourceLabel: `Source ${index}`,
+		}));
+		let nativeItems: Array<(typeof references)[number] & { asset: null }> = [];
+		let revision = 0;
+		const calls: Array<[string, Record<string, unknown> | undefined]> = [];
+		const invoke: InvokeCommand = async <T>(
+			command: string,
+			args?: Record<string, unknown>,
+		) => {
+			calls.push([command, args]);
+			const chunk = (args?.references ?? []) as typeof references;
+			nativeItems = [
+				...chunk.map((reference) => ({ ...reference, asset: null })),
+				...nativeItems,
+			];
+			revision += 1;
+			return { revision, items: structuredClone(nativeItems) } as T;
+		};
+		const service = createTauriPhotoService(invoke);
+		const published: number[] = [];
+		service.watchPicks((snapshot) => published.push(snapshot.revision));
+
+		const restored = await service.restorePicks(references);
+
+		expect(
+			calls.map(([command, args]) => [
+				command,
+				((args?.references ?? []) as typeof references).map(
+					(reference) => reference.assetId,
+				),
+			]),
+		).toEqual([
+			["restore_photo_picks", ["asset-500"]],
+			[
+				"restore_photo_picks",
+				Array.from({ length: 250 }, (_, index) => `asset-${index + 250}`),
+			],
+			[
+				"restore_photo_picks",
+				Array.from({ length: 250 }, (_, index) => `asset-${index}`),
+			],
+		]);
+		expect(
+			calls.every(
+				([, args]) =>
+					((args?.references ?? []) as typeof references).length <= 250,
+			),
+		).toBe(true);
+		expect(restored.items.map((item) => item.assetId)).toEqual(
+			references.map((reference) => reference.assetId),
+		);
+		expect(published).toEqual([3]);
+	});
+
+	it("resyncs after a later restore chunk fails without publishing partial responses", async () => {
+		const references = Array.from({ length: 251 }, (_, index) => ({
+			assetId: `asset-${index}`,
+			sourceFolderId: "folder-a",
+			sourceLabel: "Family",
+		}));
+		const calls: string[] = [];
+		let restoreCalls = 0;
+		const invoke: InvokeCommand = async <T>(command: string) => {
+			calls.push(command);
+			if (command === "list_photo_picks") {
+				return {
+					revision: 1,
+					items: [{ ...references[250], asset: null }],
+				} as T;
+			}
+			restoreCalls += 1;
+			if (restoreCalls === 2) {
+				throw {
+					code: "assetNotFound",
+					message: "That photo is no longer available.",
+				};
+			}
+			return {
+				revision: 1,
+				items: [{ ...references[250], asset: null }],
+			} as T;
+		};
+		const service = createTauriPhotoService(invoke);
+		const published: string[][] = [];
+		service.watchPicks((snapshot) =>
+			published.push(snapshot.items.map((item) => item.assetId)),
+		);
+
+		await expect(service.restorePicks(references)).rejects.toMatchObject({
+			code: "assetNotFound",
+			message: "That photo is no longer available.",
+		});
+
+		expect(calls).toEqual([
+			"restore_photo_picks",
+			"restore_photo_picks",
+			"list_photo_picks",
+		]);
+		expect(service.getPicks().items.map((item) => item.assetId)).toEqual([
+			"asset-250",
+		]);
+		expect(published).toEqual([["asset-250"]]);
+	});
+
+	it("requests more than 250 pick derivatives in sequential bounded chunks", async () => {
+		const calls: DerivativeRequest[] = [];
+		let active = 0;
+		let maximumActive = 0;
+		const invoke: InvokeCommand = async <T>(
+			command: string,
+			args?: Record<string, unknown>,
+		) => {
+			if (command !== "request_pick_derivatives") return undefined as T;
+			active += 1;
+			maximumActive = Math.max(maximumActive, active);
+			calls.push(structuredClone(args?.request as DerivativeRequest));
+			await Promise.resolve();
+			active -= 1;
+			return undefined as T;
+		};
+		const service = createTauriPhotoService(invoke);
+		const assetIds = Array.from(
+			{ length: 501 },
+			(_, index) => `asset-${index}`,
+		);
+
+		await service.requestPickDerivatives({
+			assetIds,
+			priority: "nearViewport",
+			kind: "wallThumbnail",
+		});
+
+		expect(calls.map((request) => request.assetIds)).toEqual([
+			assetIds.slice(0, 250),
+			assetIds.slice(250, 500),
+			assetIds.slice(500),
+		]);
+		expect(calls.every((request) => request.assetIds.length <= 250)).toBe(true);
+		expect(maximumActive).toBe(1);
 	});
 
 	it("converts a known native command failure to PhotoServiceError", async () => {

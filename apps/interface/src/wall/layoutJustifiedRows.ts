@@ -9,6 +9,10 @@ export interface JustifiedLayoutOptions {
 
 /** Maximum CSS-pixel error accepted when checking fractional row geometry. */
 export const LAYOUT_GEOMETRY_TOLERANCE = 1e-9;
+const MINIMUM_TILE_WIDTH = 44;
+const INLINE_CONTROLS_MINIMUM_WIDTH = 82;
+const INLINE_CONTROLS_MINIMUM_HEIGHT = 50;
+const STACKED_CONTROLS_MINIMUM_HEIGHT = 70;
 
 export interface PositionedWallAsset {
 	asset: WallAsset;
@@ -53,11 +57,28 @@ function assertAssetDimensions(asset: WallAsset): void {
 	}
 }
 
-function makeRow(
+function minimumControlHeight(asset: WallAsset): number {
+	const aspectRatio = asset.width / asset.height;
+	const inlineHeight = Math.max(
+		INLINE_CONTROLS_MINIMUM_HEIGHT,
+		INLINE_CONTROLS_MINIMUM_WIDTH / aspectRatio,
+	);
+	const stackedHeight = Math.max(
+		STACKED_CONTROLS_MINIMUM_HEIGHT,
+		MINIMUM_TILE_WIDTH / aspectRatio,
+	);
+	return Math.min(inlineHeight, stackedHeight);
+}
+
+function rowGeometry(
 	assets: readonly WallAsset[],
 	options: JustifiedLayoutOptions,
-	justified: boolean,
-): JustifiedRow {
+): {
+	aspectRatios: number[];
+	availableWidth: number;
+	maximumHeight: number;
+	minimumHeight: number;
+} {
 	const aspectRatios = assets.map((asset) => asset.width / asset.height);
 	const sumOfAspectRatios = aspectRatios.reduce((sum, ratio) => sum + ratio, 0);
 	if (!Number.isFinite(sumOfAspectRatios) || sumOfAspectRatios <= 0) {
@@ -68,28 +89,40 @@ function makeRow(
 	if (!Number.isFinite(availableWidth) || availableWidth <= 0) {
 		throw new Error("Wall layout geometry leaves no room for assets");
 	}
+	return {
+		aspectRatios,
+		availableWidth,
+		maximumHeight: availableWidth / sumOfAspectRatios,
+		minimumHeight: Math.max(...assets.map(minimumControlHeight)),
+	};
+}
 
+function rowFitsControls(
+	assets: readonly WallAsset[],
+	options: JustifiedLayoutOptions,
+): boolean {
+	const { maximumHeight, minimumHeight } = rowGeometry(assets, options);
+	return maximumHeight + LAYOUT_GEOMETRY_TOLERANCE >= minimumHeight;
+}
+
+function makeRow(
+	assets: readonly WallAsset[],
+	options: JustifiedLayoutOptions,
+	justified: boolean,
+): JustifiedRow {
+	const { aspectRatios, maximumHeight, minimumHeight } = rowGeometry(
+		assets,
+		options,
+	);
 	const rowHeight = justified
-		? availableWidth / sumOfAspectRatios
-		: options.targetRowHeight;
+		? maximumHeight
+		: Math.min(maximumHeight, Math.max(options.targetRowHeight, minimumHeight));
 	if (!Number.isFinite(rowHeight) || rowHeight <= 0) {
 		throw new Error("Wall tile geometry must be finite and positive");
 	}
-	const widths: number[] = [];
-	for (let index = 0; index < assets.length; index += 1) {
-		const ratio = aspectRatios[index];
-		if (ratio === undefined) {
-			throw new Error("Wall layout assets changed during measurement");
-		}
-		const width =
-			justified && index === assets.length - 1
-				? availableWidth - widths.reduce((sum, value) => sum + value, 0)
-				: ratio * rowHeight;
-		if (!Number.isFinite(width) || width <= 0) {
-			throw new Error("Wall tile geometry must be finite and positive");
-		}
-		widths.push(width);
-	}
+	const widths = aspectRatios.map((ratio) => ratio * rowHeight);
+	if (widths.some((width) => !Number.isFinite(width) || width <= 0))
+		throw new Error("Wall tile geometry must be finite and positive");
 
 	const items: PositionedWallAsset[] = [];
 	let left = 0;
@@ -108,10 +141,9 @@ function makeRow(
 
 	return {
 		items,
-		width: justified
-			? options.containerWidth
-			: widths.reduce((sum, value) => sum + value, 0) +
-				options.gap * (assets.length - 1),
+		width:
+			widths.reduce((sum, width) => sum + width, 0) +
+			options.gap * (assets.length - 1),
 		height: rowHeight,
 		justified,
 	};
@@ -131,13 +163,24 @@ export function layoutJustifiedRows(
 	for (const asset of assets) {
 		candidate.push(asset);
 		candidateAspectRatio += asset.width / asset.height;
+		if (candidate.length > 1 && !rowFitsControls(candidate, options)) {
+			const nextAsset = candidate.pop();
+			if (!nextAsset)
+				throw new Error("Wall layout assets changed during row formation");
+			rows.push(makeRow(candidate, options, false));
+			candidate = [nextAsset];
+			candidateAspectRatio = nextAsset.width / nextAsset.height;
+		}
 		const availableWidth =
 			options.containerWidth - options.gap * (candidate.length - 1);
 		if (!Number.isFinite(availableWidth) || availableWidth <= 0) {
 			throw new Error("Wall layout geometry leaves no room for assets");
 		}
 		const candidateHeight = availableWidth / candidateAspectRatio;
-		if (candidateHeight <= options.targetRowHeight) {
+		if (
+			candidateHeight <= options.targetRowHeight &&
+			rowFitsControls(candidate, options)
+		) {
 			rows.push(makeRow(candidate, options, true));
 			candidate = [];
 			candidateAspectRatio = 0;

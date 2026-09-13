@@ -7,6 +7,7 @@ mod health_repo;
 mod index_repo;
 mod library_repo;
 mod migrate;
+mod pick_repo;
 mod policy_repo;
 mod saved_folder_repo;
 mod selection_repo;
@@ -28,6 +29,7 @@ pub use index_repo::{
     CatalogProvenance, CatalogWarningRecord, CatalogWarningSummary,
 };
 pub use library_repo::{LibraryRootRecord, NewLibrary};
+pub use pick_repo::PhotoPickRecord;
 use rusqlite::Connection;
 pub use saved_folder_repo::SavedFolderRecord;
 pub use selection_repo::FolderGroupRecord;

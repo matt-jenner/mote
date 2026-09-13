@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { usePhotoService } from "../app/PhotoServiceContext";
-import type { DerivativeReference, WallAsset } from "../services/photoService";
+import type {
+	DerivativeReference,
+	DerivativeRequest,
+	WallAsset,
+} from "../services/photoService";
 import { buildViewerPreviewPlan } from "./viewerPreviewPlan";
 
 export interface ViewerPreviewOptions {
 	assets: readonly WallAsset[];
 	currentIndex: number;
 	previewGeneration: number;
+	requestDerivatives?: (request: DerivativeRequest) => Promise<void>;
 }
 
 export interface ViewerPreviewState {
@@ -110,6 +115,7 @@ export function useViewerPreview({
 	assets,
 	currentIndex,
 	previewGeneration,
+	requestDerivatives,
 }: ViewerPreviewOptions): ViewerPreviewState {
 	const service = usePhotoService();
 	const [retryTick, setRetryTick] = useState(0);
@@ -238,12 +244,11 @@ export function useViewerPreview({
 				ids.push(asset.id);
 			}
 			if (ids.length === 0) return;
-			void service
-				.requestDerivatives({
-					assetIds: ids,
-					priority,
-					kind: "screenPreview",
-				})
+			void (requestDerivatives ?? service.requestDerivatives)({
+				assetIds: ids,
+				priority,
+				kind: "screenPreview",
+			})
 				.then(() => {
 					if (!mountedRef.current) return;
 					for (const [key, record] of attempts) {
@@ -302,7 +307,14 @@ export function useViewerPreview({
 			: null;
 
 		return () => scheduled?.cancel();
-	}, [assets, currentIndex, previewGeneration, retryTick, service]);
+	}, [
+		assets,
+		currentIndex,
+		previewGeneration,
+		requestDerivatives,
+		retryTick,
+		service,
+	]);
 
 	useEffect(() => {
 		const cleanupToken = ++lifecycleCleanupToken.current;

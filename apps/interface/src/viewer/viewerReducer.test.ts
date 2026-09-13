@@ -25,6 +25,22 @@ describe("viewerReducer", () => {
 		expect(moved.previewGeneration).toBe(opened.previewGeneration + 1);
 	});
 
+	it("records a pick review sequence and its picks-panel return surface", () => {
+		const review = viewerReducer(initialViewerState, {
+			type: "open",
+			assetId: "forest",
+			anchor: { assetId: "forest", scrollTop: 640 },
+			sequence: "picks",
+			returnSurface: "picksPanel",
+		});
+
+		expect(review).toMatchObject({
+			sequence: "picks",
+			returnSurface: "picksPanel",
+			currentAssetId: "forest",
+		});
+	});
+
 	it("keeps information open across navigation and resets it after close", () => {
 		const open = viewerReducer(initialViewerState, {
 			type: "open",

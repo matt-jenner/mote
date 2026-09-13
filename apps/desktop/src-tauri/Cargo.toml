@@ -23,7 +23,13 @@ photo-domain = { path = "../../../crates/domain" }
 serde = { version = "1.0.229", features = ["derive"] }
 tauri = { version = "2.11.5", features = [] }
 tauri-plugin-dialog = "2.7.2"
+tauri-plugin-opener = "2"
 thiserror = "2.0.20"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+photo-catalog = { path = "../../../crates/catalog" }
+tempfile = "3.27.0"
+uuid = "1.24.1"

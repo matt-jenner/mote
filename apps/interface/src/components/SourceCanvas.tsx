@@ -1,7 +1,8 @@
 import { FolderOpen } from "lucide-react";
-import type { RefObject } from "react";
+import { type RefObject, useCallback } from "react";
 import type { PhotoWallController } from "../app/usePhotoWall";
-import type { SourceSummary } from "../services/photoService";
+import { usePickList, usePickListOrigin } from "../picks/PickListContext";
+import type { SourceSummary, WallAsset } from "../services/photoService";
 import styles from "../styles/appShell.module.css";
 import { PhotoWallCanvas } from "./PhotoWallCanvas";
 
@@ -26,11 +27,22 @@ export function SourceCanvas({
 	onOpen,
 	highlightedAssetId = null,
 }: SourceCanvasProps) {
+	const picks = usePickList();
+	const pickOrigin = usePickListOrigin();
+	const handleTogglePick = useCallback(
+		(asset: WallAsset) => {
+			if (!pickOrigin) return;
+			void picks.toggle(asset, pickOrigin).catch(() => {});
+		},
+		[pickOrigin, picks],
+	);
 	if (source)
 		return (
 			<PhotoWallCanvas
 				highlightedAssetId={highlightedAssetId}
+				isPicked={picks.isPicked}
 				onOpen={onOpen}
+				onTogglePick={handleTogglePick}
 				regionRef={regionRef}
 				source={source}
 				wall={wall}

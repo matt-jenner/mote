@@ -24,6 +24,7 @@ import type {
 	WallUpdate,
 	WallWarningState,
 } from "../services/photoService";
+import { layoutJustifiedRows } from "../wall/layoutJustifiedRows";
 import { AppShell } from "./AppShell";
 import { PhotoTile } from "./PhotoTile";
 import "../styles/tokens.css";
@@ -139,6 +140,21 @@ class TestIntersectionObserver {
 }
 
 class ControlledWallService implements PhotoService {
+	getPicks = () => ({ revision: 0, items: [], persistenceError: null });
+	watchPicks = () => () => {};
+	loadPicks = async () => this.getPicks();
+	addPick = async () => this.getPicks();
+	removePick = async () => this.getPicks();
+	clearPicks = async () => this.getPicks();
+	restorePicks = async () => this.getPicks();
+	requestPickDerivatives = async () => {};
+	originalDownloadUrl = () => null;
+	copyPickedOriginals: PhotoService["copyPickedOriginals"] = async () => {
+		throw new Error("Copying is not supported by this wall fixture");
+	};
+	showLastCopyDestination = async () => {
+		throw new Error("No copy destination in this wall fixture");
+	};
 	getSavedFolders = () => this.sourceState.savedFolders;
 	watchSavedFolders = () => () => {};
 	renameSavedFolder = async () => this.sourceState;
@@ -173,6 +189,7 @@ class ControlledWallService implements PhotoService {
 			chooseFolder: folderSelection === "native",
 			folderSelection,
 			locateFolder: false,
+			originalAction: "none",
 		};
 		this.sourceState = {
 			savedFolders: emptySavedFolders(),
@@ -510,6 +527,285 @@ afterEach(() => {
 });
 
 describe("progressive photo wall", () => {
+	it("keeps the pick toggle separate, visible, and clear of tile warnings", async () => {
+		const service = new ControlledWallService();
+		const onOpen = vi.fn();
+		const onTogglePick = vi.fn();
+		service.setDerivativeUrl(
+			"pick-control-wall",
+			"/demo-photos/coast.jpg?pick-control-wall=1",
+		);
+		const positioned = {
+			asset: asset("pick-control", "Coast.jpg", 1, {
+				warning: { code: "derivativeUnavailable", retryable: true },
+				wallThumbnail: {
+					assetId: "pick-control",
+					kind: "wallThumbnail" as const,
+					key: "pick-control-wall",
+				},
+			}),
+			left: 0,
+			width: 320,
+			height: 220,
+		};
+		const restoreImageRuntime = overrideImageRuntime({
+			complete: () => true,
+			naturalWidth: () => 320,
+			decode: () => Promise.resolve(),
+		});
+		const restoreReducedMotion = overrideReducedMotion(true);
+		try {
+			const screen = await render(
+				<PhotoTile
+					onOpen={onOpen}
+					onTogglePick={onTogglePick}
+					picked={false}
+					positioned={positioned}
+					service={service}
+				/>,
+			);
+			const pick = screen.getByRole("button", {
+				name: "Add Coast.jpg to picks",
+				exact: true,
+			});
+			const open = screen.getByRole("button", {
+				name: "Open Coast.jpg",
+				exact: true,
+			});
+			await expect.element(pick).toBeVisible();
+			await expect.element(open).toBeVisible();
+			await expect.element(pick).toHaveAttribute("aria-pressed", "false");
+			expect(pick.element()).not.toBe(open.element());
+			expect(Number(getComputedStyle(pick.element()).opacity)).toBeGreaterThan(
+				0,
+			);
+			const pickClass = pick.element().classList[0];
+			const hasCoarseVisibilityRule = [...document.styleSheets].some((sheet) =>
+				[...sheet.cssRules].some(
+					(rule) =>
+						rule instanceof CSSMediaRule &&
+						rule.conditionText.includes("(pointer: coarse)") &&
+						[...rule.cssRules].some(
+							(nested) =>
+								nested instanceof CSSStyleRule &&
+								Boolean(pickClass) &&
+								nested.selectorText.includes(`.${pickClass}`) &&
+								nested.style.opacity === "1",
+						),
+				),
+			);
+			expect(hasCoarseVisibilityRule).toBe(true);
+
+			const warning = screen
+				.getByRole("img", { name: "Photo preview warning" })
+				.element();
+			const pickRect = pick.element().getBoundingClientRect();
+			const warningRect = warning.getBoundingClientRect();
+			expect(pickRect.right).toBeLessThan(warningRect.left);
+
+			await pick.click();
+			expect(onTogglePick).toHaveBeenCalledOnce();
+			expect(onTogglePick).toHaveBeenCalledWith(positioned.asset);
+			expect(onOpen).not.toHaveBeenCalled();
+			await screen.unmount();
+
+			for (const [theme, outlineColour] of [
+				["light", "rgb(52, 125, 82)"],
+				["dark", "rgb(111, 194, 143)"],
+			] as const) {
+				document.documentElement.dataset.theme = theme;
+				const selected = await render(
+					<PhotoTile
+						onTogglePick={() => undefined}
+						picked
+						positioned={positioned}
+						service={service}
+					/>,
+				);
+				const selectedTile = document.querySelector<HTMLElement>(
+					'[data-asset-id="pick-control"]',
+				);
+				expect(selectedTile).not.toBeNull();
+				expect(
+					getComputedStyle(selectedTile as HTMLElement).boxShadow,
+				).toContain(outlineColour);
+				await expect
+					.element(
+						selected.getByRole("button", {
+							name: "Remove Coast.jpg from picks",
+							exact: true,
+						}),
+					)
+					.toHaveAttribute("aria-pressed", "true");
+				await selected.unmount();
+			}
+		} finally {
+			document.documentElement.dataset.theme = "system";
+			restoreImageRuntime();
+			restoreReducedMotion();
+		}
+	});
+
+	it("lays out a narrow portrait and panorama with unclipped pick and warning controls", async () => {
+		const service = new ControlledWallService();
+		const source = [
+			asset("narrow-pick", "Portrait.jpg", 1, {
+				width: 1,
+				height: 4,
+				warning: { code: "derivativeUnavailable", retryable: true },
+			}),
+			asset("wide-pick", "Panorama.jpg", 2, {
+				width: 5,
+				height: 1,
+				warning: { code: "derivativeUnavailable", retryable: true },
+			}),
+		];
+		const rows = layoutJustifiedRows(source, {
+			containerWidth: 320,
+			targetRowHeight: 150,
+			gap: 4,
+			layoutComplete: true,
+		});
+		const screen = await render(
+			<div style={{ width: 320 }}>
+				{rows.flatMap((row) =>
+					row.items.map((positioned) => (
+						<PhotoTile
+							key={positioned.asset.id}
+							onTogglePick={() => undefined}
+							picked={false}
+							positioned={positioned}
+							service={service}
+						/>
+					)),
+				)}
+			</div>,
+		);
+		expect(rows).toHaveLength(2);
+		for (const positioned of rows.flatMap((row) => row.items)) {
+			const tile = document.querySelector<HTMLElement>(
+				`[data-asset-id="${positioned.asset.id}"]`,
+			);
+			const pick = screen
+				.getByRole("button", {
+					name: `Add ${positioned.asset.displayName} to picks`,
+				})
+				.element();
+			const warning = tile?.querySelector<HTMLElement>("[role='img']");
+			if (!tile || !warning) throw new Error("wall controls were not rendered");
+			const tileBounds = tile.getBoundingClientRect();
+			const pickBounds = pick.getBoundingClientRect();
+			const warningBounds = warning.getBoundingClientRect();
+			expect(tileBounds.width / tileBounds.height).toBeCloseTo(
+				positioned.asset.width / positioned.asset.height,
+				5,
+			);
+			expect(tileBounds.width).toBeGreaterThanOrEqual(44);
+			expect(tileBounds.right - tileBounds.left).toBeLessThanOrEqual(320);
+			expect(pickBounds.width).toBeGreaterThanOrEqual(44);
+			expect(pickBounds.height).toBeGreaterThanOrEqual(44);
+			for (const bounds of [pickBounds, warningBounds]) {
+				expect(bounds.left).toBeGreaterThanOrEqual(tileBounds.left);
+				expect(bounds.right).toBeLessThanOrEqual(tileBounds.right);
+				expect(bounds.top).toBeGreaterThanOrEqual(tileBounds.top);
+				expect(bounds.bottom).toBeLessThanOrEqual(tileBounds.bottom);
+			}
+			expect(
+				pickBounds.left < warningBounds.right &&
+					pickBounds.right > warningBounds.left &&
+					pickBounds.top < warningBounds.bottom &&
+					pickBounds.bottom > warningBounds.top,
+			).toBe(false);
+		}
+		await screen.unmount();
+
+		service.setDerivativeUrl(
+			"square-pick-wall",
+			"/demo-photos/coast.jpg?square-pick-wall=1",
+		);
+		service.setDerivativeUrl(
+			"wide-late-pick-wall",
+			"/demo-photos/coast.jpg?wide-late-pick-wall=1",
+		);
+		const lateWarningRows = layoutJustifiedRows(
+			[
+				asset("square-pick", "Square.jpg", 1, {
+					width: 1,
+					height: 1,
+					wallThumbnail: {
+						assetId: "square-pick",
+						kind: "wallThumbnail",
+						key: "square-pick-wall",
+					},
+				}),
+				asset("wide-late-pick", "Wide.jpg", 2, {
+					width: 6,
+					height: 1,
+					wallThumbnail: {
+						assetId: "wide-late-pick",
+						kind: "wallThumbnail",
+						key: "wide-late-pick-wall",
+					},
+				}),
+			],
+			{
+				containerWidth: 320,
+				targetRowHeight: 150,
+				gap: 4,
+				layoutComplete: true,
+			},
+		);
+		expect(lateWarningRows).toHaveLength(2);
+		const lateWarningScreen = await render(
+			<div style={{ width: 320 }}>
+				{lateWarningRows.flatMap((row) =>
+					row.items.map((positioned) => (
+						<PhotoTile
+							key={positioned.asset.id}
+							onTogglePick={() => undefined}
+							positioned={positioned}
+							service={service}
+						/>
+					)),
+				)}
+			</div>,
+		);
+		const squareTile = document.querySelector<HTMLElement>(
+			'[data-asset-id="square-pick"]',
+		);
+		const squareImage = squareTile?.querySelector<HTMLImageElement>("img");
+		if (!squareTile || !squareImage)
+			throw new Error("square preview was not rendered");
+		squareImage.dispatchEvent(new Event("error"));
+		await expect
+			.poll(() =>
+				squareTile.querySelector<HTMLElement>(
+					'[aria-label="Photo preview unavailable"]',
+				),
+			)
+			.not.toBeNull();
+		const latePick = lateWarningScreen
+			.getByRole("button", { name: "Add Square.jpg to picks" })
+			.element()
+			.getBoundingClientRect();
+		const lateWarning = squareTile
+			.querySelector<HTMLElement>('[aria-label="Photo preview unavailable"]')
+			?.getBoundingClientRect();
+		if (!lateWarning) throw new Error("late preview warning was not rendered");
+		const lateTileBounds = squareTile.getBoundingClientRect();
+		for (const bounds of [latePick, lateWarning]) {
+			expect(bounds.top).toBeGreaterThanOrEqual(lateTileBounds.top);
+			expect(bounds.bottom).toBeLessThanOrEqual(lateTileBounds.bottom);
+		}
+		expect(
+			latePick.left < lateWarning.right &&
+				latePick.right > lateWarning.left &&
+				latePick.top < lateWarning.bottom &&
+				latePick.bottom > lateWarning.top,
+		).toBe(false);
+		await lateWarningScreen.unmount();
+	});
+
 	it("uses the restored direction for the first wall request and remembers changes", async () => {
 		const service = new ControlledWallService("source-a", "newestFirst");
 		const screen = await renderWall(service);
@@ -1569,7 +1865,7 @@ describe("progressive photo wall", () => {
 		expect(
 			screen.getByRole("dialog", { name: "Photo viewer" }).query(),
 		).toBeNull();
-		expect(tile.querySelector("button")).toBeNull();
+		expect(tile.querySelector("button[aria-label^='Open ']")).toBeNull();
 		screen.unmount();
 	});
 
