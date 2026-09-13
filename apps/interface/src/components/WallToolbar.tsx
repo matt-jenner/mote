@@ -89,32 +89,35 @@ export function WallToolbar({
 			) : null}
 			<div className={styles.desktopViewOptions}>
 				<button
+					aria-label="Include subfolders"
 					aria-pressed={galleryScope === "includeSubfolders"}
 					className={styles.scopeButton}
+					data-tooltip="Include subfolders"
 					onClick={toggleScope}
 					type="button"
 				>
 					<FolderTree aria-hidden="true" size={16} strokeWidth={1.7} />
-					Include subfolders
 				</button>
 				<fieldset aria-label="Photo order" className={styles.sortControls}>
 					<button
+						aria-label="Oldest first"
 						aria-pressed={direction === "oldestFirst"}
 						className={styles.sortButton}
+						data-tooltip="Oldest first"
 						onClick={() => onDirectionChange("oldestFirst")}
 						type="button"
 					>
 						<ArrowDownAZ aria-hidden="true" size={16} strokeWidth={1.7} />
-						Oldest first
 					</button>
 					<button
+						aria-label="Newest first"
 						aria-pressed={direction === "newestFirst"}
 						className={styles.sortButton}
+						data-tooltip="Newest first"
 						onClick={() => onDirectionChange("newestFirst")}
 						type="button"
 					>
 						<ArrowUpAZ aria-hidden="true" size={16} strokeWidth={1.7} />
-						Newest first
 					</button>
 				</fieldset>
 			</div>

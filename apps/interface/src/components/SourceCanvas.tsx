@@ -74,7 +74,7 @@ export function SourceCanvas({
 								: "Open a folder to browse your photos without importing or reorganising them."}
 						</p>
 						<button
-							className={styles.primaryButton}
+							className={`${styles.primaryButton} ${styles.welcomePrimaryButton}`}
 							disabled={!chooseFolderAvailable}
 							onClick={onChooseFolder}
 							type="button"

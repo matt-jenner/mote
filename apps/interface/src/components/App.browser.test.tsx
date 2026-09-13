@@ -431,7 +431,7 @@ describe("open and return shell", () => {
 			.toBe("dark");
 	});
 
-	it("applies the hosted runtime accent to primary controls", async () => {
+	it("keeps an adaptive black foreground contrasted on the welcome action", async () => {
 		const memory = createInMemoryPhotoService({ cancelFolderPicker: true });
 		const state = await memory.getBootstrapState();
 		const service: PhotoService = {
@@ -456,6 +456,59 @@ describe("open and return shell", () => {
 				getComputedStyle(primary.element()).backgroundColor,
 			),
 		).toBeGreaterThanOrEqual(4.5);
+
+		await primary.hover();
+		const hoverStyle = getComputedStyle(primary.element());
+		expect(hoverStyle.backgroundColor).toBe("rgb(119, 119, 119)");
+		expect(
+			contrastRatio(hoverStyle.color, hoverStyle.backgroundColor),
+		).toBeGreaterThanOrEqual(4.5);
+	});
+
+	it("keeps an adaptive white foreground contrasted on the welcome action", async () => {
+		const memory = createInMemoryPhotoService({ cancelFolderPicker: true });
+		const state = await memory.getBootstrapState();
+		const service: PhotoService = {
+			...memory,
+			getBootstrapState: async () => ({
+				...state,
+				accentColor: "#333333",
+			}),
+		};
+		const screen = await renderApp(service);
+		const primary = screen.getByRole("button", { name: "Choose Folder" });
+
+		await expect
+			.poll(() => getComputedStyle(primary.element()).backgroundColor)
+			.toBe("rgb(51, 51, 51)");
+		const primaryStyle = getComputedStyle(primary.element());
+		expect(primaryStyle.color).toBe("rgb(255, 255, 255)");
+		expect(
+			contrastRatio(primaryStyle.color, primaryStyle.backgroundColor),
+		).toBeGreaterThanOrEqual(4.5);
+	});
+
+	it("keeps the shared hover fill on the hosted folder action", async () => {
+		const memory = createInMemoryPhotoService({ cancelFolderPicker: true });
+		const state = await memory.getBootstrapState();
+		const service = hostedFolderService();
+		service.getBootstrapState = async () => ({
+			...state,
+			accentColor: "#777777",
+		});
+		const screen = await renderApp(service);
+		await screen
+			.getByRole("button", { name: "Add folder", exact: true })
+			.click();
+		const open = screen.getByRole("button", { name: "Open this folder" });
+
+		await expect
+			.poll(() => getComputedStyle(open.element()).backgroundColor)
+			.toBe("rgb(119, 119, 119)");
+		await open.hover();
+		expect(getComputedStyle(open.element()).backgroundColor).not.toBe(
+			"rgb(119, 119, 119)",
+		);
 	});
 
 	it("returns focus to Appearance after choosing an override", async () => {

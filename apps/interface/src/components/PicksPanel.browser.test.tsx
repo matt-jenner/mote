@@ -90,6 +90,11 @@ const unpicked: WallAsset = {
 	id: "unpicked",
 	displayName: "DSC_9999.jpg",
 	provisionalOrder: 3,
+	wallThumbnail: {
+		assetId: "unpicked",
+		kind: "wallThumbnail",
+		key: "unpicked-wall",
+	},
 };
 
 const longWall = Array.from(
