@@ -4,7 +4,7 @@
     "commit": "de2225a6dee4818c1339b3cdbf29f90c471fcb7e"
   },
   "lockfiles": {
-    "package-lock.json": "8e974ed6ca3ed440bb35adb3178f0f08233aa48fb748e93a74f267a05fc3cd68",
+    "package-lock.json": "099a092687ed6019e28a04aa093c556ab55b8abe4e4acebae047d184159be254",
     "apps/desktop/src-tauri/Cargo.lock": "75a579e4a54225d925060d6d734fa32fc4d28c91c3d21ef7571fea9186ce7306"
   }
 }
