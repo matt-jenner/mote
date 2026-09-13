@@ -675,7 +675,8 @@ impl AppService {
             }
         }
         if should_reconcile && tokio::runtime::Handle::try_current().is_ok() {
-            service.spawn_restore_verification(service.bootstrap()?.saved_folders.active_entry_id);
+            let verification = Self::restore_verification_locked(&*service.state()?)?;
+            service.spawn_restore_verification(verification);
         }
         Ok(service)
     }

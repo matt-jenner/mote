@@ -54,8 +54,12 @@ fn saved_folder_order(left: &SavedFolder, right: &SavedFolder) -> std::cmp::Orde
         left.custom_label.as_deref().unwrap_or(&left.name),
         right.custom_label.as_deref().unwrap_or(&right.name),
     )
-    .then_with(|| natural_order(&left.display_path, &right.display_path))
-    .then_with(|| left.id.cmp(&right.id))
+    .then_with(|| {
+        left.display_path
+            .encode_utf16()
+            .cmp(right.display_path.encode_utf16())
+    })
+    .then_with(|| left.id.encode_utf16().cmp(right.id.encode_utf16()))
 }
 
 impl AppService {
@@ -207,7 +211,7 @@ impl AppService {
     }
 
     pub async fn desktop_bootstrap(&self) -> Result<BootstrapState, AppServiceError> {
-        let bootstrap = {
+        let (bootstrap, verification) = {
             let _transition = self
                 .selection_transition
                 .lock()
@@ -225,17 +229,48 @@ impl AppService {
                 state.protected_group = Some(group);
                 state.folder_revision += 1;
             }
-            Self::bootstrap_locked(&state)?
+            (
+                Self::bootstrap_locked(&state)?,
+                Self::restore_verification_locked(&state)?,
+            )
         };
-        self.spawn_restore_verification(bootstrap.saved_folders.active_entry_id.clone());
+        self.spawn_restore_verification(verification);
         Ok(bootstrap)
     }
 
-    pub(crate) fn spawn_restore_verification(&self, entry: Option<String>) {
-        let Some(entry) = entry else {
-            return;
+    pub(crate) fn restore_verification_locked(
+        state: &ServiceState,
+    ) -> Result<Option<(String, SelectionToken)>, AppServiceError> {
+        let snapshot = Self::saved_folders_locked(state)?;
+        let Some(entry) = snapshot
+            .entries
+            .iter()
+            .find(|entry| Some(&entry.id) == snapshot.active_entry_id.as_ref())
+        else {
+            return Ok(None);
         };
-        let Ok(selection) = self.active_selection_token() else {
+        let group = state
+            .libraries
+            .catalog()
+            .folder_group(photo_domain::FolderGroupId::from_uuid(
+                id(&entry.folder_id)?,
+            ))?
+            .ok_or_else(invalid)?;
+        Ok(Some((
+            entry.id.clone(),
+            SelectionToken {
+                library_id: group.library_id,
+                group_id: group.id,
+                epoch: state.selection_epoch,
+            },
+        )))
+    }
+
+    pub(crate) fn spawn_restore_verification(
+        &self,
+        verification: Option<(String, SelectionToken)>,
+    ) {
+        let Some((entry, selection)) = verification else {
             return;
         };
         let service = self.clone();
@@ -247,8 +282,8 @@ impl AppService {
                     ..
                 })
             );
-            if available && service.active_selection_token().ok() == Some(selection) {
-                service.reconcile_existing().await;
+            if available {
+                let _ = service.start_selected_scan(selection).await;
             }
         });
     }
@@ -479,6 +514,70 @@ impl AppService {
 mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicUsize};
+    #[tokio::test]
+    async fn desktop_bootstrap_verification_cannot_start_a_replacement_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = AppService::open(crate::AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let mut original = String::new();
+        let mut captured = None;
+        for name in ["a", "b"] {
+            let path = temp.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            image::ImageBuffer::from_pixel(12, 8, image::Rgb([10_u8, 20, 30]))
+                .save(path.join("photo.jpg"))
+                .unwrap();
+            let (bootstrap, token) = service.select_recent(&path).unwrap();
+            if name == "a" {
+                original = bootstrap.saved_folders.active_entry_id.unwrap();
+                captured = Some(token);
+            }
+        }
+        let captured = captured.unwrap();
+        let mut updates = service.subscribe_wall_updates();
+        service.spawn_restore_verification(Some((original.clone(), captured)));
+        service.check_saved_folders(&[original]).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), updates.recv())
+                .await
+                .is_err(),
+            "verification for A must not scan the replacement B"
+        );
+        assert_eq!(
+            service
+                .bootstrap()
+                .unwrap()
+                .active_source
+                .unwrap()
+                .display_name,
+            "b"
+        );
+    }
+    #[test]
+    fn desktop_bootstrap_order_matches_sidebar_for_duplicate_and_non_ascii_labels() {
+        let mut folders = [
+            ("two", "Photos", "/photos/2"),
+            ("ten", "Photos", "/photos/10"),
+            ("accent10", "éclair 10", "/photos/e10"),
+            ("accent2", "Éclair 2", "/photos/e2"),
+            ("zebra", "Zebra", "/photos/z"),
+        ]
+        .map(|(id, name, path)| SavedFolder {
+            id: id.into(),
+            folder_id: id.into(),
+            name: name.into(),
+            display_path: path.into(),
+            custom_label: None,
+        });
+        folders.sort_by(saved_folder_order);
+        assert_eq!(
+            folders.map(|f| f.id),
+            ["ten", "two", "zebra", "accent2", "accent10"]
+        );
+    }
     #[test]
     fn desktop_bootstrap_order_compares_text_after_equal_numbers() {
         assert!(natural_order("album 2b", "album 2a").is_gt());

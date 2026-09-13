@@ -52,13 +52,6 @@ impl AppService {
         result
     }
 
-    pub(crate) async fn reconcile_existing(&self) {
-        let Ok(selection_token) = self.active_selection_token() else {
-            return;
-        };
-        let _ = self.start_selected_scan(selection_token).await;
-    }
-
     fn start_desktop_update_bridge(
         &self,
         selection: &crate::GallerySelection,
