@@ -41,6 +41,12 @@
 	margin-top: 3px;
 }
 
+.availabilityNotice {
+	padding: var(--space-3) var(--space-6) 0;
+	margin: 0;
+	line-height: 1.45;
+}
+
 .closeButton,
 .removeButton,
 .reviewButton,

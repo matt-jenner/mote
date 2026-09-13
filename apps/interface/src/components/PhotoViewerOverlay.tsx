@@ -117,6 +117,7 @@ export function PhotoViewerOverlay({
 	const announcementResetKey = `${state.currentAssetId ?? ""}:${state.previewGeneration}`;
 	const previousAnnouncementResetKey = useRef<string | null>(null);
 	const controlsFocused = useRef(false);
+	const keyboardFocusBoundary = useRef<"first" | "last" | null>(null);
 	const entryFocusPending = useRef(true);
 	const drawableSizeRef = useRef({ width: 0, height: 0 });
 	const [panning, setPanning] = useState(false);
@@ -206,6 +207,21 @@ export function PhotoViewerOverlay({
 		onShow: onShowControls,
 		onToggleTouch: onToggleTouchControls,
 	});
+	useLayoutEffect(() => {
+		const boundary = keyboardFocusBoundary.current;
+		if (!state.controlsVisible || !boundary) return;
+		keyboardFocusBoundary.current = null;
+		const focusable = [
+			...(dialogRef.current?.querySelectorAll<HTMLElement>(
+				"button, [href], input, select, textarea, [tabindex]",
+			) ?? []),
+		].filter(isTabbable);
+		const target = boundary === "last" ? focusable.at(-1) : focusable[0];
+		queueMicrotask(() => {
+			if (target?.isConnected) target.focus();
+			else dialogRef.current?.focus({ preventScroll: true });
+		});
+	}, [state.controlsVisible]);
 	const viewerCenter = useCallback(
 		() => ({
 			x: drawableSizeRef.current.width / 2,
@@ -503,14 +519,21 @@ export function PhotoViewerOverlay({
 	};
 	const trapFocus = (event: ReactKeyboardEvent<HTMLElement>) => {
 		if (event.key !== "Tab") return;
-		const focusable = [
-			...(dialogRef.current?.querySelectorAll<HTMLElement>(
-				"button, [href], input, select, textarea, [tabindex]",
-			) ?? []),
-		].filter(isTabbable);
+		const tabbableControls = () =>
+			[
+				...(dialogRef.current?.querySelectorAll<HTMLElement>(
+					"button, [href], input, select, textarea, [tabindex]",
+				) ?? []),
+			].filter(isTabbable);
+		const focusable = tabbableControls();
 		if (focusable.length === 0) {
 			event.preventDefault();
-			dialogRef.current?.focus({ preventScroll: true });
+			if (!state.controlsVisible) {
+				keyboardFocusBoundary.current = event.shiftKey ? "last" : "first";
+				controls.keepVisible();
+			} else {
+				dialogRef.current?.focus({ preventScroll: true });
+			}
 			return;
 		}
 		const first = focusable[0];

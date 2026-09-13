@@ -4388,7 +4388,7 @@ describe("immersive photo viewer checkpoint", () => {
 		}
 	});
 
-	it("keeps Tab inside the dialog when all viewer chrome is hidden", async () => {
+	it("reveals hidden viewer controls for forward and reverse keyboard navigation", async () => {
 		const { view, tile } = await openAsset("Coast");
 		(tile.element() as HTMLButtonElement).click();
 		await expect
@@ -4421,7 +4421,26 @@ describe("immersive photo viewer checkpoint", () => {
 			});
 			dialog.dispatchEvent(tab);
 			expect(tab.defaultPrevented).toBe(true);
-			expect(document.activeElement).toBe(dialog);
+			await expect
+				.poll(() =>
+					dialog
+						.querySelector("[data-viewer-chrome]")
+						?.getAttribute("aria-hidden"),
+				)
+				.toBe("false");
+			await expect
+				.poll(() => document.activeElement)
+				.toBe(view.getByRole("button", { name: "Back to photos" }).element());
+
+			dialog.focus();
+			await vi.advanceTimersByTimeAsync(2500);
+			await expect
+				.poll(() =>
+					dialog
+						.querySelector("[data-viewer-chrome]")
+						?.getAttribute("aria-hidden"),
+				)
+				.toBe("true");
 			const reverseTab = new KeyboardEvent("keydown", {
 				bubbles: true,
 				cancelable: true,
@@ -4430,7 +4449,15 @@ describe("immersive photo viewer checkpoint", () => {
 			});
 			dialog.dispatchEvent(reverseTab);
 			expect(reverseTab.defaultPrevented).toBe(true);
-			expect(document.activeElement).toBe(dialog);
+			await expect
+				.poll(() =>
+					dialog
+						.querySelector("[data-viewer-chrome]")
+						?.getAttribute("aria-hidden"),
+				)
+				.toBe("false");
+			await expect.poll(() => document.activeElement).not.toBe(dialog);
+			expect(dialog.contains(document.activeElement)).toBe(true);
 		} finally {
 			vi.useRealTimers();
 		}

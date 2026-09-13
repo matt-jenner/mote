@@ -895,7 +895,7 @@ describe("responsive Picks panel", () => {
 				.getByRole("dialog", { name: "Photo viewer" })
 				.getByRole("button", { name: "Back to photos" })
 				.click();
-			await expect.poll(() => triggerElement.inert).toBe(false);
+			await expect.poll(() => triggerElement.inert).toBe(width < 900);
 			await expect
 				.element(
 					screen.getByRole(width >= 900 ? "complementary" : "dialog", {
@@ -1314,6 +1314,7 @@ describe("responsive Picks panel", () => {
 		document.documentElement.style.setProperty("--safe-area-bottom", "16px");
 		const { screen } = await renderPicksApp();
 		const bar = screen.getByRole("button", { name: "Picks, 2 picks" });
+		const barElement = bar.element() as HTMLButtonElement;
 		await expect
 			.element(bar)
 			.toHaveAttribute("aria-controls", "picks-sheet-mobile");
@@ -1329,9 +1330,19 @@ describe("responsive Picks panel", () => {
 			Number.parseFloat(getComputedStyle(wallContent).paddingBottom),
 		).toBeGreaterThanOrEqual(72);
 
-		bar.element().focus();
+		barElement.focus();
 		await bar.click();
 		const sheet = screen.getByRole("dialog", { name: "Picks" });
+		expect(barElement.inert).toBe(true);
+		expect(barElement.getAttribute("aria-hidden")).toBe("true");
+		expect(
+			screen.getByRole("button", { name: "Dismiss picks" }).query(),
+		).toBeNull();
+		expect(
+			document
+				.querySelector("[data-testid='picks-dismiss']")
+				?.getAttribute("aria-hidden"),
+		).toBe("true");
 		await expect.element(sheet).toHaveAttribute("aria-modal", "true");
 		await expect.element(sheet).toHaveAttribute("id", "picks-sheet-mobile");
 		const sheetBounds = sheet.element().getBoundingClientRect();
@@ -1355,7 +1366,7 @@ describe("responsive Picks panel", () => {
 
 		await userEvent.keyboard("{Escape}");
 		expect(screen.getByRole("dialog", { name: "Picks" }).query()).toBeNull();
-		expect(document.activeElement).toBe(bar.element());
+		expect(document.activeElement).toBe(barElement);
 	});
 
 	it("dismisses the mobile sheet by backdrop, platform back, and downward drag", async () => {
@@ -1364,11 +1375,9 @@ describe("responsive Picks panel", () => {
 		const bar = screen.getByRole("button", { name: "Picks, 2 picks" });
 		await bar.click();
 		await expect.poll(() => window.history.state?.picksSheet).toBe(true);
-		(
-			screen
-				.getByRole("button", { name: "Dismiss picks" })
-				.element() as HTMLButtonElement
-		).click();
+		document
+			.querySelector<HTMLElement>("[data-testid='picks-dismiss']")
+			?.click();
 		await expect
 			.poll(() => screen.getByRole("dialog", { name: "Picks" }).query())
 			.toBeNull();
@@ -1392,6 +1401,22 @@ describe("responsive Picks panel", () => {
 		await expect
 			.poll(() => screen.getByRole("dialog", { name: "Picks" }).query())
 			.toBeNull();
+	});
+
+	it("keeps the mobile status and hosted availability note visually readable", async () => {
+		await page.viewport(390, 844);
+		const { screen } = await renderPicksApp({ originalAction: "none" });
+		const status = screen.getByRole("status").element();
+		status.textContent = "2 photos ready";
+		expect(status.scrollWidth).toBeLessThanOrEqual(status.clientWidth);
+
+		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
+		const note = screen
+			.getByText("This site does not offer original downloads.")
+			.element();
+		const style = getComputedStyle(note);
+		expect(Number.parseFloat(style.paddingLeft)).toBeGreaterThanOrEqual(16);
+		expect(Number.parseFloat(style.paddingRight)).toBeGreaterThanOrEqual(16);
 	});
 
 	it("unwinds mobile sheet history when the viewport switches to desktop", async () => {

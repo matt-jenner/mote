@@ -284,7 +284,7 @@ export function PicksPanel({
 				</button>
 			</div>
 			{service.capabilities.originalAction === "none" ? (
-				<p className={styles.panelCount}>
+				<p className={`${styles.panelCount} ${styles.availabilityNotice}`}>
 					This site does not offer original downloads.
 				</p>
 			) : null}
@@ -414,18 +414,17 @@ export function PicksPanel({
 				controlsId={PICKS_MOBILE_SHEET_ID}
 				copy={picks.copy}
 				expanded={open}
-				inert={viewerOpen}
+				inert={viewerOpen || open}
 				onClick={open ? onClose : openMobileSheet}
 				triggerRef={mobileTriggerRef}
 			/>
 			{open && !viewerOpen ? (
 				<div className={styles.mobileBackdrop}>
-					<button
-						aria-label="Dismiss picks"
+					<div
+						aria-hidden="true"
 						className={styles.dismissButton}
+						data-testid="picks-dismiss"
 						onClick={onClose}
-						tabIndex={-1}
-						type="button"
 					/>
 					<section
 						aria-label="Picks"
