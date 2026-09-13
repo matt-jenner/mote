@@ -128,7 +128,7 @@ describe("Tauri PhotoService", () => {
 		});
 		const operation = store.getState().copyOriginals();
 		void store.getState().copyOriginals();
-		expect(ids).toEqual([["one", "two"]]);
+		expect(ids).toEqual([null]);
 		expect(store.getState().copy.phase).toBe("choosing");
 		progress({
 			completed: 1,
@@ -173,7 +173,7 @@ describe("Tauri PhotoService", () => {
 		});
 		expect(store.getState().announcement).toBe("Copied 1 of 2");
 		const retry = store.getState().copyOriginals();
-		expect(ids).toEqual([["one", "two"], ["two"]]);
+		expect(ids).toEqual([null, ["two"]]);
 		release({ kind: "selectionCancelled" });
 		await retry;
 		expect(store.getState().copy).toMatchObject({

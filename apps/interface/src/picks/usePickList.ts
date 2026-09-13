@@ -112,6 +112,7 @@ export interface PickListStore {
 
 const undoDurationMs = 5_000;
 const confirmationDurationMs = 1_000;
+const copyFailureDurationMs = 5_000;
 const toastFadeDurationMs = 200;
 const initialCopy: PickCopyState = {
 	phase: "idle",
@@ -186,6 +187,7 @@ class PickListStoreImplementation implements PickListStore {
 	private announcementId = 0;
 	private toast: PickToastState | null = null;
 	private deferredCopyToast: PickToastState | null = null;
+	private deferredCopyToastDurationMs = confirmationDurationMs;
 	private toastId = 0;
 	private toastTimer: ReturnType<typeof setTimeout> | null = null;
 	private toastFadeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -326,6 +328,9 @@ class PickListStoreImplementation implements PickListStore {
 						error instanceof PhotoServiceError
 							? error.message
 							: "Couldn't cancel the copy",
+						true,
+						false,
+						copyFailureDurationMs,
 					);
 				});
 			this.cancelCommand = command;
@@ -336,17 +341,17 @@ class PickListStoreImplementation implements PickListStore {
 
 	private runCopy = async (): Promise<void> => {
 		const previous = this.copy;
-		const assetIds =
-			previous.phase === "partial"
-				? [...previous.failedAssetIds]
-				: this.state.snapshot.items.map((item) => item.assetId);
-		if (assetIds.length === 0) return;
+		const assetIds: readonly string[] | null =
+			previous.phase === "partial" ? [...previous.failedAssetIds] : null;
+		const total =
+			assetIds === null ? this.state.snapshot.items.length : assetIds.length;
+		if (total === 0) return;
 		const copyId = ++this.operationId;
 		this.activeCopyId = copyId;
 		this.copy = {
 			...previous,
 			phase: "choosing",
-			total: assetIds.length,
+			total,
 			completed: 0,
 		};
 		this.publish();
@@ -413,10 +418,18 @@ class PickListStoreImplementation implements PickListStore {
 			};
 			if (this.undo && Date.now() < this.undo.expiresAt) {
 				this.deferredCopyToast = completionToast;
+				this.deferredCopyToastDurationMs =
+					result.failedCount > 0
+						? copyFailureDurationMs
+						: confirmationDurationMs;
 			} else {
 				this.toast = completionToast;
 				this.deferredCopyToast = null;
-				this.scheduleToastDismissal(confirmationDurationMs);
+				this.scheduleToastDismissal(
+					result.failedCount > 0
+						? copyFailureDurationMs
+						: confirmationDurationMs,
+				);
 			}
 			this.publish();
 		} catch (error) {
@@ -430,6 +443,9 @@ class PickListStoreImplementation implements PickListStore {
 				error instanceof PhotoServiceError
 					? error.message
 					: "Couldn't copy originals",
+				true,
+				false,
+				copyFailureDurationMs,
 			);
 		} finally {
 			if (this.activeCopyId === copyId) this.activeCopyId = null;
@@ -445,6 +461,9 @@ class PickListStoreImplementation implements PickListStore {
 				error instanceof PhotoServiceError
 					? error.message
 					: "Couldn't open the copy destination",
+				true,
+				false,
+				copyFailureDurationMs,
 			);
 		}
 	};
@@ -483,19 +502,20 @@ class PickListStoreImplementation implements PickListStore {
 		message: string,
 		temporary = true,
 		interruptUndo = false,
+		durationMs = confirmationDurationMs,
 	): void {
 		this.announcement = message;
 		this.announcementId += 1;
 		if (!this.undo || interruptUndo) {
 			this.toast = { id: ++this.toastId, message, phase: "visible" };
-			if (temporary) this.scheduleToastDismissal(confirmationDurationMs);
+			if (temporary) this.scheduleToastDismissal(durationMs);
 		}
 		this.publish();
 	}
 
-	private scheduleToastDismissal(delay: number): void {
+	private scheduleToastDismissal(delay: number, ownsUndo = false): void {
 		this.clearToastTimer();
-		if (delay === undoDurationMs) {
+		if (ownsUndo) {
 			this.clearUndoTimer();
 			this.undoToast = this.toast;
 			this.undoTimer = setTimeout(() => {
@@ -504,7 +524,11 @@ class PickListStoreImplementation implements PickListStore {
 				if (this.toast?.id === this.undoToast?.id) {
 					this.toast = this.deferredCopyToast;
 					this.deferredCopyToast = null;
-					if (this.toast) this.scheduleToastDismissal(confirmationDurationMs);
+					if (this.toast) {
+						const deferredDuration = this.deferredCopyToastDurationMs;
+						this.deferredCopyToastDurationMs = confirmationDurationMs;
+						this.scheduleToastDismissal(deferredDuration);
+					}
 				}
 				this.undoToast = null;
 				this.publish();
@@ -529,7 +553,11 @@ class PickListStoreImplementation implements PickListStore {
 			else {
 				this.toast = this.deferredCopyToast;
 				this.deferredCopyToast = null;
-				if (this.toast) this.scheduleToastDismissal(confirmationDurationMs);
+				if (this.toast) {
+					const deferredDuration = this.deferredCopyToastDurationMs;
+					this.deferredCopyToastDurationMs = confirmationDurationMs;
+					this.scheduleToastDismissal(deferredDuration);
+				}
 			}
 			this.publish();
 		}, delay);
@@ -724,7 +752,7 @@ class PickListStoreImplementation implements PickListStore {
 					message: "Picks cleared",
 					action: { label: "Undo", run: this.undoClear },
 				};
-				this.scheduleToastDismissal(undoDurationMs);
+				this.scheduleToastDismissal(undoDurationMs, true);
 				this.publish();
 			} catch (error) {
 				this.rejectMutation(operation.id, this.lifecycleIsActive(lifecycleId));

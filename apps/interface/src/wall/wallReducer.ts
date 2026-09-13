@@ -673,9 +673,12 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 							liveUpdateRacedPage,
 						)
 					: remembered.assets;
-			const merged = firstPage
-				? mergeAssets([], replacementPage)
-				: mergeAssets(state.items, remembered.assets);
+			const preservesSettledRemainder =
+				firstPage && state.settledGeneration !== null && !state.sortPending;
+			const merged =
+				firstPage && !preservesSettledRemainder
+					? mergeAssets([], replacementPage)
+					: mergeAssets(state.items, remembered.assets);
 			const orderState =
 				state.settledGeneration !== null || settledPage
 					? "settled"
@@ -689,7 +692,13 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			const items = reuseSequence(state.items, sorted);
 			const pagesExhausted = action.nextCursor === null;
 			const totalCount = settledPage
-				? (action.totalCount ?? merged.items.length)
+				? preservesSettledRemainder
+					? Math.max(
+							state.totalCount ?? 0,
+							action.totalCount ?? 0,
+							merged.items.length,
+						)
+					: (action.totalCount ?? merged.items.length)
 				: (state.scanProgress?.total ??
 					action.totalCount ??
 					Math.max(state.totalCount ?? 0, merged.items.length));
@@ -845,7 +854,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			const generation = action.generation ?? 1;
 			if (
 				state.settledGeneration !== null &&
-				generation <= state.settledGeneration
+				generation < state.settledGeneration
 			)
 				return { ...state, activeRequest: null };
 			const recoveredWarnings = clearRecoveredSourceWarnings(
@@ -871,22 +880,32 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				remembered.assets,
 				state.activeRequest?.previewCountVersion !== state.previewCountVersion,
 			);
-			const merged = mergeSettledAssets(state.items, replacementPage);
+			const replacesCompleteGeneration =
+				state.settledGeneration !== null &&
+				generation > state.settledGeneration &&
+				action.requestCursor === null &&
+				action.nextCursor === null;
+			const merged = replacesCompleteGeneration
+				? mergeSettledAssets([], replacementPage)
+				: mergeSettledAssets(state.items, replacementPage);
+			const items = reuseSequence(state.items, merged.items);
 			const previewCounts = pagePreviewCounts(state, action.previewCounts);
 			const settledIds = new Set(action.assets.map((asset) => asset.id));
-			const preservesLoadedRemainder = state.items.some(
-				(current) => !settledIds.has(current.id),
-			);
+			const preservesLoadedRemainder =
+				!replacesCompleteGeneration &&
+				state.items.some((current) => !settledIds.has(current.id));
 			const preservePagination =
 				state.pagesExhausted || preservesLoadedRemainder;
 			return {
 				...state,
-				items: merged.items,
-				totalCount: Math.max(
-					state.totalCount ?? 0,
-					action.totalCount ?? 0,
-					merged.items.length,
-				),
+				items,
+				totalCount: replacesCompleteGeneration
+					? (action.totalCount ?? merged.items.length)
+					: Math.max(
+							state.totalCount ?? 0,
+							action.totalCount ?? 0,
+							merged.items.length,
+						),
 				previewCounts,
 				cursor: preservePagination ? state.cursor : action.nextCursor,
 				orderState: "settled",
@@ -894,7 +913,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				pagesExhausted: preservePagination
 					? state.pagesExhausted
 					: action.nextCursor === null,
-				settledGeneration: generation,
+				settledGeneration: Math.max(state.settledGeneration ?? 0, generation),
 				assetWarnings:
 					remembered.changed || recoveredWarnings !== state.assetWarnings
 						? remembered.warnings

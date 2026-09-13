@@ -88,8 +88,8 @@ where
     };
     let operation = state.copy_registry.begin();
     let service = state.service.clone();
-    // Freeze all authorized batches only after the user chooses a destination.
-    let (batches, total) = tauri::async_runtime::spawn_blocking(move || {
+    // Freeze the authorized IDs only after the user chooses a destination.
+    let ids = tauri::async_runtime::spawn_blocking(move || {
         let ids = match asset_ids {
             Some(ids) => ids,
             None => service
@@ -111,20 +111,42 @@ where
                 "Mote could not prepare these originals.",
             ));
         }
-        let total = u32::try_from(ids.len()).map_err(|_| CommandError::internal())?;
-        let batches = ids
-            .chunks(250)
-            .map(|ids| {
-                service
-                    .prepare_original_copy(ids)
-                    .map(|batch| (batch, ids.to_vec()))
-                    .map_err(map_service_error)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok((batches, total))
+        Ok(ids)
     })
     .await
     .map_err(|_| CommandError::internal())??;
+    let total = u32::try_from(ids.len()).map_err(|_| CommandError::internal())?;
+    on_event(CopyProgress {
+        completed: 0,
+        total,
+        item: None,
+    });
+    if operation.cancellation.is_cancelled() {
+        return Ok(CopyResult::CopyCancelled);
+    }
+    let cancellation = operation.cancellation.clone();
+    let service = state.service.clone();
+    let batches = tauri::async_runtime::spawn_blocking(move || {
+        let mut batches = Vec::with_capacity(ids.len().div_ceil(250));
+        for ids in ids.chunks(250) {
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            let batch = service
+                .prepare_original_copy(ids)
+                .map_err(map_service_error)?;
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+            batches.push((batch, ids.to_vec()));
+        }
+        Ok(Some(batches))
+    })
+    .await
+    .map_err(|_| CommandError::internal())??;
+    let Some(batches) = batches else {
+        return Ok(CopyResult::CopyCancelled);
+    };
     let service = state.service.clone();
     let last_completed_destination = state.last_completed_copy_destination.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -145,11 +167,6 @@ where
             warning_code: None,
         };
         let mut completed = 0;
-        on_event(CopyProgress {
-            completed,
-            total,
-            item: None,
-        });
         for (batch, ids) in batches {
             let result = service.copy_originals_with_control(
                 batch,
@@ -714,15 +731,45 @@ mod tests {
         let fixture = CopyFixture::with_count(250);
         let mut ids = fixture.ids.clone();
         ids.push("not-an-asset-id".into());
+        let events = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let received = events.clone();
         let error = super::run_original_copy(
             &fixture.state,
             Some(ids),
             |_| async { Ok(Some(fixture.destination.clone())) },
-            |_| panic!("must not start copying"),
+            move |event| {
+                received
+                    .lock()
+                    .unwrap()
+                    .push((event.completed, event.total))
+            },
         )
         .await
         .unwrap_err();
         assert_eq!(error.code, "assetNotFound");
+        assert_eq!(*events.lock().unwrap(), [(0, 251)]);
+        assert_eq!(std::fs::read_dir(&fixture.destination).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn zero_progress_makes_invalid_preparation_cancellable() {
+        let fixture = CopyFixture::new();
+        let registry = fixture.state.copy_registry.clone();
+        let result = super::run_original_copy(
+            &fixture.state,
+            Some(vec!["not-an-asset-id".into()]),
+            |_| async { Ok(Some(fixture.destination.clone())) },
+            move |event| {
+                assert_eq!((event.completed, event.total), (0, 1));
+                registry
+                    .cancel()
+                    .expect("copy operation must be cancellable");
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, crate::dto::CopyResult::CopyCancelled));
         assert_eq!(std::fs::read_dir(&fixture.destination).unwrap().count(), 0);
     }
 
