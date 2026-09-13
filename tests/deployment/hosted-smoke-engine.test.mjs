@@ -15,6 +15,15 @@ const repositoryRoot = path.resolve(import.meta.dirname, "../..");
 const smokeScript = path.join(repositoryRoot, "scripts/hosted-smoke.sh");
 const smokeAssets = path.join(repositoryRoot, "scripts/hosted-smoke-assets.sh");
 
+test("hosted smoke gives standalone browser fixtures an isolated web root", () => {
+	const script = readFileSync(smokeScript, "utf8");
+	assert.match(
+		script,
+		/with-ephemeral-interface-assets\.sh["']? \\\n\s+npm run web:build -- --outDir/,
+	);
+	assert.match(script, /PHOTO_VIEWER_WEB_ROOT="\$browser_web_root"/);
+});
+
 test("hosted smoke validates the selected container engine", () => {
 	const missingEngine = "photo-viewer-missing-container-engine";
 	const result = spawnSync(smokeScript, [], {

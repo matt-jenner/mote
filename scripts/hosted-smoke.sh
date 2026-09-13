@@ -191,6 +191,7 @@ run_browser_phase() {
 	PHOTO_VIEWER_BASE_URL="$base_url" \
 	PHOTO_VIEWER_PHASE="$phase_name" \
 	PHOTO_VIEWER_STATE_DIR="$state_dir" \
+	PHOTO_VIEWER_WEB_ROOT="$browser_web_root" \
 		npm run test:hosted
 }
 
@@ -270,6 +271,10 @@ esac
 	--tag "$image_name" \
 	--file Containerfile .
 assert_image_runtime_user
+
+browser_web_root="$temporary_root/web"
+sh "$project_dir/scripts/with-ephemeral-interface-assets.sh" \
+	npm run web:build -- --outDir "$browser_web_root"
 
 "$container_engine" network create \
 	--label "$asset_label" \

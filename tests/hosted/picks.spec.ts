@@ -7,11 +7,15 @@ import path from "node:path";
 import { expect, type Page, test } from "@playwright/test";
 
 const project = path.resolve(__dirname, "../..");
+const webRoot = path.resolve(
+	process.env.PHOTO_VIEWER_WEB_ROOT ??
+		path.join(project, "apps/interface/dist"),
+);
 
 // These fixtures exercise the built hosted app and real Rust API. Source photos
 // are disposable copies, with catalogue and cache outside the photo root.
 async function hostedFixture(downloads: boolean) {
-	await readFile(path.join(project, "apps/interface/dist/index.html"));
+	await readFile(path.join(webRoot, "index.html"));
 	const directory = await mkdtemp(path.join(os.tmpdir(), "mote-picks-"));
 	for (const folder of ["A", "B"]) {
 		await mkdir(path.join(directory, "photos", folder), { recursive: true });
@@ -35,7 +39,7 @@ async function hostedFixture(downloads: boolean) {
 			PHOTO_VIEWER_DATA_DIR: path.join(directory, "data"),
 			PHOTO_VIEWER_CACHE_DIR: path.join(directory, "cache"),
 			PHOTO_VIEWER_SOURCE_ROOT: path.join(directory, "photos"),
-			PHOTO_VIEWER_WEB_ROOT: path.join(project, "apps/interface/dist"),
+			PHOTO_VIEWER_WEB_ROOT: webRoot,
 			PHOTO_VIEWER_BIND: `127.0.0.1:${port}`,
 			PHOTO_VIEWER_ALLOW_ORIGINAL_DOWNLOADS: downloads ? "true" : "",
 		},
