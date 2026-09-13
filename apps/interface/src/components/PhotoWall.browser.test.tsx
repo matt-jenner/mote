@@ -3354,6 +3354,43 @@ describe("progressive photo wall", () => {
 		);
 	});
 
+	it("advances cached indexing progress from live catalogue counts without scrolling", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(0, {
+			...pageOf(
+				realFixtureAssets.slice(0, 4),
+				"provisional",
+				"cursor-2",
+				[],
+				4_448,
+			),
+			indexedCount: 1_951,
+		} as WallPage);
+		service.emit({
+			kind: "progress",
+			selectionId: "source-a",
+			generation: 2,
+			progress: {
+				discovered: 2_100,
+				shaped: 1_200,
+				enriched: 900,
+				indexedCount: 3_520,
+				total: 4_448,
+			},
+		});
+
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("Indexing - 3520 of 4448");
+		expect(service.queryRequests).toHaveLength(1);
+		expect(screen.getByRole("progressbar").element()).toHaveAttribute(
+			"value",
+			"3520",
+		);
+	});
+
 	it("keeps the collection total independent from the first wall page", async () => {
 		const service = new ControlledWallService();
 		const screen = await renderWall(service);

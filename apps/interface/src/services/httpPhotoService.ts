@@ -375,13 +375,25 @@ function decodeProgress(value: unknown): ScanProgressDto {
 		"discovered",
 		"shaped",
 		"enriched",
+		"directIndexedCount",
+		"indexedCount",
 		"directTotal",
 		"total",
 	]);
+	const directIndexedCount =
+		progress.directIndexedCount === undefined
+			? undefined
+			: nullable(progress.directIndexedCount, integerValue);
+	const indexedCount =
+		progress.indexedCount === undefined
+			? undefined
+			: nullable(progress.indexedCount, integerValue);
 	return {
 		discovered: integerValue(progress.discovered),
 		shaped: integerValue(progress.shaped),
 		enriched: integerValue(progress.enriched),
+		...(directIndexedCount === undefined ? {} : { directIndexedCount }),
+		...(indexedCount === undefined ? {} : { indexedCount }),
 		directTotal: nullable(progress.directTotal, integerValue),
 		total: nullable(progress.total, integerValue),
 	};

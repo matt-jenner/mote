@@ -369,6 +369,8 @@ pub(crate) fn progress_dto(progress: photo_indexer::ScanProgress) -> crate::Scan
         discovered: progress.discovered,
         shaped: progress.shaped,
         enriched: progress.enriched,
+        direct_indexed_count: None,
+        indexed_count: None,
         direct_total: progress.direct_total,
         total: progress.total,
     }

@@ -3794,10 +3794,27 @@ impl GalleryEngine {
                     format!("hosted scan batch could not be persisted: {error}"),
                 )));
             }
-            let progress_update = progress.map(|progress| WallUpdate::Progress {
+            let catalog = state.libraries.catalog();
+            let mut published_progress =
+                progress.map(crate::scan::progress_dto).unwrap_or_default();
+            published_progress.direct_indexed_count = Some(catalog.wall_photo_count_scoped(
+                runtime.selection.group_id,
+                GalleryScope::CurrentFolder,
+            )?);
+            published_progress.indexed_count = Some(catalog.wall_photo_count_scoped(
+                runtime.selection.group_id,
+                GalleryScope::IncludeSubfolders,
+            )?);
+            published_progress.direct_total = published_progress
+                .direct_total
+                .or_else(|| runtime.inventory_total(GalleryScope::CurrentFolder));
+            published_progress.total = published_progress
+                .total
+                .or_else(|| runtime.inventory_total(GalleryScope::IncludeSubfolders));
+            let progress_update = progress.map(|_| WallUpdate::Progress {
                 selection_id: runtime.selection.id().to_owned(),
                 generation,
-                progress: crate::scan::progress_dto(progress),
+                progress: published_progress,
             });
             if let Some(update) = progress_update {
                 updates.push(update);
@@ -3836,7 +3853,7 @@ impl GalleryEngine {
                     assets,
                     order_state: OrderState::Provisional,
                     generation,
-                    progress: progress.map(crate::scan::progress_dto).unwrap_or_default(),
+                    progress: published_progress,
                 });
             }
             updates

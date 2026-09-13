@@ -1399,6 +1399,31 @@ async fn scan_publishes_geometry_batches_beyond_the_first_wall_page() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_scan_updates_report_the_persisted_catalogue_count() {
+    let fixture = ProgressiveFixture::new(1);
+    let (reader, release) = BlockingReader::new();
+    let service = fixture.service(reader);
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    let event = recv_until(
+        &mut updates,
+        |event| matches!(event, WallUpdate::CatalogBatch { assets, .. } if !assets.is_empty()),
+    )
+    .await;
+    let WallUpdate::CatalogBatch { progress, .. } = event else {
+        unreachable!()
+    };
+    let page = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+
+    assert_eq!(progress.indexed_count, Some(page.indexed_count));
+    assert_eq!(progress.direct_indexed_count, Some(page.indexed_count));
+    release.release();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metadata_settlement_emits_once_even_with_duplicate_completion_observation() {
     let fixture = ProgressiveFixture::new(12);
     let (reader, release) = BlockingReader::new();

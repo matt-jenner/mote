@@ -162,6 +162,8 @@ export interface ScanProgressDto {
 	discovered: number;
 	shaped: number;
 	enriched: number;
+	directIndexedCount?: number | null;
+	indexedCount?: number | null;
 	directTotal?: number | null;
 	total: number | null;
 }

@@ -707,6 +707,53 @@ describe("wallReducer", () => {
 		expect(noSelection.scanComplete).toBe(false);
 	});
 
+	it("tracks scan activity independently from a cached settled wall page", () => {
+		const selected = reduce(initialWallState, {
+			type: "resetSource",
+			sourceGeneration: 4,
+			selectionId: "selection-a",
+		});
+		expect(selected.scanActive).toBe(false);
+		const scanning = reduce(selected, {
+			type: "progress",
+			selectionId: "selection-a",
+			generation: 7,
+			progress: {
+				discovered: 1,
+				shaped: 1,
+				enriched: 0,
+				total: 2,
+			},
+		});
+		const request = reduce(scanning, {
+			type: "pageRequestStarted",
+			requestId: "cached",
+			requestCursor: null,
+			requestEpoch: 0,
+			sourceGeneration: 4,
+		});
+		const cached = reduce(request, {
+			type: "pageLoaded",
+			assets: [wallAsset("cached", 1)],
+			orderState: "settled",
+			nextCursor: null,
+			requestCursor: null,
+			requestEpoch: 0,
+			requestId: "cached",
+			sourceGeneration: 4,
+		});
+
+		expect(cached.scanComplete).toBe(true);
+		expect(cached.scanActive).toBe(true);
+
+		const settled = reduce(cached, {
+			type: "scanSettled",
+			selectionId: "selection-a",
+			generation: 7,
+		});
+		expect(settled.scanActive).toBe(false);
+	});
+
 	it("accepts a cached page after a source error races its active request", () => {
 		const source = reduce(initialWallState, {
 			type: "resetSource",

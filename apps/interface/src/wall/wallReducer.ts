@@ -19,6 +19,7 @@ export interface WallState {
 	direction: SortDirection;
 	scrollEpoch: number;
 	scanComplete: boolean;
+	scanActive: boolean;
 	pagesExhausted: boolean;
 	settledGeneration: number | null;
 	sourceWarnings: Record<string, NonNullable<WallAsset["warning"]>>;
@@ -81,6 +82,11 @@ export type WallAction =
 			selectionId: string;
 			generation: number;
 			progress: ScanProgressDto;
+	  }
+	| {
+			type: "scanSettled";
+			selectionId: string;
+			generation: number;
 	  }
 	| {
 			type: "derivativeRetrying";
@@ -150,6 +156,7 @@ export const initialWallState: WallState = {
 	direction: "oldestFirst",
 	scrollEpoch: 0,
 	scanComplete: false,
+	scanActive: false,
 	pagesExhausted: false,
 	settledGeneration: null,
 	sourceWarnings: {},
@@ -660,12 +667,13 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			const items = reuseSequence(state.items, sorted);
 			const indexedCount = Math.max(
 				state.indexedCount ?? 0,
-				action.progress?.shaped ?? 0,
+				action.progress?.indexedCount ?? action.progress?.shaped ?? 0,
 				merged.items.length,
 			);
 			return {
 				...state,
 				items,
+				scanActive: true,
 				indexedCount,
 				totalCount:
 					acceptsProgress && action.progress?.total !== null
@@ -698,16 +706,28 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				action.generation > state.streamedAssetGeneration;
 			return {
 				...state,
+				scanActive: true,
 				scanProgress: action.progress,
 				scanProgressGeneration: action.generation,
 				totalCount: action.progress.total ?? state.totalCount,
-				indexedCount: Math.max(state.indexedCount ?? 0, action.progress.shaped),
+				indexedCount: Math.max(
+					state.indexedCount ?? 0,
+					action.progress.indexedCount ?? action.progress.shaped,
+				),
 				streamedAssetGeneration: startsNewStream
 					? action.generation
 					: state.streamedAssetGeneration,
 				streamedAssetIds: startsNewStream ? {} : state.streamedAssetIds,
 			};
 		}
+		case "scanSettled":
+			if (!matchesSelection(state, action.selectionId)) return state;
+			if (
+				state.scanProgressGeneration !== null &&
+				action.generation < state.scanProgressGeneration
+			)
+				return state;
+			return state.scanActive ? { ...state, scanActive: false } : state;
 		case "derivativeRetrying":
 			if (!matchesSource(state, action.sourceGeneration)) return state;
 			return state.derivativeRetrying === action.retrying
@@ -845,13 +865,19 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 		}
 		case "wallError":
 			if (!matchesSource(state, action.sourceGeneration)) return state;
-			return { ...state, scanComplete: true, error: action.error };
+			return {
+				...state,
+				scanComplete: true,
+				scanActive: false,
+				error: action.error,
+			};
 		case "sourceUnavailable": {
 			if (!matchesSource(state, action.sourceGeneration)) return state;
 			if (state.items.length === 0) {
 				return {
 					...state,
 					scanComplete: true,
+					scanActive: false,
 					error: "Source unavailable. Try again.",
 				};
 			}
@@ -870,6 +896,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				items,
 				assetWarnings,
 				scanComplete: true,
+				scanActive: false,
 				error: null,
 			};
 		}
@@ -1022,6 +1049,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				cursor: preservePagination ? state.cursor : action.nextCursor,
 				orderState: "settled",
 				scanComplete: true,
+				scanActive: preservesNewerStream ? state.scanActive : false,
 				pagesExhausted: preservePagination
 					? state.pagesExhausted
 					: action.nextCursor === null,
@@ -1047,6 +1075,10 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			return {
 				...initialWallState,
 				direction: state.direction,
+				scanActive:
+					action.selectionId !== undefined &&
+					action.selectionId === state.selectionId &&
+					state.scanActive,
 				scanComplete:
 					state.selectionId !== null &&
 					action.selectionId === state.selectionId &&
@@ -1149,6 +1181,7 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				direction: state.direction,
 				scrollEpoch: state.scrollEpoch + 1,
 				scanComplete: state.scanComplete,
+				scanActive: state.scanActive,
 				sourceGeneration: state.sourceGeneration,
 				selectionId: action.selectionId,
 			};

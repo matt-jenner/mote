@@ -16,12 +16,14 @@ import styles from "../styles/appShell.module.css";
 
 interface Props {
 	snapshot: SavedFolderSnapshot;
+	activeFolderIndexing?: boolean;
 	onActivate: (id: string) => Promise<void>;
 	onRename: (id: string, label: string) => Promise<void>;
 	onRemove: (id: string) => Promise<void>;
 }
 export function SavedFolderList({
 	snapshot,
+	activeFolderIndexing = false,
 	onActivate,
 	onRename,
 	onRemove,
@@ -112,7 +114,9 @@ export function SavedFolderList({
 					const unavailable = sourceIsUnavailable(state);
 					const checking = state === "checking" || state === "unknown";
 					const active = snapshot.activeEntryId === entry.id;
-					const title = `${folderLabel(entry)}\n${entry.displayPath || "/"}${unavailable ? "\nFolder unavailable. Select to check again." : checking ? "\nChecking folder…" : ""}`;
+					const indexing = active && activeFolderIndexing;
+					const busy = checking || indexing;
+					const title = `${folderLabel(entry)}\n${entry.displayPath || "/"}${unavailable ? "\nFolder unavailable. Select to check again." : checking ? "\nChecking folder…" : indexing ? "\nIndexing folder…" : ""}`;
 					return (
 						<li
 							key={entry.id}
@@ -148,13 +152,19 @@ export function SavedFolderList({
 									type="button"
 									data-folder-id={entry.id}
 									aria-current={active ? "page" : undefined}
-									aria-busy={checking}
-									aria-description={checking ? "Checking folder" : undefined}
+									aria-busy={busy}
+									aria-description={
+										checking
+											? "Checking folder"
+											: indexing
+												? "Indexing folder"
+												: undefined
+									}
 									title={title}
 									className={styles.savedFolderButton}
 									onClick={() => void run(() => onActivate(entry.id))}
 								>
-									{checking ? (
+									{busy ? (
 										<LoaderCircle
 											aria-hidden="true"
 											size={18}

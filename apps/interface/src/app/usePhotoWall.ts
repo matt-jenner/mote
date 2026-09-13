@@ -109,6 +109,18 @@ function rememberScanProgress(
 			discovered: Math.max(current.progress.discovered, incoming.discovered),
 			shaped: Math.max(current.progress.shaped, incoming.shaped),
 			enriched: Math.max(current.progress.enriched, incoming.enriched),
+			directIndexedCount:
+				incoming.directIndexedCount === null ||
+				incoming.directIndexedCount === undefined
+					? current.progress.directIndexedCount
+					: Math.max(
+							current.progress.directIndexedCount ?? 0,
+							incoming.directIndexedCount,
+						),
+			indexedCount:
+				incoming.indexedCount === null || incoming.indexedCount === undefined
+					? current.progress.indexedCount
+					: Math.max(current.progress.indexedCount ?? 0, incoming.indexedCount),
 			directTotal: incoming.directTotal ?? current.progress.directTotal,
 			total: incoming.total ?? current.progress.total,
 		},
@@ -121,6 +133,10 @@ function progressForScope(
 ): ScanProgressDto {
 	return {
 		...progress,
+		indexedCount:
+			scope === "currentFolder"
+				? (progress.directIndexedCount ?? progress.indexedCount)
+				: progress.indexedCount,
 		total:
 			scope === "currentFolder"
 				? (progress.directTotal ?? progress.total)
@@ -140,7 +156,10 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 	const total = Math.max(known, state.totalCount ?? 0);
 	const indexed = Math.min(
 		total,
-		Math.max(state.indexedCount ?? 0, state.scanProgress?.shaped ?? 0),
+		Math.max(
+			state.indexedCount ?? 0,
+			state.scanProgress?.indexedCount ?? state.scanProgress?.shaped ?? 0,
+		),
 	);
 	const wallReady = Math.min(
 		total,
@@ -545,6 +564,17 @@ export function usePhotoWall(
 							ownerRef.current?.settlementGeneration ?? 0,
 							settlementPending.current ?? 0,
 						);
+						if (
+							latestScanProgress.current?.sourceId === expectedSourceId &&
+							settledGeneration >= latestScanProgress.current.generation
+						) {
+							latestScanProgress.current = null;
+						}
+						dispatch({
+							type: "scanSettled",
+							selectionId: expectedSourceId,
+							generation: settledGeneration,
+						});
 						if (settledGeneration <= knownGeneration) break;
 						if (ownerRef.current)
 							settlementPending.current = Math.max(

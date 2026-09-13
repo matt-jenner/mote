@@ -335,7 +335,6 @@ describe("open and return shell", () => {
 					.getByText("Iceland", { exact: true }),
 			)
 			.toBeVisible();
-
 		await memory.finishFixtureScan();
 		const photo = screen.getByRole("button", {
 			name: "Open Aurora",
@@ -700,15 +699,41 @@ it("renames a saved entry and removing it clears the active folder", async () =>
 	await options.click();
 	await userEvent.keyboard("{Escape}");
 	await expect.element(options).toHaveFocus();
-	await expect
-		.element(page.getByRole("button", { name: "Holiday", exact: true }))
-		.toHaveAttribute("title", "Holiday\n/Photos/Iceland 2025");
+	expect(
+		page
+			.getByRole("button", { name: "Holiday", exact: true })
+			.element()
+			.getAttribute("title"),
+	).toMatch(/^Holiday\n\/Photos\/Iceland 2025/);
 	await options.click();
 	await page.getByRole("menuitem", { name: "Remove" }).click();
 	await expect
 		.element(page.getByRole("heading", { name: "Select a folder" }))
 		.toBeVisible();
 	expect(service.getSavedFolders().entries).toEqual([]);
+});
+
+it("keeps the active folder busy through scan settlement and scope changes", async () => {
+	await page.viewport(1200, 800);
+	const memory = createInMemoryPhotoService({
+		selectedFolderName: "Iceland 2025",
+		metadataDelayMs: 50,
+	});
+	const service = { ...memory, startFixtureScan: undefined } as PhotoService;
+	const screen = await renderApp(service);
+	await screen
+		.getByRole("button", { name: "Choose folder", exact: true })
+		.click();
+	const activeFolder = screen
+		.getByRole("navigation", { name: "Sources" })
+		.getByRole("button", { name: "Iceland 2025", exact: true });
+	await memory.startFixtureScan();
+	await expect.element(activeFolder).toHaveAttribute("aria-busy", "true");
+
+	await memory.finishFixtureScan();
+	await expect.element(activeFolder).toHaveAttribute("aria-busy", "false");
+	await screen.getByRole("button", { name: "Include subfolders" }).click();
+	await expect.element(activeFolder).toHaveAttribute("aria-busy", "false");
 });
 
 it("truncates a long saved-folder label without displacing its menu", async () => {
@@ -767,6 +792,48 @@ it("truncates a long saved-folder label without displacing its menu", async () =
 	expect(row.getBoundingClientRect().right).toBeLessThanOrEqual(
 		rail.getBoundingClientRect().right,
 	);
+});
+
+it("keeps the active folder busy while its scan is still indexing", async () => {
+	const snapshot = {
+		...emptySavedFolders(),
+		activeEntryId: "saved-active",
+		entries: [
+			{
+				id: "saved-active",
+				folderId: "folder-active",
+				name: "Active photos",
+				displayPath: "/Photos/Active",
+				customLabel: null,
+			},
+		],
+		access: {
+			"folder-active": {
+				folderId: "folder-active",
+				state: "available" as const,
+				generation: 1,
+				retryAfterMs: 0,
+			},
+		},
+	};
+	await render(
+		<NavigationRail
+			savedFolders={snapshot}
+			activeFolderIndexing
+			onChooseFolder={() => {}}
+			chooseFolderAvailable
+			folderSelection="native"
+		/>,
+	);
+
+	const folder = page.getByRole("button", {
+		name: "Active photos",
+		exact: true,
+	});
+	await expect.element(folder).toHaveAttribute("aria-busy", "true");
+	await expect
+		.element(folder)
+		.toHaveAttribute("aria-description", "Indexing folder");
 });
 
 it("keeps the folder header and last-row menu visible in a long sidebar", async () => {

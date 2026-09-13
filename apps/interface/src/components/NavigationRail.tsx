@@ -11,6 +11,7 @@ import { SavedFolderList } from "./SavedFolderList";
 
 interface NavigationRailProps {
 	savedFolders?: SavedFolderSnapshot;
+	activeFolderIndexing?: boolean;
 	onActivate?: (id: string) => Promise<void>;
 	onRename?: (id: string, label: string) => Promise<void>;
 	onRemove?: (id: string) => Promise<void>;
@@ -25,6 +26,7 @@ interface NavigationRailProps {
 
 export function NavigationRail({
 	savedFolders = emptySavedFolders(),
+	activeFolderIndexing = false,
 	onActivate = async () => {},
 	onRename = async () => {},
 	onRemove = async () => {},
@@ -69,6 +71,7 @@ export function NavigationRail({
 			</div>
 			<SavedFolderList
 				snapshot={savedFolders}
+				activeFolderIndexing={activeFolderIndexing}
 				onActivate={onActivate}
 				onRename={onRename}
 				onRemove={onRemove}

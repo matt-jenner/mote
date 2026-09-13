@@ -411,6 +411,9 @@ function AppShellContents({
 			>
 				<NavigationRail
 					savedFolders={controller.state?.savedFolders}
+					activeFolderIndexing={
+						source !== null && !folderUnavailable && wall.state.scanActive
+					}
 					onActivate={async (id) => {
 						if (await controller.activateSavedFolder(id)) setDrawerOpen(false);
 					}}
@@ -622,6 +625,9 @@ function AppShellContents({
 							</div>
 							<NavigationRail
 								savedFolders={controller.state?.savedFolders}
+								activeFolderIndexing={
+									source !== null && !folderUnavailable && wall.state.scanActive
+								}
 								onActivate={async (id) => {
 									if (await controller.activateSavedFolder(id))
 										setDrawerOpen(false);
