@@ -1202,6 +1202,144 @@ describe("wallReducer", () => {
 		expect(replaced.pagesExhausted).toBe(false);
 	});
 
+	it("retains only the remainder streamed by the newer generation when its first page settles", () => {
+		const retainedFirstPage = Array.from({ length: 100 }, (_, index) =>
+			wallAsset(`retained-${index}`, 1, index + 1),
+		);
+		const staleRemainder = Array.from({ length: 50 }, (_, index) =>
+			wallAsset(`stale-${index}`, 1, index + 101),
+		);
+		const oldItems = [...retainedFirstPage, ...staleRemainder];
+		const nextFirstPage = retainedFirstPage.map((asset) => ({ ...asset }));
+		const nextRemainder = Array.from({ length: 21 }, (_, index) =>
+			wallAsset(`new-${index}`, 1, index + 101),
+		);
+		const current = {
+			...activeState(),
+			items: oldItems,
+			totalCount: 150,
+			cursor: null,
+			pagesExhausted: true,
+			orderState: "settled" as const,
+			settledGeneration: 4,
+		};
+		const streamed = reduce(current, {
+			type: "catalogBatch",
+			assets: nextRemainder,
+			orderState: "settled",
+			selectionId: "selection-a",
+			generation: 5,
+			progress: { discovered: 121, shaped: 121, enriched: 100, total: 121 },
+		});
+		const requested = reduce(streamed, {
+			type: "pageRequestStarted",
+			requestId: "new-generation-with-streamed-remainder",
+			requestCursor: null,
+			requestEpoch: streamed.scrollEpoch,
+		});
+		const settled = reduce(requested, {
+			type: "metadataSettled",
+			assets: nextFirstPage,
+			totalCount: 121,
+			nextCursor: "new-page-2",
+			requestEpoch: streamed.scrollEpoch,
+			requestCursor: null,
+			requestId: "new-generation-with-streamed-remainder",
+			generation: 5,
+		});
+
+		expect(settled.items.map(({ id }) => id)).toEqual(
+			[...nextFirstPage, ...nextRemainder].map(({ id }) => id),
+		);
+		expect(settled.items[0]).toBe(streamed.items[0]);
+		expect(settled.items.some(({ id }) => id.startsWith("stale-"))).toBe(false);
+		expect(settled.totalCount).toBe(121);
+		expect(settled.cursor).toBe("new-page-2");
+		expect(settled.pagesExhausted).toBe(false);
+	});
+
+	it("preserves a newer streamed remainder across an older generation settlement", () => {
+		const retainedFirstPage = Array.from({ length: 100 }, (_, index) =>
+			wallAsset(`retained-${index}`, 1, index + 1),
+		);
+		const staleRemainder = Array.from({ length: 50 }, (_, index) =>
+			wallAsset(`stale-${index}`, 1, index + 101),
+		);
+		const generationSixRemainder = Array.from({ length: 21 }, (_, index) =>
+			wallAsset(`generation-six-${index}`, 1, index + 101),
+		);
+		const current = {
+			...activeState(),
+			items: [...retainedFirstPage, ...staleRemainder],
+			totalCount: 150,
+			cursor: null,
+			pagesExhausted: true,
+			orderState: "settled" as const,
+			settledGeneration: 4,
+		};
+		const streamed = reduce(current, {
+			type: "catalogBatch",
+			assets: generationSixRemainder,
+			orderState: "settled",
+			selectionId: "selection-a",
+			generation: 6,
+			progress: { discovered: 121, shaped: 121, enriched: 100, total: 121 },
+		});
+		const generationFiveRequested = reduce(streamed, {
+			type: "pageRequestStarted",
+			requestId: "generation-five-settlement",
+			requestCursor: null,
+			requestEpoch: streamed.scrollEpoch,
+		});
+		const generationFiveSettled = reduce(generationFiveRequested, {
+			type: "metadataSettled",
+			assets: retainedFirstPage,
+			totalCount: 140,
+			nextCursor: "generation-five-page-2",
+			requestEpoch: streamed.scrollEpoch,
+			requestCursor: null,
+			requestId: "generation-five-settlement",
+			generation: 5,
+		});
+
+		expect(generationFiveSettled.streamedAssetGeneration).toBe(6);
+		expect(Object.keys(generationFiveSettled.streamedAssetIds)).toEqual(
+			generationSixRemainder.map(({ id }) => id),
+		);
+		expect(
+			generationFiveSettled.items.filter(({ id }) =>
+				id.startsWith("generation-six-"),
+			),
+		).toHaveLength(21);
+
+		const generationSixRequested = reduce(generationFiveSettled, {
+			type: "pageRequestStarted",
+			requestId: "generation-six-settlement",
+			requestCursor: null,
+			requestEpoch: generationFiveSettled.scrollEpoch,
+		});
+		const generationSixSettled = reduce(generationSixRequested, {
+			type: "metadataSettled",
+			assets: retainedFirstPage,
+			totalCount: 121,
+			nextCursor: "generation-six-page-2",
+			requestEpoch: generationFiveSettled.scrollEpoch,
+			requestCursor: null,
+			requestId: "generation-six-settlement",
+			generation: 6,
+		});
+
+		expect(generationSixSettled.items.map(({ id }) => id)).toEqual(
+			[...retainedFirstPage, ...generationSixRemainder].map(({ id }) => id),
+		);
+		expect(
+			generationSixSettled.items.some(({ id }) => id.startsWith("stale-")),
+		).toBe(false);
+		expect(generationSixSettled.totalCount).toBe(121);
+		expect(generationSixSettled.cursor).toBe("generation-six-page-2");
+		expect(generationSixSettled.streamedAssetIds).toEqual({});
+	});
+
 	it("keeps an advanced nonterminal cursor when settlement covers only earlier items", () => {
 		const loaded = Array.from({ length: 150 }, (_, index) =>
 			wallAsset(`asset-${index}`, 1, index + 1),

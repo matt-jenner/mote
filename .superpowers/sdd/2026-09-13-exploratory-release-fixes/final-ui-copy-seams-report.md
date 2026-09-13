@@ -52,3 +52,33 @@ Fix-round verification:
 - Interface typecheck: passed.
 - Biome on the four fix-round interface files: passed.
 - `git diff --check`: passed.
+
+## Fix round 2
+
+The full browser suite exposed a second settlement edge: generation 2 streamed 21 photos after the 100 already displayed, then its authoritative query returned only the first 100 with a next-page cursor. Replacing the wall with that page correctly removed stale generation-1 assets, but also removed the 21 assets already observed in generation 2.
+
+The reducer now records asset IDs delivered by `catalogBatch` for the current generation. When a newer generation settles, it rebuilds the wall from the authoritative first page plus only that generation's streamed remainder, clears the tracking set, accepts the new total and cursor, and drops every unobserved prior-generation asset. Unchanged first-page asset objects are reused so settlement does not needlessly restart rendered tile preview state.
+
+The new reducer regression failed RED with 100 items instead of 121. It now proves that a paged generation-2 settlement retains its 21 streamed assets, removes 50 stale generation-1 assets, reports total 121, resets pagination to the new cursor, and preserves identity for unchanged first-page assets. `PhotoViewer.browser.test.tsx` was not changed; its existing “keeps catalog-loaded photos when a later settlement page is shorter” acceptance test remains the integrated contract.
+
+Fix-round-2 verification:
+
+- Focused wall reducer unit test: 59 tests passed.
+- Existing focused PhotoViewer browser acceptance test: 1 passed, 92 skipped.
+- Interface typecheck: passed.
+- Biome on the two changed wall files: passed.
+- `git diff --check`: passed.
+
+## Fix round 3
+
+Re-review identified an event-order race: a generation-6 catalog batch can arrive before a delayed generation-5 metadata settlement. The older settlement previously replaced `streamedAssetGeneration` with 5 and cleared generation 6's tracked IDs, so the later paged generation-6 settlement could no longer retain its already-streamed remainder.
+
+The RED reducer test interleaves those events deterministically and initially observed generation 5 where generation 6 was required. Settlement now treats an equal-or-newer tracked stream as protected wall content, and only clears stream tracking when the settlement is for that generation or a newer one. The test proves generation 6's 21 assets and tracking survive generation 5, then generation 6 retains those assets while pruning 50 stale assets and adopting its authoritative total and cursor.
+
+Fix-round-3 verification:
+
+- Focused wall reducer unit test: 60 tests passed.
+- Focused PhotoViewer browser run: 2 tests passed, including the unchanged “keeps catalog-loaded photos when a later settlement page is shorter” expectation.
+- Interface typecheck: passed.
+- Biome on the two changed wall files: passed.
+- `git diff --check`: passed.
