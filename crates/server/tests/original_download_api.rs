@@ -256,7 +256,7 @@ async fn unreadable_original_returns_a_path_free_error() {
     let mut fixture = Fixture::new(true);
     let path = fixture.source.join("private.jpg");
     std::fs::write(&path, ORIGINAL).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
     // Root bypasses mode bits; the permission-denied case requires an unprivileged runner.
     if unsafe { libc::geteuid() } == 0 {
         return;

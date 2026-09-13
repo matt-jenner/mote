@@ -1277,12 +1277,11 @@ impl GalleryEngine {
             &ids,
         )?;
         for id in &ids {
-            if let Some(asset) = catalog.find_asset(*id)? {
-                if asset.library_id != selection.library_id
-                    || !records.iter().any(|record| record.id == *id)
-                {
-                    return Err(AppServiceError::ForeignAsset);
-                }
+            if let Some(asset) = catalog.find_asset(*id)?
+                && (asset.library_id != selection.library_id
+                    || !records.iter().any(|record| record.id == *id))
+            {
+                return Err(AppServiceError::ForeignAsset);
             }
         }
         let order = if catalog
