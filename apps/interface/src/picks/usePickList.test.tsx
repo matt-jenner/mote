@@ -108,11 +108,119 @@ afterEach(() => {
 });
 
 describe("pick list controller", () => {
+	it("publishes optimistic add immediately and resets its final fade within one second", async () => {
+		vi.useFakeTimers();
+		const memory = createInMemoryPhotoService({
+			wallAssets: [asset("first"), asset("second")],
+		});
+		const saved = deferred<void>();
+		const store = createPickListStore({
+			...memory,
+			addPick: async (pick) => {
+				await saved.promise;
+				return memory.addPick(pick);
+			},
+		});
+		const stop = store.start();
+		const first = store.getState().toggle(asset("first"), origin);
+		expect(store.getState().toast).toMatchObject({
+			message: "Added to picks",
+			phase: "visible",
+		});
+		const firstId = store.getState().toast?.id;
+		vi.advanceTimersByTime(850);
+		expect(store.getState().toast?.phase).toBe("exiting");
+		const second = store.getState().toggle(asset("second"), origin);
+		expect(store.getState().toast?.id).not.toBe(firstId);
+		expect(store.getState().toast?.phase).toBe("visible");
+		vi.advanceTimersByTime(150);
+		expect(store.getState().toast?.phase).toBe("visible");
+		vi.advanceTimersByTime(850);
+		expect(store.getState().toast).toBeNull();
+		saved.resolve();
+		await Promise.all([first, second]);
+		expect(store.getState().toast).toBeNull();
+		stop();
+	});
+
+	it.each([false, true])(
+		"cancel waits for command and worker before restoring the exact prior state, partial=%s",
+		async (partial) => {
+			vi.useFakeTimers();
+			const worker = deferred<CopyResult>();
+			const cancelled = deferred<void>();
+			let attempts = 0;
+			let cancelCalls = 0;
+			let progress!: Parameters<PhotoService["copyPickedOriginals"]>[1];
+			const memory = createInMemoryPhotoService({
+				wallAssets: [asset("first"), asset("second")],
+			});
+			await memory.addPick(reference(asset("first")));
+			await memory.addPick(reference(asset("second")));
+			const store = createPickListStore({
+				...memory,
+				copyPickedOriginals: async (_ids, listener) => {
+					if (partial && attempts++ === 0) return partialCopy;
+					progress = listener;
+					listener({ completed: 0, total: 2, item: null });
+					return worker.promise;
+				},
+				cancelOriginalCopy: () => {
+					cancelCalls++;
+					return cancelled.promise;
+				},
+			});
+			const stop = store.start();
+			if (partial) await store.getState().copyOriginals();
+			const previous = store.getState().copy;
+			const operation = store.getState().copyOriginals();
+			const cancellation = store.getState().cancelCopy();
+			void store.getState().cancelCopy();
+			expect(cancelCalls).toBe(1);
+			expect(store.getState().copy.phase).toBe("cancelling");
+			progress({ completed: 1, total: 2, item: null });
+			expect(store.getState().copy.phase).toBe("cancelling");
+			await store.getState().clear();
+			expect(store.getState().count).toBe(2);
+			worker.resolve({ kind: "copyCancelled" });
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(store.getState().copy.phase).toBe("cancelling");
+			cancelled.resolve();
+			await Promise.all([operation, cancellation]);
+			expect(store.getState().copy).toBe(previous);
+			expect(store.getState().toast).toMatchObject({
+				message: "Copy cancelled",
+				phase: "visible",
+			});
+			expect(store.getState().copy.message).toBe(previous.message);
+			vi.advanceTimersByTime(1_000);
+			expect(store.getState().toast).toBeNull();
+			stop();
+		},
+	);
+
+	it("picker dismissal restores silently and Clear resets completion messages and failures", async () => {
+		let attempts = 0;
+		const { store, stop } = await copyFixture(async () =>
+			++attempts === 1 ? { kind: "selectionCancelled" } : partialCopy,
+		);
+		const initial = store.getState().copy;
+		await store.getState().copyOriginals();
+		expect(store.getState().copy).toBe(initial);
+		expect(store.getState().toast).toBeNull();
+		await store.getState().copyOriginals();
+		await store.getState().clear();
+		expect(store.getState().copy).toEqual(initial);
+		stop();
+	});
 	it("retires removed failures so a later pick joins a fresh copy", async () => {
 		const batches: Array<readonly string[] | null> = [];
 		const { store, stop } = await copyFixture(async (ids) => {
 			batches.push(ids);
-			return batches.length === 1 ? partialCopy : { kind: "selectionCancelled" };
+			return batches.length === 1
+				? partialCopy
+				: { kind: "selectionCancelled" };
 		});
 		await store.getState().copyOriginals();
 		await store.getState().remove("second");
@@ -132,7 +240,9 @@ describe("pick list controller", () => {
 		const batches: Array<readonly string[] | null> = [];
 		const { store, stop } = await copyFixture(async (ids) => {
 			batches.push(ids);
-			return batches.length === 1 ? partialCopy : { kind: "selectionCancelled" };
+			return batches.length === 1
+				? partialCopy
+				: { kind: "selectionCancelled" };
 		});
 		await store.getState().copyOriginals();
 		await store.getState().toggle(asset("later"), origin);
@@ -140,7 +250,7 @@ describe("pick list controller", () => {
 		expect(batches).toEqual([["first", "second"], ["second"]]);
 		await store.getState().clear();
 		expect(store.getState().copy).toMatchObject({
-			phase: "complete",
+			phase: "idle",
 			failedAssetIds: [],
 			failures: [],
 		});
@@ -171,9 +281,12 @@ describe("pick list controller", () => {
 	it("keeps the original Undo deadline and exposes queued copy feedback after it expires", async () => {
 		vi.useFakeTimers();
 		const result = deferred<CopyResult>();
-		const { store, stop, shown } = await copyFixture(() => result.promise);
-		const copying = store.getState().copyOriginals();
+		const { store, stop, shown, memory } = await copyFixture(
+			() => result.promise,
+		);
 		await store.getState().clear();
+		await memory.addPick(reference(asset("later")));
+		const copying = store.getState().copyOriginals();
 		const undoToast = store.getState().toast;
 		vi.advanceTimersByTime(1_000);
 		result.resolve(partialCopy);
@@ -202,8 +315,9 @@ describe("pick list controller", () => {
 		vi.useFakeTimers();
 		const result = deferred<CopyResult>();
 		const { store, stop, memory } = await copyFixture(() => result.promise);
-		const copying = store.getState().copyOriginals();
 		await store.getState().clear();
+		await memory.addPick(reference(asset("later")));
+		const copying = store.getState().copyOriginals();
 		result.resolve(partialCopy);
 		await copying;
 		vi.advanceTimersByTime(4_999);
@@ -212,6 +326,7 @@ describe("pick list controller", () => {
 		expect(memory.getPicks().items.map((pick) => pick.assetId)).toEqual([
 			"first",
 			"second",
+			"later",
 		]);
 		stop();
 	});
@@ -518,7 +633,9 @@ describe("pick list controller", () => {
 		expect(store.getState().snapshot.items.map((item) => item.assetId)).toEqual(
 			["later"],
 		);
-		expect(vi.getTimerCount()).toBe(1);
+		vi.advanceTimersByTime(1_000);
+		expect(store.getState().toast).toBeNull();
+		expect(vi.getTimerCount()).toBe(0);
 		stopRestart();
 	});
 
@@ -715,6 +832,7 @@ describe("pick list provider", () => {
 			<PickToast
 				toast={{
 					id: 1,
+					phase: "visible",
 					message: "Picks cleared",
 					action: { label: "Undo", run: () => {} },
 				}}

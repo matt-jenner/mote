@@ -86,11 +86,17 @@ describe("Tauri PhotoService", () => {
 	it("distinguishes selection dismissal from worker cancellation and forwards cancel", async () => {
 		const calls: Array<[string, Record<string, unknown> | undefined]> = [];
 		for (const kind of ["selectionCancelled", "copyCancelled"] as const) {
-			const service = createTauriPhotoService(async <T>(command: string, args?: Record<string, unknown>) => {
-				calls.push([command, args]);
-				return { kind } as T;
-			}, undefined, (listener) => new FakeChannel(listener));
-			expect(await service.copyPickedOriginals(null, () => {})).toEqual({ kind });
+			const service = createTauriPhotoService(
+				async <T>(command: string, args?: Record<string, unknown>) => {
+					calls.push([command, args]);
+					return { kind } as T;
+				},
+				undefined,
+				(listener) => new FakeChannel(listener),
+			);
+			expect(await service.copyPickedOriginals(null, () => {})).toEqual({
+				kind,
+			});
 			await service.cancelOriginalCopy();
 			expect(calls.at(-1)).toEqual(["cancel_original_copy", undefined]);
 		}
