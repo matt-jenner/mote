@@ -229,7 +229,7 @@ pub async fn get_bootstrap_state(
 ) -> Result<BootstrapState, CommandError> {
     state
         .service
-        .checked_bootstrap()
+        .desktop_bootstrap()
         .await
         .map_err(map_service_error)
 }

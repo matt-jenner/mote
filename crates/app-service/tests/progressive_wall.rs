@@ -894,7 +894,7 @@ async fn wall_cursor_is_rejected_after_switching_folder_groups() {
 }
 
 #[tokio::test]
-async fn unavailable_reopen_clears_the_view_and_preserves_the_cached_catalog() {
+async fn desktop_bootstrap_unavailable_reopen_preserves_the_view_and_cached_catalog() {
     let fixture = ProgressiveFixture::new(12);
     let (reader, release) = BlockingReader::new();
     let service = fixture.service(reader);
@@ -916,17 +916,18 @@ async fn unavailable_reopen_clears_the_view_and_preserves_the_cached_catalog() {
     let reopened =
         AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
             .unwrap();
-    let bootstrap = reopened.checked_bootstrap().await.unwrap();
-    assert!(bootstrap.active_source.is_none());
+    let bootstrap = reopened.desktop_bootstrap().await.unwrap();
+    assert!(bootstrap.active_source.is_some());
     assert_eq!(bootstrap.saved_folders.entries.len(), 1);
-    assert!(bootstrap.saved_folders.active_entry_id.is_none());
-    assert!(
+    assert!(bootstrap.saved_folders.active_entry_id.is_some());
+    assert_eq!(
         reopened
             .query_wall(query(SortDirection::NewestFirst))
             .await
             .unwrap()
             .items
-            .is_empty()
+            .len(),
+        12
     );
     let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
     let library = catalog.list_libraries().unwrap().remove(0);
@@ -936,6 +937,27 @@ async fn unavailable_reopen_clears_the_view_and_preserves_the_cached_catalog() {
         "clearing the view must preserve the cached catalog"
     );
     std::fs::rename(unavailable, &fixture.source).unwrap();
+}
+
+#[tokio::test]
+async fn desktop_bootstrap_selects_naturally_first_saved_folder() {
+    let fixture = ProgressiveFixture::new(0);
+    let service = AppService::open(fixture.config.clone()).unwrap();
+    let mut first_id = String::new();
+    for name in ["Album 10", "album 2", "Zoo"] {
+        let path = fixture.temp.path().join(name);
+        std::fs::create_dir(&path).unwrap();
+        let bootstrap = service.open_recent(&path).unwrap();
+        if name == "album 2" {
+            first_id = bootstrap.saved_folders.active_entry_id.unwrap();
+        }
+    }
+    let bootstrap = service.desktop_bootstrap().await.unwrap();
+    assert_eq!(
+        bootstrap.saved_folders.active_entry_id.as_deref(),
+        Some(first_id.as_str())
+    );
+    assert_eq!(bootstrap.active_source.unwrap().display_name, "album 2");
 }
 
 #[tokio::test]
@@ -3841,7 +3863,7 @@ async fn second_identical_wall_request_reuses_cache_after_the_source_goes_offlin
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn offline_reopen_keeps_cached_references() {
+async fn desktop_bootstrap_offline_reopen_keeps_cached_references() {
     let fixture = ProgressiveFixture::new(4);
     let service = AppService::open_with_reader(
         fixture.config.clone(),
@@ -3874,12 +3896,29 @@ async fn offline_reopen_keeps_cached_references() {
     let reopened =
         AppService::open_with_reader(fixture.config.clone(), Arc::new(CountingReader::default()))
             .unwrap();
+    let bootstrap = reopened.desktop_bootstrap().await.unwrap();
     let page = reopened
         .query_wall(query(SortDirection::OldestFirst))
         .await
         .unwrap();
+    assert_eq!(page.items.len(), 4);
     assert!(
         page.items
+            .iter()
+            .all(|asset| asset.wall_thumbnail.is_some())
+    );
+    reopened
+        .check_saved_folders(&[bootstrap.saved_folders.active_entry_id.unwrap()])
+        .await
+        .unwrap();
+    let confirmed = reopened
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    assert_eq!(confirmed.items.len(), 4);
+    assert!(
+        confirmed
+            .items
             .iter()
             .all(|asset| asset.wall_thumbnail.is_some())
     );

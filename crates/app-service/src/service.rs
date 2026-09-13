@@ -675,17 +675,7 @@ impl AppService {
             }
         }
         if should_reconcile && tokio::runtime::Handle::try_current().is_ok() {
-            let startup = service.clone();
-            tokio::spawn(async move {
-                tokio::task::yield_now().await;
-                if startup
-                    .checked_bootstrap()
-                    .await
-                    .is_ok_and(|s| s.active_source.is_some())
-                {
-                    startup.reconcile_existing().await;
-                }
-            });
+            service.spawn_restore_verification(service.bootstrap()?.saved_folders.active_entry_id);
         }
         Ok(service)
     }
