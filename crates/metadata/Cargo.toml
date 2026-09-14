@@ -6,13 +6,13 @@ rust-version.workspace = true
 
 [features]
 default = ["heic"]
-heic = ["photo-domain/heic"]
+heic = ["photo-codec/heic", "photo-domain/heic"]
 
 [dependencies]
 photo-domain = { path = "../domain", default-features = false }
+photo-codec = { path = "../codec", default-features = false }
 chrono.workspace = true
 image.workspace = true
-imagesize.workspace = true
 kamadak-exif.workspace = true
 quick-xml.workspace = true
 serde.workspace = true

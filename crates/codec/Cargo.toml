@@ -14,3 +14,6 @@ image.workspace = true
 imagesize.workspace = true
 thiserror.workspace = true
 libheif-rs = { version = "=3.0.0", default-features = false, features = ["v1_23"], optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true

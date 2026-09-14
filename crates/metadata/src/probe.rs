@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::MetadataReadWarning;
+use photo_codec::{CodecError, MediaKind, decode_display_image, display_shape};
 
 pub struct MediaProbe;
 
@@ -19,22 +20,15 @@ pub struct RepresentativeRgb {
 
 impl MediaProbe {
     pub fn shape(path: &Path) -> Result<ImageShape, MetadataReadWarning> {
-        let size = imagesize::size(path)
-            .map_err(|error| MetadataReadWarning::new("shape_read_failed", format!("{error}")))?;
-        let width = u32::try_from(size.width)
-            .map_err(|_| MetadataReadWarning::new("shape_too_large", "width exceeds u32"))?;
-        let height = u32::try_from(size.height)
-            .map_err(|_| MetadataReadWarning::new("shape_too_large", "height exceeds u32"))?;
-        Ok(ImageShape { width, height })
+        let shape = display_shape(path, media_kind(path)).map_err(shape_warning)?;
+        Ok(ImageShape {
+            width: shape.width,
+            height: shape.height,
+        })
     }
 
     pub fn representative_rgb(path: &Path) -> Result<RepresentativeRgb, MetadataReadWarning> {
-        let image = image::ImageReader::open(path)
-            .map_err(|error| MetadataReadWarning::new("image_open_failed", error.to_string()))?
-            .with_guessed_format()
-            .map_err(|error| MetadataReadWarning::new("image_format_failed", error.to_string()))?
-            .decode()
-            .map_err(|error| MetadataReadWarning::new("image_decode_failed", error.to_string()))?;
+        let image = decode_display_image(path, media_kind(path), 1).map_err(decode_warning)?;
         let image = if image.width() > 32 || image.height() > 32 {
             image.thumbnail(32, 32)
         } else {
@@ -60,4 +54,21 @@ impl MediaProbe {
             blue: ((sums[2] + count / 2) / count) as u8,
         })
     }
+}
+
+fn media_kind(path: &Path) -> MediaKind {
+    MediaKind::from_path(path).unwrap_or(MediaKind::Unknown)
+}
+
+fn shape_warning(error: CodecError) -> MetadataReadWarning {
+    MetadataReadWarning::new("shape_read_failed", error.to_string())
+}
+
+fn decode_warning(error: CodecError) -> MetadataReadWarning {
+    let code = if matches!(error, CodecError::Io { .. }) {
+        "image_open_failed"
+    } else {
+        "image_decode_failed"
+    };
+    MetadataReadWarning::new(code, error.to_string())
 }

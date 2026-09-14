@@ -1170,6 +1170,7 @@ dependencies = [
  "image",
  "libc",
  "photo-catalog",
+ "photo-codec",
  "photo-domain",
  "photo-metadata",
  "tempfile",
@@ -1201,6 +1202,7 @@ dependencies = [
  "imagesize",
  "libheif-rs",
  "photo-domain",
+ "tempfile",
  "thiserror",
 ]
 
@@ -1251,8 +1253,8 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "image",
- "imagesize",
  "kamadak-exif",
+ "photo-codec",
  "photo-domain",
  "quick-xml",
  "serde",

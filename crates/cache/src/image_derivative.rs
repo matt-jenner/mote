@@ -7,6 +7,7 @@ use std::time::Instant;
 use crate::{CacheBudget, ProtectedGroups};
 use image::{DynamicImage, ImageReader, codecs::jpeg::JpegEncoder};
 use photo_catalog::{Catalog, NewDerivative};
+use photo_codec::{CodecError, decode_display_image};
 use photo_domain::{AssetId, DerivativeId, FileSignature, FolderGroupId};
 use photo_metadata::RepresentativeRgb;
 
@@ -218,8 +219,7 @@ impl ImageDerivativeGenerator {
         if spec.kind != DerivativeKind::WallThumbnail {
             return Err(ImageDerivativeError::UnsupportedTarget);
         }
-        let image = ImageReader::open(source)?.with_guessed_format()?.decode()?;
-        let image = apply_orientation(image, spec.orientation);
+        let image = decode_source(source, spec.orientation)?;
         let representative_rgb = average_rgb(&image.thumbnail(32, 32).to_rgb8());
         let resized = resize_without_upscale(image, 1024).to_rgb8();
         let mut bytes = Vec::new();
@@ -397,16 +397,11 @@ impl ImageDerivativeGenerator {
         };
         let durable = spec.kind == DerivativeKind::WallThumbnail;
         let decode_started = Instant::now();
-        let image = (|| {
-            Ok::<_, ImageDerivativeError>(
-                ImageReader::open(source)?.with_guessed_format()?.decode()?,
-            )
-        })();
+        let image = decode_source(source, spec.orientation);
         record_timing_stage("source_read_decode", decode_started);
         let image = image?;
         let transform_started = Instant::now();
         let transformed = (|| {
-            let image = apply_orientation(image, spec.orientation);
             let representative_rgb = average_rgb(&image.thumbnail(32, 32).to_rgb8());
             let resized = resize_without_upscale(image, edge).to_rgb8();
             let mut encoded = Vec::new();
@@ -475,14 +470,11 @@ fn encode_screen(
     spec: &DerivativeSpec,
 ) -> Result<(Vec<u8>, RepresentativeRgb), ImageDerivativeError> {
     let decode_started = Instant::now();
-    let image = (|| {
-        Ok::<_, ImageDerivativeError>(ImageReader::open(source)?.with_guessed_format()?.decode()?)
-    })();
+    let image = decode_source(source, spec.orientation);
     record_timing_stage("source_read_decode", decode_started);
     let image = image?;
     let transform_started = Instant::now();
     let transformed = (|| {
-        let image = apply_orientation(image, spec.orientation);
         let representative_rgb = average_rgb(&image.thumbnail(32, 32).to_rgb8());
         let resized = resize_without_upscale(image, 4096).to_rgb8();
         let mut bytes = Vec::new();
@@ -524,16 +516,20 @@ fn resize_without_upscale(image: DynamicImage, edge: u32) -> DynamicImage {
     }
 }
 
-fn apply_orientation(image: DynamicImage, orientation: u16) -> DynamicImage {
-    match orientation {
-        2 => image.fliph(),
-        3 => image.rotate180(),
-        4 => image.flipv(),
-        5 => image.fliph().rotate270(),
-        6 => image.rotate90(),
-        7 => image.fliph().rotate90(),
-        8 => image.rotate270(),
-        _ => image,
+fn decode_source(source: &Path, orientation: u16) -> Result<DynamicImage, ImageDerivativeError> {
+    let kind =
+        photo_domain::MediaKind::from_path(source).unwrap_or(photo_domain::MediaKind::Unknown);
+    decode_display_image(source, kind, orientation).map_err(codec_error)
+}
+
+fn codec_error(error: CodecError) -> ImageDerivativeError {
+    match error {
+        CodecError::Io { kind, message, .. } => {
+            ImageDerivativeError::Io(std::io::Error::new(kind, message))
+        }
+        error => ImageDerivativeError::Decode(image::ImageError::Decoding(
+            image::error::DecodingError::new(image::error::ImageFormatHint::Unknown, error),
+        )),
     }
 }
 

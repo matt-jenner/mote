@@ -6,10 +6,11 @@ rust-version.workspace = true
 
 [features]
 default = ["heic"]
-heic = ["photo-catalog/heic", "photo-domain/heic", "photo-metadata/heic"]
+heic = ["photo-catalog/heic", "photo-codec/heic", "photo-domain/heic", "photo-metadata/heic"]
 
 [dependencies]
 photo-catalog = { path = "../catalog", default-features = false }
+photo-codec = { path = "../codec", default-features = false }
 photo-domain = { path = "../domain", default-features = false }
 photo-metadata = { path = "../metadata", default-features = false }
 blake3.workspace = true
