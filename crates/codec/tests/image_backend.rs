@@ -1,7 +1,9 @@
-use std::path::Path;
+use std::{io, path::Path};
 
 use image::{DynamicImage, GenericImageView, ImageReader, Rgba, RgbaImage};
-use photo_codec::{CodecError, MediaKind, decode_display_image, decoder_fingerprint};
+use photo_codec::{
+    CodecError, MediaKind, decode_display_image, decoder_fingerprint, display_shape,
+};
 
 fn asymmetric_image() -> RgbaImage {
     RgbaImage::from_fn(5, 3, |x, y| {
@@ -111,5 +113,18 @@ fn identifies_the_image_decoder_and_rejects_video() {
     assert!(matches!(
         decoder_fingerprint(MediaKind::Video),
         Err(CodecError::Unsupported { .. })
+    ));
+}
+
+#[test]
+fn display_shape_preserves_io_error_kind() {
+    let path = tempfile::tempdir().unwrap().path().join("missing.png");
+
+    assert!(matches!(
+        display_shape(&path, MediaKind::Png),
+        Err(CodecError::Io {
+            kind: io::ErrorKind::NotFound,
+            ..
+        })
     ));
 }

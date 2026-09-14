@@ -7,9 +7,7 @@ use crate::{CodecError, DisplayShape, IMAGE_DECODER_FINGERPRINT};
 
 pub fn display_shape(path: &Path, kind: MediaKind) -> Result<DisplayShape, CodecError> {
     ensure_image_backend(kind)?;
-    let size = imagesize::size(path).map_err(|error| CodecError::Decode {
-        message: error.to_string(),
-    })?;
+    let size = imagesize::size(path).map_err(|error| size_error(path, error))?;
     let width = u32::try_from(size.width).map_err(|_| CodecError::Decode {
         message: "image width exceeds u32".into(),
     })?;
@@ -72,6 +70,15 @@ fn io_error(path: &Path, error: io::Error) -> CodecError {
         path: path.to_owned(),
         kind: error.kind(),
         message: error.to_string(),
+    }
+}
+
+fn size_error(path: &Path, error: imagesize::ImageError) -> CodecError {
+    match error {
+        imagesize::ImageError::IoError(error) => io_error(path, error),
+        error => CodecError::Decode {
+            message: error.to_string(),
+        },
     }
 }
 
