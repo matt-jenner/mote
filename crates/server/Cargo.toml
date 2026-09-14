@@ -4,12 +4,17 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["mote-defaults", "heic"]
+mote-defaults = []
+heic = ["photo-app-service/heic"]
+
 [dependencies]
-photo-cache = { path = "../cache" }
-photo-catalog = { path = "../catalog" }
-photo-domain = { path = "../domain" }
-photo-core = { path = "../core" }
-photo-app-service = { path = "../app-service", features = ["server-internal-prevalidated-source"] }
+photo-cache = { path = "../cache", default-features = false }
+photo-catalog = { path = "../catalog", default-features = false }
+photo-domain = { path = "../domain", default-features = false }
+photo-core = { path = "../core", default-features = false }
+photo-app-service = { path = "../app-service", default-features = false, features = ["server-internal-prevalidated-source"] }
 axum.workspace = true
 futures-util.workspace = true
 libc = "0.2.189"

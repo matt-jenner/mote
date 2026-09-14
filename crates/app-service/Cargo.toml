@@ -5,15 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
+default = ["heic"]
+heic = ["photo-cache/heic", "photo-catalog/heic", "photo-codec/heic", "photo-core/heic", "photo-domain/heic", "photo-indexer/heic", "photo-metadata/heic"]
 server-internal-prevalidated-source = ["photo-core/server-internal-prevalidated-source"]
 
 [dependencies]
-photo-cache = { path = "../cache" }
-photo-catalog = { path = "../catalog" }
-photo-core = { path = "../core" }
-photo-domain = { path = "../domain" }
-photo-indexer = { path = "../indexer" }
-photo-metadata = { path = "../metadata" }
+photo-cache = { path = "../cache", default-features = false }
+photo-catalog = { path = "../catalog", default-features = false }
+photo-codec = { path = "../codec", default-features = false }
+photo-core = { path = "../core", default-features = false }
+photo-domain = { path = "../domain", default-features = false }
+photo-indexer = { path = "../indexer", default-features = false }
+photo-metadata = { path = "../metadata", default-features = false }
 image.workspace = true
 serde.workspace = true
 serde_json.workspace = true

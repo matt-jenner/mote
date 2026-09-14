@@ -1,22 +1,16 @@
 [package]
-name = "photo-metadata"
+name = "photo-codec"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
 [features]
 default = ["heic"]
-heic = ["photo-domain/heic"]
+heic = ["dep:libheif-rs", "photo-domain/heic"]
 
 [dependencies]
 photo-domain = { path = "../domain", default-features = false }
-chrono.workspace = true
 image.workspace = true
 imagesize.workspace = true
-kamadak-exif.workspace = true
-quick-xml.workspace = true
-serde.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
+libheif-rs = { version = "=3.0.0", default-features = false, features = ["v1_23"], optional = true }

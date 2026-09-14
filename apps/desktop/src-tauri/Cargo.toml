@@ -13,13 +13,18 @@ opt-level = 3
 name = "photo_viewer_desktop_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
 
+[features]
+default = ["mote-defaults", "heic"]
+mote-defaults = []
+heic = ["photo-app-service/heic"]
+
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
-photo-app-service = { path = "../../../crates/app-service" }
-photo-core = { path = "../../../crates/core" }
-photo-domain = { path = "../../../crates/domain" }
+photo-app-service = { path = "../../../crates/app-service", default-features = false }
+photo-core = { path = "../../../crates/core", default-features = false }
+photo-domain = { path = "../../../crates/domain", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 tauri = { version = "2.11.5", features = [] }
 tauri-plugin-dialog = "2.7.2"
@@ -30,6 +35,6 @@ tracing-subscriber = "0.3.23"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
-photo-catalog = { path = "../../../crates/catalog" }
+photo-catalog = { path = "../../../crates/catalog", default-features = false }
 tempfile = "3.27.0"
 uuid = "1.24.1"

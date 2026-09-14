@@ -4,8 +4,12 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["heic"]
+heic = ["photo-domain/heic"]
+
 [dependencies]
-photo-domain = { path = "../domain" }
+photo-domain = { path = "../domain", default-features = false }
 chrono.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

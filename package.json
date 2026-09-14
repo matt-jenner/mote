@@ -18,6 +18,7 @@
 		"desktop:build": "sh scripts/desktop-build.sh native",
 		"desktop:build:universal": "sh scripts/desktop-build.sh universal",
 		"clean:build-assets": "sh scripts/clean-build-assets.sh",
+		"test:build": "node --test tests/build/*.test.mjs",
 		"test:deployment": "node --test tests/deployment/*.test.mjs",
 		"test:flatpak": "node --test tests/packaging/*.test.mjs",
 		"flatpak": "bash scripts/flatpak.sh",

@@ -4,13 +4,16 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["heic"]
+heic = ["photo-cache/heic", "photo-catalog/heic", "photo-domain/heic"]
+
 [dependencies]
-photo-cache = { path = "../cache" }
-photo-catalog = { path = "../catalog" }
-photo-domain = { path = "../domain" }
+photo-cache = { path = "../cache", default-features = false }
+photo-catalog = { path = "../catalog", default-features = false }
+photo-domain = { path = "../domain", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
-
