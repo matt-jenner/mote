@@ -1,11 +1,24 @@
+#[cfg(feature = "heic")]
+use image::GenericImageView;
 use photo_cache::{
     CacheBudget, DerivativeKind, DerivativeSpec, DerivativeTarget, ImageDerivativeError,
     ImageDerivativeGenerator, ProtectedGroups,
 };
 use photo_catalog::{Catalog, NewFolderGroup, NewLibrary};
 use photo_domain::{AssetId, FileSignature, FolderGroupId, LibraryId, MediaKind, RelativePathKey};
+#[cfg(feature = "heic")]
+use sha2::{Digest, Sha256};
 
 fn spec(kind: DerivativeKind, edge: u32, orientation: u16) -> DerivativeSpec {
+    spec_for_media(kind, edge, orientation, MediaKind::Jpeg)
+}
+
+fn spec_for_media(
+    kind: DerivativeKind,
+    edge: u32,
+    orientation: u16,
+    media_kind: MediaKind,
+) -> DerivativeSpec {
     DerivativeSpec {
         asset_id: AssetId::for_path(
             LibraryId::from_uuid(uuid::Uuid::from_u128(1)),
@@ -17,12 +30,33 @@ fn spec(kind: DerivativeKind, edge: u32, orientation: u16) -> DerivativeSpec {
             modified_unix_ns: 1,
             sidecar_modified_unix_ns: None,
         },
+        media_kind,
         orientation,
         kind,
-        decoder_version: "image-0.25-v1".into(),
+        decoder_version: photo_codec::decoder_fingerprint(media_kind)
+            .unwrap()
+            .to_owned(),
         colour_space: "srgb".into(),
         target: DerivativeTarget::LongEdge(edge),
     }
+}
+
+#[cfg(feature = "heic")]
+fn heif_fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../codec/tests/fixtures/heif")
+        .join(name)
+}
+
+#[cfg(feature = "heic")]
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn fixture() -> tempfile::NamedTempFile {
@@ -171,6 +205,204 @@ fn a_second_identical_request_reuses_the_atomic_cache_file_and_source() {
 }
 
 #[test]
+#[cfg(feature = "heic")]
+fn fingerprint_validation_binds_the_decoder_to_the_media_kind() {
+    let source = heif_fixture("iphone-8bit.heic");
+    let cache = tempfile::tempdir().unwrap();
+    let generator = ImageDerivativeGenerator::new(cache.path()).unwrap();
+    let heif_with_jpeg_fingerprint = DerivativeSpec {
+        decoder_version: photo_codec::decoder_fingerprint(MediaKind::Jpeg)
+            .unwrap()
+            .to_owned(),
+        ..spec_for_media(DerivativeKind::WallThumbnail, 1024, 1, MediaKind::Heif)
+    };
+    assert!(matches!(
+        generator.generate(&source, &heif_with_jpeg_fingerprint),
+        Err(ImageDerivativeError::InvalidSpecification)
+    ));
+
+    let jpeg_with_heif_fingerprint = DerivativeSpec {
+        decoder_version: photo_codec::decoder_fingerprint(MediaKind::Heif)
+            .unwrap()
+            .to_owned(),
+        ..spec(DerivativeKind::WallThumbnail, 1024, 1)
+    };
+    assert!(matches!(
+        generator.generate(fixture().path(), &jpeg_with_heif_fingerprint),
+        Err(ImageDerivativeError::InvalidSpecification)
+    ));
+}
+
+#[test]
+fn declared_media_kind_controls_source_decoding_instead_of_the_extension() {
+    let jpeg = fixture();
+    let renamed = tempfile::Builder::new().suffix(".heic").tempfile().unwrap();
+    std::fs::copy(jpeg.path(), renamed.path()).unwrap();
+    let cache = tempfile::tempdir().unwrap();
+
+    let generated = ImageDerivativeGenerator::new(cache.path())
+        .unwrap()
+        .generate(
+            renamed.path(),
+            &spec_for_media(DerivativeKind::WallThumbnail, 1024, 1, MediaKind::Jpeg),
+        )
+        .unwrap();
+
+    assert_eq!(
+        image::image_dimensions(cache.path().join(generated.relative_path)).unwrap(),
+        (1024, 683)
+    );
+}
+
+#[test]
+#[cfg(feature = "heic")]
+fn real_heif_wall_and_screen_derivatives_are_jpegs_reused_and_leave_source_unchanged() {
+    let source = heif_fixture("iphone-8bit.heic");
+    let source_bytes = std::fs::read(&source).unwrap();
+    let source_sha256 = sha256_hex(&source_bytes);
+    assert_eq!(
+        source_sha256,
+        "a28a4106084425aaf4b5b77aba75c397ed4a0d87857c1f349bd0ab7bb35fc884"
+    );
+    let source_metadata = std::fs::metadata(&source).unwrap();
+    let source_modified = source_metadata.modified().unwrap();
+    #[cfg(unix)]
+    let source_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        source_metadata.permissions().mode()
+    };
+
+    let cache = tempfile::tempdir().unwrap();
+    let generator = ImageDerivativeGenerator::new(cache.path()).unwrap();
+    let wall_spec = spec_for_media(DerivativeKind::WallThumbnail, 1024, 1, MediaKind::Heif);
+    let wall = generator.generate(&source, &wall_spec).unwrap();
+    let reused_wall = generator.generate(&source, &wall_spec).unwrap();
+    let wall_bytes = std::fs::read(cache.path().join(&wall.relative_path)).unwrap();
+    assert_eq!(
+        image::guess_format(&wall_bytes).unwrap(),
+        image::ImageFormat::Jpeg
+    );
+    assert_eq!(
+        image::load_from_memory(&wall_bytes).unwrap().dimensions(),
+        (29, 100)
+    );
+    assert!(reused_wall.reused);
+
+    let library = NewLibrary::configured("Photos", cache.path());
+    let mut asset = photo_catalog::NewAsset::minimal(
+        library.id,
+        RelativePathKey::from_relative_path(std::path::Path::new("iphone-8bit.heic")).unwrap(),
+        "iphone-8bit.heic",
+        MediaKind::Heif,
+        source_metadata.len(),
+    );
+    let group = FolderGroupId::new();
+    asset.folder_group_id = Some(group);
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    catalog.add_library(&library).unwrap();
+    catalog
+        .upsert_folder_group(&NewFolderGroup {
+            id: group,
+            library_id: library.id,
+            relative_path: RelativePathKey::from_relative_path(std::path::Path::new("album"))
+                .unwrap(),
+            display_path: "album".to_owned(),
+            last_viewed_at: Some(1),
+        })
+        .unwrap();
+    catalog.upsert_asset(&asset).unwrap();
+    let signature = FileSignature {
+        size_bytes: source_metadata.len(),
+        modified_unix_ns: 1,
+        sidecar_modified_unix_ns: None,
+    };
+    let budget = CacheBudget::from_total_space(10_000_000);
+    let protected = ProtectedGroups::default();
+    let screen = generator
+        .generate_screen_preview(
+            &source,
+            asset.id,
+            signature,
+            1,
+            MediaKind::Heif,
+            group,
+            &mut catalog,
+            budget,
+            &protected,
+        )
+        .unwrap();
+    let reused_screen = generator
+        .generate_screen_preview(
+            &source,
+            asset.id,
+            signature,
+            1,
+            MediaKind::Heif,
+            group,
+            &mut catalog,
+            budget,
+            &protected,
+        )
+        .unwrap();
+    let screen_bytes = std::fs::read(cache.path().join(&screen.relative_path)).unwrap();
+    assert_eq!(
+        image::guess_format(&screen_bytes).unwrap(),
+        image::ImageFormat::Jpeg
+    );
+    assert_eq!(
+        image::load_from_memory(&screen_bytes).unwrap().dimensions(),
+        (29, 100)
+    );
+    assert!(reused_screen.reused);
+
+    for representative in [wall.representative_rgb, screen.representative_rgb] {
+        for (actual, expected) in [
+            (representative.red, 126_u8),
+            (representative.green, 128_u8),
+            (representative.blue, 126_u8),
+        ] {
+            assert!(
+                actual.abs_diff(expected) <= 6,
+                "representative channel {actual}"
+            );
+        }
+    }
+    assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+    assert_eq!(sha256_hex(&std::fs::read(&source).unwrap()), source_sha256);
+    assert_eq!(
+        std::fs::metadata(&source).unwrap().modified().unwrap(),
+        source_modified
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().permissions().mode(),
+            source_mode
+        );
+    }
+}
+
+#[test]
+#[cfg(feature = "heic")]
+fn heif_container_orientation_is_not_applied_again() {
+    let source = heif_fixture("portrait-rotated.heic");
+    let cache = tempfile::tempdir().unwrap();
+    let generated = ImageDerivativeGenerator::new(cache.path())
+        .unwrap()
+        .generate(
+            &source,
+            &spec_for_media(DerivativeKind::WallThumbnail, 1024, 6, MediaKind::Heif),
+        )
+        .unwrap();
+
+    assert_eq!(
+        image::image_dimensions(cache.path().join(generated.relative_path)).unwrap(),
+        (100, 28)
+    );
+}
+
+#[test]
 fn commit_wall_thumbnail_replaces_corrupt_bytes_under_an_immutable_key() {
     let fixture = fixture();
     let cache = tempfile::tempdir().unwrap();
@@ -247,9 +479,12 @@ fn shared_screen_repair_failure_preserves_bytes_and_existing_group_link() {
     let requested = DerivativeSpec {
         asset_id: asset.id,
         signature: source_signature,
+        media_kind: MediaKind::Jpeg,
         orientation: 1,
         kind: DerivativeKind::ScreenPreview,
-        decoder_version: "image-0.25-v1".into(),
+        decoder_version: photo_codec::decoder_fingerprint(MediaKind::Jpeg)
+            .unwrap()
+            .to_owned(),
         colour_space: "srgb".into(),
         target: DerivativeTarget::LongEdge(4096),
     };
@@ -260,6 +495,7 @@ fn shared_screen_repair_failure_preserves_bytes_and_existing_group_link() {
             asset.id,
             source_signature,
             1,
+            MediaKind::Jpeg,
             first_group,
             &mut catalog,
             budget,
@@ -491,6 +727,7 @@ fn managed_screen_budget_authorizes_exact_encoded_bytes_and_reuses_row() {
             asset.id,
             signature,
             1,
+            MediaKind::Jpeg,
             group,
             &mut catalog,
             tight,
@@ -520,6 +757,7 @@ fn managed_screen_budget_authorizes_exact_encoded_bytes_and_reuses_row() {
             asset.id,
             signature,
             1,
+            MediaKind::Jpeg,
             group,
             &mut catalog,
             sufficient,
@@ -532,6 +770,7 @@ fn managed_screen_budget_authorizes_exact_encoded_bytes_and_reuses_row() {
             asset.id,
             signature,
             1,
+            MediaKind::Jpeg,
             group,
             &mut catalog,
             sufficient,
@@ -615,6 +854,7 @@ fn independent_public_generators_serialize_screen_budget_transactions() {
                 asset_id,
                 signature,
                 1,
+                MediaKind::Jpeg,
                 group,
                 &mut catalog,
                 budget,
@@ -659,9 +899,12 @@ fn spec_for_asset(asset_id: AssetId, kind: DerivativeKind) -> DerivativeSpec {
             modified_unix_ns: 1,
             sidecar_modified_unix_ns: None,
         },
+        media_kind: MediaKind::Jpeg,
         orientation: 1,
         kind,
-        decoder_version: "image-0.25-v1".into(),
+        decoder_version: photo_codec::decoder_fingerprint(MediaKind::Jpeg)
+            .unwrap()
+            .to_owned(),
         colour_space: "srgb".into(),
         target: DerivativeTarget::LongEdge(4096),
     }

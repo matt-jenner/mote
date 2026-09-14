@@ -30,6 +30,7 @@ fn spec(signature: FileSignature, decoder: &str) -> DerivativeSpec {
                 .unwrap(),
         ),
         signature,
+        media_kind: MediaKind::Jpeg,
         orientation: 6,
         kind: DerivativeKind::ScreenPreview,
         decoder_version: decoder.to_owned(),
@@ -63,6 +64,46 @@ fn derivative_key_changes_with_source_or_decoder_inputs() {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     );
     assert_eq!(key.sharded_path("jpg").components().count(), 3);
+}
+
+#[test]
+fn existing_jpeg_derivative_key_golden_vector() {
+    let key = DerivativeKey::compute(&spec(signature(100, 7), "image-0.25-v1"));
+    assert_eq!(
+        key.as_str(),
+        "4ab8932a6927d5221d38396a9173f8f6a195d33dd2b16a9c0217bc0a4455487f"
+    );
+}
+
+#[test]
+fn heif_derivative_keys_use_a_separate_media_domain() {
+    let jpeg = spec(signature(100, 7), "image-0.25-v1");
+    for media_kind in [MediaKind::Png, MediaKind::Tiff, MediaKind::Webp] {
+        assert_eq!(
+            DerivativeKey::compute(&jpeg),
+            DerivativeKey::compute(&DerivativeSpec {
+                media_kind,
+                ..jpeg.clone()
+            }),
+            "legacy media kinds must not add key bytes"
+        );
+    }
+    let heif = DerivativeSpec {
+        media_kind: MediaKind::Heif,
+        decoder_version: "libheif-1.23.4-libde265-1.1.1-sdr-v1".to_owned(),
+        ..jpeg.clone()
+    };
+    let heif_with_legacy_fingerprint = DerivativeSpec {
+        decoder_version: jpeg.decoder_version.clone(),
+        ..heif.clone()
+    };
+
+    assert_ne!(DerivativeKey::compute(&jpeg), DerivativeKey::compute(&heif));
+    assert_ne!(
+        DerivativeKey::compute(&jpeg),
+        DerivativeKey::compute(&heif_with_legacy_fingerprint),
+        "HEIF key isolation must not depend only on the decoder fingerprint"
+    );
 }
 
 #[test]

@@ -30,7 +30,6 @@ use crate::{
     DerivativeRequest, WallUpdate,
 };
 
-const DECODER_VERSION: &str = "image-0.25-v1";
 const ASSET_DERIVATIVE_WARNING: &str = "derivative_generation_failed";
 const TERMINAL_ASSET_DERIVATIVE_WARNING: &str = "derivative_generation_terminal";
 const WALL_CACHE_DERIVATIVE_WARNING: &str = "wall_thumbnail_cache_unavailable";
@@ -3212,9 +3211,12 @@ fn derivative_spec(asset: &photo_catalog::AssetRecord, class: DerivativeClass) -
     DerivativeSpec {
         asset_id: asset.id,
         signature: asset.signature,
+        media_kind: asset.media_kind,
         orientation: asset.orientation.unwrap_or(1),
         kind,
-        decoder_version: DECODER_VERSION.into(),
+        decoder_version: photo_codec::decoder_fingerprint(asset.media_kind)
+            .unwrap_or_default()
+            .to_owned(),
         colour_space: "srgb".into(),
         target: DerivativeTarget::LongEdge(edge),
     }
@@ -4881,9 +4883,12 @@ mod tests {
                 modified_unix_ns: 20,
                 sidecar_modified_unix_ns: None,
             },
+            media_kind: MediaKind::Jpeg,
             orientation: 1,
             kind: DerivativeKind::ScreenPreview,
-            decoder_version: "image-0.25-v1".to_owned(),
+            decoder_version: photo_codec::decoder_fingerprint(MediaKind::Jpeg)
+                .unwrap()
+                .to_owned(),
             colour_space: "srgb".to_owned(),
             target: DerivativeTarget::LongEdge(4096),
         };
@@ -4958,9 +4963,12 @@ mod tests {
                 modified_unix_ns: 20,
                 sidecar_modified_unix_ns: None,
             },
+            media_kind: MediaKind::Jpeg,
             orientation: 1,
             kind: DerivativeKind::ScreenPreview,
-            decoder_version: "image-0.25-v1".to_owned(),
+            decoder_version: photo_codec::decoder_fingerprint(MediaKind::Jpeg)
+                .unwrap()
+                .to_owned(),
             colour_space: "srgb".to_owned(),
             target: DerivativeTarget::LongEdge(4096),
         };

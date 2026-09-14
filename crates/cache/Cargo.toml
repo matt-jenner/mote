@@ -25,3 +25,4 @@ tracing.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 image.workspace = true
+sha2 = "0.10.9"

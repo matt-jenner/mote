@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use photo_domain::{AssetId, FileSignature};
+use photo_domain::{AssetId, FileSignature, MediaKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DerivativeKind {
@@ -28,6 +28,7 @@ pub enum DerivativeTarget {
 pub struct DerivativeSpec {
     pub asset_id: AssetId,
     pub signature: FileSignature,
+    pub media_kind: MediaKind,
     pub orientation: u16,
     pub kind: DerivativeKind,
     pub decoder_version: String,
@@ -53,6 +54,10 @@ impl DerivativeKey {
             None => {
                 hasher.update(&[0]);
             }
+        }
+        if spec.media_kind == MediaKind::Heif {
+            hasher.update(b"photo-viewer-derivative-media-v1\0");
+            hasher.update(b"heif\0");
         }
         hasher.update(&spec.orientation.to_le_bytes());
         hasher.update(&[kind_tag(spec.kind)]);

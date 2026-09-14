@@ -7,15 +7,14 @@ use std::time::Instant;
 use crate::{CacheBudget, ProtectedGroups};
 use image::{DynamicImage, ImageReader, codecs::jpeg::JpegEncoder};
 use photo_catalog::{Catalog, NewDerivative};
-use photo_codec::{CodecError, decode_display_image};
-use photo_domain::{AssetId, DerivativeId, FileSignature, FolderGroupId};
+use photo_codec::{CodecError, decode_display_image, decoder_fingerprint};
+use photo_domain::{AssetId, DerivativeId, FileSignature, FolderGroupId, MediaKind};
 use photo_metadata::RepresentativeRgb;
 
 use crate::{
     CacheError, CacheWriter, DerivativeKey, DerivativeKind, DerivativeSpec, DerivativeTarget,
 };
 
-pub const DECODER_VERSION: &str = "image-0.25-v1";
 const MAX_CACHED_DERIVATIVE_BYTES: u64 = 64 * 1024 * 1024;
 
 fn record_timing_stage(stage: &'static str, started: Instant) {
@@ -103,7 +102,6 @@ impl ImageDerivativeGenerator {
         source: &Path,
         spec: &DerivativeSpec,
     ) -> Result<GeneratedDerivative, ImageDerivativeError> {
-        let _decoder_version = DECODER_VERSION;
         validate_spec(spec)?;
         if spec.kind == DerivativeKind::ScreenPreview {
             return Err(ImageDerivativeError::BudgetAuthorizationRequired);
@@ -172,6 +170,7 @@ impl ImageDerivativeGenerator {
         asset_id: AssetId,
         signature: FileSignature,
         orientation: u16,
+        media_kind: MediaKind,
         folder_group_id: FolderGroupId,
         catalog: &mut Catalog,
         budget: CacheBudget,
@@ -180,9 +179,12 @@ impl ImageDerivativeGenerator {
         let spec = DerivativeSpec {
             asset_id,
             signature,
+            media_kind,
             orientation,
             kind: DerivativeKind::ScreenPreview,
-            decoder_version: DECODER_VERSION.into(),
+            decoder_version: decoder_fingerprint(media_kind)
+                .map_err(codec_error)?
+                .to_owned(),
             colour_space: "srgb".into(),
             target: DerivativeTarget::LongEdge(4096),
         };
@@ -219,7 +221,7 @@ impl ImageDerivativeGenerator {
         if spec.kind != DerivativeKind::WallThumbnail {
             return Err(ImageDerivativeError::UnsupportedTarget);
         }
-        let image = decode_source(source, spec.orientation)?;
+        let image = decode_source(source, spec)?;
         let representative_rgb = average_rgb(&image.thumbnail(32, 32).to_rgb8());
         let resized = resize_without_upscale(image, 1024).to_rgb8();
         let mut bytes = Vec::new();
@@ -397,7 +399,7 @@ impl ImageDerivativeGenerator {
         };
         let durable = spec.kind == DerivativeKind::WallThumbnail;
         let decode_started = Instant::now();
-        let image = decode_source(source, spec.orientation);
+        let image = decode_source(source, spec);
         record_timing_stage("source_read_decode", decode_started);
         let image = image?;
         let transform_started = Instant::now();
@@ -470,7 +472,7 @@ fn encode_screen(
     spec: &DerivativeSpec,
 ) -> Result<(Vec<u8>, RepresentativeRgb), ImageDerivativeError> {
     let decode_started = Instant::now();
-    let image = decode_source(source, spec.orientation);
+    let image = decode_source(source, spec);
     record_timing_stage("source_read_decode", decode_started);
     let image = image?;
     let transform_started = Instant::now();
@@ -496,8 +498,10 @@ fn validate_spec(spec: &DerivativeSpec) -> Result<(), ImageDerivativeError> {
         DerivativeKind::ScreenPreview => 4096,
         _ => return Err(ImageDerivativeError::InvalidSpecification),
     };
+    let fingerprint_matches = decoder_fingerprint(spec.media_kind)
+        .is_ok_and(|fingerprint| fingerprint == spec.decoder_version);
     if spec.target != DerivativeTarget::LongEdge(expected)
-        || spec.decoder_version != DECODER_VERSION
+        || !fingerprint_matches
         || spec.colour_space != "srgb"
     {
         return Err(ImageDerivativeError::InvalidSpecification);
@@ -516,10 +520,11 @@ fn resize_without_upscale(image: DynamicImage, edge: u32) -> DynamicImage {
     }
 }
 
-fn decode_source(source: &Path, orientation: u16) -> Result<DynamicImage, ImageDerivativeError> {
-    let kind =
-        photo_domain::MediaKind::from_path(source).unwrap_or(photo_domain::MediaKind::Unknown);
-    decode_display_image(source, kind, orientation).map_err(codec_error)
+fn decode_source(
+    source: &Path,
+    spec: &DerivativeSpec,
+) -> Result<DynamicImage, ImageDerivativeError> {
+    decode_display_image(source, spec.media_kind, spec.orientation).map_err(codec_error)
 }
 
 fn codec_error(error: CodecError) -> ImageDerivativeError {

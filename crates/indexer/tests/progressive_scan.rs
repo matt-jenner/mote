@@ -1193,9 +1193,12 @@ async fn heif_scan_and_derivative_use_the_container_transform_once() {
                     modified_unix_ns: 1,
                     sidecar_modified_unix_ns: None,
                 },
+                media_kind: MediaKind::Heif,
                 orientation,
                 kind: DerivativeKind::WallThumbnail,
-                decoder_version: "image-0.25-v1".into(),
+                decoder_version: photo_codec::decoder_fingerprint(MediaKind::Heif)
+                    .unwrap()
+                    .to_owned(),
                 colour_space: "srgb".into(),
                 target: DerivativeTarget::LongEdge(1024),
             },

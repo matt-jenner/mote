@@ -444,9 +444,12 @@ fn wall_cache_key(asset: &photo_catalog::AssetRecord) -> String {
     photo_cache::DerivativeKey::compute(&photo_cache::DerivativeSpec {
         asset_id: asset.id,
         signature: asset.signature,
+        media_kind: asset.media_kind,
         orientation: asset.orientation.unwrap_or(1),
         kind: photo_cache::DerivativeKind::WallThumbnail,
-        decoder_version: "image-0.25-v1".to_owned(),
+        decoder_version: photo_codec::decoder_fingerprint(asset.media_kind)
+            .unwrap_or_default()
+            .to_owned(),
         colour_space: "srgb".to_owned(),
         target: photo_cache::DerivativeTarget::LongEdge(1024),
     })
@@ -2282,6 +2285,7 @@ async fn legacy_screen_preview_is_repaired_locally_before_prefetching_new_previe
             asset.id,
             asset.signature,
             asset.orientation.unwrap_or(1),
+            asset.media_kind,
             group,
             &mut catalog,
             photo_cache::CacheBudget::from_total_space(10_000_000),
@@ -4766,9 +4770,12 @@ async fn derivative_requests_reject_indexed_video_ids() {
     let cache_key = photo_cache::DerivativeKey::compute(&photo_cache::DerivativeSpec {
         asset_id: video.id,
         signature: video.signature,
+        media_kind: video.media_kind,
         orientation: video.orientation.unwrap_or(1),
         kind: photo_cache::DerivativeKind::WallThumbnail,
-        decoder_version: "image-0.25-v1".to_owned(),
+        decoder_version: photo_codec::decoder_fingerprint(video.media_kind)
+            .unwrap_or_default()
+            .to_owned(),
         colour_space: "srgb".to_owned(),
         target: photo_cache::DerivativeTarget::LongEdge(1024),
     });

@@ -55,7 +55,6 @@ fn canonicalize_for_identity(path: &Path) -> PathBuf {
     canonical
 }
 
-const DERIVATIVE_DECODER_VERSION: &str = "image-0.25-v1";
 const MAX_MANAGED_DERIVATIVE_BYTES: u64 = 64 * 1024 * 1024;
 const HOSTED_ASSET_DERIVATIVE_WARNING: &str = "derivative_generation_failed";
 const HOSTED_DERIVATIVE_WORKERS: usize = 4;
@@ -72,9 +71,12 @@ fn derivative_spec_for_gallery(
     DerivativeSpec {
         asset_id: asset.id,
         signature: asset.signature,
+        media_kind: asset.media_kind,
         orientation: asset.orientation.unwrap_or(1),
         kind,
-        decoder_version: DERIVATIVE_DECODER_VERSION.to_owned(),
+        decoder_version: photo_codec::decoder_fingerprint(asset.media_kind)
+            .unwrap_or_default()
+            .to_owned(),
         colour_space: "srgb".to_owned(),
         target: DerivativeTarget::LongEdge(edge),
     }
@@ -2325,8 +2327,6 @@ impl GalleryEngine {
         let protected = self.protected_groups.clone();
         let asset_id = key.asset_id;
         let class = key.class;
-        let signature = spec.signature;
-        let orientation = spec.orientation;
         let generation_spec = spec.clone();
         let generation_cache_root = cache_root.clone();
         #[cfg(debug_assertions)]
@@ -2369,18 +2369,7 @@ impl GalleryEngine {
             }
             let prepared = if class == DerivativeClass::ScreenPreview {
                 generator
-                    .encode_screen_preview(
-                        &source,
-                        &photo_cache::DerivativeSpec {
-                            asset_id,
-                            signature,
-                            orientation,
-                            kind: photo_cache::DerivativeKind::ScreenPreview,
-                            decoder_version: DERIVATIVE_DECODER_VERSION.to_owned(),
-                            colour_space: "srgb".to_owned(),
-                            target: photo_cache::DerivativeTarget::LongEdge(4096),
-                        },
-                    )
+                    .encode_screen_preview(&source, &generation_spec)
                     .map(HostedDerivativePrepared::Screen)
                     .map_err(|_| AppServiceError::DerivativeFailed)
             } else {
