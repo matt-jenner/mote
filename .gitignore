@@ -8,5 +8,6 @@ apps/interface/tsconfig.tsbuildinfo
 runtime/
 .flatpak-builder/
 build/flatpak/
+build/heic-native/
 dist/flatpak/
 dist/macos/

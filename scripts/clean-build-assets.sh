@@ -42,6 +42,7 @@ clean_checkout() {
 	remove_generated_path "$checkout/apps/interface/node_modules/.vite" "$checkout"
 	remove_generated_path "$checkout/apps/interface/node_modules/.vite-temp" "$checkout"
 	remove_generated_path "$checkout/apps/interface/tsconfig.tsbuildinfo" "$checkout"
+	remove_generated_path "$checkout/build/heic-native" "$checkout"
 }
 
 clean_checkout "$repository_root"

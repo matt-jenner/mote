@@ -395,6 +395,7 @@ test("legacy build assets cleanup is strictly repository-scoped", () => {
 		"apps/interface/node_modules/.vite",
 		"apps/interface/node_modules/.vite-temp",
 		"build/flatpak",
+		"build/heic-native",
 		".flatpak-builder",
 		"dist/flatpak/repo",
 		".worktrees/example/target",
@@ -403,6 +404,7 @@ test("legacy build assets cleanup is strictly repository-scoped", () => {
 		".worktrees/example/node_modules/.vite-temp",
 		".worktrees/example/apps/interface/node_modules/.vite",
 		".worktrees/example/apps/interface/node_modules/.vite-temp",
+		".worktrees/example/build/heic-native",
 	];
 	for (const relative of removable) {
 		fs.mkdirSync(path.join(repository, relative), { recursive: true });
@@ -502,6 +504,10 @@ test("package commands route local builds through managed asset lifecycles", () 
 	);
 	assert.equal(
 		packageJson.scripts["clean:build-assets"],
+		"sh scripts/clean-build-assets.sh",
+	);
+	assert.equal(
+		packageJson.scripts["clean:build"],
 		"sh scripts/clean-build-assets.sh",
 	);
 	for (const [command, child] of [

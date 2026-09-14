@@ -17,6 +17,7 @@
 		"desktop:dev": "sh scripts/with-ephemeral-cargo-target.sh npm exec --workspace @photo-viewer/desktop -- tauri dev",
 		"desktop:build": "sh scripts/desktop-build.sh native",
 		"desktop:build:universal": "sh scripts/desktop-build.sh universal",
+		"clean:build": "sh scripts/clean-build-assets.sh",
 		"clean:build-assets": "sh scripts/clean-build-assets.sh",
 		"test:build": "node --test tests/build/*.test.mjs",
 		"test:deployment": "node --test tests/deployment/*.test.mjs",
