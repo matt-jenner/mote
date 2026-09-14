@@ -1571,7 +1571,7 @@ impl GalleryEngine {
         let mut queued = false;
         let mut capacity_exceeded = false;
         for asset in batch.assets {
-            if asset.media_kind == photo_domain::MediaKind::Video {
+            if !asset.media_kind.is_wall_viewable() {
                 continue;
             }
             let spec = derivative_spec_for_gallery(asset, batch.class);
@@ -2033,7 +2033,7 @@ impl GalleryEngine {
             .ok()
             .and_then(|state| {
                 let asset = state.libraries.catalog().find_asset(key.asset_id).ok()??;
-                if asset.media_kind == photo_domain::MediaKind::Video
+                if !asset.media_kind.is_wall_viewable()
                     || asset.availability != key.availability
                     || DerivativeKey::compute(&derivative_spec_for_gallery(&asset, key.class))
                         .as_str()
@@ -2592,7 +2592,7 @@ impl GalleryEngine {
         let (asset, source, spec, wall_record) = {
             let state = self.state.lock().ok()?;
             let asset = state.libraries.catalog().find_asset(key.asset_id).ok()??;
-            if asset.media_kind == photo_domain::MediaKind::Video
+            if !asset.media_kind.is_wall_viewable()
                 || asset.availability != photo_domain::Availability::Available
                 || asset.availability != key.availability
             {

@@ -3,6 +3,11 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::{Catalog, CatalogError};
 
+#[cfg(feature = "heic")]
+const WALL_MEDIA_KINDS: &str = "('jpeg','png','tiff','heif','webp')";
+#[cfg(not(feature = "heic"))]
+const WALL_MEDIA_KINDS: &str = "('jpeg','png','tiff','webp')";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShapeStatus {
     Pending,
@@ -95,11 +100,11 @@ impl Catalog {
         group: FolderGroupId,
         scope: GalleryScope,
     ) -> Result<u64, CatalogError> {
-        let mut sql = String::from(
+        let mut sql = format!(
             "SELECT COUNT(*) \
              FROM assets JOIN folder_group_assets fga ON fga.asset_id = assets.id \
              WHERE fga.folder_group_id = ?1 \
-               AND media_kind IN ('jpeg','png','tiff','webp') \
+               AND media_kind IN {WALL_MEDIA_KINDS} \
                AND NOT EXISTS (SELECT 1 FROM derivative_failures \
                                WHERE derivative_failures.asset_id = assets.id \
                                  AND derivative_failures.kind = 'wall_thumbnail' \
@@ -122,19 +127,25 @@ impl Catalog {
         group: FolderGroupId,
         scope: GalleryScope,
     ) -> Result<WallPreviewCounts, CatalogError> {
-        let sql = match scope {
-            GalleryScope::CurrentFolder => {
-                "SELECT direct_wall_ready, direct_screen_ready \
-                 FROM folder_group_preview_counts WHERE folder_group_id = ?1"
-            }
-            GalleryScope::IncludeSubfolders => {
-                "SELECT wall_ready, screen_ready \
-                 FROM folder_group_preview_counts WHERE folder_group_id = ?1"
-            }
-        };
+        let mut sql = format!(
+            "SELECT COALESCE(SUM(EXISTS(SELECT 1 FROM derivatives derivative \
+                                        WHERE derivative.asset_id = assets.id \
+                                          AND derivative.kind = 'wall_thumbnail')), 0), \
+                    COALESCE(SUM(EXISTS(SELECT 1 FROM derivatives derivative \
+                                        WHERE derivative.asset_id = assets.id \
+                                          AND derivative.kind = 'screen_preview')), 0) \
+             FROM assets JOIN folder_group_assets fga ON fga.asset_id = assets.id \
+             WHERE fga.folder_group_id = ?1 \
+               AND media_kind IN {WALL_MEDIA_KINDS}"
+        );
+        if scope == GalleryScope::CurrentFolder {
+            sql.push_str(
+                " AND relative_parent_key = (SELECT relative_path_key FROM folder_groups WHERE id = ?1)",
+            );
+        }
         let (wall_ready, screen_ready): (i64, i64) =
             self.connection
-                .query_row(sql, [group.as_uuid().as_bytes()], |row| {
+                .query_row(&sql, [group.as_uuid().as_bytes()], |row| {
                     Ok((row.get(0)?, row.get(1)?))
                 })?;
         Ok(WallPreviewCounts {
@@ -157,13 +168,13 @@ impl Catalog {
         scope: GalleryScope,
         assets: &[AssetId],
     ) -> Result<Vec<WallCatalogRecord>, CatalogError> {
-        let mut sql = String::from(
+        let mut sql = format!(
             "SELECT id, display_path, media_kind, provisional_order, captured_at_utc, width, height, representative_rgb, availability, shape_status, rating, \
                     EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id), \
                     (SELECT code FROM warnings WHERE warnings.asset_id = assets.id ORDER BY CASE code WHEN 'derivative_generation_failed' THEN 0 ELSE 1 END, occurred_at DESC, id DESC LIMIT 1) \
              FROM assets JOIN folder_group_assets fga ON fga.asset_id = assets.id \
              WHERE fga.folder_group_id = ?1 AND assets.id = ?2 \
-               AND media_kind IN ('jpeg','png','tiff','webp') \
+               AND media_kind IN {WALL_MEDIA_KINDS} \
                AND NOT EXISTS (SELECT 1 FROM derivative_failures \
                                WHERE derivative_failures.asset_id = assets.id \
                                  AND derivative_failures.kind = 'wall_thumbnail' \
@@ -222,13 +233,13 @@ impl Catalog {
         }) {
             return Err(CatalogError::WallCursorOrderMismatch);
         }
-        let mut sql = String::from(
+        let mut sql = format!(
             "SELECT id, display_path, media_kind, provisional_order, captured_at_utc, width, height, representative_rgb, availability, shape_status, rating, \
                     EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id), \
                     (SELECT code FROM warnings WHERE warnings.asset_id = assets.id ORDER BY CASE code WHEN 'derivative_generation_failed' THEN 0 ELSE 1 END, occurred_at DESC, id DESC LIMIT 1) \
              FROM assets JOIN folder_group_assets fga ON fga.asset_id = assets.id \
              WHERE fga.folder_group_id = ?1 \
-               AND media_kind IN ('jpeg','png','tiff','webp') \
+               AND media_kind IN {WALL_MEDIA_KINDS} \
                AND NOT EXISTS (SELECT 1 FROM derivative_failures \
                                WHERE derivative_failures.asset_id = assets.id \
                                  AND derivative_failures.kind = 'wall_thumbnail' \
@@ -434,37 +445,6 @@ mod tests {
                 .iter()
                 .any(|detail| detail.contains("assets_group_capture_photo")),
             "expected captured wall index in query plan: {details:?}"
-        );
-    }
-
-    #[test]
-    fn preview_count_lookup_uses_one_materialized_group_row() {
-        let catalog = Catalog::open_in_memory().unwrap();
-        let mut statement = catalog
-            .connection
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT wall_ready, screen_ready
-                 FROM folder_group_preview_counts
-                 WHERE folder_group_id = ?1",
-            )
-            .unwrap();
-        let details = statement
-            .query_map([vec![0_u8; 16]], |row| row.get::<_, String>(3))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(
-            details
-                .iter()
-                .any(|detail| detail.contains("PRIMARY KEY (folder_group_id=?)")),
-            "expected one primary-key preview-count lookup: {details:?}"
-        );
-        assert!(
-            details
-                .iter()
-                .all(|detail| !detail.contains("USE TEMP B-TREE")),
-            "preview counts must not rebuild distinct aggregates: {details:?}"
         );
     }
 

@@ -565,31 +565,46 @@ async fn inventory_total_counts_only_formats_the_wall_can_display() {
     write_png(&fixture.path().join("displayable.jpg"), [1, 2, 3]);
     std::fs::write(fixture.path().join("camera-raw.dng"), b"raw fixture").unwrap();
     std::fs::write(fixture.path().join("phone-photo.heic"), b"heif fixture").unwrap();
+    std::fs::write(fixture.path().join("future.avif"), b"avif fixture").unwrap();
+    std::fs::write(fixture.path().join("clip.mp4"), b"video fixture").unwrap();
 
     let indexer = Indexer::new(NoopMetadataReader, empty_policy_engine());
     let mut scan = indexer.start(ScanRequest::new(fixture.path())).unwrap();
-    let (inventory_total, completed) = tokio::time::timeout(Duration::from_secs(1), async {
-        let mut inventory_total = None;
-        loop {
-            if let Some(IndexEvent::Progress(progress)) = scan.events.recv().await {
-                inventory_total = inventory_total.or(progress.total);
-                if progress.stage == ScanStage::Completed {
-                    break (inventory_total, progress);
+    let (inventory_total, completed, discovered_kinds) =
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut inventory_total = None;
+            let mut discovered_kinds = Vec::new();
+            loop {
+                match scan.events.recv().await {
+                    Some(IndexEvent::Discovered { asset }) => {
+                        discovered_kinds.push(asset.media_kind)
+                    }
+                    Some(IndexEvent::Progress(progress)) => {
+                        inventory_total = inventory_total.or(progress.total);
+                        if progress.stage == ScanStage::Completed {
+                            break (inventory_total, progress, discovered_kinds);
+                        }
+                    }
+                    _ => {}
                 }
             }
-        }
-    })
-    .await
-    .unwrap();
+        })
+        .await
+        .unwrap();
     let summary = scan.join().await.unwrap();
 
-    assert_eq!(inventory_total, Some(1));
-    assert_eq!(completed.direct_total, Some(1));
-    assert_eq!(completed.total, Some(1));
-    assert_eq!(completed.discovered, 1);
-    assert_eq!(completed.shaped, 1);
-    assert_eq!(completed.enriched, 1);
-    assert_eq!(summary.discovered, 3);
+    let expected_photo_count = if cfg!(feature = "heic") { 2 } else { 1 };
+    assert_eq!(inventory_total, Some(expected_photo_count));
+    assert_eq!(completed.direct_total, Some(expected_photo_count));
+    assert_eq!(completed.total, Some(expected_photo_count));
+    assert_eq!(completed.discovered, expected_photo_count);
+    assert_eq!(completed.shaped, expected_photo_count);
+    assert_eq!(completed.enriched, expected_photo_count);
+    assert_eq!(summary.discovered, 5);
+    assert!(discovered_kinds.contains(&MediaKind::Heif));
+    assert!(discovered_kinds.contains(&MediaKind::Avif));
+    assert!(discovered_kinds.contains(&MediaKind::Raw));
+    assert!(discovered_kinds.contains(&MediaKind::Video));
 }
 
 #[tokio::test]

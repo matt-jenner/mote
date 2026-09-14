@@ -2,10 +2,11 @@ use std::path::Path;
 
 use photo_catalog::{
     AssetMetadataUpdate, AssetShapeUpdate, Catalog, CatalogError, CatalogIndexRecord, NewAsset,
-    NewFolderGroup, NewLibrary, ShapeStatus, TerminalDerivativeFailure, WallCursorKey, WallOrder,
+    NewDerivative, NewFolderGroup, NewLibrary, ShapeStatus, TerminalDerivativeFailure,
+    WallCursorKey, WallOrder,
 };
 use photo_domain::{
-    AssetId, Availability, FolderGroupId, GalleryScope, MediaKind, RelativePathKey,
+    AssetId, Availability, DerivativeId, FolderGroupId, GalleryScope, MediaKind, RelativePathKey,
 };
 use rusqlite::Connection;
 
@@ -177,8 +178,7 @@ fn wall_pages_skip_videos_before_limit_and_cursor_calculation() {
     assert!(second.next.is_some());
 }
 
-#[test]
-fn wall_pages_include_only_formats_the_derivative_decoder_supports() {
+fn assert_wall_capability_filters(expected_paths: &[&str]) {
     let fixture = WallFixture::with_assets([
         asset("photo.jpg", MediaKind::Jpeg, 1),
         asset("photo.png", MediaKind::Png, 2),
@@ -188,6 +188,7 @@ fn wall_pages_include_only_formats_the_derivative_decoder_supports() {
         asset("photo.avif", MediaKind::Avif, 6),
         asset("photo.dng", MediaKind::Raw, 7),
         asset("clip.mp4", MediaKind::Video, 8),
+        asset("mystery.bin", MediaKind::Unknown, 9),
     ]);
 
     let page = fixture
@@ -195,17 +196,137 @@ fn wall_pages_include_only_formats_the_derivative_decoder_supports() {
         .wall_page(fixture.group, WallOrder::Provisional, None, 20)
         .unwrap();
 
-    assert_eq!(
-        display_paths(&page.items),
-        ["photo.jpg", "photo.png", "photo.tiff", "photo.webp"]
-    );
+    assert_eq!(display_paths(&page.items), expected_paths);
     assert_eq!(
         fixture
             .catalog
             .wall_photo_count_scoped(fixture.group, GalleryScope::IncludeSubfolders)
             .unwrap(),
-        4
+        expected_paths.len() as u64
     );
+
+    let heif_id = AssetId::for_path(
+        fixture.library,
+        &RelativePathKey::from_relative_path(Path::new("photo.heic")).unwrap(),
+    );
+    assert_eq!(
+        fixture
+            .catalog
+            .find_asset(heif_id)
+            .unwrap()
+            .unwrap()
+            .media_kind,
+        MediaKind::Heif,
+        "HEIF must remain in durable inventory in every build"
+    );
+    let selected = fixture
+        .catalog
+        .wall_records_for_assets(fixture.group, &[heif_id])
+        .unwrap();
+    assert_eq!(
+        selected
+            .iter()
+            .map(|record| record.display_path.as_str())
+            .collect::<Vec<_>>(),
+        expected_paths
+            .contains(&"photo.heic")
+            .then_some("photo.heic")
+            .into_iter()
+            .collect::<Vec<_>>()
+    );
+}
+
+#[cfg(feature = "heic")]
+#[test]
+fn enabled_wall_queries_include_only_supported_photo_formats() {
+    assert_wall_capability_filters(&[
+        "photo.jpg",
+        "photo.png",
+        "photo.tiff",
+        "photo.webp",
+        "photo.heic",
+    ]);
+}
+
+#[cfg(not(feature = "heic"))]
+#[test]
+fn disabled_wall_queries_retain_but_hide_heif_and_other_unsupported_formats() {
+    assert_wall_capability_filters(&["photo.jpg", "photo.png", "photo.tiff", "photo.webp"]);
+}
+
+fn assert_preview_counts_use_compiled_capability(expected: u64) {
+    let mut fixture = WallFixture::with_assets([
+        asset("photo.jpg", MediaKind::Jpeg, 1),
+        asset("photo.heic", MediaKind::Heif, 2),
+        asset("photo.avif", MediaKind::Avif, 3),
+        asset("photo.dng", MediaKind::Raw, 4),
+        asset("clip.mp4", MediaKind::Video, 5),
+        asset("mystery.bin", MediaKind::Unknown, 6),
+    ]);
+    for path in [
+        "photo.jpg",
+        "photo.heic",
+        "photo.avif",
+        "photo.dng",
+        "clip.mp4",
+        "mystery.bin",
+    ] {
+        let asset_id = AssetId::for_path(
+            fixture.library,
+            &RelativePathKey::from_relative_path(Path::new(path)).unwrap(),
+        );
+        fixture
+            .catalog
+            .insert_derivative(&NewDerivative {
+                id: DerivativeId::new(),
+                asset_id,
+                folder_group_id: fixture.group,
+                kind: "wall_thumbnail".to_owned(),
+                cache_key: format!("{path}-wall"),
+                relative_cache_path: format!("{path}.jpg").into(),
+                size_bytes: 10,
+                durable: true,
+                created_at: 1,
+            })
+            .unwrap();
+        fixture
+            .catalog
+            .insert_derivative(&NewDerivative {
+                id: DerivativeId::new(),
+                asset_id,
+                folder_group_id: fixture.group,
+                kind: "screen_preview".to_owned(),
+                cache_key: format!("{path}-screen"),
+                relative_cache_path: format!("{path}-screen.jpg").into(),
+                size_bytes: 10,
+                durable: false,
+                created_at: 1,
+            })
+            .unwrap();
+    }
+
+    assert_eq!(
+        fixture
+            .catalog
+            .wall_preview_counts_scoped(fixture.group, GalleryScope::IncludeSubfolders)
+            .unwrap(),
+        photo_catalog::WallPreviewCounts {
+            wall_ready: expected,
+            screen_ready: expected,
+        }
+    );
+}
+
+#[cfg(feature = "heic")]
+#[test]
+fn enabled_preview_counts_include_heif_but_not_unsupported_formats() {
+    assert_preview_counts_use_compiled_capability(2);
+}
+
+#[cfg(not(feature = "heic"))]
+#[test]
+fn disabled_preview_counts_exclude_retained_heif_and_unsupported_formats() {
+    assert_preview_counts_use_compiled_capability(1);
 }
 
 #[test]

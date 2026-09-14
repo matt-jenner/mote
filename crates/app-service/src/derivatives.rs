@@ -15,7 +15,7 @@ use photo_cache::{
 };
 use photo_catalog::{Catalog, NewDerivative, TerminalDerivativeFailure, WallOrder};
 use photo_domain::{
-    AssetId, Availability, DerivativeId, FolderGroupId, GalleryScope, MediaKind, RelativePathKey,
+    AssetId, Availability, DerivativeId, FolderGroupId, GalleryScope, RelativePathKey,
 };
 use photo_indexer::{InteractionMode, JobPriority};
 
@@ -460,7 +460,7 @@ impl AppService {
             if !state.libraries.catalog().asset_is_member(group, id)? {
                 return Err(AppServiceError::ForeignAsset);
             }
-            if asset.media_kind != MediaKind::Video {
+            if asset.media_kind.is_wall_viewable() {
                 photo_assets.push((id, asset));
             }
         }
@@ -1327,7 +1327,7 @@ impl AppService {
             .catalog()
             .asset_is_member(group, key.asset_id)
             .map_err(|_| DerivativeWorkError::WorkerUnavailable)?
-            || asset.media_kind == MediaKind::Video
+            || !asset.media_kind.is_wall_viewable()
         {
             return Ok(None);
         }
@@ -2066,7 +2066,7 @@ impl AppService {
                                 .catalog()
                                 .asset_is_member(selection.group_id, asset.id)
                                 .unwrap_or(false)
-                                && asset.media_kind != MediaKind::Video
+                                && asset.media_kind.is_wall_viewable()
                         })
                 })
                 .collect::<Vec<_>>()
@@ -2453,7 +2453,7 @@ impl AppService {
                 .libraries
                 .catalog()
                 .asset_is_member(selection.group_id, asset.id)?
-                || asset.media_kind == MediaKind::Video
+                || !asset.media_kind.is_wall_viewable()
             {
                 return Ok(true);
             }
@@ -2514,7 +2514,7 @@ impl AppService {
                             .catalog()
                             .asset_is_member(selection.group_id, asset.id)
                             .unwrap_or(false)
-                            && asset.media_kind != MediaKind::Video
+                            && asset.media_kind.is_wall_viewable()
                             && asset.availability == availability
                     })
                     .map(|asset| {
@@ -2570,7 +2570,7 @@ impl AppService {
                 .find_asset(asset_id)?
                 .filter(|asset| {
                     state.libraries.catalog().asset_is_member(selection.group_id, asset.id).unwrap_or(false)
-                        && asset.media_kind != MediaKind::Video
+                        && asset.media_kind.is_wall_viewable()
                 });
             let Some(asset) = asset else {
                 return Ok(false);
@@ -3114,7 +3114,7 @@ fn has_current_terminal_derivative_failure(
     catalog: &Catalog,
     asset: &photo_catalog::AssetRecord,
 ) -> Result<bool, photo_catalog::CatalogError> {
-    if asset.media_kind == MediaKind::Video || asset.folder_group_id.is_none() {
+    if !asset.media_kind.is_wall_viewable() || asset.folder_group_id.is_none() {
         return Ok(false);
     }
     for class in [
@@ -3186,7 +3186,7 @@ fn validate_requested_assets(
         if !catalog.asset_is_member(group, *id)? {
             return Err(AppServiceError::ForeignAsset);
         }
-        if asset.media_kind == MediaKind::Video {
+        if !asset.media_kind.is_wall_viewable() {
             return Err(AppServiceError::DerivativeUnavailable);
         }
         if scope == GalleryScope::CurrentFolder {

@@ -50,7 +50,11 @@ impl MediaKind {
     }
 
     pub const fn is_wall_viewable(self) -> bool {
-        matches!(self, Self::Jpeg | Self::Png | Self::Tiff | Self::Webp)
+        match self {
+            Self::Jpeg | Self::Png | Self::Tiff | Self::Webp => true,
+            Self::Heif => cfg!(feature = "heic"),
+            Self::Avif | Self::Raw | Self::Video | Self::Unknown => false,
+        }
     }
 }
 

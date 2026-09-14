@@ -18,7 +18,7 @@ use photo_catalog::{
 };
 use photo_domain::{
     Appearance, AssetId, Availability, DerivativeId, FolderGroupId, GalleryScope, LibraryId,
-    RelativePathKey,
+    MediaKind, RelativePathKey,
 };
 use photo_metadata::{MetadataBundle, MetadataCandidate, MetadataReadWarning, MetadataSource};
 
@@ -360,6 +360,30 @@ impl ProgressiveFixture {
         let source = temp.path().join("videos");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join("clip.mp4"), b"not a video").unwrap();
+        let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+        Self {
+            temp,
+            source,
+            config,
+        }
+    }
+
+    fn capability_matrix() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("photos");
+        std::fs::create_dir_all(&source).unwrap();
+        ImageBuffer::from_pixel(16, 12, Rgb([20_u8, 40, 60]))
+            .save(source.join("displayable.jpg"))
+            .unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../codec/tests/fixtures/heif/iphone-8bit.heic"),
+            source.join("phone.HEIC"),
+        )
+        .unwrap();
+        std::fs::write(source.join("future.avif"), b"avif fixture").unwrap();
+        std::fs::write(source.join("camera.dng"), b"raw fixture").unwrap();
+        std::fs::write(source.join("clip.mp4"), b"video fixture").unwrap();
         let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
         Self {
             temp,
@@ -2225,6 +2249,155 @@ async fn direct_video_derivative_request_is_rejected_without_work() {
     while let Ok(event) = updates.try_recv() {
         assert!(!matches!(event, WallUpdate::DerivativesReady { .. }));
     }
+}
+
+async fn assert_compiled_photo_capability(expect_heif: bool) {
+    let fixture = ProgressiveFixture::capability_matrix();
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    let bootstrap = service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+
+    let library_id =
+        LibraryId::from_uuid(uuid::Uuid::parse_str(&bootstrap.active_source.unwrap().id).unwrap());
+    let jpeg_id = AssetId::for_path(
+        library_id,
+        &RelativePathKey::from_relative_path(Path::new("displayable.jpg")).unwrap(),
+    );
+    let heif_id = AssetId::for_path(
+        library_id,
+        &RelativePathKey::from_relative_path(Path::new("phone.HEIC")).unwrap(),
+    );
+    let page = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    let expected_names = if expect_heif {
+        vec!["displayable.jpg", "phone.HEIC"]
+    } else {
+        vec!["displayable.jpg"]
+    };
+    let mut actual_names = page
+        .items
+        .iter()
+        .map(|asset| asset.display_name.as_str())
+        .collect::<Vec<_>>();
+    actual_names.sort_unstable();
+    assert_eq!(actual_names, expected_names);
+    assert_eq!(page.indexed_count, expected_names.len() as u64);
+    assert_eq!(page.total_count, expected_names.len() as u64);
+
+    let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    assert_eq!(
+        catalog.find_asset(heif_id).unwrap().unwrap().media_kind,
+        MediaKind::Heif,
+        "HEIF inventory must survive a decoder-disabled build"
+    );
+    drop(catalog);
+
+    let heif_text = heif_id.as_uuid().hyphenated().to_string();
+    if expect_heif {
+        let ids = vec![
+            jpeg_id.as_uuid().hyphenated().to_string(),
+            heif_text.clone(),
+        ];
+        service
+            .request_derivatives(DerivativeRequest::visible(ids.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_derivatives_until(&mut updates, DerivativeClass::WallThumbnail, 2)
+                .await
+                .len(),
+            2
+        );
+        service
+            .request_derivatives(DerivativeRequest::visible_screen_preview(ids))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_derivatives_until(&mut updates, DerivativeClass::ScreenPreview, 2)
+                .await
+                .len(),
+            2
+        );
+    } else {
+        for request in [
+            DerivativeRequest::visible(vec![heif_text.clone()]),
+            DerivativeRequest::visible_screen_preview(vec![heif_text]),
+        ] {
+            assert!(matches!(
+                service.request_derivatives(request).await,
+                Err(photo_app_service::AppServiceError::DerivativeUnavailable)
+            ));
+        }
+        let jpeg_text = jpeg_id.as_uuid().hyphenated().to_string();
+        service
+            .request_derivatives(DerivativeRequest::visible(vec![jpeg_text.clone()]))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_derivatives_until(&mut updates, DerivativeClass::WallThumbnail, 1)
+                .await
+                .len(),
+            1
+        );
+        service
+            .request_derivatives(DerivativeRequest::visible_screen_preview(vec![jpeg_text]))
+            .await
+            .unwrap();
+        assert_eq!(
+            recv_derivatives_until(&mut updates, DerivativeClass::ScreenPreview, 1)
+                .await
+                .len(),
+            1
+        );
+    }
+
+    service.wait_for_derivative_tasks_quiescent_test().await;
+    let derivatives = Catalog::open(&fixture.config.catalog_path())
+        .unwrap()
+        .all_derivatives()
+        .unwrap();
+    assert!(derivatives.iter().all(|record| {
+        record.asset_id == jpeg_id || (expect_heif && record.asset_id == heif_id)
+    }));
+    assert_eq!(
+        derivatives
+            .iter()
+            .filter(|record| record.kind == "wall_thumbnail")
+            .count(),
+        expected_names.len()
+    );
+    assert_eq!(
+        derivatives
+            .iter()
+            .filter(|record| record.kind == "screen_preview")
+            .count(),
+        expected_names.len()
+    );
+}
+
+#[cfg(feature = "heic")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enabled_build_presents_and_generates_derivatives_for_heif() {
+    assert_compiled_photo_capability(true).await;
+}
+
+#[cfg(not(feature = "heic"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disabled_build_retains_heif_inventory_without_presenting_or_processing_it() {
+    assert_compiled_photo_capability(false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
