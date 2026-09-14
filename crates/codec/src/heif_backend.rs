@@ -8,7 +8,8 @@ use std::{
 use crate::{CodecError, CodecLimit, DisplayShape};
 use image::{DynamicImage, RgbImage};
 use libheif_rs::{
-    ColorSpace, DecodingOptions, HeifContext, ImageHandle, LibHeif, RgbChroma, SecurityLimits,
+    ColorSpace, DecodingOptions, HeifContext, ImageHandle, ItemId, LibHeif, RgbChroma,
+    SecurityLimits,
 };
 use moxcms::{CicpProfile, ColorProfile, Layout, MatrixCoefficients, ParsingOptions};
 
@@ -140,25 +141,44 @@ pub(crate) fn embedded_exif_tiff(path: &Path) -> Result<Option<Vec<u8>>, CodecEr
     let bytes = source_bytes(path)?;
     let context = context(&bytes)?;
     let handle = primary(&context)?;
-    if handle.number_of_metadata_blocks(b"Exif") <= 0 {
-        return Ok(None);
-    }
+    let declared_count = handle.number_of_metadata_blocks(b"Exif");
     let mut identifiers = [0];
-    if handle.metadata_block_ids(&mut identifiers, b"Exif") == 0 || identifiers[0] == 0 {
+    let listed_count = if declared_count > 0 {
+        handle.metadata_block_ids(&mut identifiers, b"Exif")
+    } else {
+        0
+    };
+    let Some(identifier) = select_first_exif_id(declared_count, listed_count, identifiers[0])?
+    else {
         return Ok(None);
-    }
-    let size = handle.metadata_size(identifiers[0]);
+    };
+    let size = handle.metadata_size(identifier);
     check(CodecLimit::AllocationBytes, size as u64, MAX_ALLOCATION)?;
-    let mut metadata =
-        handle
-            .metadata(identifiers[0])
-            .map_err(|error| CodecError::InvalidExif {
-                message: error.to_string(),
-            })?;
+    let mut metadata = handle
+        .metadata(identifier)
+        .map_err(|error| CodecError::InvalidExif {
+            message: error.to_string(),
+        })?;
     let tiff = extract_tiff_payload(&metadata)?;
     let start = metadata.len() - tiff.len();
     metadata.drain(..start);
     Ok(Some(metadata))
+}
+
+fn select_first_exif_id(
+    declared_count: i32,
+    listed_count: usize,
+    first_id: ItemId,
+) -> Result<Option<ItemId>, CodecError> {
+    if declared_count <= 0 {
+        return Ok(None);
+    }
+    if listed_count == 0 || first_id == 0 {
+        return Err(CodecError::InvalidExif {
+            message: "declared EXIF metadata block has no valid item identifier".into(),
+        });
+    }
+    Ok(Some(first_id))
 }
 
 fn extract_tiff_payload(metadata: &[u8]) -> Result<&[u8], CodecError> {
@@ -437,6 +457,22 @@ fn copy_high_precision_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn positive_exif_count_requires_one_nonzero_first_id() {
+        for (listed, first) in [(0, 0), (1, 0)] {
+            assert!(matches!(
+                select_first_exif_id(1, listed, first),
+                Err(CodecError::InvalidExif { .. })
+            ));
+        }
+        assert!(select_first_exif_id(0, 0, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn multiple_exif_blocks_select_the_first_listed_id() {
+        assert_eq!(select_first_exif_id(2, 1, 37).unwrap(), Some(37));
+    }
 
     #[test]
     fn exif_offsets_accept_both_tiff_byte_orders() {
