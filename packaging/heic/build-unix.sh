@@ -107,7 +107,7 @@ heic_cleanup_on_exit() {
 		fi
 	elif [ -e "$heic_publish_backup" ]; then
 		mote_remove_managed_path "$heic_publish_backup" "$heic_native_root" || heic_cleanup_status=$?
-	fi
+fi
 	if [ -e "$heic_publish_stage_root" ]; then
 		mote_remove_managed_path "$heic_publish_stage_root" "$heic_native_root" || heic_cleanup_status=$?
 	fi
@@ -324,9 +324,11 @@ fi
 [ ! -e "$heic_staged_prefix/bin/heif-enc" ]
 [ ! -e "$heic_staged_prefix/bin/enc265" ]
 
-heic_publication_active=1
 if [ -e "$heic_install_prefix" ]; then
 	heic_install_existed=1
+	fi
+heic_publication_active=1
+if [ "$heic_install_existed" -eq 1 ]; then
 	mv "$heic_install_prefix" "$heic_publish_backup"
 fi
 heic_publish_status=0

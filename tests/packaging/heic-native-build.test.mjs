@@ -53,6 +53,16 @@ const nativeFixture = () => {
 	);
 
 	writeExecutable(
+		path.join(bin, "uname"),
+		`#!/bin/sh
+case "$1" in
+  -s) printf '%s\n' Darwin ;;
+  -m) printf '%s\n' arm64 ;;
+  *) exit 2 ;;
+esac
+`,
+	);
+	writeExecutable(
 		path.join(bin, "curl"),
 		`#!/bin/sh
 output=
@@ -378,6 +388,34 @@ test("TERM during publication rolls back and removes all temporary work", async 
 		process.kill(-child.pid, "SIGTERM");
 		const status = await new Promise((resolve) => child.once("exit", resolve));
 		assert.equal(status, 143);
+		assert.equal(fs.readFileSync(marker, "utf8"), "keep");
+		assertNoEphemeralNativePaths(fixture);
+	} finally {
+		fs.rmSync(fixture.repository, { recursive: true, force: true });
+	}
+});
+
+test("TERM at publication activation preserves the previous prefix", () => {
+	const fixture = nativeFixture();
+	try {
+		const first = runNativeBuilder(fixture);
+		assert.equal(first.status, 0, first.stderr);
+		const marker = path.join(fixturePrefix(fixture), "previous");
+		fs.writeFileSync(marker, "keep");
+		const builder = path.join(fixture.packaging, "build-unix.sh");
+		const builderSource = fs.readFileSync(builder, "utf8");
+		const activation = "heic_publication_active=1\n";
+		assert.equal(builderSource.split(activation).length, 2);
+		fs.writeFileSync(
+			builder,
+			builderSource.replace(
+				activation,
+				() => `${activation}kill -TERM "$$"\n`,
+			),
+		);
+
+		const interrupted = runNativeBuilder(fixture);
+		assert.equal(interrupted.status, 143, interrupted.stderr);
 		assert.equal(fs.readFileSync(marker, "utf8"), "keep");
 		assertNoEphemeralNativePaths(fixture);
 	} finally {
