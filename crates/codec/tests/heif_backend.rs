@@ -77,8 +77,35 @@ fn rejects_declared_pixel_item_and_tile_bombs() {
             }
             _ => {
                 let i = bytes.windows(4).position(|b| b == b"idat").unwrap();
-                bytes[i + 6] = 255;
-                bytes[i + 7] = 255;
+                bytes[i + 6] = 16; // 17 x 241 = 4,097 tiles.
+                bytes[i + 7] = 240;
+                // Supply the complete reference table so rejection cannot be
+                // satisfied by Missing_grid_images. HEVC grid references are
+                // bounded by the stricter 1,024-item security limit, before
+                // the 4,096 tili limit could apply.
+                let dimg = bytes.windows(4).position(|b| b == b"dimg").unwrap();
+                let old_size =
+                    u32::from_be_bytes(bytes[dimg - 4..dimg].try_into().unwrap()) as usize;
+                let mut replacement = Vec::new();
+                replacement.extend_from_slice(&(12u32 + 4097 * 2).to_be_bytes());
+                replacement.extend_from_slice(b"dimg");
+                replacement.extend_from_slice(&2u16.to_be_bytes());
+                replacement.extend_from_slice(&4097u16.to_be_bytes());
+                for id in 1u16..=4097 {
+                    replacement.extend_from_slice(&id.to_be_bytes());
+                }
+                let delta = replacement.len() - old_size;
+                for parent in [b"meta", b"iref"] {
+                    let p = bytes.windows(4).position(|b| b == parent).unwrap();
+                    let size = u32::from_be_bytes(bytes[p - 4..p].try_into().unwrap());
+                    bytes[p - 4..p].copy_from_slice(&(size + delta as u32).to_be_bytes());
+                }
+                let iloc = bytes.windows(4).position(|b| b == b"iloc").unwrap();
+                for base in [iloc + 18, iloc + 58] {
+                    let offset = u32::from_be_bytes(bytes[base..base + 4].try_into().unwrap());
+                    bytes[base..base + 4].copy_from_slice(&(offset + delta as u32).to_be_bytes());
+                }
+                bytes.splice(dimg - 4..dimg - 4 + old_size, replacement);
             }
         }
         let path = directory.path().join(format!("{kind}.heic"));
@@ -91,6 +118,32 @@ fn rejects_declared_pixel_item_and_tile_bombs() {
             ),
             "{kind}: {error}"
         );
+        let diagnostic = error.to_string().to_lowercase();
+        if kind == "pixels" {
+            assert!(matches!(
+                error,
+                CodecError::LimitExceeded {
+                    limit: CodecLimit::DecodedPixels,
+                    actual: 400_000_000,
+                    maximum: 150_000_000
+                }
+            ));
+        } else {
+            assert!(diagnostic.contains("security limit"), "{kind}: {error}");
+        }
+        if kind == "items" {
+            assert!(
+                diagnostic.contains("iinf box contains 1025") && diagnostic.contains("1024 items"),
+                "{error}"
+            );
+        }
+        if kind == "tiles" {
+            assert!(
+                diagnostic.contains("references in iref box (4097)")
+                    && diagnostic.contains("1024 references"),
+                "{error}"
+            );
+        }
     }
 }
 
@@ -119,8 +172,78 @@ fn ten_bit_two_tile_grid_selects_primary_and_reduces_to_rgb8() {
         panic!("expected SDR RGB8")
     };
     assert_eq!(image.dimensions(), (93, 100));
-    assert_eq!(image.get_pixel(0, 0).0, [6, 1, 245]);
-    assert_eq!(image.get_pixel(92, 99).0, [252, 254, 3]);
+    for (position, expected) in [((0, 0), [6u8, 1, 245]), ((92, 99), [252, 254, 3])] {
+        for (actual, expected) in image
+            .get_pixel(position.0, position.1)
+            .0
+            .into_iter()
+            .zip(expected)
+        {
+            assert!(actual.abs_diff(expected) <= 2);
+        }
+    }
+}
+
+fn tagged_hdr_fixture(transfer: u16) -> Vec<u8> {
+    let mut bytes = fs::read(fixture("iphone-10bit-grid.heic")).unwrap();
+    let ipco = bytes.windows(4).position(|b| b == b"ipco").unwrap();
+    let size = u32::from_be_bytes(bytes[ipco - 4..ipco].try_into().unwrap()) as usize;
+    let mut property = 19u32.to_be_bytes().to_vec();
+    property.extend_from_slice(b"colrnclx");
+    property.extend_from_slice(&9u16.to_be_bytes()); // BT.2020
+    property.extend_from_slice(&transfer.to_be_bytes());
+    property.extend_from_slice(&6u16.to_be_bytes());
+    property.push(128);
+    bytes.splice(ipco - 4 + size..ipco - 4 + size, property);
+    bytes[ipco - 4..ipco].copy_from_slice(&(size as u32 + 19).to_be_bytes());
+    let ipma = bytes.windows(4).position(|b| b == b"ipma").unwrap();
+    let mut entry = ipma + 12;
+    while u16::from_be_bytes(bytes[entry..entry + 2].try_into().unwrap()) != 2 {
+        entry += 3 + usize::from(bytes[entry + 2]);
+    }
+    let end = entry + 3 + usize::from(bytes[entry + 2]);
+    bytes[entry + 2] += 1;
+    bytes.insert(end, 0x85); // Essential property #5 on declared primary.
+    for (name, delta) in [(b"ipma", 1u32), (b"iprp", 20), (b"meta", 20)] {
+        let p = bytes.windows(4).position(|b| b == name).unwrap();
+        let size = u32::from_be_bytes(bytes[p - 4..p].try_into().unwrap());
+        bytes[p - 4..p].copy_from_slice(&(size + delta).to_be_bytes());
+    }
+    let iloc = bytes.windows(4).position(|b| b == b"iloc").unwrap();
+    for base in [iloc + 18, iloc + 58] {
+        let value = u32::from_be_bytes(bytes[base..base + 4].try_into().unwrap());
+        bytes[base..base + 4].copy_from_slice(&(value + 20).to_be_bytes());
+    }
+    bytes
+}
+
+#[test]
+fn pq_and_hlg_ten_bit_files_render_reference_neutral_and_saturated_highlight() {
+    let directory = tempfile::tempdir().unwrap();
+    // Independent ST 2084 / BT.2100 + BT.2020-to-sRGB matrix calculations
+    // from native 10-bit samples [252,261,784] and [521,516,487].
+    for (transfer, expected) in [
+        (16, [[205u8, 209, 255], [233, 223, 193]]),
+        (18, [[83, 105, 255], [194, 190, 180]]),
+    ] {
+        let bytes = tagged_hdr_fixture(transfer);
+        let path = directory.path().join("hdr.heic");
+        fs::write(&path, bytes).unwrap();
+        let image = decode_display_image(&path, MediaKind::Heif, 1).unwrap();
+        let DynamicImage::ImageRgb8(image) = image else {
+            panic!("expected SDR RGB8")
+        };
+        assert_eq!(image.dimensions(), (93, 100));
+        for ((x, y), expected) in [(7, 25), (14, 50)].into_iter().zip(expected) {
+            let pixel = image.get_pixel(x, y).0;
+            for (actual, expected) in pixel.into_iter().zip(expected) {
+                assert!(
+                    actual.abs_diff(expected) <= 2,
+                    "transfer {transfer}, {x},{y}: {pixel:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

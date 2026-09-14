@@ -3,6 +3,8 @@
 mod error;
 #[cfg(feature = "heic")]
 mod heif_backend;
+#[cfg(feature = "heic")]
+mod heif_hdr;
 mod image_backend;
 
 pub const IMAGE_DECODER_FINGERPRINT: &str = "image-0.25-v1";

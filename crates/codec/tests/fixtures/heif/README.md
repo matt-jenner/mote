@@ -37,6 +37,23 @@ Other expected corners were measured with the direct native API before the
 Mote backend existed. Rotation positions are the source corners permuted
 90 degrees counter-clockwise.
 
+HDR integration cases derive PQ and HLG variants of the 10-bit fixture in
+temporary directories by adding primary NCLX tags (BT.2020 primaries,
+transfer 16 or 18); no encoder or additional committed binary is needed.
+Expected colours use independent ST 2084 / BT.2100 calculations from known
+native 10-bit samples, plus the BT.2020-to-sRGB matrix.
+
+Mote's SDR policy uses PQ absolute luminance, or an HLG 1,000-nit reference
+display with system gamma 1.2. It preserves linear luminance through 50 nits
+on a 100-nit SDR target, then uses a smooth shoulder `1 - 25 / luminance_nits`.
+Thus 100-nit neutral maps to about sRGB 225 and 1,000-nit neutral to about 252.
+A single luminance scale preserves RGB ratios through the shoulder; any
+out-of-gamut chroma is compressed toward the same luminance before the sRGB
+transfer function. Native sample precision is retained until this mapping,
+then output is quantized to RGB8. This deterministic policy intentionally
+does not preserve HDR display output or dynamically follow monitor peak
+brightness.
+
 ## Known pinned-library edge case
 
 The positive rotation fixture uses an even 28-pixel crop. libheif 1.23.4

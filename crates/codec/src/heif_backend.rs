@@ -141,11 +141,17 @@ pub(crate) fn decode(path: &Path) -> Result<DynamicImage, CodecError> {
     let context = context(&bytes)?;
     let handle = primary(&context)?;
     let expected = shape(&handle)?;
+    let high_precision = handle
+        .luma_bits_per_pixel()
+        .max(handle.chroma_bits_per_pixel())
+        > 8;
     let mut options =
         DecodingOptions::new().ok_or_else(|| decode_error("cannot allocate decoding options"))?;
     options.set_ignore_transformations(false);
     options.set_strict_decoding(true);
-    options.set_convert_hdr_to_8bit(true);
+    // Retain source precision until HDR luminance mapping. Reducing PQ/HLG
+    // code values first destroys shadow detail, even if output is SDR RGB8.
+    options.set_convert_hdr_to_8bit(!high_precision);
     // libheif converts YCbCr layout/range and bit depth, but is not an ICC
     // colour-management engine. Preserve source colourimetry for moxcms.
     options.set_output_image_nclx_profile_passthrough(true);
@@ -154,7 +160,15 @@ pub(crate) fn decode(path: &Path) -> Result<DynamicImage, CodecError> {
         .map_err(decode_error)?;
     let image = LIBRARY
         .get_or_init(LibHeif::new)
-        .decode(&handle, ColorSpace::Rgb(RgbChroma::Rgb), Some(options))
+        .decode(
+            &handle,
+            ColorSpace::Rgb(if high_precision {
+                RgbChroma::HdrRgbLe
+            } else {
+                RgbChroma::Rgb
+            }),
+            Some(options),
+        )
         .map_err(decode_error)?;
     if image.width() != expected.width || image.height() != expected.height {
         return Err(decode_error(
@@ -165,7 +179,10 @@ pub(crate) fn decode(path: &Path) -> Result<DynamicImage, CodecError> {
         .planes()
         .interleaved
         .ok_or(CodecError::MissingInterleavedPlane)?;
-    if plane.width != expected.width || plane.height != expected.height || plane.bits_per_pixel != 8
+    if plane.width != expected.width
+        || plane.height != expected.height
+        || (!high_precision && plane.bits_per_pixel != 8)
+        || (high_precision && !(9..=16).contains(&plane.bits_per_pixel))
     {
         return Err(CodecError::InvalidPixelLayout {
             width: expected.width,
@@ -173,8 +190,7 @@ pub(crate) fn decode(path: &Path) -> Result<DynamicImage, CodecError> {
             stride: plane.stride,
         });
     }
-    let mut pixels = copy_rgb_rows(plane.data, expected.width, expected.height, plane.stride)?;
-    if let Some(raw) = handle.color_profile_raw() {
+    let profile = if let Some(raw) = handle.color_profile_raw() {
         check(
             CodecLimit::ColourProfileBytes,
             raw.data.len() as u64,
@@ -189,7 +205,7 @@ pub(crate) fn decode(path: &Path) -> Result<DynamicImage, CodecError> {
             },
         )
         .map_err(decode_error)?;
-        convert_to_srgb(&mut pixels, expected.width, &profile)?;
+        Some(profile)
     } else if let Some(nclx) = image
         .color_profile_nclx()
         .or_else(|| handle.color_profile_nclx())
@@ -208,7 +224,27 @@ pub(crate) fn decode(path: &Path) -> Result<DynamicImage, CodecError> {
         if profile.cicp.is_none() || profile.red_trc.is_none() {
             return Err(decode_error("unsupported NCLX colour profile"));
         }
-        convert_to_srgb(&mut pixels, expected.width, &profile)?;
+        Some(profile)
+    } else {
+        None
+    };
+    let mut pixels = if high_precision {
+        copy_high_precision_rows(
+            plane.data,
+            expected.width,
+            expected.height,
+            plane.stride,
+            plane.bits_per_pixel,
+            profile.as_ref(),
+        )?
+    } else {
+        copy_rgb_rows(plane.data, expected.width, expected.height, plane.stride)?
+    };
+    // The high-precision HDR path already performed transfer/gamut/tone mapping.
+    if let Some(profile) = profile.as_ref()
+        && (!high_precision || crate::heif_hdr::HdrColour::from_profile(profile)?.is_none())
+    {
+        convert_to_srgb(&mut pixels, expected.width, profile)?;
     }
     let rgb = RgbImage::from_raw(expected.width, expected.height, pixels).ok_or(
         CodecError::InvalidPixelLayout {
@@ -257,6 +293,13 @@ fn convert_to_srgb(
     width: u32,
     profile: &ColorProfile,
 ) -> Result<(), CodecError> {
+    if let Some(hdr) = crate::heif_hdr::HdrColour::from_profile(profile)? {
+        for pixel in pixels.chunks_exact_mut(3) {
+            let encoded = [pixel[0], pixel[1], pixel[2]].map(|v| f64::from(v) / 255.0);
+            pixel.copy_from_slice(&hdr.pixel(encoded));
+        }
+        return Ok(());
+    }
     let transform = profile
         .create_transform_8bit(
             Layout::Rgb,
@@ -279,9 +322,111 @@ fn convert_to_srgb(
     Ok(())
 }
 
+fn copy_high_precision_rows(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    bits: u8,
+    profile: Option<&ColorProfile>,
+) -> Result<Vec<u8>, CodecError> {
+    let invalid = || CodecError::InvalidPixelLayout {
+        width,
+        height,
+        stride,
+    };
+    let row = (width as usize).checked_mul(6).ok_or_else(invalid)?;
+    let length = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(invalid)?;
+    if width == 0 || height == 0 || stride < row || !(9..=16).contains(&bits) {
+        return Err(invalid());
+    }
+    let end = (height as usize - 1)
+        .checked_mul(stride)
+        .and_then(|n| n.checked_add(row))
+        .ok_or_else(invalid)?;
+    if end > data.len() {
+        return Err(invalid());
+    }
+    check(CodecLimit::AllocationBytes, length as u64, MAX_ALLOCATION)?;
+    let hdr = profile
+        .map(crate::heif_hdr::HdrColour::from_profile)
+        .transpose()?
+        .flatten();
+    let maximum = (1u32 << bits) - 1;
+    let mut pixels = Vec::new();
+    pixels.try_reserve_exact(length).map_err(decode_error)?;
+    for y in 0..height as usize {
+        for pixel in data[y * stride..y * stride + row].chunks_exact(6) {
+            let values = [
+                u16::from_le_bytes([pixel[0], pixel[1]]),
+                u16::from_le_bytes([pixel[2], pixel[3]]),
+                u16::from_le_bytes([pixel[4], pixel[5]]),
+            ];
+            if values.iter().any(|v| u32::from(*v) > maximum) {
+                return Err(invalid());
+            }
+            let rgb = if let Some(hdr) = hdr.as_ref() {
+                hdr.pixel(values.map(|v| f64::from(v) / f64::from(maximum)))
+            } else {
+                // SDR uses the native bit-shift reduction. Performing YCbCr
+                // conversion before quantization can improve rounding by one
+                // code value; HDR remains precise through luminance mapping.
+                values.map(|v| (v >> (bits - 8)) as u8)
+            };
+            pixels.extend_from_slice(&rgb);
+        }
+    }
+    Ok(pixels)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pq_ten_bit_plane_preserves_distinct_shadow_codes_and_stride() {
+        // ST 2084: codes 100 and 103 (10-bit) independently map to sRGB
+        // 10 and 11. Reducing both to code 25 (8-bit) would erase this detail.
+        let bytes = [100, 0, 100, 0, 100, 0, 99, 99, 103, 0, 103, 0, 103, 0];
+        let pixels =
+            copy_high_precision_rows(&bytes, 1, 2, 8, 10, Some(&ColorProfile::new_bt2020_pq()))
+                .unwrap();
+        assert_eq!(pixels, [10, 10, 10, 11, 11, 11]);
+    }
+
+    #[test]
+    fn pq_reference_white_and_highlights_use_absolute_luminance() {
+        // ST 2084 independently gives 101.75 / 1010.3 / 10000 nits.
+        let mut pixels = [130, 130, 130, 192, 192, 192, 255, 255, 255];
+        convert_to_srgb(&mut pixels, 3, &ColorProfile::new_bt2020_pq()).unwrap();
+        for (actual, expected) in pixels
+            .into_iter()
+            .zip([225u8, 225, 225, 252, 252, 252, 255, 255, 255])
+        {
+            assert!(
+                actual.abs_diff(expected) <= 1,
+                "actual {actual}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn hlg_reference_display_and_highlights_use_system_gamma() {
+        let mut pixels = [64, 64, 64, 160, 160, 160, 255, 255, 255];
+        convert_to_srgb(&mut pixels, 3, &ColorProfile::new_bt2020_hlg()).unwrap();
+        for (actual, expected) in pixels
+            .into_iter()
+            .zip([88u8, 88, 88, 224, 224, 224, 252, 252, 252])
+        {
+            assert!(
+                actual.abs_diff(expected) <= 1,
+                "actual {actual}, expected {expected}"
+            );
+        }
+    }
 
     #[test]
     fn stride_padding_is_discarded_without_requiring_last_row_padding() {
