@@ -10,6 +10,14 @@ pub struct EmbeddedExifReader;
 
 impl EmbeddedExifReader {
     pub fn read(path: &Path) -> Result<MetadataBundle, MetadataReadWarning> {
+        if photo_domain::MediaKind::from_path(path) == Some(photo_domain::MediaKind::Heif) {
+            return match photo_codec::embedded_exif_tiff(path, photo_domain::MediaKind::Heif)
+                .map_err(|error| MetadataReadWarning::new("exif_read_failed", error.to_string()))?
+            {
+                Some(tiff) => Self::read_tiff(&tiff),
+                None => Ok(MetadataBundle::default()),
+            };
+        }
         let file = std::fs::File::open(path)
             .map_err(|error| MetadataReadWarning::new("exif_open_failed", error.to_string()))?;
         let mut reader = BufReader::new(file);

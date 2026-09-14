@@ -3,6 +3,7 @@
 use image::DynamicImage;
 use photo_codec::{
     CodecError, CodecLimit, MediaKind, decode_display_image, decoder_fingerprint, display_shape,
+    embedded_exif_tiff,
 };
 use std::{
     fs,
@@ -13,6 +14,76 @@ fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/heif")
         .join(name)
+}
+
+#[test]
+fn embedded_exif_comes_from_the_declared_primary_and_no_exif_is_none() {
+    let portrait = fixture("portrait-rotated.heic");
+    let before_bytes = fs::read(&portrait).unwrap();
+    let before_metadata = fs::metadata(&portrait).unwrap();
+    let tiff = embedded_exif_tiff(&portrait, MediaKind::Heif)
+        .unwrap()
+        .expect("portrait fixture should carry EXIF");
+    assert_eq!(&tiff[..4], b"II\x2a\0");
+    assert_eq!(fs::read(&portrait).unwrap(), before_bytes);
+    let after_metadata = fs::metadata(&portrait).unwrap();
+    assert_eq!(
+        before_metadata.modified().unwrap(),
+        after_metadata.modified().unwrap()
+    );
+    assert_eq!(before_metadata.permissions(), after_metadata.permissions());
+
+    assert_eq!(
+        embedded_exif_tiff(&fixture("iphone-8bit.heic"), MediaKind::Heif).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn big_endian_exif_header_is_returned_from_the_primary() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("big-endian.heic");
+    let mut bytes = fs::read(fixture("portrait-rotated.heic")).unwrap();
+    let header = bytes
+        .windows(4)
+        .position(|bytes| bytes == b"II\x2a\0")
+        .unwrap();
+    bytes[header..header + 4].copy_from_slice(b"MM\0\x2a");
+    fs::write(&path, bytes).unwrap();
+
+    let tiff = embedded_exif_tiff(&path, MediaKind::Heif).unwrap().unwrap();
+    assert_eq!(&tiff[..4], b"MM\0\x2a");
+}
+
+#[test]
+fn malformed_exif_blocks_return_owned_typed_errors() {
+    let original = fs::read(fixture("portrait-rotated.heic")).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    for (name, mutate) in [("short", 0u8), ("overflow", 1), ("outside", 2)] {
+        let mut bytes = original.clone();
+        let header = bytes
+            .windows(4)
+            .position(|bytes| bytes == b"II\x2a\0")
+            .unwrap();
+        if mutate == 0 {
+            let entry_prefix = [0, 3, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 8];
+            let entry = bytes
+                .windows(entry_prefix.len())
+                .position(|window| window == entry_prefix)
+                .unwrap();
+            bytes[entry + 16..entry + 20].copy_from_slice(&3u32.to_be_bytes());
+        } else if mutate == 1 {
+            bytes[header - 4..header].copy_from_slice(&u32::MAX.to_be_bytes());
+        } else {
+            bytes[header - 4..header].copy_from_slice(&80u32.to_be_bytes());
+        }
+        let path = directory.path().join(format!("{name}.heic"));
+        fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            embedded_exif_tiff(&path, MediaKind::Heif),
+            Err(CodecError::InvalidExif { .. })
+        ));
+    }
 }
 
 #[test]

@@ -136,6 +136,58 @@ pub(crate) fn display_shape(path: &Path) -> Result<DisplayShape, CodecError> {
     shape(&primary(&context)?)
 }
 
+pub(crate) fn embedded_exif_tiff(path: &Path) -> Result<Option<Vec<u8>>, CodecError> {
+    let bytes = source_bytes(path)?;
+    let context = context(&bytes)?;
+    let handle = primary(&context)?;
+    if handle.number_of_metadata_blocks(b"Exif") <= 0 {
+        return Ok(None);
+    }
+    let mut identifiers = [0];
+    if handle.metadata_block_ids(&mut identifiers, b"Exif") == 0 || identifiers[0] == 0 {
+        return Ok(None);
+    }
+    let size = handle.metadata_size(identifiers[0]);
+    check(CodecLimit::AllocationBytes, size as u64, MAX_ALLOCATION)?;
+    let mut metadata =
+        handle
+            .metadata(identifiers[0])
+            .map_err(|error| CodecError::InvalidExif {
+                message: error.to_string(),
+            })?;
+    let tiff = extract_tiff_payload(&metadata)?;
+    let start = metadata.len() - tiff.len();
+    metadata.drain(..start);
+    Ok(Some(metadata))
+}
+
+fn extract_tiff_payload(metadata: &[u8]) -> Result<&[u8], CodecError> {
+    let offset = metadata
+        .get(..4)
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .map(u32::from_be_bytes)
+        .ok_or_else(|| CodecError::InvalidExif {
+            message: "metadata block is shorter than its four-byte TIFF offset".into(),
+        })?;
+    let start = offset
+        .checked_add(4)
+        .ok_or_else(|| CodecError::InvalidExif {
+            message: "TIFF offset overflows the metadata block".into(),
+        })? as usize;
+    let tiff = metadata
+        .get(start..)
+        .filter(|tiff| tiff.len() >= 4)
+        .ok_or_else(|| CodecError::InvalidExif {
+            message: "TIFF offset is outside the metadata block".into(),
+        })?;
+    if !matches!(&tiff[..4], b"II\x2a\0" | b"MM\0\x2a") {
+        return Err(CodecError::InvalidExif {
+            message: "metadata block does not contain a TIFF header".into(),
+        });
+    }
+    Ok(tiff)
+}
+
 pub(crate) fn decode(path: &Path) -> Result<DynamicImage, CodecError> {
     let bytes = source_bytes(path)?;
     let context = context(&bytes)?;
@@ -385,6 +437,33 @@ fn copy_high_precision_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exif_offsets_accept_both_tiff_byte_orders() {
+        assert_eq!(
+            extract_tiff_payload(b"\0\0\0\0II\x2a\0rest").unwrap(),
+            b"II\x2a\0rest"
+        );
+        assert_eq!(
+            extract_tiff_payload(b"\0\0\0\x02xxMM\0\x2arest").unwrap(),
+            b"MM\0\x2arest"
+        );
+    }
+
+    #[test]
+    fn malformed_exif_offsets_are_typed_errors() {
+        for raw in [
+            &b"\0\0\0"[..],
+            &b"\xff\xff\xff\xffII\x2a\0"[..],
+            &b"\0\0\0\x08II\x2a\0"[..],
+            &b"\0\0\0\0bad!"[..],
+        ] {
+            assert!(matches!(
+                extract_tiff_payload(raw),
+                Err(CodecError::InvalidExif { .. })
+            ));
+        }
+    }
 
     #[test]
     fn pq_ten_bit_plane_preserves_distinct_shadow_codes_and_stride() {

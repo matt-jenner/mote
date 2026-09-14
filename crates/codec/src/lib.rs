@@ -34,6 +34,18 @@ pub fn decode_display_image(
     image_backend::decode_display_image(path, kind, orientation)
 }
 
+pub fn embedded_exif_tiff(
+    path: &std::path::Path,
+    kind: MediaKind,
+) -> Result<Option<Vec<u8>>, CodecError> {
+    #[cfg(feature = "heic")]
+    if kind == MediaKind::Heif {
+        return heif_backend::embedded_exif_tiff(path);
+    }
+    let _ = path;
+    Err(CodecError::Unsupported { kind })
+}
+
 pub fn decoder_fingerprint(kind: MediaKind) -> Result<&'static str, CodecError> {
     #[cfg(feature = "heic")]
     if kind == MediaKind::Heif {

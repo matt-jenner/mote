@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+#[cfg(feature = "heic")]
+use photo_cache::{DerivativeKind, DerivativeSpec, DerivativeTarget, ImageDerivativeGenerator};
 use photo_catalog::{Catalog, NewAsset, NewFolderGroup, NewLibrary, ShapeStatus, WallOrder};
 use photo_core::FolderPolicyEngine;
 use photo_domain::{FolderGroupId, GalleryScope, MediaKind, RelativePathKey};
@@ -1141,6 +1143,68 @@ async fn oriented_image_emits_display_dimensions_and_orientation() {
     }
     scan.join().await.unwrap();
     assert_eq!(observed, Some((3, 2, 6)));
+}
+
+#[cfg(feature = "heic")]
+#[tokio::test]
+async fn heif_scan_and_derivative_use_the_container_transform_once() {
+    let fixture = tempfile::tempdir().unwrap();
+    let media = fixture.path().join("portrait-rotated.heic");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../codec/tests/fixtures/heif/portrait-rotated.heic"),
+        &media,
+    )
+    .unwrap();
+    let mut scan = Indexer::new(DefaultMetadataReader, empty_policy_engine())
+        .start(ScanRequest::new(fixture.path()))
+        .unwrap();
+
+    let mut observed = None;
+    let mut captured_at = None;
+    while let Some(event) = scan.events.recv().await {
+        match event {
+            IndexEvent::ShapeReady {
+                asset_id,
+                width,
+                height,
+                orientation,
+            } => observed = Some((asset_id, width, height, orientation)),
+            IndexEvent::MetadataReady { metadata, .. } => {
+                captured_at = metadata.captured_at.map(|value| value.to_rfc3339());
+            }
+            _ => {}
+        }
+    }
+    scan.join().await.unwrap();
+    let (asset_id, width, height, orientation) = observed.expect("HEIF shape event");
+    assert_eq!((width, height, orientation), (100, 28, 1));
+    assert_eq!(captured_at.as_deref(), Some("2024-03-04T05:06:07+00:00"));
+
+    let cache = tempfile::tempdir().unwrap();
+    let generated = ImageDerivativeGenerator::new(cache.path())
+        .unwrap()
+        .generate(
+            &media,
+            &DerivativeSpec {
+                asset_id,
+                signature: photo_domain::FileSignature {
+                    size_bytes: std::fs::metadata(&media).unwrap().len(),
+                    modified_unix_ns: 1,
+                    sidecar_modified_unix_ns: None,
+                },
+                orientation,
+                kind: DerivativeKind::WallThumbnail,
+                decoder_version: "image-0.25-v1".into(),
+                colour_space: "srgb".into(),
+                target: DerivativeTarget::LongEdge(1024),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        image::image_dimensions(cache.path().join(generated.relative_path)).unwrap(),
+        (100, 28)
+    );
 }
 
 #[tokio::test]

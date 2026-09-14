@@ -20,6 +20,12 @@ items that reference the same compressed bytes, assembled into a 93×100
 primary grid. The extra tile is hidden and is not a second display image.
 These fixtures intentionally remain small (under 20 KB combined).
 
+The rotated portrait also has synthetic little-endian EXIF on the declared
+primary item. It records orientation 6 and `DateTimeOriginal` as
+`2024:03:04 05:06:07`. The HEIF `irot` property remains authoritative for
+pixels and display geometry, so Mote must not apply that EXIF orientation to
+the already transformed image.
+
 `derive-fixtures.mjs` performs only container edits; it never invokes an
 encoder or changes the HEVC bitstreams. Run it with a path to the original
 upstream 10-bit file to reproduce all derived files, or with no argument

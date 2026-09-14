@@ -305,11 +305,16 @@ impl<R: MetadataReader> Indexer<R> {
                         let path = item.source_path.clone();
                         let shape_result = tokio::task::spawn_blocking(move || {
                             check_asset_access(&path)?;
+                            let kind = MediaKind::from_path(&path).unwrap_or(MediaKind::Unknown);
                             let shape = MediaProbe::shape(&path)?;
-                            let orientation = EmbeddedExifReader::read(&path)
-                                .ok()
-                                .and_then(|bundle| bundle.orientation)
-                                .unwrap_or(1);
+                            let orientation = if kind == MediaKind::Heif {
+                                1
+                            } else {
+                                EmbeddedExifReader::read(&path)
+                                    .ok()
+                                    .and_then(|bundle| bundle.orientation)
+                                    .unwrap_or(1)
+                            };
                             let rotated = matches!(orientation, 5..=8);
                             Ok::<_, MetadataReadWarning>((
                                 if rotated { shape.height } else { shape.width },

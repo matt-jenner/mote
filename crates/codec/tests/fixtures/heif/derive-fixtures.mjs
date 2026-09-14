@@ -19,6 +19,45 @@ const children = data => {
   }
   return result;
 };
+const portraitExifTiff = Buffer.from(
+  '49492a00080000000200120103000100000006000000698704000100000026000000' +
+  '00000000010003900200140000003800000000000000323032343a30333a303420' +
+  '30353a30363a303700',
+  'hex',
+);
+function addExifMetadata(boxes, primaryItemId, tiff) {
+  const itemId = 3;
+  const raw = Buffer.concat([Buffer.alloc(4), tiff]);
+  const idat = boxes.find(b => b.type === 'idat');
+  const extentOffset = idat.data.length;
+  idat.data = Buffer.concat([idat.data, raw]);
+
+  const iloc = boxes.find(b => b.type === 'iloc');
+  const location = Buffer.alloc(20);
+  location.writeUInt16BE(itemId, 0);
+  location.writeUInt16BE(1, 2); // Version 1 construction method: idat.
+  location.writeUInt16BE(1, 10);
+  location.writeUInt32BE(extentOffset, 12);
+  location.writeUInt32BE(raw.length, 16);
+  iloc.data.writeUInt16BE(iloc.data.readUInt16BE(6) + 1, 6);
+  iloc.data = Buffer.concat([iloc.data, location]);
+
+  const iinf = boxes.find(b => b.type === 'iinf');
+  const info = Buffer.concat([
+    Buffer.from([2, 0, 0, 0]),
+    Buffer.from([0, itemId, 0, 0]),
+    Buffer.from('Exif\0'),
+  ]);
+  iinf.data.writeUInt16BE(iinf.data.readUInt16BE(4) + 1, 4);
+  iinf.data = Buffer.concat([iinf.data, box('infe', info)]);
+
+  const iref = boxes.find(b => b.type === 'iref');
+  const reference = Buffer.alloc(6);
+  reference.writeUInt16BE(itemId, 0);
+  reference.writeUInt16BE(1, 2);
+  reference.writeUInt16BE(primaryItemId, 4);
+  iref.data = Buffer.concat([iref.data, box('cdsc', reference)]);
+}
 function derive(bytes, mode) {
   const top = children(bytes);
   const meta = top.find(b => b.type === 'meta');
@@ -65,6 +104,7 @@ function derive(bytes, mode) {
     // The final association is the primary grid item (ID 2).
     ipma.data[ipma.data.length - 3] += 1;
     ipma.data = Buffer.concat([ipma.data, Buffer.from([props.length | 128])]);
+    if (mode === 'rotate') addExifMetadata(boxes, 2, portraitExifTiff);
   }
   ipco.data = Buffer.concat(props.map(b => box(b.type,b.data)));
   iprp.data = Buffer.concat(properties.map(b => box(b.type,b.data)));

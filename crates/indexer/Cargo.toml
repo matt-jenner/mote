@@ -6,7 +6,7 @@ rust-version.workspace = true
 
 [features]
 default = ["heic"]
-heic = ["photo-catalog/heic", "photo-core/heic", "photo-domain/heic", "photo-metadata/heic"]
+heic = ["photo-cache/heic", "photo-catalog/heic", "photo-core/heic", "photo-domain/heic", "photo-metadata/heic"]
 
 [dependencies]
 photo-domain = { path = "../domain", default-features = false }
@@ -22,4 +22,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 image.workspace = true
+photo-cache = { path = "../cache", default-features = false }
 tempfile.workspace = true
