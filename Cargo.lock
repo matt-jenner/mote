@@ -1201,7 +1201,9 @@ dependencies = [
  "image",
  "imagesize",
  "libheif-rs",
+ "moxcms",
  "photo-domain",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

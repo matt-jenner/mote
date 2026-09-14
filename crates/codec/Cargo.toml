@@ -6,7 +6,7 @@ rust-version.workspace = true
 
 [features]
 default = ["heic"]
-heic = ["dep:libheif-rs", "photo-domain/heic"]
+heic = ["dep:libheif-rs", "dep:moxcms", "photo-domain/heic"]
 
 [dependencies]
 photo-domain = { path = "../domain", default-features = false }
@@ -14,6 +14,8 @@ image.workspace = true
 imagesize.workspace = true
 thiserror.workspace = true
 libheif-rs = { version = "=3.0.0", default-features = false, features = ["v1_23"], optional = true }
+moxcms = { version = "=0.8.1", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+serde_json.workspace = true
