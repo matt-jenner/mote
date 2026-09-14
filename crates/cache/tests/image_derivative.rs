@@ -59,6 +59,152 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+#[cfg(feature = "heic")]
+#[derive(Clone)]
+struct IsoBox {
+    kind: [u8; 4],
+    data: Vec<u8>,
+}
+
+#[cfg(feature = "heic")]
+fn parse_iso_boxes(bytes: &[u8]) -> Vec<IsoBox> {
+    let mut boxes = Vec::new();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        assert!(offset + 8 <= bytes.len(), "truncated ISO-BMFF box header");
+        let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        assert!(
+            size >= 8 && offset + size <= bytes.len(),
+            "invalid ISO-BMFF box size"
+        );
+        boxes.push(IsoBox {
+            kind: bytes[offset + 4..offset + 8].try_into().unwrap(),
+            data: bytes[offset + 8..offset + size].to_vec(),
+        });
+        offset += size;
+    }
+    boxes
+}
+
+#[cfg(feature = "heic")]
+fn serialize_iso_boxes(boxes: &[IsoBox]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for item in boxes {
+        let size = u32::try_from(item.data.len() + 8).unwrap();
+        bytes.extend_from_slice(&size.to_be_bytes());
+        bytes.extend_from_slice(&item.kind);
+        bytes.extend_from_slice(&item.data);
+    }
+    bytes
+}
+
+#[cfg(feature = "heic")]
+fn iso_box_mut<'a>(boxes: &'a mut [IsoBox], kind: &[u8; 4]) -> &'a mut IsoBox {
+    boxes
+        .iter_mut()
+        .find(|item| &item.kind == kind)
+        .unwrap_or_else(|| panic!("missing ISO-BMFF box {}", String::from_utf8_lossy(kind)))
+}
+
+/// Expands the licensed 64x100 encoded tile through container metadata only.
+/// Sixty-five distinct item IDs share the same encoded extent, producing a
+/// compact 4160x100 grid without invoking or depending on an encoder.
+#[cfg(feature = "heic")]
+fn oversized_heif_grid() -> tempfile::NamedTempFile {
+    const COLUMNS: u16 = 65;
+    const WIDTH: u16 = 4160;
+    const HEIGHT: u16 = 100;
+
+    let original = std::fs::read(heif_fixture("iphone-8bit.heic")).unwrap();
+    let mut top = parse_iso_boxes(&original);
+    let meta = iso_box_mut(&mut top, b"meta");
+    let original_meta_len = meta.data.len();
+    let mut boxes = parse_iso_boxes(&meta.data[4..]);
+
+    let grid = &mut iso_box_mut(&mut boxes, b"idat").data;
+    assert_eq!(grid.len(), 8);
+    grid[2] = 0;
+    grid[3] = u8::try_from(COLUMNS - 1).unwrap();
+    grid[4..6].copy_from_slice(&WIDTH.to_be_bytes());
+    grid[6..8].copy_from_slice(&HEIGHT.to_be_bytes());
+
+    let iref = iso_box_mut(&mut boxes, b"iref");
+    let mut references = parse_iso_boxes(&iref.data[4..]);
+    let dimg = iso_box_mut(&mut references, b"dimg");
+    dimg.data.clear();
+    dimg.data.extend_from_slice(&2u16.to_be_bytes());
+    dimg.data.extend_from_slice(&COLUMNS.to_be_bytes());
+    dimg.data.extend_from_slice(&1u16.to_be_bytes());
+    for id in 3..=COLUMNS + 1 {
+        dimg.data.extend_from_slice(&id.to_be_bytes());
+    }
+    iref.data.truncate(4);
+    iref.data
+        .extend_from_slice(&serialize_iso_boxes(&references));
+
+    let iloc = iso_box_mut(&mut boxes, b"iloc");
+    assert_eq!(iloc.data.len(), 48);
+    let tile_location = iloc.data[8..28].to_vec();
+    iloc.data[6..8].copy_from_slice(&(COLUMNS + 1).to_be_bytes());
+    for id in 3..=COLUMNS + 1 {
+        let mut location = tile_location.clone();
+        location[0..2].copy_from_slice(&id.to_be_bytes());
+        iloc.data.extend_from_slice(&location);
+    }
+
+    let iinf = iso_box_mut(&mut boxes, b"iinf");
+    let mut entries = parse_iso_boxes(&iinf.data[6..]);
+    let tile_info = entries[0].clone();
+    for id in 3..=COLUMNS + 1 {
+        let mut info = tile_info.clone();
+        info.data[4..6].copy_from_slice(&id.to_be_bytes());
+        entries.push(info);
+    }
+    iinf.data.truncate(6);
+    iinf.data[4..6].copy_from_slice(&(COLUMNS + 1).to_be_bytes());
+    iinf.data.extend_from_slice(&serialize_iso_boxes(&entries));
+
+    let iprp = iso_box_mut(&mut boxes, b"iprp");
+    let mut property_boxes = parse_iso_boxes(&iprp.data);
+    let ipco = iso_box_mut(&mut property_boxes, b"ipco");
+    let mut properties = parse_iso_boxes(&ipco.data);
+    assert_eq!(&properties[2].kind, b"ispe");
+    properties[2].data[4..8].copy_from_slice(&u32::from(WIDTH).to_be_bytes());
+    properties[2].data[8..12].copy_from_slice(&u32::from(HEIGHT).to_be_bytes());
+    ipco.data = serialize_iso_boxes(&properties);
+
+    let ipma = iso_box_mut(&mut property_boxes, b"ipma");
+    assert_eq!(ipma.data.len(), 18);
+    let tile_properties = ipma.data[8..13].to_vec();
+    ipma.data[4..8].copy_from_slice(&u32::from(COLUMNS + 1).to_be_bytes());
+    for id in 3..=COLUMNS + 1 {
+        let mut association = tile_properties.clone();
+        association[0..2].copy_from_slice(&id.to_be_bytes());
+        ipma.data.extend_from_slice(&association);
+    }
+    iprp.data = serialize_iso_boxes(&property_boxes);
+
+    meta.data = [meta.data[..4].to_vec(), serialize_iso_boxes(&boxes)].concat();
+    let delta = u32::try_from(meta.data.len() - original_meta_len).unwrap();
+    let iloc = iso_box_mut(&mut boxes, b"iloc");
+    for item_index in std::iter::once(0usize).chain(2..usize::from(COLUMNS + 1)) {
+        let base_offset = 8 + item_index * 20 + 6;
+        let old = u32::from_be_bytes(iloc.data[base_offset..base_offset + 4].try_into().unwrap());
+        iloc.data[base_offset..base_offset + 4]
+            .copy_from_slice(&old.checked_add(delta).unwrap().to_be_bytes());
+    }
+    meta.data = [meta.data[..4].to_vec(), serialize_iso_boxes(&boxes)].concat();
+
+    let derived = serialize_iso_boxes(&top);
+    assert!(
+        derived.len() < 16 * 1024,
+        "container-only fixture must remain compact"
+    );
+    let mut file = tempfile::Builder::new().suffix(".heic").tempfile().unwrap();
+    std::io::Write::write_all(file.as_file_mut(), &derived).unwrap();
+    file
+}
+
 fn fixture() -> tempfile::NamedTempFile {
     let file = tempfile::Builder::new().suffix(".jpg").tempfile().unwrap();
     let image = image::RgbImage::from_fn(1200, 800, |x, y| {
@@ -381,6 +527,45 @@ fn real_heif_wall_and_screen_derivatives_are_jpegs_reused_and_leave_source_uncha
             source_mode
         );
     }
+}
+
+#[test]
+#[cfg(feature = "heic")]
+fn real_oversized_heif_uses_distinct_wall_and_screen_long_edge_caps() {
+    let source = oversized_heif_grid();
+    let cache = tempfile::tempdir().unwrap();
+    let generator = ImageDerivativeGenerator::new(cache.path()).unwrap();
+
+    let wall = generator
+        .generate(
+            source.path(),
+            &spec_for_media(DerivativeKind::WallThumbnail, 1024, 1, MediaKind::Heif),
+        )
+        .unwrap();
+    let wall_bytes = std::fs::read(cache.path().join(wall.relative_path)).unwrap();
+    assert_eq!(
+        image::guess_format(&wall_bytes).unwrap(),
+        image::ImageFormat::Jpeg
+    );
+    assert_eq!(
+        image::load_from_memory(&wall_bytes).unwrap().dimensions(),
+        (1024, 25)
+    );
+
+    let screen = generator
+        .encode_screen_preview(
+            source.path(),
+            &spec_for_media(DerivativeKind::ScreenPreview, 4096, 1, MediaKind::Heif),
+        )
+        .unwrap();
+    assert_eq!(
+        image::guess_format(&screen.bytes).unwrap(),
+        image::ImageFormat::Jpeg
+    );
+    assert_eq!(
+        image::load_from_memory(&screen.bytes).unwrap().dimensions(),
+        (4096, 98)
+    );
 }
 
 #[test]
