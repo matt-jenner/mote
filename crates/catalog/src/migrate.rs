@@ -21,6 +21,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0011_preview_counts.sql"),
     include_str!("../migrations/0012_saved_folders.sql"),
     include_str!("../migrations/0013_photo_picks.sql"),
+    include_str!("../migrations/0014_preview_counts_by_media.sql"),
 ];
 
 pub(crate) fn migrate_with(path: &Path, migrations: &[&str]) -> Result<Connection, CatalogError> {
@@ -321,7 +322,7 @@ mod tests {
             )
             .unwrap();
 
-        apply_migrations(&mut connection, MIGRATIONS).unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..11]).unwrap();
 
         let counts: (i64, i64, i64, i64) = connection
             .query_row(
@@ -332,6 +333,133 @@ mod tests {
             )
             .unwrap();
         assert_eq!(counts, (1, 0, 1, 0));
+    }
+
+    #[test]
+    fn media_preview_count_migration_backfills_feature_neutral_rows() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..13]).unwrap();
+        let library = vec![11_u8; 16];
+        let group = vec![12_u8; 16];
+        connection
+            .execute(
+                "INSERT INTO library_roots
+                 (id, kind, display_name, canonical_root_key, display_path, availability)
+                 VALUES (?1, 'configured', 'Photos', ?2, '/Photos', 'available')",
+                params![&library, b"/Photos".as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO folder_groups
+                 (id, library_id, relative_path_key, display_path)
+                 VALUES (?1, ?2, ?3, 'selected')",
+                params![&group, &library, b"selected".as_slice()],
+            )
+            .unwrap();
+
+        for (index, media_kind) in ["jpeg", "heif", "avif"].into_iter().enumerate() {
+            let asset = vec![20 + index as u8; 16];
+            let path = format!("selected/photo-{index}");
+            connection
+                .execute(
+                    "INSERT INTO assets
+                     (id, library_id, folder_group_id, relative_path_key, relative_parent_key,
+                      display_path, media_kind, size_bytes, modified_unix_ns, width, height,
+                      availability, provisional_order, shape_status)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 8, '1', 16, 9,
+                             'available', ?8, 'ready')",
+                    params![
+                        &asset,
+                        &library,
+                        &group,
+                        path.as_bytes(),
+                        b"selected".as_slice(),
+                        &path,
+                        media_kind,
+                        index as i64 + 1,
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO folder_group_assets(folder_group_id, asset_id, last_seen_generation)
+                     VALUES (?1, ?2, 1)",
+                    params![&group, &asset],
+                )
+                .unwrap();
+            for (kind_index, kind) in ["wall_thumbnail", "screen_preview"].into_iter().enumerate() {
+                let derivative = vec![40 + (index * 2 + kind_index) as u8; 16];
+                connection
+                    .execute(
+                        "INSERT INTO derivatives
+                         (id, asset_id, folder_group_id, kind, cache_key, relative_cache_path,
+                          size_bytes, durable, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 8, 1, 1)",
+                        params![
+                            &derivative,
+                            &asset,
+                            &group,
+                            kind,
+                            format!("{media_kind}-{kind}"),
+                            format!("{media_kind}-{kind}.jpg"),
+                        ],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO derivative_folder_groups(derivative_id, folder_group_id)
+                         VALUES (?1, ?2)",
+                        params![&derivative, &group],
+                    )
+                    .unwrap();
+            }
+        }
+
+        apply_migrations(&mut connection, MIGRATIONS).unwrap();
+
+        let rows = connection
+            .prepare(
+                "SELECT media_kind, wall_ready, screen_ready,
+                        direct_wall_ready, direct_screen_ready
+                 FROM folder_group_preview_counts_by_media
+                 WHERE folder_group_id = ?1
+                 ORDER BY media_kind",
+            )
+            .unwrap()
+            .query_map([&group], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("avif".to_owned(), 1, 1, 1, 1),
+                ("heif".to_owned(), 1, 1, 1, 1),
+                ("jpeg".to_owned(), 1, 1, 1, 1),
+            ]
+        );
+        let legacy_objects: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE name = 'folder_group_preview_counts'
+                    OR name GLOB 'preview_counts_*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy_objects, 0,
+            "the superseded aggregate must not keep charging every catalog write"
+        );
     }
 
     #[test]

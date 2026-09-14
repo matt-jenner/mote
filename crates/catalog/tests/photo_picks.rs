@@ -311,7 +311,7 @@ fn schema_twelve_catalog_upgrades_once_and_reopens_cleanly() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        13,
+        14,
     );
     assert_eq!(
         connection

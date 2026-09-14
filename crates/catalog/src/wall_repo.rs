@@ -8,6 +8,19 @@ const WALL_MEDIA_KINDS: &str = "('jpeg','png','tiff','heif','webp')";
 #[cfg(not(feature = "heic"))]
 const WALL_MEDIA_KINDS: &str = "('jpeg','png','tiff','webp')";
 
+fn wall_preview_counts_sql(scope: GalleryScope) -> String {
+    let (wall_column, screen_column) = match scope {
+        GalleryScope::CurrentFolder => ("direct_wall_ready", "direct_screen_ready"),
+        GalleryScope::IncludeSubfolders => ("wall_ready", "screen_ready"),
+    };
+    format!(
+        "SELECT COALESCE(SUM({wall_column}), 0), \
+                COALESCE(SUM({screen_column}), 0) \
+         FROM folder_group_preview_counts_by_media \
+         WHERE folder_group_id = ?1 AND media_kind IN {WALL_MEDIA_KINDS}"
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShapeStatus {
     Pending,
@@ -127,22 +140,7 @@ impl Catalog {
         group: FolderGroupId,
         scope: GalleryScope,
     ) -> Result<WallPreviewCounts, CatalogError> {
-        let mut sql = format!(
-            "SELECT COALESCE(SUM(EXISTS(SELECT 1 FROM derivatives derivative \
-                                        WHERE derivative.asset_id = assets.id \
-                                          AND derivative.kind = 'wall_thumbnail')), 0), \
-                    COALESCE(SUM(EXISTS(SELECT 1 FROM derivatives derivative \
-                                        WHERE derivative.asset_id = assets.id \
-                                          AND derivative.kind = 'screen_preview')), 0) \
-             FROM assets JOIN folder_group_assets fga ON fga.asset_id = assets.id \
-             WHERE fga.folder_group_id = ?1 \
-               AND media_kind IN {WALL_MEDIA_KINDS}"
-        );
-        if scope == GalleryScope::CurrentFolder {
-            sql.push_str(
-                " AND relative_parent_key = (SELECT relative_path_key FROM folder_groups WHERE id = ?1)",
-            );
-        }
+        let sql = wall_preview_counts_sql(scope);
         let (wall_ready, screen_ready): (i64, i64) =
             self.connection
                 .query_row(&sql, [group.as_uuid().as_bytes()], |row| {
@@ -388,7 +386,8 @@ fn decode_wall_record(row: &rusqlite::Row<'_>) -> Result<WallCatalogRecord, rusq
 mod tests {
     use rusqlite::params;
 
-    use super::Catalog;
+    use super::{Catalog, wall_preview_counts_sql};
+    use photo_domain::GalleryScope;
 
     fn plan_details(catalog: &Catalog, sql: &str) -> Vec<String> {
         let mut statement = catalog.connection.prepare(sql).unwrap();
@@ -399,6 +398,36 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
+    }
+
+    #[test]
+    fn preview_count_queries_only_probe_bounded_media_aggregate_rows() {
+        let catalog = Catalog::open_in_memory().unwrap();
+
+        for scope in [GalleryScope::CurrentFolder, GalleryScope::IncludeSubfolders] {
+            let sql = format!("EXPLAIN QUERY PLAN {}", wall_preview_counts_sql(scope));
+            let mut statement = catalog.connection.prepare(&sql).unwrap();
+            let details = statement
+                .query_map([vec![0_u8; 16]], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let joined = details.join("\n");
+
+            assert!(
+                details.iter().any(|detail| {
+                    detail.contains("folder_group_preview_counts_by_media")
+                        && detail.contains("folder_group_id=? AND media_kind=?")
+                }),
+                "preview counts must probe the per-kind aggregate primary key: {details:?}"
+            );
+            for forbidden in ["assets", "folder_group_assets", "derivatives"] {
+                assert!(
+                    !joined.contains(forbidden),
+                    "preview counts must not read {forbidden}: {details:?}"
+                );
+            }
+        }
     }
 
     #[test]
