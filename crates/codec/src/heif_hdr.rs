@@ -1,6 +1,6 @@
 //! Deterministic SDR rendering policy for absolute PQ and reference-display HLG.
 use crate::CodecError;
-use moxcms::{ColorProfile, Matrix3d, TransferCharacteristics, Vector3d};
+use moxcms::{ColorProfile, DataColorSpace, Matrix3d, TransferCharacteristics, Vector3d};
 
 pub(crate) struct HdrColour {
     transfer: TransferCharacteristics,
@@ -19,6 +19,19 @@ impl HdrColour {
         ) {
             return Ok(None);
         }
+        // HDR CICP is authoritative for primaries and transfer. ICC LUT profiles
+        // need not have RGB colourant tags, and parsed missing tags become zero.
+        // Build colourimetry from the supported CICP definition instead of using
+        // the ICC matrix or mixing its LUT/matrix primaries with the CICP EOTF.
+        let colourimetry = ColorProfile::new_from_cicp(cicp);
+        if profile.color_space != DataColorSpace::Rgb
+            || colourimetry.cicp.is_none()
+            || colourimetry.red_trc.is_none()
+        {
+            return Err(CodecError::Decode {
+                message: "unsupported HDR CICP colourimetry".into(),
+            });
+        }
         // HLG's OOTF uses scene luminance in the source RGB primaries.
         let source_luma = match cicp.color_primaries as u8 {
             1 => [0.2126, 0.7152, 0.0722],
@@ -35,7 +48,7 @@ impl HdrColour {
         let to_srgb = ColorProfile::new_srgb()
             .rgb_to_xyz_matrix()
             .inverse()
-            .mat_mul(profile.rgb_to_xyz_matrix());
+            .mat_mul(colourimetry.rgb_to_xyz_matrix());
         Ok(Some(Self {
             transfer: cicp.transfer_characteristics,
             to_srgb,
@@ -118,6 +131,45 @@ fn srgb_byte(linear: f64) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hdr_icc_with_unspecified_cicp_primaries_returns_typed_error() {
+        let mut profile = ColorProfile::new_bt2020_pq();
+        profile.cicp.as_mut().unwrap().color_primaries = 2u8.try_into().unwrap();
+        let parsed = ColorProfile::new_from_slice(&profile.encode().unwrap()).unwrap();
+        assert!(matches!(
+            HdrColour::from_profile(&parsed),
+            Err(CodecError::Decode { .. })
+        ));
+    }
+
+    #[test]
+    fn hdr_icc_without_usable_colourants_uses_cicp_colourimetry() {
+        for (profile, code, expected) in [
+            (ColorProfile::new_bt2020_pq(), 130.0, 225u8),
+            (ColorProfile::new_bt2020_hlg(), 64.0, 88u8),
+        ] {
+            for missing in [true, false] {
+                let mut malformed = profile.clone();
+                if missing {
+                    malformed.red_colorant = Default::default();
+                }
+                // Either omit all colourant tags or provide a singular matrix.
+                malformed.green_colorant = malformed.red_colorant;
+                malformed.blue_colorant = malformed.red_colorant;
+                let bytes = malformed.encode().unwrap();
+                let parsed = ColorProfile::new_from_slice(&bytes).unwrap();
+                let hdr = HdrColour::from_profile(&parsed).unwrap().unwrap();
+                let pixel = hdr.pixel([code / 255.0; 3]);
+                assert!(
+                    pixel.into_iter().all(|v| v.abs_diff(expected) <= 1),
+                    "missing={missing}, transfer={:?}: {pixel:?}, expected {expected}",
+                    parsed.cicp.unwrap().transfer_characteristics
+                );
+            }
+        }
+    }
+
     #[test]
     fn shoulder_preserves_luminance_and_chroma_direction_for_saturated_highlights() {
         for rgb in [
