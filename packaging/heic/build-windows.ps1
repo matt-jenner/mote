@@ -20,6 +20,10 @@ $backup = Join-Path $work 'previous'
 $vcpkgStage = Join-Path $work 'vcpkg'
 $triplet = "$Arch-windows"
 $prefix = Join-Path $vcpkgStage "installed/$triplet"
+$de265ImportLibrary = 'de265.lib'
+$de265RuntimeLibrary = 'libde265.dll'
+$heifImportLibrary = 'heif.lib'
+$heifRuntimeLibrary = 'heif.dll'
 $committed = $false
 $publicationActive = $false
 $destinationExisted = Test-Path $destination
@@ -69,7 +73,8 @@ try {
     Invoke-Native 'cmake' @("-DSOURCE_DIR=$(Join-Path $work 'LIBHEIF')", '-P', (Join-Path $PSScriptRoot 'decode-only.cmake'))
     $common = @('-G', 'NMake Makefiles', '-DCMAKE_BUILD_TYPE=Release', "-DCMAKE_INSTALL_PREFIX=$prefix",
         '-DCMAKE_INSTALL_LIBDIR=lib', '-DBUILD_SHARED_LIBS=ON', '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL',
-        "-DCMAKE_C_FLAGS=/pathmap:$work=.", "-DCMAKE_CXX_FLAGS=/pathmap:$work=.")
+        "-DCMAKE_PROJECT_INCLUDE=$(Join-Path $PSScriptRoot 'compiler-path-maps.cmake')",
+        "-DMOTE_HEIC_WORK_ROOT=$work", "-DMOTE_HEIC_STAGE_ROOT=$vcpkgStage")
     $de265Build = Join-Path $work 'de265-build'
     Configure-Native 'libde265' ($common + @('-S', (Join-Path $work 'LIBDE265'), '-B', $de265Build,
         '-DENABLE_DECODER=OFF', '-DENABLE_ENCODER=OFF', '-DENABLE_SDL=OFF', '-DENABLE_SHERLOCK265=OFF',
@@ -78,7 +83,7 @@ try {
     Invoke-Native 'cmake' @('--install', $de265Build, '--config', 'Release')
     $heifBuild = Join-Path $work 'heif-build'
     Configure-Native 'libheif' ($common + @('-S', (Join-Path $work 'LIBHEIF'), '-B', $heifBuild,
-        "-DLIBDE265_INCLUDE_DIR=$prefix/include", "-DLIBDE265_LIBRARY=$prefix/lib/libde265.lib",
+        "-DLIBDE265_INCLUDE_DIR=$prefix/include", "-DLIBDE265_LIBRARY=$prefix/lib/$de265ImportLibrary",
         '-DBUILD_TESTING=OFF', '-DBUILD_DOCUMENTATION=OFF', '-DBUILD_DEVELOPMENT_TOOLS=OFF',
         '-DENABLE_COVERAGE=OFF', '-DENABLE_EXPERIMENTAL_FEATURES=OFF', '-DENABLE_PLUGIN_LOADING=OFF',
         '-DENABLE_MULTITHREADING_SUPPORT=ON', '-DENABLE_PARALLEL_TILE_DECODING=ON',
@@ -107,12 +112,13 @@ try {
     $metadata = Join-Path $vcpkgStage 'installed/vcpkg'
     New-Item -ItemType Directory (Join-Path $metadata 'info'), (Join-Path $metadata 'updates') | Out-Null
     $status = @()
-    foreach ($port in @(@('libde265', $versions.LIBDE265_VERSION, 'libde265'), @('libheif', $versions.LIBHEIF_VERSION, 'heif'))) {
-        $name, $version, $library = $port
+    foreach ($port in @(@('libde265', $versions.LIBDE265_VERSION, $de265ImportLibrary, $de265RuntimeLibrary),
+            @('libheif', $versions.LIBHEIF_VERSION, $heifImportLibrary, $heifRuntimeLibrary))) {
+        $name, $version, $importLibrary, $runtimeLibrary = $port
         $status += "Package: $name`nVersion: $version`nArchitecture: $triplet`nStatus: install ok installed"
         if ($name -eq 'libheif') { $status[-1] += "`nDepends: libde265" }
         $status[-1] += "`n"
-        @("$triplet/lib/$library.lib", "$triplet/bin/$library.dll") |
+        @("$triplet/lib/$importLibrary", "$triplet/bin/$runtimeLibrary") |
             Set-Content (Join-Path $metadata "info/${name}_${version}_${triplet}.list") -Encoding utf8
     }
     $status | Set-Content (Join-Path $metadata 'status') -Encoding utf8
@@ -125,7 +131,7 @@ try {
     & (Join-Path $PSScriptRoot 'verify-native-deps.ps1') -Prefix $prefix -Arch $Arch
     $probe = Join-Path $work 'verify-decoder.exe'
     Invoke-Native 'cl' @('/nologo', '/MD', "/I$prefix/include", (Join-Path $PSScriptRoot 'verify-decoder.c'),
-        "/Fe:$probe", "/Fo:$(Join-Path $work 'verify-decoder.obj')", '/link', "/LIBPATH:$prefix/lib", 'heif.lib', 'libde265.lib')
+        "/Fe:$probe", "/Fo:$(Join-Path $work 'verify-decoder.obj')", '/link', "/LIBPATH:$prefix/lib", $heifImportLibrary, $de265ImportLibrary)
     $savedPath = $env:PATH
     try {
         $env:PATH = "$prefix/bin;$env:PATH"

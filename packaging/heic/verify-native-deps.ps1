@@ -58,9 +58,10 @@ if ($Prefix) {
         $de265Deps = Inspect-Binary (Join-Path $libraryDir 'libde265.dll') $true
         $heifDeps = Inspect-Binary (Join-Path $libraryDir 'heif.dll') $true
         if ($heifDeps -notcontains 'libde265.dll') { throw 'libheif does not dynamically link libde265' }
-        foreach ($name in @('heif', 'libde265')) {
-            $importLibrary = Join-Path $Prefix "lib/$name.lib"
-            if ((Get-Dump '/headers' $importLibrary) -notmatch "(?i)$name\.dll") { throw "Not a DLL import library: $importLibrary" }
+        foreach ($library in @(@('heif', 'heif'), @('de265', 'libde265'))) {
+            $importName, $runtimeName = $library
+            $importLibrary = Join-Path $Prefix "lib/$importName.lib"
+            if ((Get-Dump '/headers' $importLibrary) -notmatch "(?i)$runtimeName\.dll") { throw "Not a DLL import library: $importLibrary" }
         }
     }
 }

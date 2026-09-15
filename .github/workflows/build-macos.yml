@@ -30,6 +30,9 @@ jobs:
         with:
           node-version: 24.18.0
           cache: npm
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri -> target
       - run: npm ci
       - run: npm run --workspace @photo-viewer/interface build
       - run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all --check

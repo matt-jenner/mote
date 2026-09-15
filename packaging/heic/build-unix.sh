@@ -190,8 +190,9 @@ configure_cmake() {
 		set -- "$@" '-DCMAKE_INSTALL_RPATH=$ORIGIN'
 	fi
 	set -- "$@" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-		"-DCMAKE_C_FLAGS=-ffile-prefix-map=$MOTE_BUILD_DIR=. -ffile-prefix-map=$heic_publish_stage_root=." \
-		"-DCMAKE_CXX_FLAGS=-ffile-prefix-map=$MOTE_BUILD_DIR=. -ffile-prefix-map=$heic_publish_stage_root=."
+		"-DCMAKE_PROJECT_INCLUDE=$script_dir/compiler-path-maps.cmake" \
+		"-DMOTE_HEIC_WORK_ROOT=$MOTE_BUILD_DIR" \
+		"-DMOTE_HEIC_STAGE_ROOT=$heic_publish_stage_root"
 	cmake --warn-uninitialized -Werror=dev "$@" >"$heic_configure_log" 2>&1 || heic_configure_status=$?
 	cat "$heic_configure_log" >&2
 	if grep -E 'Manually-specified variables were not used by the project|Unknown CMake command|Unknown argument' "$heic_configure_log" >/dev/null; then

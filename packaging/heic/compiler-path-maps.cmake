@@ -1,0 +1,15 @@
+# Included after project() identifies the compiler. Keep each map as a CMake
+# list item so the generator quotes the complete option, including spaced roots.
+set(_mote_path_roots "${MOTE_HEIC_WORK_ROOT}" "${MOTE_HEIC_STAGE_ROOT}")
+list(REMOVE_DUPLICATES _mote_path_roots)
+foreach(_mote_path_root IN LISTS _mote_path_roots)
+    if(NOT IS_ABSOLUTE "${_mote_path_root}")
+        message(FATAL_ERROR "Native path mapping requires absolute managed roots")
+    endif()
+    if(MSVC)
+        file(TO_NATIVE_PATH "${_mote_path_root}" _mote_native_root)
+        add_compile_options("/pathmap:${_mote_native_root}=.")
+    else()
+        add_compile_options("-ffile-prefix-map=${_mote_path_root}=.")
+    endif()
+endforeach()
