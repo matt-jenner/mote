@@ -186,18 +186,25 @@ test("HEIC Flatpak package consumes the Mote flag and preserves builder argument
 		const result = runFlatpakFixture(fixtureDirectory, [
 			"--no-heic",
 			"--disable-rofiles-fuse",
+			"--stop-at=libheif",
 		]);
 		assert.equal(result.status, 0, result.stderr);
 		const buildCall = flatpakBuildCall(fixtureDirectory);
 		assert.match(buildCall, /^disabled\|/);
 		assert.doesNotMatch(buildCall, /--no-heic/);
 		assert.match(buildCall, /--disable-rofiles-fuse/);
+		assert.match(buildCall, /--stop-at=libheif/);
 	} finally {
 		fs.rmSync(fixtureDirectory.directory, { recursive: true, force: true });
 	}
 });
 
-for (const args of [["--no-heic", "--no-heic"], ["--no-heicc"]]) {
+for (const args of [
+	["--no-heic", "--no-heic"],
+	["--no-heicc"],
+	["--no-hiec"],
+	["--no-HEIC"],
+]) {
 	test(`HEIC Flatpak package rejects invalid Mote arguments: ${args.join(" ")}`, () => {
 		const fixtureDirectory = flatpakFixture();
 		try {

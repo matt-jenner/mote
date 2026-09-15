@@ -369,7 +369,11 @@ for (const mode of ["native", "universal"]) {
 	test(`HEIC ${mode} desktop mode translates the Mote flag and keeps Tauri arguments`, () => {
 		const repository = desktopFixture();
 		try {
-			const result = runDesktopBuild(repository, mode, ["--no-heic", "--ci"]);
+			const result = runDesktopBuild(repository, mode, [
+				"--no-heic",
+				"--config=libheif.toml",
+				"--ci",
+			]);
 			assert.equal(result.status, 0, result.stderr);
 			const arguments_ = desktopBuildArguments(repository);
 			assert.equal(arguments_.includes("--no-heic"), false);
@@ -381,6 +385,7 @@ for (const mode of ["native", "universal"]) {
 				),
 				["--no-default-features", "--features", "mote-defaults"],
 			);
+			assert.equal(arguments_.includes("--config=libheif.toml"), true);
 			assert.equal(arguments_.at(-1), "--ci");
 			assertDesktopTempsRemoved(repository);
 		} finally {
@@ -409,8 +414,32 @@ test("HEIC default desktop mode adds no Cargo feature arguments", () => {
 	}
 });
 
-for (const args of [["--no-heic", "--no-heic"], ["--no-heicc"]]) {
+for (const args of [
+	["--no-heic", "--no-heic"],
+	["--no-heicc"],
+	["--no-hiec"],
+	["--no-HEIC"],
+]) {
 	test(`HEIC desktop mode rejects invalid Mote arguments: ${args.join(" ")}`, () => {
+		const repository = desktopFixture();
+		try {
+			const result = runDesktopBuild(repository, "native", args);
+			assert.equal(result.status, 2);
+			assert.match(result.stderr, /usage:/);
+			assert.equal(fs.existsSync(path.join(repository, "npm-argv")), false);
+		} finally {
+			fs.rmSync(repository, { recursive: true, force: true });
+		}
+	});
+}
+
+for (const args of [
+	["--no-heic", "--all-features"],
+	["--no-heic", "--features", "heic"],
+	["--no-heic", "--features=heic"],
+	["--no-default-features"],
+]) {
+	test(`desktop Mote mode rejects Cargo feature overrides: ${args.join(" ")}`, () => {
 		const repository = desktopFixture();
 		try {
 			const result = runDesktopBuild(repository, "native", args);

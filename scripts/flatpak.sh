@@ -150,9 +150,10 @@ if [[ ${1:-} == --no-heic ]]; then
   shift
 fi
 for argument in "$@"; do
-  case "$argument" in
-    --*heic* | --*heif*) usage >&2; exit 2 ;;
-  esac
+  if mote_is_invalid_heic_flag "$argument"; then
+    usage >&2
+    exit 2
+  fi
 done
 
 case "$command" in

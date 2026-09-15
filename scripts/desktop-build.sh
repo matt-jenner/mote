@@ -24,8 +24,12 @@ if [ "${1:-}" = --no-heic ]; then
 	shift
 fi
 for argument in "$@"; do
+	if mote_is_invalid_heic_flag "$argument"; then
+		usage
+		exit 2
+	fi
 	case "$argument" in
-		--*heic* | --*heif*)
+		--all-features | --features | --features=* | --no-default-features)
 			usage
 			exit 2
 			;;

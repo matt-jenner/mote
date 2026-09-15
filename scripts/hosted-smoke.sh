@@ -14,12 +14,10 @@ if [ "${1:-}" = --no-heic ]; then
 	shift
 fi
 for argument in "$@"; do
-	case "$argument" in
-		--*heic* | --*heif*)
-			usage
-			exit 2
-			;;
-	esac
+	if mote_is_invalid_heic_flag "$argument"; then
+		usage
+		exit 2
+	fi
 done
 
 container_engine=${CONTAINER_ENGINE:-podman}

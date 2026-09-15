@@ -126,7 +126,12 @@ test("hosted smoke removes its unique image after a failed build", () => {
 test("HEIC hosted smoke consumes the Mote flag and preserves build arguments", () => {
 	const fixture = failingBuildEngineFixture();
 	try {
-		const result = runFailingSmokeBuild(fixture, ["--no-heic", "--pull=never"]);
+		const result = runFailingSmokeBuild(fixture, [
+			"--no-heic",
+			"--pull=never",
+			"--build-arg=HEIC_CACHE=/cache/heic",
+			"--label=decoder=libheif",
+		]);
 		assert.equal(result.status, 31, result.stderr);
 		const buildCall = readFileSync(fixture.log, "utf8")
 			.split("\n")
@@ -134,13 +139,20 @@ test("HEIC hosted smoke consumes the Mote flag and preserves build arguments", (
 		assert.ok(buildCall);
 		assert.match(buildCall, /--build-arg MOTE_HEIC=disabled/);
 		assert.match(buildCall, /--pull=never/);
+		assert.match(buildCall, /--build-arg=HEIC_CACHE=\/cache\/heic/);
+		assert.match(buildCall, /--label=decoder=libheif/);
 		assert.doesNotMatch(buildCall, /--no-heic/);
 	} finally {
 		rmSync(fixture.directory, { recursive: true, force: true });
 	}
 });
 
-for (const args of [["--no-heic", "--no-heic"], ["--no-heicc"]]) {
+for (const args of [
+	["--no-heic", "--no-heic"],
+	["--no-heicc"],
+	["--no-hiec"],
+	["--no-HEIC"],
+]) {
 	test(`HEIC hosted smoke rejects invalid Mote arguments: ${args.join(" ")}`, () => {
 		const fixture = failingBuildEngineFixture();
 		try {
