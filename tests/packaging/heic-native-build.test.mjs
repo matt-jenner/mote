@@ -40,13 +40,20 @@ const nativeFixture = () => {
 	for (const directory of [packaging, scripts, bin, temporary, log]) {
 		fs.mkdirSync(directory, { recursive: true });
 	}
-	for (const file of ["build-unix.sh", "versions.env"]) {
+	for (const file of [
+		"build-unix.sh",
+		"versions.env",
+		"verify-native-deps.sh",
+	]) {
+		if (!fs.existsSync(path.join(root, "packaging/heic", file))) continue;
 		fs.copyFileSync(
 			path.join(root, "packaging/heic", file),
 			path.join(packaging, file),
 		);
 	}
 	fs.chmodSync(path.join(packaging, "build-unix.sh"), 0o755);
+	if (fs.existsSync(path.join(packaging, "verify-native-deps.sh")))
+		fs.chmodSync(path.join(packaging, "verify-native-deps.sh"), 0o755);
 	fs.copyFileSync(
 		path.join(root, "scripts/build-lifecycle.sh"),
 		path.join(scripts, "build-lifecycle.sh"),
@@ -60,6 +67,51 @@ case "$1" in
   -m) printf '%s\n' arm64 ;;
   *) exit 2 ;;
 esac
+`,
+	);
+	writeExecutable(
+		path.join(bin, "lipo"),
+		`#!/bin/sh
+if [ "$1" = -create ]; then
+  printf '%s\\n' "$*" >> "$FAKE_TOOL_LOG/lipo"
+  while [ "$1" != -output ]; do shift; done
+  [ "\${FAKE_LIPO_FAIL:-0}" = 0 ] || exit 43
+  printf 'universal' > "$2"
+else
+  [ "\${FAKE_MISSING_ARCH:-0}" = 0 ] || exit 44
+  printf 'arm64 x86_64\\n'
+fi
+`,
+	);
+	writeExecutable(path.join(bin, "install_name_tool"), "#!/bin/sh\nexit 0\n");
+	writeExecutable(
+		path.join(bin, "otool"),
+		`#!/bin/sh
+for argument in "$@"; do file=$argument; done
+printf '%s:\\n' "$file"
+case "$*" in
+  *' -l '*|'-l '*) printf '' ;;
+  *)
+    printf '\\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0)\\n'
+    case "$file" in *libheif*) printf '\\t@rpath/libde265.dylib (compatibility version 0.0.0)\\n' ;; esac
+    [ -z "\${FAKE_DEPENDENCY:-}" ] || printf '\\t%s (compatibility version 0.0.0)\\n' "$FAKE_DEPENDENCY"
+    ;;
+esac
+`,
+	);
+	writeExecutable(
+		path.join(bin, "nm"),
+		`#!/bin/sh
+printf '%s\\n' "\${FAKE_SYMBOL:-000 T _de265_decode}"
+[ "$1" = -gU ] || printf '%s\\n' "\${FAKE_LOCAL_SYMBOL:-}"
+`,
+	);
+	writeExecutable(
+		path.join(bin, "cc"),
+		`#!/bin/sh
+while [ "$1" != -o ]; do shift; done
+printf '#!/bin/sh\\n[ "\${FAKE_ENCODERS:-0}" = 0 ] || exit 45\\n' > "$2"
+chmod +x "$2"
 `,
 	);
 	writeExecutable(
@@ -114,6 +166,7 @@ printf '%s\n' "$destination" >> "$FAKE_TOOL_LOG/tar"
 		path.join(bin, "cmake"),
 		`#!/bin/sh
 case "$1" in
+  -DSOURCE_DIR=*) exit 0 ;;
   --build)
     build=$2
     case "$build" in
@@ -191,10 +244,10 @@ const fixtureEnvironment = (fixture, overrides = {}) => ({
 	...overrides,
 });
 
-const runNativeBuilder = (fixture, overrides = {}) =>
+const runNativeBuilder = (fixture, overrides = {}, arch = "arm64") =>
 	spawnSync(
 		path.join(fixture.packaging, "build-unix.sh"),
-		["--platform", "macos", "--arch", "arm64"],
+		["--platform", "macos", "--arch", arch],
 		{
 			cwd: fixture.repository,
 			env: fixtureEnvironment(fixture, overrides),
@@ -218,7 +271,7 @@ const assertNoEphemeralNativePaths = (fixture) => {
 	);
 };
 
-const waitForFile = (file, timeout = 5_000) =>
+const waitForFile = (file, timeout = 30_000) =>
 	new Promise((resolve, reject) => {
 		const started = Date.now();
 		const poll = () => {
@@ -365,13 +418,14 @@ test("publication failure rolls back the previous prefix", () => {
 
 test("TERM during publication rolls back and removes all temporary work", async () => {
 	const fixture = nativeFixture();
+	let child;
 	try {
 		const first = runNativeBuilder(fixture);
 		assert.equal(first.status, 0, first.stderr);
 		const marker = path.join(fixturePrefix(fixture), "previous");
 		fs.writeFileSync(marker, "keep");
 		const ready = path.join(fixture.repository, "publication-ready");
-		const child = spawn(
+		child = spawn(
 			path.join(fixture.packaging, "build-unix.sh"),
 			["--platform", "macos", "--arch", "arm64"],
 			{
@@ -391,6 +445,7 @@ test("TERM during publication rolls back and removes all temporary work", async 
 		assert.equal(fs.readFileSync(marker, "utf8"), "keep");
 		assertNoEphemeralNativePaths(fixture);
 	} finally {
+		if (child?.exitCode === null) process.kill(-child.pid, "SIGKILL");
 		fs.rmSync(fixture.repository, { recursive: true, force: true });
 	}
 });
@@ -408,10 +463,7 @@ test("TERM at publication activation preserves the previous prefix", () => {
 		assert.equal(builderSource.split(activation).length, 2);
 		fs.writeFileSync(
 			builder,
-			builderSource.replace(
-				activation,
-				() => `${activation}kill -TERM "$$"\n`,
-			),
+			builderSource.replace(activation, () => `${activation}kill -TERM "$$"\n`),
 		);
 
 		const interrupted = runNativeBuilder(fixture);
@@ -498,3 +550,481 @@ test("native work and archive retention use the managed build lifecycle", () => 
 		/remove_generated_path "\$(?:checkout|repository_root)\/dist" /,
 	);
 });
+
+test("Windows uses the same pins and decode-only dynamic policy as Unix", () => {
+	const windows = readRepoFile("packaging/heic/build-windows.ps1");
+	const unix = readRepoFile("packaging/heic/build-unix.sh");
+	assert.match(windows, /versions\.env/);
+	assert.match(windows, /Get-FileHash.*SHA256/);
+	assert.match(windows, /VCPKGRS_DYNAMIC/);
+	assert.match(windows, /VCPKG_ROOT/);
+	assert.match(windows, /finally/);
+	assert.match(windows, /decode-only\.cmake/);
+	assert.match(unix, /decode-only\.cmake/);
+	for (const option of unix.matchAll(
+		/-D((?:WITH_|ENABLE_|BUILD_SHARED|BUILD_TESTING|BUILD_DOCUMENTATION|BUILD_DEVELOPMENT)[A-Za-z0-9_]*=(?:ON|OFF))/g,
+	)) {
+		assert.ok(windows.includes(`-D${option[1]}`), option[1]);
+	}
+	for (const script of [unix, windows]) {
+		assert.doesNotMatch(script, /embedded-libheif|1\.23\.4|1\.1\.1/);
+	}
+	assert.ok(
+		readRepoFile("crates/codec/src/lib.rs").includes(
+			`libheif-${versions.LIBHEIF_VERSION}-libde265-${versions.LIBDE265_VERSION}-sdr-v1`,
+		),
+	);
+});
+
+test("decode-only source patch removes the unconditional mask encoder and fails closed on source drift", () => {
+	const source = fs.mkdtempSync(path.join(os.tmpdir(), "mote-heic-patch-"));
+	try {
+		fs.mkdirSync(path.join(source, "libheif/plugins"), { recursive: true });
+		const registry = path.join(source, "libheif/plugin_registry.cc");
+		const plugins = path.join(source, "libheif/plugins/CMakeLists.txt");
+		fs.writeFileSync(
+			registry,
+			'#include "plugins/encoder_mask.h"\n  register_encoder(get_encoder_plugin_mask());\nkeep_decoder();\n',
+		);
+		fs.writeFileSync(
+			plugins,
+			"target_sources(heif PRIVATE\n               encoder_mask.h\n               encoder_mask.cc\n               nalu_utils.cc)\n",
+		);
+		const patchSource = path.join(root, "packaging/heic/decode-only.cmake");
+		const run = () =>
+			spawnSync("cmake", [`-DSOURCE_DIR=${source}`, "-P", patchSource], {
+				encoding: "utf8",
+			});
+		const patched = run();
+		assert.equal(patched.status, 0, patched.stdout + patched.stderr);
+		assert.equal(fs.readFileSync(registry, "utf8"), "keep_decoder();\n");
+		assert.equal(
+			fs.readFileSync(plugins, "utf8"),
+			"target_sources(heif PRIVATE\n               nalu_utils.cc)\n",
+		);
+		assert.notEqual(
+			run().status,
+			0,
+			"changed upstream source must require an explicit patch update",
+		);
+	} finally {
+		fs.rmSync(source, { recursive: true, force: true });
+	}
+});
+
+test("every CI platform has enabled fixtures and inspected disabled binaries", () => {
+	const ci = readRepoFile(".github/workflows/ci.yml");
+	assert.match(ci, /os: \[ubuntu-latest, macos-latest, windows-latest\]/);
+	assert.match(ci, /heic: \[enabled, disabled\]/);
+	for (const command of [
+		/build-unix\.sh/,
+		/build-windows\.ps1/,
+		/--test heif_backend/,
+		/cargo tree[^\n]*--no-default-features --features mote-defaults/,
+		/verify-native-deps\.sh[^\n]*--no-heic/,
+		/verify-native-deps\.ps1[^\n]*-NoHeic/,
+		/clippy[^\n]*--all-features/,
+		/test --workspace --all-features/,
+	]) {
+		assert.match(ci, command);
+	}
+	const macos = readRepoFile(".github/workflows/build-macos.yml");
+	assert.match(macos, /heic: \[enabled, disabled\]/);
+	assert.match(macos, /build-unix\.sh[^\n]*--arch universal/);
+	assert.match(macos, /desktop:build:universal[^\n]*--no-heic/);
+	assert.match(macos, /verify-native-deps\.sh/);
+});
+
+test("universal builder merges both slices and leaves no per-architecture build trees", () => {
+	const fixture = nativeFixture();
+	try {
+		writeExecutable(
+			path.join(fixture.bin, "lipo"),
+			`#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_TOOL_LOG/lipo"
+if [ "$1" = -create ]; then
+  while [ "$1" != -output ]; do shift; done
+  printf 'universal' > "$2"
+else
+  printf 'arm64 x86_64\\n'
+fi
+`,
+		);
+		writeExecutable(
+			path.join(fixture.bin, "install_name_tool"),
+			"#!/bin/sh\nexit 0\n",
+		);
+		const result = spawnSync(
+			path.join(fixture.packaging, "build-unix.sh"),
+			["--platform", "macos", "--arch", "universal"],
+			{ env: fixtureEnvironment(fixture), encoding: "utf8" },
+		);
+		assert.equal(result.status, 0, result.stderr);
+		assert.equal(
+			fs.readFileSync(
+				path.join(
+					fixture.repository,
+					"build/heic-native/macos-universal/lib/libheif.dylib",
+				),
+				"utf8",
+			),
+			"universal",
+		);
+		assert.equal(
+			fs
+				.readFileSync(path.join(fixture.log, "lipo"), "utf8")
+				.split("\n")
+				.filter((line) => line.startsWith("-create")).length,
+			2,
+		);
+		assertNoEphemeralNativePaths(fixture);
+		assert.deepEqual(
+			fs.readdirSync(path.join(fixture.repository, "build/heic-native")).sort(),
+			["cache", "macos-universal"],
+		);
+	} finally {
+		fs.rmSync(fixture.repository, { recursive: true, force: true });
+	}
+});
+
+test("native inspectors exist for both platform families", () => {
+	for (const file of ["verify-native-deps.sh", "verify-native-deps.ps1"]) {
+		assert.ok(fs.existsSync(path.join(root, "packaging/heic", file)), file);
+	}
+});
+
+for (const [name, overrides, remove] of [
+	["missing runtime library", { FAKE_DEPENDENCY: "@rpath/missing.dylib" }],
+	[
+		"absolute build dependency",
+		{ FAKE_DEPENDENCY: "/tmp/stage/libheif.dylib" },
+	],
+	[
+		"encoder implementation symbol",
+		{ FAKE_SYMBOL: "000 T _en265_new_encoder" },
+	],
+	["x265 dependency", { FAKE_DEPENDENCY: "@rpath/libx265.dylib" }],
+	["missing architecture", { FAKE_MISSING_ARCH: "1" }],
+	["missing libde265", {}, "libde265.dylib"],
+	[
+		"hidden mask encoder",
+		{ FAKE_LOCAL_SYMBOL: "000 t __Z23get_encoder_plugin_maskv" },
+	],
+]) {
+	test(`inspection rejects ${name}`, () => {
+		const fixture = nativeFixture();
+		try {
+			const built = runNativeBuilder(fixture);
+			assert.equal(built.status, 0, built.stderr);
+			if (remove)
+				fs.unlinkSync(path.join(fixturePrefix(fixture), "lib", remove));
+			const result = spawnSync(
+				"sh",
+				[
+					path.join(fixture.packaging, "verify-native-deps.sh"),
+					"--prefix",
+					fixturePrefix(fixture),
+					"--arch",
+					"universal",
+				],
+				{ env: fixtureEnvironment(fixture, overrides), encoding: "utf8" },
+			);
+			assert.notEqual(result.status, 0, result.stdout);
+		} finally {
+			fs.rmSync(fixture.repository, { recursive: true, force: true });
+		}
+	});
+}
+
+test("native build rejects a decoder with runtime encoders before publication", () => {
+	const fixture = nativeFixture();
+	try {
+		const result = runNativeBuilder(fixture, { FAKE_ENCODERS: "1" });
+		assert.notEqual(result.status, 0);
+		assert.equal(fs.existsSync(fixturePrefix(fixture)), false);
+		assertNoEphemeralNativePaths(fixture);
+	} finally {
+		fs.rmSync(fixture.repository, { recursive: true, force: true });
+	}
+});
+
+test("disabled inspection rejects bundled HEIF libraries even when unused", () => {
+	const fixture = nativeFixture();
+	try {
+		assert.equal(runNativeBuilder(fixture).status, 0);
+		const result = spawnSync(
+			"sh",
+			[
+				path.join(fixture.packaging, "verify-native-deps.sh"),
+				"--prefix",
+				fixturePrefix(fixture),
+				"--no-heic",
+			],
+			{ env: fixtureEnvironment(fixture), encoding: "utf8" },
+		);
+		assert.notEqual(result.status, 0);
+	} finally {
+		fs.rmSync(fixture.repository, { recursive: true, force: true });
+	}
+});
+
+test("inspection permits the upstream temporary filename template but rejects embedded build paths", () => {
+	const fixture = nativeFixture();
+	try {
+		assert.equal(runNativeBuilder(fixture).status, 0);
+		const library = path.join(fixturePrefix(fixture), "lib/libheif.dylib");
+		fs.writeFileSync(library, "/tmp/libheif-XXXXXX\n");
+		const inspect = () =>
+			spawnSync(
+				"sh",
+				[
+					path.join(fixture.packaging, "verify-native-deps.sh"),
+					"--prefix",
+					fixturePrefix(fixture),
+				],
+				{ env: fixtureEnvironment(fixture), encoding: "utf8" },
+			);
+		assert.equal(inspect().status, 0);
+		fs.writeFileSync(
+			library,
+			"/private/tmp/mote-build-heic-native.abc/source.cc\n",
+		);
+		assert.notEqual(inspect().status, 0);
+	} finally {
+		fs.rmSync(fixture.repository, { recursive: true, force: true });
+	}
+});
+
+test("universal merge failure preserves the prior prefix and removes slices and partials", () => {
+	const fixture = nativeFixture();
+	try {
+		const previous = path.join(
+			fixture.repository,
+			"build/heic-native/macos-universal",
+		);
+		fs.mkdirSync(previous, { recursive: true });
+		fs.writeFileSync(path.join(previous, "previous"), "keep");
+		const result = runNativeBuilder(
+			fixture,
+			{ FAKE_LIPO_FAIL: "1" },
+			"universal",
+		);
+		assert.equal(result.status, 43, result.stderr);
+		assert.equal(
+			fs.readFileSync(path.join(previous, "previous"), "utf8"),
+			"keep",
+		);
+		assertNoEphemeralNativePaths(fixture);
+	} finally {
+		fs.rmSync(fixture.repository, { recursive: true, force: true });
+	}
+});
+
+test("TERM during universal publication restores the old bundle and cleans both slices", async () => {
+	const fixture = nativeFixture();
+	let child;
+	try {
+		const previous = path.join(
+			fixture.repository,
+			"build/heic-native/macos-universal",
+		);
+		fs.mkdirSync(previous, { recursive: true });
+		fs.writeFileSync(path.join(previous, "previous"), "keep");
+		const ready = path.join(fixture.repository, "publication-ready");
+		child = spawn(
+			path.join(fixture.packaging, "build-unix.sh"),
+			["--platform", "macos", "--arch", "universal"],
+			{
+				detached: true,
+				stdio: "ignore",
+				env: fixtureEnvironment(fixture, {
+					FAKE_MV_PAUSE_PUBLICATION: "1",
+					FAKE_PUBLICATION_READY: ready,
+				}),
+			},
+		);
+		await waitForFile(ready, 15000);
+		process.kill(-child.pid, "SIGTERM");
+		const status = await new Promise((resolve) => child.once("exit", resolve));
+		assert.equal(status, 143);
+		assert.equal(
+			fs.readFileSync(path.join(previous, "previous"), "utf8"),
+			"keep",
+		);
+		assertNoEphemeralNativePaths(fixture);
+	} finally {
+		if (child?.exitCode === null) process.kill(-child.pid, "SIGKILL");
+		fs.rmSync(fixture.repository, { recursive: true, force: true });
+	}
+});
+
+test("Windows builder publishes discoverable DLL metadata and cleans failed or interrupted work", {
+	skip: process.platform !== "win32",
+}, () => {
+	const repository = fs.mkdtempSync(
+		path.join(os.tmpdir(), "mote-heic-windows-"),
+	);
+	try {
+		const packaging = path.join(repository, "packaging/heic");
+		fs.mkdirSync(packaging, { recursive: true });
+		for (const name of [
+			"versions.env",
+			"build-windows.ps1",
+			"verify-native-deps.ps1",
+			"decode-only.cmake",
+			"verify-decoder.c",
+		])
+			fs.copyFileSync(
+				path.join(root, "packaging/heic", name),
+				path.join(packaging, name),
+			);
+		const script = path.join(repository, "test.ps1");
+		fs.writeFileSync(
+			script,
+			`
+$ErrorActionPreference = 'Stop'
+$global:buildPrefixes = @{}
+function global:cl {
+    $probe = ($args | Where-Object { $_ -like '/Fe:*' }) -replace '^/Fe:', ''
+    $object = ($args | Where-Object { $_ -like '/Fo:*' }) -replace '^/Fo:', ''
+    $source = "$probe.c"
+    Set-Content $source '#include <stdlib.h>\nint main(void) { return getenv("MOTE_TEST_ENCODERS") != NULL; }'
+    & cl.exe /nologo /MD $source "/Fe:$probe" "/Fo:$object"
+}
+function global:tar.exe { $global:LASTEXITCODE = 0 }
+function global:Invoke-WebRequest { param($Uri, $OutFile); Set-Content $OutFile 'archive' }
+function global:Get-FileHash { param($LiteralPath, $Algorithm); @{ Hash = if ($LiteralPath -like '*${versions.LIBDE265_SHA256}*') { '${versions.LIBDE265_SHA256}' } else { '${versions.LIBHEIF_SHA256}' } } }
+function global:cmake {
+    $global:LASTEXITCODE = 0
+    if ($args -contains '-P') { return }
+    if ($args[0] -eq '--build') { return }
+    if ($args[0] -eq '--install') {
+        $prefix = $global:buildPrefixes[$args[1]]
+        New-Item -ItemType Directory -Force "$prefix/lib/pkgconfig", "$prefix/lib/cmake", "$prefix/bin" | Out-Null
+        $name = if ($args[1] -like '*de265-build') { 'libde265' } else { 'heif' }
+        Set-Content "$prefix/lib/$name.lib" 'import library'
+        Set-Content "$prefix/bin/$name.dll" 'shared library'
+        Set-Content "$prefix/lib/pkgconfig/$name.pc" "prefix=$prefix"
+        return
+    }
+    $build = $args[[array]::IndexOf($args, '-B') + 1]
+    $prefix = ($args | Where-Object { $_ -like '-DCMAKE_INSTALL_PREFIX=*' }) -replace '^-DCMAKE_INSTALL_PREFIX=', ''
+    $global:buildPrefixes[$build] = $prefix
+    if ($build -like '*heif-build' -and $env:MOTE_TEST_FAILURE) {
+        if ($env:MOTE_TEST_FAILURE -eq 'interrupt') { throw [System.OperationCanceledException]::new('interrupted') }
+        $global:LASTEXITCODE = 31
+        return
+    }
+    'libde265 HEVC decoder : + built-in'
+    'x265 HEVC encoder : - disabled'
+}
+function global:dumpbin {
+    $global:LASTEXITCODE = 0
+    $file = $args[-1]
+    switch ($args[1]) {
+        '/headers' { '8664 machine (x64)'; if ($file -like '*heif.lib') { 'heif.dll' }; if ($file -like '*libde265.lib') { 'libde265.dll' } }
+        '/dependents' { '    KERNEL32.dll'; if ($file -like '*heif.dll') { '    libde265.dll' } }
+        '/exports' { '    de265_decode' }
+    }
+}
+$builder = Join-Path $PSScriptRoot 'packaging/heic/build-windows.ps1'
+$env:GITHUB_ENV = ''
+& $builder
+$nativeRoot = Join-Path $PSScriptRoot 'build/heic-native'
+$marker = Join-Path $nativeRoot 'windows-x64/previous'
+Set-Content $marker 'keep'
+foreach ($failure in @('build', 'interrupt', 'runtime')) {
+    $env:MOTE_TEST_FAILURE = if ($failure -eq 'runtime') { '' } else { $failure }
+    $env:MOTE_TEST_ENCODERS = if ($failure -eq 'runtime') { '1' } else { '' }
+    $failed = $false
+    try { & $builder } catch { $failed = $true }
+    if (-not $failed) { throw 'failure was ignored' }
+    if ((Get-Content $marker) -ne 'keep') { throw 'previous prefix lost' }
+    if (@(Get-ChildItem $nativeRoot -Force | Where-Object Name -Like '*.stage.*').Count) { throw 'staging leaked' }
+}
+$env:MOTE_TEST_FAILURE = ''
+$env:MOTE_TEST_ENCODERS = ''
+& $builder
+if (Test-Path $marker) { throw 'old prefix was not replaced' }
+if (@(Get-ChildItem $nativeRoot -Force | Where-Object Name -Like '*.stage.*').Count) { throw 'staging leaked' }
+if (@(Get-ChildItem "$nativeRoot/cache").Count -ne 2) { throw 'cache is unbounded' }
+`,
+		);
+		const result = spawnSync("pwsh", ["-NoProfile", "-File", script], {
+			cwd: repository,
+			encoding: "utf8",
+			timeout: 60_000,
+		});
+		assert.equal(result.status, 0, result.stdout + result.stderr);
+		const status = fs.readFileSync(
+			path.join(
+				repository,
+				"build/heic-native/windows-x64/installed/vcpkg/status",
+			),
+			"utf8",
+		);
+		assert.match(status, /Package: libheif/);
+		assert.match(status, /Depends: libde265/);
+		for (const [name, version, library] of [
+			["libheif", versions.LIBHEIF_VERSION, "heif"],
+			["libde265", versions.LIBDE265_VERSION, "libde265"],
+		]) {
+			const manifest = fs.readFileSync(
+				path.join(
+					repository,
+					`build/heic-native/windows-x64/installed/vcpkg/info/${name}_${version}_x64-windows.list`,
+				),
+				"utf8",
+			);
+			assert.match(manifest, new RegExp(`x64-windows/lib/${library}\\.lib`));
+			assert.match(manifest, new RegExp(`x64-windows/bin/${library}\\.dll`));
+		}
+	} finally {
+		fs.rmSync(repository, { recursive: true, force: true });
+	}
+});
+
+for (const [name, environment] of [
+	["wrong ELF architecture", { FAKE_ELF_MACHINE: "AArch64" }],
+	["absolute ELF dependency", { FAKE_ELF_NEEDED: "/tmp/stage/libde265.so.0" }],
+]) {
+	test(`Linux inspection rejects ${name}`, () => {
+		const fixture = nativeFixture();
+		try {
+			const prefix = fixturePrefix(fixture);
+			fs.mkdirSync(path.join(prefix, "lib"), { recursive: true });
+			for (const name of ["libheif.so", "libde265.so"])
+				fs.writeFileSync(path.join(prefix, "lib", name), "shared library");
+			writeExecutable(
+				path.join(fixture.bin, "uname"),
+				'#!/bin/sh\ncase "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac\n',
+			);
+			writeExecutable(
+				path.join(fixture.bin, "ldd"),
+				'#!/bin/sh\nprintf "libde265.so.0 => /runtime/libde265.so.0 (0x1)\\nlibc.so.6 => /lib/libc.so.6 (0x2)\\n"\n',
+			);
+			writeExecutable(
+				path.join(fixture.bin, "readelf"),
+				`#!/bin/sh
+if [ "$1" = -h ]; then printf 'Machine: %s\\n' "\${FAKE_ELF_MACHINE:-Advanced Micro Devices X86-64}"; else
+printf '0 (NEEDED) Shared library: [%s]\\n' "\${FAKE_ELF_NEEDED:-libde265.so.0}"
+fi
+`,
+			);
+			const inspect = (overrides) =>
+				spawnSync(
+					"sh",
+					[
+						path.join(fixture.packaging, "verify-native-deps.sh"),
+						"--prefix",
+						prefix,
+					],
+					{ env: fixtureEnvironment(fixture, overrides), encoding: "utf8" },
+				);
+			assert.equal(inspect({}).status, 0);
+			assert.notEqual(inspect(environment).status, 0);
+		} finally {
+			fs.rmSync(fixture.repository, { recursive: true, force: true });
+		}
+	});
+}

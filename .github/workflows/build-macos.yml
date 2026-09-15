@@ -14,6 +14,9 @@ concurrency:
 
 jobs:
   macos-app:
+    strategy:
+      matrix:
+        heic: [enabled, disabled]
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
@@ -27,16 +30,34 @@ jobs:
         with:
           node-version: 24.18.0
           cache: npm
-      - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: apps/desktop/src-tauri -> target
       - run: npm ci
       - run: npm run --workspace @photo-viewer/interface build
       - run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all --check
-      - run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
-      - run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
+      - name: Build pinned universal native decoders
+        if: matrix.heic == 'enabled'
+        run: |
+          native_environment=$(packaging/heic/build-unix.sh --platform macos --arch universal)
+          eval "$native_environment"
+          printf 'MOTE_HEIC_PREFIX=%s\nPKG_CONFIG_PATH=%s\nDYLD_LIBRARY_PATH=%s\n' "$MOTE_HEIC_PREFIX" "$PKG_CONFIG_PATH" "$DYLD_LIBRARY_PATH" >> "$GITHUB_ENV"
+      - if: matrix.heic == 'enabled'
+        run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+      - if: matrix.heic == 'enabled'
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
+      - if: matrix.heic == 'disabled'
+        run: |
+          cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --no-default-features --features mote-defaults
+          cargo tree --manifest-path apps/desktop/src-tauri/Cargo.toml --no-default-features --features mote-defaults > disabled-tree.txt
+          if grep -Ei 'libheif|libde265' disabled-tree.txt; then exit 1; fi
       - name: Build universal macOS app
+        if: matrix.heic == 'enabled'
         run: npm run desktop:build:universal -- --ci
+      - name: Build universal macOS app without HEIC
+        if: matrix.heic == 'disabled'
+        run: npm run desktop:build:universal -- --no-heic --ci
+      - if: matrix.heic == 'enabled'
+        run: packaging/heic/verify-native-deps.sh --app dist/macos/Mote.app --arch universal
+      - if: matrix.heic == 'disabled'
+        run: packaging/heic/verify-native-deps.sh --app dist/macos/Mote.app --arch universal --no-heic
       - name: Verify and archive app
         run: |
           app="dist/macos/Mote.app"
@@ -45,7 +66,7 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "$app" dist/macos/Mote-universal-macos.zip
       - uses: actions/upload-artifact@v7
         with:
-          name: Mote-universal-macos
+          name: Mote-universal-macos-${{ matrix.heic }}
           path: dist/macos/Mote-universal-macos.zip
           archive: false
           if-no-files-found: error

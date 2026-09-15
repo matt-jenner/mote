@@ -7,20 +7,87 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        heic: [enabled, disabled]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.18.0
+      - if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - if: runner.os != 'Windows'
+      - name: Build pinned native decoders on Unix
+        if: matrix.heic == 'enabled' && runner.os != 'Windows'
+        shell: bash
+        run: |
+          platform=linux
+          if [ "$RUNNER_OS" = macOS ]; then platform=macos; fi
+          native_environment=$(packaging/heic/build-unix.sh --platform "$platform" --arch "$(uname -m)")
+          eval "$native_environment"
+          printf 'MOTE_HEIC_PREFIX=%s\nPKG_CONFIG_PATH=%s\n' "$MOTE_HEIC_PREFIX" "$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+          if [ "$platform" = macos ]; then
+            printf 'DYLD_LIBRARY_PATH=%s\n' "$DYLD_LIBRARY_PATH" >> "$GITHUB_ENV"
+          else
+            printf 'LD_LIBRARY_PATH=%s\n' "$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+          fi
+      - name: Build pinned native DLLs
+        if: matrix.heic == 'enabled' && runner.os == 'Windows'
+        shell: pwsh
+        run: ./packaging/heic/build-windows.ps1 -Arch x64
+      - if: matrix.heic == 'enabled'
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - if: matrix.heic == 'enabled' && runner.os != 'Windows'
         run: cargo test --workspace --all-features
-      - if: runner.os == 'Windows'
+      - if: matrix.heic == 'enabled' && runner.os == 'Windows'
         run: cargo test --workspace --all-features -- --test-threads=1
-      - run: cargo test -p catalog-bench --test benchmark_smoke
+      - if: matrix.heic == 'enabled'
+        run: cargo test -p photo-codec --test heif_backend
+      - if: matrix.heic == 'enabled'
+        run: cargo build -p photo-server --locked
+      - if: matrix.heic == 'enabled' && runner.os != 'Windows'
+        shell: bash
+        run: packaging/heic/verify-native-deps.sh --prefix "$MOTE_HEIC_PREFIX" --binary target/debug/photo-server
+      - if: matrix.heic == 'enabled' && runner.os == 'Windows'
+        shell: pwsh
+        run: ./packaging/heic/verify-native-deps.ps1 -Prefix $env:MOTE_HEIC_PREFIX -Binary target/debug/photo-server.exe
+      - if: matrix.heic == 'enabled'
+        run: cargo test -p catalog-bench --test benchmark_smoke
+      - name: Build and test without HEIC
+        if: matrix.heic == 'disabled'
+        run: cargo build -p photo-server --locked --no-default-features --features mote-defaults
+      - if: matrix.heic == 'disabled'
+        run: cargo test -p photo-server --no-default-features --features mote-defaults
+      - if: matrix.heic == 'disabled'
+        run: cargo test -p photo-codec --no-default-features
+      - name: Check disabled dependency graph and binary on Unix
+        if: matrix.heic == 'disabled' && runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo tree -p photo-server --no-default-features --features mote-defaults > disabled-tree.txt
+          if grep -Ei 'libheif|libde265' disabled-tree.txt; then exit 1; fi
+          packaging/heic/verify-native-deps.sh --binary target/debug/photo-server --no-heic
+      - name: Check disabled dependency graph and binary on Windows
+        if: matrix.heic == 'disabled' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo tree -p photo-server --no-default-features --features mote-defaults | Set-Content disabled-tree.txt
+          if ($LASTEXITCODE -ne 0) { throw 'cargo tree failed' }
+          if (Select-String -Path disabled-tree.txt -Pattern 'libheif|libde265') { throw 'HEIF dependency in disabled graph' }
+          ./packaging/heic/verify-native-deps.ps1 -Prefix target/debug -Binary target/debug/photo-server.exe -NoHeic
+      - name: Packaging contracts
+        if: runner.os != 'Windows' && matrix.heic == 'enabled'
+        run: node --test tests/packaging/heic-native-build.test.mjs
+      - name: Windows packaging and cleanup contracts
+        if: runner.os == 'Windows' && matrix.heic == 'enabled'
+        shell: pwsh
+        run: node --test --test-name-pattern=Windows tests/packaging/heic-native-build.test.mjs
 
   interface:
     runs-on: ubuntu-latest

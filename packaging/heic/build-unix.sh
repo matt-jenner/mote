@@ -7,7 +7,7 @@ repository_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 . "$script_dir/versions.env"
 
 usage() {
-	printf '%s\n' "usage: $0 --platform macos|linux --arch ARCH" >&2
+	printf '%s\n' "usage: $0 --platform macos|linux --arch ARCH|universal" >&2
 }
 
 platform=
@@ -59,10 +59,12 @@ host_arch=$(uname -m)
 	printf '%s\n' "requested $platform build on $host_system" >&2
 	exit 2
 }
-[ "$host_arch" = "$arch" ] || {
+if [ "$platform" = macos ]; then
+	case "$arch" in arm64 | x86_64 | universal) ;; *) usage; exit 2 ;; esac
+elif [ "$host_arch" != "$arch" ]; then
 	printf '%s\n' "this builder only supports the current architecture ($host_arch), not $arch" >&2
 	exit 2
-}
+fi
 
 require_tool() {
 	command -v "$1" >/dev/null 2>&1 || {
@@ -75,8 +77,9 @@ require_tool cmake
 require_tool curl
 require_tool grep
 require_tool tar
+require_tool cc
 case "$platform" in
-	macos) require_tool shasum ;;
+	macos) require_tool shasum; require_tool lipo; require_tool install_name_tool ;;
 	linux) require_tool sha256sum ;;
 esac
 
@@ -178,6 +181,17 @@ configure_cmake() {
 	shift
 	heic_configure_log="$MOTE_BUILD_DIR/$heic_configure_name-configure.log"
 	heic_configure_status=0
+	# Install-relative load paths also apply inside the temporary build tree.
+	# No loader may depend on a staging directory that cleanup will remove.
+	if [ "$platform" = macos ]; then
+		set -- "$@" "-DCMAKE_OSX_ARCHITECTURES=$heic_slice_arch" \
+			-DCMAKE_INSTALL_NAME_DIR=@rpath '-DCMAKE_INSTALL_RPATH=@loader_path'
+	else
+		set -- "$@" '-DCMAKE_INSTALL_RPATH=$ORIGIN'
+	fi
+	set -- "$@" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+		"-DCMAKE_C_FLAGS=-ffile-prefix-map=$MOTE_BUILD_DIR=. -ffile-prefix-map=$heic_publish_stage_root=." \
+		"-DCMAKE_CXX_FLAGS=-ffile-prefix-map=$MOTE_BUILD_DIR=. -ffile-prefix-map=$heic_publish_stage_root=."
 	cmake --warn-uninitialized -Werror=dev "$@" >"$heic_configure_log" 2>&1 || heic_configure_status=$?
 	cat "$heic_configure_log" >&2
 	if grep -E 'Manually-specified variables were not used by the project|Unknown CMake command|Unknown argument' "$heic_configure_log" >/dev/null; then
@@ -193,14 +207,17 @@ download_archive "$LIBHEIF_URL" "$LIBHEIF_SHA256"
 
 heic_de265_source="$MOTE_BUILD_DIR/libde265-$LIBDE265_VERSION"
 heic_heif_source="$MOTE_BUILD_DIR/libheif-$LIBHEIF_VERSION"
-heic_de265_build="$MOTE_BUILD_DIR/libde265-build"
-heic_heif_build="$MOTE_BUILD_DIR/libheif-build"
-heic_stage_root="$heic_publish_stage_root/root"
-heic_staged_prefix="$heic_stage_root$heic_install_prefix"
 mkdir -p "$heic_publish_stage_root"
-
 extract_archive "$heic_archive_cache/$LIBDE265_SHA256.tar.gz" "$heic_de265_source"
 extract_archive "$heic_archive_cache/$LIBHEIF_SHA256.tar.gz" "$heic_heif_source"
+cmake "-DSOURCE_DIR=$heic_heif_source" -P "$script_dir/decode-only.cmake" >&2
+
+build_slice() {
+heic_slice_arch=$1
+heic_de265_build="$MOTE_BUILD_DIR/libde265-build"
+heic_heif_build="$MOTE_BUILD_DIR/libheif-build"
+heic_stage_root="$heic_publish_stage_root/$heic_slice_arch"
+heic_staged_prefix="$heic_stage_root$heic_install_prefix"
 
 configure_cmake libde265 \
 	-S "$heic_de265_source" \
@@ -305,6 +322,50 @@ grep -E 'x265 HEVC encoder[[:space:]]*: - disabled' "$MOTE_BUILD_DIR/libheif-con
 
 cmake --build "$heic_heif_build" --target heif --parallel >&2
 DESTDIR="$heic_stage_root" cmake --install "$heic_heif_build" >&2
+mote_remove_managed_path "$heic_de265_build" "$MOTE_BUILD_DIR"
+mote_remove_managed_path "$heic_heif_build" "$MOTE_BUILD_DIR"
+}
+
+if [ "$arch" = universal ]; then
+	build_slice arm64
+	build_slice x86_64
+	heic_staged_prefix="$heic_publish_stage_root/merged"
+	cp -R "$heic_publish_stage_root/arm64$heic_install_prefix" "$heic_staged_prefix"
+	for heic_library in "$heic_staged_prefix/lib/"*.dylib; do
+		[ ! -L "$heic_library" ] || continue
+		heic_library_name=$(basename "$heic_library")
+		lipo -create \
+			"$heic_publish_stage_root/arm64$heic_install_prefix/lib/$heic_library_name" \
+			"$heic_publish_stage_root/x86_64$heic_install_prefix/lib/$heic_library_name" \
+			-output "$heic_library"
+		lipo "$heic_library" -verify_arch arm64 x86_64
+	done
+else
+	build_slice "$arch"
+fi
+
+if [ "$platform" = macos ]; then
+	# Normalize IDs independently of upstream ABI filenames. Preserve the ABI
+	# aliases for consumers that already linked against the upstream IDs.
+	install_name_tool -id @rpath/libde265.dylib "$heic_staged_prefix/lib/libde265.dylib"
+	install_name_tool -id @rpath/libheif.dylib \
+		-change @rpath/libde265.0.dylib @rpath/libde265.dylib "$heic_staged_prefix/lib/libheif.dylib"
+fi
+LD_LIBRARY_PATH="$heic_staged_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+	"$script_dir/verify-native-deps.sh" --prefix "$heic_staged_prefix" --arch "$arch" >&2
+
+# Run against the staged shared libraries, before publication. The probe and
+# its build-machine rpath are temporary and are never installed or bundled.
+set --
+if [ "$platform" = macos ]; then
+	heic_probe_arch=$arch
+	[ "$arch" != universal ] || heic_probe_arch=$host_arch
+	set -- -arch "$heic_probe_arch"
+fi
+cc "$@" -I"$heic_staged_prefix/include" "$script_dir/verify-decoder.c" \
+	-L"$heic_staged_prefix/lib" -lheif -lde265 "-Wl,-rpath,$heic_staged_prefix/lib" \
+	-o "$MOTE_BUILD_DIR/verify-decoder" >&2
+"$MOTE_BUILD_DIR/verify-decoder" "$LIBHEIF_VERSION" "$LIBDE265_VERSION" >&2
 
 case "$platform" in
 	macos)
@@ -345,6 +406,9 @@ shell_quote() {
 }
 
 pkg_config_path="$heic_install_prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+printf 'export MOTE_HEIC_PREFIX='
+shell_quote "$heic_install_prefix"
+printf '\n'
 printf 'export PKG_CONFIG_PATH='
 shell_quote "$pkg_config_path"
 printf '\n'

@@ -219,6 +219,8 @@ function desktopFixture({
 	existingMarker = "accepted",
 	buildStatus = 0,
 	invalid = "",
+	inspectionStatus = 0,
+	signStatus = 0,
 } = {}) {
 	const repository = fixture();
 	const scripts = path.join(repository, "scripts");
@@ -237,6 +239,44 @@ function desktopFixture({
 		fs.chmodSync(path.join(scripts, "desktop-build.sh"), 0o755);
 	}
 	const stable = path.join(repository, "dist/macos/Mote.app");
+	const heicPackaging = path.join(repository, "packaging/heic");
+	fs.mkdirSync(heicPackaging, { recursive: true });
+	fs.writeFileSync(
+		path.join(heicPackaging, "build-unix.sh"),
+		`#!/bin/sh
+prefix="$PWD/build/heic-native/macos-universal"
+mkdir -p "$prefix/lib/pkgconfig"
+printf 'heif' > "$prefix/lib/libheif.dylib"
+printf 'de265' > "$prefix/lib/libde265.dylib"
+printf 'export MOTE_HEIC_PREFIX="%s"\\n' "$prefix"
+printf 'built' >> "$PWD/native-build-log"
+`,
+	);
+	fs.writeFileSync(
+		path.join(heicPackaging, "verify-native-deps.sh"),
+		`#!/bin/sh
+printf '%s\\n' "$*" >> "$PWD/native-inspection-log"
+case "$*" in *--app*)
+  [ "${inspectionStatus}" = 0 ] || exit "${inspectionStatus}"
+  app=$2
+  case "$*" in
+    *--no-heic*) [ ! -e "$app/Contents/Frameworks/libheif.dylib" ] && [ ! -e "$app/Contents/Frameworks/libde265.dylib" ] ;;
+    *) [ -f "$app/Contents/Frameworks/libheif.dylib" ] && [ -f "$app/Contents/Frameworks/libde265.dylib" ] ;;
+  esac ;;
+esac
+`,
+	);
+	for (const name of ["build-unix.sh", "verify-native-deps.sh"])
+		fs.chmodSync(path.join(heicPackaging, name), 0o755);
+	for (const name of ["install_name_tool", "codesign", "lipo"]) {
+		fs.writeFileSync(
+			path.join(bin, name),
+			`#!/bin/sh\nprintf '%s\\n' "$*" >> "$PWD/${name}-log"\nexit ${name === "codesign" ? signStatus : 0}\n`,
+		);
+		fs.chmodSync(path.join(bin, name), 0o755);
+	}
+	fs.writeFileSync(path.join(bin, "otool"), "#!/bin/sh\nprintf ''\n");
+	fs.chmodSync(path.join(bin, "otool"), 0o755);
 	fs.mkdirSync(stable, { recursive: true });
 	fs.writeFileSync(path.join(stable, "marker"), existingMarker);
 	fs.writeFileSync(
@@ -415,6 +455,80 @@ test("HEIC default desktop mode adds no Cargo feature arguments", () => {
 		fs.rmSync(repository, { recursive: true, force: true });
 	}
 });
+
+test("enabled desktop bundle stages and signs decoder dylibs before publication", () => {
+	const repository = desktopFixture();
+	try {
+		const result = runDesktopBuild(repository, "universal");
+		assert.equal(result.status, 0, result.stderr);
+		for (const name of ["libheif", "libde265"]) {
+			assert.ok(
+				fs.existsSync(
+					path.join(
+						repository,
+						`dist/macos/Mote.app/Contents/Frameworks/${name}.dylib`,
+					),
+				),
+			);
+		}
+		assert.match(
+			fs.readFileSync(path.join(repository, "native-inspection-log"), "utf8"),
+			/--app .*\.Mote\.app\.next.*--arch universal/,
+		);
+		assert.match(
+			fs.readFileSync(path.join(repository, "install_name_tool-log"), "utf8"),
+			/-add_rpath @executable_path\/\.\.\/Frameworks/,
+		);
+		assert.match(
+			fs.readFileSync(path.join(repository, "codesign-log"), "utf8"),
+			/--verify/,
+		);
+		assertDesktopTempsRemoved(repository);
+	} finally {
+		fs.rmSync(repository, { recursive: true, force: true });
+	}
+});
+
+test("disabled desktop builds skip native compilation and inspect the staged app", () => {
+	const repository = desktopFixture();
+	try {
+		const result = runDesktopBuild(repository, "universal", ["--no-heic"]);
+		assert.equal(result.status, 0, result.stderr);
+		assert.equal(
+			fs.existsSync(path.join(repository, "native-build-log")),
+			false,
+		);
+		assert.match(
+			fs.readFileSync(path.join(repository, "native-inspection-log"), "utf8"),
+			/--app .*--no-heic/,
+		);
+	} finally {
+		fs.rmSync(repository, { recursive: true, force: true });
+	}
+});
+
+for (const [name, options] of [
+	["native inspection", { inspectionStatus: 53 }],
+	["native signing", { signStatus: 53 }],
+]) {
+	test(`failed ${name} keeps the accepted app and removes desktop staging`, () => {
+		const repository = desktopFixture(options);
+		try {
+			const result = runDesktopBuild(repository, "universal");
+			assert.equal(result.status, 53, result.stderr);
+			assert.equal(
+				fs.readFileSync(
+					path.join(repository, "dist/macos/Mote.app/marker"),
+					"utf8",
+				),
+				"accepted",
+			);
+			assertDesktopTempsRemoved(repository);
+		} finally {
+			fs.rmSync(repository, { recursive: true, force: true });
+		}
+	});
+}
 
 for (const args of [
 	["--no-heic", "--no-heic"],
