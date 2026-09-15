@@ -110,12 +110,13 @@ mkdir -p "$CARGO_TARGET_DIR" "$output_dir"
 
 native_arch=$(uname -m)
 [ "$mode" != universal ] || native_arch=universal
+desktop_deployment_target=$(sh "$script_dir/macos-deployment-target.sh")
 if [ "$MOTE_HEIC_MODE" = enabled ]; then
 	if [ -z "${MOTE_HEIC_PREFIX:-}" ]; then
 		native_environment=$("$repository_root/packaging/heic/build-unix.sh" --platform macos --arch "$native_arch")
 		eval "$native_environment"
 	fi
-	"$repository_root/packaging/heic/verify-native-deps.sh" --prefix "$MOTE_HEIC_PREFIX" --arch "$native_arch"
+	"$repository_root/packaging/heic/verify-native-deps.sh" --prefix "$MOTE_HEIC_PREFIX" --arch "$native_arch" --deployment-target "$desktop_deployment_target"
 	export PKG_CONFIG_PATH="$MOTE_HEIC_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 	export DYLD_LIBRARY_PATH="$MOTE_HEIC_PREFIX/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 	[ "$mode" != universal ] || export PKG_CONFIG_ALLOW_CROSS=1
@@ -160,7 +161,7 @@ if [ "$MOTE_HEIC_MODE" = enabled ]; then
 	if ! otool -l "$executable" | grep -F 'path @executable_path/../Frameworks ' >/dev/null; then
 		install_name_tool -add_rpath @executable_path/../Frameworks "$executable"
 	fi
-	"$repository_root/packaging/heic/verify-native-deps.sh" --app "$staging_app" --arch "$native_arch"
+	"$repository_root/packaging/heic/verify-native-deps.sh" --app "$staging_app" --arch "$native_arch" --deployment-target "$desktop_deployment_target"
 	# Changing a Mach-O invalidates its signature. Sign nested libraries first,
 	# then the bundle, preserving Tauri's executable entitlements and flags.
 	for library in "$frameworks/libheif.dylib" "$frameworks/libde265.dylib"; do
@@ -169,7 +170,7 @@ if [ "$MOTE_HEIC_MODE" = enabled ]; then
 	codesign --force --sign "${APPLE_SIGNING_IDENTITY:--}" --preserve-metadata=identifier,entitlements,flags "$staging_app"
 	codesign --verify --deep --strict "$staging_app"
 else
-	"$repository_root/packaging/heic/verify-native-deps.sh" --app "$staging_app" --arch "$native_arch" --no-heic
+	"$repository_root/packaging/heic/verify-native-deps.sh" --app "$staging_app" --arch "$native_arch" --deployment-target "$desktop_deployment_target" --no-heic
 fi
 
 if [ -e "$stable_app" ]; then

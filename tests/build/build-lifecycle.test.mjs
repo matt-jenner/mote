@@ -227,12 +227,30 @@ function desktopFixture({
 	const bin = path.join(repository, "bin");
 	fs.mkdirSync(scripts);
 	fs.mkdirSync(bin);
-	for (const name of ["build-lifecycle.sh", "cargo-feature-mode.sh"]) {
+	for (const name of [
+		"build-lifecycle.sh",
+		"cargo-feature-mode.sh",
+		"macos-deployment-target.sh",
+	]) {
 		const source = path.join(root, "scripts", name);
 		if (fs.existsSync(source)) {
 			fs.copyFileSync(source, path.join(scripts, name));
 		}
 	}
+	const config = path.join(
+		repository,
+		"apps/desktop/src-tauri/tauri.conf.json",
+	);
+	fs.mkdirSync(path.dirname(config), { recursive: true });
+	fs.copyFileSync(
+		path.join(root, "apps/desktop/src-tauri/tauri.conf.json"),
+		config,
+	);
+	fs.writeFileSync(
+		path.join(bin, "plutil"),
+		`#!${process.execPath}\nconst fs = require('fs'); console.log(JSON.parse(fs.readFileSync(process.argv.at(-1))).bundle.macOS.minimumSystemVersion);\n`,
+	);
+	fs.chmodSync(path.join(bin, "plutil"), 0o755);
 	const desktopBuild = path.join(root, "scripts/desktop-build.sh");
 	if (fs.existsSync(desktopBuild)) {
 		fs.copyFileSync(desktopBuild, path.join(scripts, "desktop-build.sh"));
@@ -329,7 +347,7 @@ fi
 	return repository;
 }
 
-function runDesktopBuild(repository, mode, args = []) {
+function runDesktopBuild(repository, mode, args = [], environment = {}) {
 	return spawnSync(
 		path.join(repository, "scripts/desktop-build.sh"),
 		[mode, ...args],
@@ -339,6 +357,7 @@ function runDesktopBuild(repository, mode, args = []) {
 				...process.env,
 				TMPDIR: repository,
 				PATH: `${path.join(repository, "bin")}:${process.env.PATH}`,
+				...environment,
 			},
 			encoding: "utf8",
 		},
@@ -382,6 +401,113 @@ function assertDesktopTempsRemoved(repository) {
 		);
 	}
 }
+
+test("external native prefix is checked against the app deployment target before desktop compilation", () => {
+	const repository = desktopFixture();
+	try {
+		const config = path.join(
+			repository,
+			"apps/desktop/src-tauri/tauri.conf.json",
+		);
+		const app = JSON.parse(fs.readFileSync(config, "utf8"));
+		app.bundle.macOS.minimumSystemVersion = "12.3.4";
+		fs.writeFileSync(config, JSON.stringify(app));
+		const prefix = path.join(repository, "external prefix");
+		fs.mkdirSync(prefix);
+		const inspector = path.join(
+			repository,
+			"packaging/heic/verify-native-deps.sh",
+		);
+		fs.writeFileSync(
+			inspector,
+			`#!/bin/sh\nprintf '%s\\n' "$@" > "$PWD/external-inspection-argv"\nexit 54\n`,
+		);
+		const result = runDesktopBuild(repository, "universal", [], {
+			MOTE_HEIC_PREFIX: prefix,
+		});
+		assert.equal(result.status, 54, result.stderr);
+		assert.deepEqual(
+			fs
+				.readFileSync(path.join(repository, "external-inspection-argv"), "utf8")
+				.trim()
+				.split("\n"),
+			[
+				"--prefix",
+				prefix,
+				"--arch",
+				"universal",
+				"--deployment-target",
+				"12.3.4",
+			],
+		);
+		assert.equal(
+			fs.existsSync(path.join(repository, "native-build-log")),
+			false,
+		);
+		assert.equal(fs.existsSync(path.join(repository, "npm-argv")), false);
+		assert.equal(
+			fs.readFileSync(
+				path.join(repository, "dist/macos/Mote.app/marker"),
+				"utf8",
+			),
+			"accepted",
+		);
+		assertDesktopTempsRemoved(repository);
+	} finally {
+		fs.rmSync(repository, { recursive: true, force: true });
+	}
+});
+
+test("external prefix with a newer macOS minimum fails real inspection before desktop compilation", () => {
+	const repository = desktopFixture();
+	try {
+		const prefix = path.join(repository, "external prefix");
+		fs.mkdirSync(path.join(prefix, "lib"), { recursive: true });
+		for (const name of ["libheif", "libde265"])
+			fs.writeFileSync(path.join(prefix, "lib", `${name}.dylib`), "shared");
+		fs.copyFileSync(
+			path.join(root, "packaging/heic/verify-native-deps.sh"),
+			path.join(repository, "packaging/heic/verify-native-deps.sh"),
+		);
+		for (const [name, source] of [
+			[
+				"uname",
+				'#!/bin/sh\ncase "$1" in -s) echo Darwin ;; -m) echo arm64 ;; esac\n',
+			],
+			["lipo", "#!/bin/sh\necho arm64\n"],
+			[
+				"otool",
+				'#!/bin/sh\nprintf "Load command 0\\n      cmd LC_BUILD_VERSION\\n platform 1\\n    minos 26.0\\n"\n',
+			],
+		]) {
+			fs.writeFileSync(path.join(repository, "bin", name), source);
+			fs.chmodSync(path.join(repository, "bin", name), 0o755);
+		}
+		const result = runDesktopBuild(repository, "native", [], {
+			MOTE_HEIC_PREFIX: prefix,
+		});
+		assert.equal(result.status, 1, result.stderr);
+		assert.match(
+			result.stderr,
+			/minimum 26\.0 exceeds deployment target 11\.0/,
+		);
+		assert.equal(
+			fs.existsSync(path.join(repository, "native-build-log")),
+			false,
+		);
+		assert.equal(fs.existsSync(path.join(repository, "npm-argv")), false);
+		assert.equal(
+			fs.readFileSync(
+				path.join(repository, "dist/macos/Mote.app/marker"),
+				"utf8",
+			),
+			"accepted",
+		);
+		assertDesktopTempsRemoved(repository);
+	} finally {
+		fs.rmSync(repository, { recursive: true, force: true });
+	}
+});
 
 test("failed desktop build preserves the stable app", () => {
 	const repository = desktopFixture({ buildStatus: 17 });

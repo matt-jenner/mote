@@ -61,6 +61,7 @@ host_arch=$(uname -m)
 }
 if [ "$platform" = macos ]; then
 	case "$arch" in arm64 | x86_64 | universal) ;; *) usage; exit 2 ;; esac
+	heic_deployment_target=$(sh "$repository_root/scripts/macos-deployment-target.sh")
 elif [ "$host_arch" != "$arch" ]; then
 	printf '%s\n' "this builder only supports the current architecture ($host_arch), not $arch" >&2
 	exit 2
@@ -185,6 +186,7 @@ configure_cmake() {
 	# No loader may depend on a staging directory that cleanup will remove.
 	if [ "$platform" = macos ]; then
 		set -- "$@" "-DCMAKE_OSX_ARCHITECTURES=$heic_slice_arch" \
+			"-DCMAKE_OSX_DEPLOYMENT_TARGET=$heic_deployment_target" \
 			-DCMAKE_INSTALL_NAME_DIR=@rpath '-DCMAKE_INSTALL_RPATH=@loader_path'
 	else
 		set -- "$@" '-DCMAKE_INSTALL_RPATH=$ORIGIN'
@@ -352,8 +354,10 @@ if [ "$platform" = macos ]; then
 	install_name_tool -id @rpath/libheif.dylib \
 		-change @rpath/libde265.0.dylib @rpath/libde265.dylib "$heic_staged_prefix/lib/libheif.dylib"
 fi
+set -- --prefix "$heic_staged_prefix" --arch "$arch"
+[ "$platform" != macos ] || set -- "$@" --deployment-target "$heic_deployment_target"
 LD_LIBRARY_PATH="$heic_staged_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-	"$script_dir/verify-native-deps.sh" --prefix "$heic_staged_prefix" --arch "$arch" >&2
+	"$script_dir/verify-native-deps.sh" "$@" >&2
 
 # Run against the staged shared libraries, before publication. The probe and
 # its build-machine rpath are temporary and are never installed or bundled.

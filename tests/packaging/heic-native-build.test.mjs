@@ -64,6 +64,24 @@ const nativeFixture = ({ spaces = false } = {}) => {
 		path.join(root, "scripts/build-lifecycle.sh"),
 		path.join(scripts, "build-lifecycle.sh"),
 	);
+	if (fs.existsSync(path.join(root, "scripts/macos-deployment-target.sh")))
+		fs.copyFileSync(
+			path.join(root, "scripts/macos-deployment-target.sh"),
+			path.join(scripts, "macos-deployment-target.sh"),
+		);
+	const tauriConfig = path.join(
+		repository,
+		"apps/desktop/src-tauri/tauri.conf.json",
+	);
+	fs.mkdirSync(path.dirname(tauriConfig), { recursive: true });
+	fs.copyFileSync(
+		path.join(root, "apps/desktop/src-tauri/tauri.conf.json"),
+		tauriConfig,
+	);
+	writeExecutable(
+		path.join(bin, "plutil"),
+		`#!${process.execPath}\nconst fs = require('fs'); console.log(JSON.parse(fs.readFileSync(process.argv.at(-1))).bundle.macOS.minimumSystemVersion);\n`,
+	);
 
 	writeExecutable(
 		path.join(bin, "uname"),
@@ -96,7 +114,17 @@ fi
 for argument in "$@"; do file=$argument; done
 printf '%s:\\n' "$file"
 case "$*" in
-  *' -l '*|'-l '*) printf '' ;;
+  *' -l '*|'-l '*)
+    slice=$2
+    printf '%s|%s\\n' "$slice" "$file" >> "$FAKE_TOOL_LOG/minos-inspection"
+    minimum=\${FAKE_MINOS:-11.0}
+    case "$slice" in arm64) minimum=\${FAKE_MINOS_ARM64:-$minimum} ;; x86_64) minimum=\${FAKE_MINOS_X86_64:-$minimum} ;; esac
+    case "$file" in *libheif*) minimum=\${FAKE_MINOS_HEIF:-$minimum} ;; esac
+    case "\${FAKE_LOAD_FORMAT:-modern}" in
+      missing) ;;
+      legacy) printf 'Load command 0\\n      cmd LC_VERSION_MIN_MACOSX\\n  cmdsize 16\\n  version %s\\n      sdk 26.0\\n' "$minimum" ;;
+      *) printf 'Load command 0\\n      cmd LC_BUILD_VERSION\\n  cmdsize 32\\n platform %s\\n    minos %s\\n      sdk 26.0\\n' "\${FAKE_PLATFORM:-1}" "$minimum" ;;
+    esac ;;
   *)
     printf '\\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0)\\n'
     case "$file" in *libheif*) printf '\\t@rpath/libde265.dylib (compatibility version 0.0.0)\\n' ;; esac
@@ -201,6 +229,7 @@ esac
 build=
 prefix=
 previous=
+printf '%s\\n' "$*" >> "$FAKE_TOOL_LOG/cmake-configures"
 for argument in "$@"; do
   if [ "$previous" = B ]; then build=$argument; previous=; continue; fi
   case "$argument" in
@@ -475,6 +504,118 @@ test("TERM at publication activation preserves the previous prefix", () => {
 		const interrupted = runNativeBuilder(fixture);
 		assert.equal(interrupted.status, 143, interrupted.stderr);
 		assert.equal(fs.readFileSync(marker, "utf8"), "keep");
+		assertNoEphemeralNativePaths(fixture);
+	} finally {
+		fs.rmSync(fixture.repository, { recursive: true, force: true });
+	}
+});
+
+for (const arch of ["arm64", "universal"]) {
+	test(`macOS deployment target follows app configuration for both decoders (${arch})`, () => {
+		const fixture = nativeFixture();
+		try {
+			const config = path.join(
+				fixture.repository,
+				"apps/desktop/src-tauri/tauri.conf.json",
+			);
+			const app = JSON.parse(fs.readFileSync(config, "utf8"));
+			app.bundle.macOS.minimumSystemVersion = "13.4.5";
+			fs.writeFileSync(config, JSON.stringify(app));
+			const result = runNativeBuilder(fixture, {}, arch);
+			assert.equal(result.status, 0, result.stderr);
+			const calls = fs
+				.readFileSync(path.join(fixture.log, "cmake-configures"), "utf8")
+				.trim()
+				.split("\n");
+			assert.equal(calls.length, arch === "universal" ? 4 : 2);
+			for (const call of calls)
+				assert.match(call, /-DCMAKE_OSX_DEPLOYMENT_TARGET=13\.4\.5(?: |$)/);
+			assertNoEphemeralNativePaths(fixture);
+		} finally {
+			fs.rmSync(fixture.repository, { recursive: true, force: true });
+		}
+	});
+}
+
+for (const [name, target, environment, accepted] of [
+	["equal padded version", "11.0", { FAKE_MINOS: "11.0.0" }, true],
+	["older minor", "10.10", { FAKE_MINOS: "10.9" }, true],
+	["newer minor", "11.9", { FAKE_MINOS: "11.10" }, false],
+	["newer patch in libheif", "11.0", { FAKE_MINOS_HEIF: "11.0.1" }, false],
+	["newer x86 slice", "11.0", { FAKE_MINOS_X86_64: "26.0" }, false],
+	["newer arm slice", "11.0", { FAKE_MINOS_ARM64: "26.0" }, false],
+	[
+		"legacy load command",
+		"11.0",
+		{ FAKE_LOAD_FORMAT: "legacy", FAKE_MINOS: "10.15.7" },
+		true,
+	],
+	["named macOS platform", "11.0", { FAKE_PLATFORM: "macos" }, true],
+	["wrong platform", "11.0", { FAKE_PLATFORM: "2" }, false],
+	["missing minimum", "11.0", { FAKE_LOAD_FORMAT: "missing" }, false],
+	["invalid minimum", "11.0", { FAKE_MINOS: "11.bad" }, false],
+]) {
+	test(`macOS deployment inspection handles ${name} in every universal slice`, () => {
+		const fixture = nativeFixture();
+		try {
+			const prefix = fixturePrefix(fixture);
+			fs.mkdirSync(path.join(prefix, "lib"), { recursive: true });
+			for (const library of ["libheif", "libde265"])
+				fs.writeFileSync(
+					path.join(prefix, "lib", `${library}.dylib`),
+					"shared",
+				);
+			const result = spawnSync(
+				"sh",
+				[
+					path.join(fixture.packaging, "verify-native-deps.sh"),
+					"--prefix",
+					prefix,
+					"--arch",
+					"universal",
+					"--deployment-target",
+					target,
+				],
+				{ env: fixtureEnvironment(fixture, environment), encoding: "utf8" },
+			);
+			assert.equal(
+				result.status === 0,
+				accepted,
+				result.stdout + result.stderr,
+			);
+			if (accepted) {
+				const inspected = fs.readFileSync(
+					path.join(fixture.log, "minos-inspection"),
+					"utf8",
+				);
+				for (const slice of ["arm64", "x86_64"])
+					for (const library of ["libheif", "libde265"])
+						assert.ok(
+							inspected.includes(`${slice}|${prefix}/lib/${library}.dylib`),
+						);
+			} else assert.match(result.stderr, /deployment|minimum|platform/i);
+		} finally {
+			fs.rmSync(fixture.repository, { recursive: true, force: true });
+		}
+	});
+}
+
+test("macOS deployment inspection failure preserves the previous native prefix and cleans staging", () => {
+	const fixture = nativeFixture();
+	try {
+		const prefix = fixturePrefix(fixture);
+		fs.mkdirSync(prefix, { recursive: true });
+		fs.writeFileSync(path.join(prefix, "previous"), "keep");
+		const result = runNativeBuilder(fixture, { FAKE_MINOS: "26.0" });
+		assert.equal(result.status, 1, result.stderr);
+		assert.match(
+			result.stderr,
+			/minimum 26\.0 exceeds deployment target 11\.0/,
+		);
+		assert.equal(
+			fs.readFileSync(path.join(prefix, "previous"), "utf8"),
+			"keep",
+		);
 		assertNoEphemeralNativePaths(fixture);
 	} finally {
 		fs.rmSync(fixture.repository, { recursive: true, force: true });

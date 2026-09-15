@@ -2,7 +2,7 @@
 set -eu
 
 usage() {
-	printf '%s\n' "usage: $0 [--prefix DIR | --app Mote.app] [--binary FILE] [--arch ARCH|universal] [--no-heic]" >&2
+	printf '%s\n' "usage: $0 [--prefix DIR | --app Mote.app] [--binary FILE] [--arch ARCH|universal] [--deployment-target VERSION] [--no-heic]" >&2
 	exit 2
 }
 fail() { printf '%s\n' "$*" >&2; exit 1; }
@@ -11,11 +11,12 @@ app=
 binary=
 arch=$(uname -m)
 disabled=0
+deployment_target=
 while [ "$#" -gt 0 ]; do
 	case "$1" in
-		--prefix | --app | --binary | --arch)
+		--prefix | --app | --binary | --arch | --deployment-target)
 			[ "$#" -ge 2 ] || usage
-			case "$1" in --prefix) prefix=$2 ;; --app) app=$2 ;; --binary) binary=$2 ;; --arch) arch=$2 ;; esac
+			case "$1" in --prefix) prefix=$2 ;; --app) app=$2 ;; --binary) binary=$2 ;; --arch) arch=$2 ;; --deployment-target) deployment_target=$2 ;; esac
 			shift 2 ;;
 		--no-heic) disabled=1; shift ;;
 		*) usage ;;
@@ -26,6 +27,13 @@ done
 system=$(uname -s)
 case "$system" in Darwin | Linux) ;; *) fail "unsupported inspection host: $system" ;; esac
 case "$arch" in '' | *[!a-zA-Z0-9_-]*) usage ;; esac
+if [ "$system" = Darwin ]; then
+	if [ -z "$deployment_target" ]; then
+		inspection_script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+		deployment_target=$(sh "$inspection_script_dir/../../scripts/macos-deployment-target.sh")
+	fi
+	printf '%s\n' "$deployment_target" | grep -E '^[0-9]+(\.[0-9]+)?(\.[0-9]+)?$' >/dev/null || fail 'invalid macOS deployment target'
+fi
 library_dir=
 scan_root=$prefix
 if [ -n "$prefix" ]; then
@@ -52,6 +60,38 @@ if [ -n "$scan_root" ]; then
 		fail "HEIF-disabled artifact contains native decoder files: $scan_root"
 	fi
 fi
+
+inspect_deployment_target() {
+	deployment_file=$1
+	deployment_slices=$(lipo -archs "$deployment_file")
+	[ -n "$deployment_slices" ] || fail "missing architecture for deployment inspection: $deployment_file"
+	for deployment_slice in $deployment_slices; do
+		case "$deployment_slice" in arm64 | x86_64) ;; *) fail "unsupported deployment architecture: $deployment_slice" ;; esac
+		# Query one slice at a time: a universal header alone cannot establish
+		# that both slices carry a compatible macOS load command.
+		deployment_commands=$(otool -arch "$deployment_slice" -l "$deployment_file")
+		deployment_minimum=$(printf '%s\n' "$deployment_commands" | awk '
+			$1 == "cmd" { kind = $2; platform = "" }
+			kind == "LC_BUILD_VERSION" && $1 == "platform" { platform = tolower($2) }
+			kind == "LC_BUILD_VERSION" && $1 == "minos" {
+				if (platform != "1" && platform != "macos") exit 1
+				print $2; count++
+			}
+			kind == "LC_VERSION_MIN_MACOSX" && $1 == "version" { print $2; count++ }
+			END { if (count != 1) exit 1 }
+		') || fail "missing or invalid macOS minimum/platform for $deployment_slice: $deployment_file"
+		# Numeric component comparison, padding absent minor/patch with zero.
+		# Lexical and decimal-number comparisons misorder 11.10 and 11.9.
+		awk -v minimum="$deployment_minimum" -v expected="$deployment_target" 'BEGIN {
+			if (minimum !~ /^[0-9]+([.][0-9]+)?([.][0-9]+)?$/) exit 1
+			split(minimum, actual, "."); split(expected, target, ".")
+			for (i = 1; i <= 3; i++) {
+				if (actual[i] + 0 < target[i] + 0) exit 0
+				if (actual[i] + 0 > target[i] + 0) exit 1
+			}
+		}' || fail "macOS minimum $deployment_minimum exceeds deployment target $deployment_target or is invalid ($deployment_slice): $deployment_file"
+	done
+}
 
 inspect() {
 	inspect_file=$1
@@ -115,6 +155,11 @@ inspect() {
 	fi
 }
 
+if [ "$system" = Darwin ] && [ -n "$scan_root" ]; then
+	find "$scan_root" \( -type f -o -type l \) -name '*.dylib' -print | while IFS= read -r deployment_library; do
+		inspect_deployment_target "$deployment_library"
+	done
+fi
 if [ "$disabled" -eq 0 ] && [ -n "$library_dir" ]; then
 	case "$system" in Darwin) suffix=dylib ;; Linux) suffix=so ;; esac
 	inspect "$library_dir/libde265.$suffix"
