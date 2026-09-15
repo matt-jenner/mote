@@ -32,19 +32,32 @@ async function hostedFixture(downloads: boolean) {
 		throw new Error("No fixture port");
 	const port = address.port;
 	await new Promise<void>((resolve) => socket.close(() => resolve()));
-	const child = spawn("cargo", ["run", "-p", "photo-server"], {
-		cwd: project,
-		env: {
-			...process.env,
-			PHOTO_VIEWER_DATA_DIR: path.join(directory, "data"),
-			PHOTO_VIEWER_CACHE_DIR: path.join(directory, "cache"),
-			PHOTO_VIEWER_SOURCE_ROOT: path.join(directory, "photos"),
-			PHOTO_VIEWER_WEB_ROOT: webRoot,
-			PHOTO_VIEWER_BIND: `127.0.0.1:${port}`,
-			PHOTO_VIEWER_ALLOW_ORIGINAL_DOWNLOADS: downloads ? "true" : "",
+	// JPEG-only host fixtures do not need the native HEIC libraries packaged
+	// inside the smoke container. Keep their Cargo features explicit in both modes.
+	const child = spawn(
+		"cargo",
+		[
+			"run",
+			"-p",
+			"photo-server",
+			"--no-default-features",
+			"--features",
+			"mote-defaults",
+		],
+		{
+			cwd: project,
+			env: {
+				...process.env,
+				PHOTO_VIEWER_DATA_DIR: path.join(directory, "data"),
+				PHOTO_VIEWER_CACHE_DIR: path.join(directory, "cache"),
+				PHOTO_VIEWER_SOURCE_ROOT: path.join(directory, "photos"),
+				PHOTO_VIEWER_WEB_ROOT: webRoot,
+				PHOTO_VIEWER_BIND: `127.0.0.1:${port}`,
+				PHOTO_VIEWER_ALLOW_ORIGINAL_DOWNLOADS: downloads ? "true" : "",
+			},
+			stdio: ["ignore", "pipe", "pipe"],
 		},
-		stdio: ["ignore", "pipe", "pipe"],
-	});
+	);
 	let output = "";
 	child.stdout.on("data", (chunk) => {
 		output += String(chunk);

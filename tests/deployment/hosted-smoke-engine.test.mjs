@@ -9,13 +9,88 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
+import { stripTypeScriptTypes } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "../..");
 const smokeScript = path.join(repositoryRoot, "scripts/hosted-smoke.sh");
 const smokeAssets = path.join(repositoryRoot, "scripts/hosted-smoke-assets.sh");
+
+test("JPEG Picks host fixture uses only mote-defaults in either HEIC smoke mode", async () => {
+	const filename = path.join(repositoryRoot, "tests/hosted/picks.spec.ts");
+	// Supply all imported dependencies explicitly instead of loading Playwright
+	// or granting the fixture access to real subprocesses, sockets, or files.
+	const source = stripTypeScriptTypes(readFileSync(filename, "utf8")).replace(
+		/^import\b[^;]+;\s*/gm,
+		"",
+	);
+	for (const mode of ["enabled", "disabled"]) {
+		for (const downloads of [false, true]) {
+			const environment = {
+				PATH: "/fixture/tools",
+				CARGO_TARGET_DIR: "/fixture/cargo-target",
+				PHOTO_VIEWER_HEIC_MODE: mode,
+				PHOTO_VIEWER_WEB_ROOT: "/fixture/web",
+				PHOTO_VIEWER_BIND: "overridden",
+				PHOTO_VIEWER_ALLOW_ORIGINAL_DOWNLOADS: "overridden",
+			};
+			let invocation;
+			const launchRecorded = new Error("stopped before launching Cargo");
+			const fixture = runInNewContext(`${source}\nhostedFixture;`, {
+				spawn: (...args) => {
+					invocation = JSON.parse(JSON.stringify(args));
+					throw launchRecorded;
+				},
+				path: path.posix,
+				__dirname: "/fixture/project/tests/hosted",
+				os: { tmpdir: () => "/fixture/temp" },
+				readFile: async () => "",
+				mkdtemp: async () => "/fixture/session",
+				mkdir: async () => {},
+				copyFile: async () => {},
+				once: async () => {},
+				createServer: () => ({
+					listen() {},
+					address: () => ({ port: 43210 }),
+					close: (callback) => callback(),
+				}),
+				test: { describe() {} },
+				process: { env: environment },
+			});
+			await assert.rejects(
+				fixture(downloads),
+				(error) => error === launchRecorded,
+			);
+			assert.deepEqual(invocation, [
+				"cargo",
+				[
+					"run",
+					"-p",
+					"photo-server",
+					"--no-default-features",
+					"--features",
+					"mote-defaults",
+				],
+				{
+					cwd: "/fixture/project",
+					env: {
+						...environment,
+						PHOTO_VIEWER_DATA_DIR: "/fixture/session/data",
+						PHOTO_VIEWER_CACHE_DIR: "/fixture/session/cache",
+						PHOTO_VIEWER_SOURCE_ROOT: "/fixture/session/photos",
+						PHOTO_VIEWER_WEB_ROOT: "/fixture/web",
+						PHOTO_VIEWER_BIND: "127.0.0.1:43210",
+						PHOTO_VIEWER_ALLOW_ORIGINAL_DOWNLOADS: downloads ? "true" : "",
+					},
+					stdio: ["ignore", "pipe", "pipe"],
+				},
+			]);
+		}
+	}
+});
 
 test("HEIC container separates native build and runtime copies and supports disabled builds", () => {
 	const source = readFileSync(
@@ -35,6 +110,7 @@ test("HEIC hosted smoke uses cleared source media and inspects both package mode
 	const source = readFileSync(smokeScript, "utf8");
 	assert.match(source, /fixtures\/heif\/iphone-8bit.heic/);
 	assert.match(source, /PHOTO_VIEWER_HEIC_MODE="\$MOTE_HEIC_MODE"/);
+	assert.match(source, /PHOTO_VIEWER_BASE_URL="\$base_url"/);
 	assert.match(source, /verify-linux-runtime.sh/);
 	assert.match(source, /run --rm --interactive --name "\$container_name"/);
 	const browser = readFileSync(
@@ -50,6 +126,30 @@ test("HEIC hosted smoke uses cleared source media and inspects both package mode
 		/totalPhotos/,
 	])
 		assert.match(browser, contract);
+	assert.doesNotMatch(browser, /node:child_process|\bspawn\s*\(/);
+	assert.match(browser, /page\.goto\("\/"\)/);
+	const config = readFileSync(
+		path.join(repositoryRoot, "tests/hosted/playwright.config.ts"),
+		"utf8",
+	);
+	assert.match(config, /baseURL: process\.env\.PHOTO_VIEWER_BASE_URL/);
+	const isolatedBrowser = stripTypeScriptTypes(browser).replace(
+		/^import\b[^;]+;\s*/gm,
+		"",
+	);
+	for (const [mode, expected] of [
+		["enabled", true],
+		["disabled", false],
+	]) {
+		assert.equal(
+			runInNewContext(`${isolatedBrowser}\nenabled;`, {
+				path,
+				process: { env: { PHOTO_VIEWER_HEIC_MODE: mode } },
+				test() {},
+			}),
+			expected,
+		);
+	}
 });
 
 test("HEIC container Cargo command builds defaults or only mote-defaults", () => {
