@@ -297,8 +297,8 @@ esac
 assert_image_runtime_user
 "$container_engine" run --rm --interactive --name "$container_name" \
 	--label "$asset_label" --label "$owner_label" --network=none --read-only \
-	--entrypoint sh "$image_name" \
-	-s -- /usr/local /usr/local/bin/photo-server "$MOTE_HEIC_MODE" \
+	--user 0:0 --entrypoint sh "$image_name" \
+	-s -- / /usr/local/bin/photo-server "$MOTE_HEIC_MODE" \
 	< "$project_dir/packaging/heic/verify-linux-runtime.sh"
 
 browser_web_root="$temporary_root/web"

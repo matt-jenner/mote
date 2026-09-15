@@ -28,7 +28,18 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 candidate_root="$MOTE_BUILD_DIR/generated"
-cp -R "$output_root" "$candidate_root"
+for record in "$output_root"/* "$output_root"/.[!.]* "$output_root"/..?*; do
+  [[ -e "$record" || -L "$record" ]] || continue
+  case "${record##*/}" in
+    cargo-sources.json|node-sources.json|source-lock.json)
+      [[ -f "$record" && ! -L "$record" ]] || { echo "unexpected generated record: $record" >&2; exit 1; } ;;
+    *) echo "unexpected generated record: $record" >&2; exit 1 ;;
+  esac
+done
+mkdir "$candidate_root"
+for record in cargo-sources.json node-sources.json source-lock.json; do
+  install -m0644 "$output_root/$record" "$candidate_root/$record"
+done
 if [[ "$1" != --offline ]]; then
   tools_root="$(cd -- "$1" && pwd)"
   [[ -f "$tools_root/cargo/flatpak-cargo-generator.py" ]]
@@ -47,7 +58,10 @@ fs.writeFileSync(file, JSON.stringify({ generator: { repository, commit } }));
 NODE
 fi
 node "$repository_root/scripts/flatpak-source-lock.mjs" "$repository_root" "$candidate_root"
-cp -R "$candidate_root" "$stage"
+mkdir "$stage"
+for record in cargo-sources.json node-sources.json source-lock.json; do
+  install -m0644 "$candidate_root/$record" "$stage/$record"
+done
 active=true
 mv "$output_root" "$backup"
 mv "$stage" "$output_root"

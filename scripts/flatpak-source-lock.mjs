@@ -9,12 +9,25 @@ if (!root || !output)
 	throw new Error("expected repository and candidate directory");
 const read = (file) => fs.readFileSync(path.join(root, file), "utf8");
 const digest = (file) => createHash("sha256").update(read(file)).digest("hex");
+const generatedRecords = new Set([
+	"cargo-sources.json",
+	"node-sources.json",
+	"source-lock.json",
+]);
+for (const file of fs.readdirSync(output)) {
+	if (
+		!generatedRecords.has(file) ||
+		!fs.lstatSync(path.join(output, file)).isFile()
+	)
+		throw new Error(`unexpected generated record: ${file}`);
+}
 const nodeSources = JSON.parse(
 	fs.readFileSync(path.join(output, "node-sources.json"), "utf8"),
 );
-for (const pkg of Object.values(
+const npmPackages = Object.values(
 	JSON.parse(read("package-lock.json")).packages,
-)) {
+).filter((pkg) => !pkg.link && pkg.resolved);
+for (const pkg of npmPackages) {
 	if (pkg.link || !pkg.resolved) continue;
 	const [algorithm, base64] = (pkg.integrity ?? "").split("-");
 	const hex = Buffer.from(base64 ?? "", "base64").toString("hex");
@@ -26,6 +39,29 @@ for (const pkg of Object.values(
 	)
 		throw new Error(
 			`missing or stale npm source: ${pkg.resolved}; run flatpak-node-generator`,
+		);
+}
+for (const source of nodeSources) {
+	if (!["archive", "file"].includes(source.type)) continue;
+	// Package tarballs live in npm's content cache, including private-registry
+	// packages. Browser/runtime archives use the generator's separate cache.
+	const packageSource =
+		/(?:^|\/)npm-cache(?:\/|$)/.test(source.dest ?? "") ||
+		/^https?:\/\/registry\.npmjs\.org\//.test(source.url ?? "") ||
+		npmPackages.some((pkg) => pkg.resolved === source.url);
+	if (!packageSource) continue;
+	if (
+		!npmPackages.some((pkg) => {
+			const [algorithm, base64] = (pkg.integrity ?? "").split("-");
+			return (
+				source.url === pkg.resolved &&
+				source[algorithm] ===
+					Buffer.from(base64 ?? "", "base64").toString("hex")
+			);
+		})
+	)
+		throw new Error(
+			`obsolete npm source: ${source.url}; run flatpak-node-generator`,
 		);
 }
 const packages = new Map();
