@@ -152,6 +152,7 @@ for (const args of [
 	["--no-heicc"],
 	["--no-hiec"],
 	["--no-HEIC"],
+	["--no-heif"],
 ]) {
 	test(`HEIC hosted smoke rejects invalid Mote arguments: ${args.join(" ")}`, () => {
 		const fixture = failingBuildEngineFixture();

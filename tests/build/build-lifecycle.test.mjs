@@ -372,6 +372,7 @@ for (const mode of ["native", "universal"]) {
 			const result = runDesktopBuild(repository, mode, [
 				"--no-heic",
 				"--config=libheif.toml",
+				"-v",
 				"--ci",
 			]);
 			assert.equal(result.status, 0, result.stderr);
@@ -386,6 +387,7 @@ for (const mode of ["native", "universal"]) {
 				["--no-default-features", "--features", "mote-defaults"],
 			);
 			assert.equal(arguments_.includes("--config=libheif.toml"), true);
+			assert.equal(arguments_.includes("-v"), true);
 			assert.equal(arguments_.at(-1), "--ci");
 			assertDesktopTempsRemoved(repository);
 		} finally {
@@ -419,6 +421,7 @@ for (const args of [
 	["--no-heicc"],
 	["--no-hiec"],
 	["--no-HEIC"],
+	["--no-heif"],
 ]) {
 	test(`HEIC desktop mode rejects invalid Mote arguments: ${args.join(" ")}`, () => {
 		const repository = desktopFixture();
@@ -438,6 +441,9 @@ for (const args of [
 	["--no-heic", "--features", "heic"],
 	["--no-heic", "--features=heic"],
 	["--no-default-features"],
+	["--no-heic", "-f", "heic"],
+	["--no-heic", "-fheic"],
+	["--no-heic", "-f=heic"],
 ]) {
 	test(`desktop Mote mode rejects Cargo feature overrides: ${args.join(" ")}`, () => {
 		const repository = desktopFixture();

@@ -29,7 +29,7 @@ for argument in "$@"; do
 		exit 2
 	fi
 	case "$argument" in
-		--all-features | --features | --features=* | --no-default-features)
+		-f* | --all-features | --features | --features=* | --no-default-features)
 			usage
 			exit 2
 			;;

@@ -10,7 +10,7 @@ mote_disable_heic() {
 
 mote_is_invalid_heic_flag() {
 	case "$1" in
-		--no-heic | --no-heic=* | --no-heicc | --no-hiec | --no-HEIC) return 0 ;;
+		--no-heic | --no-heic=* | --no-heif | --no-heicc | --no-hiec | --no-HEIC) return 0 ;;
 		*) return 1 ;;
 	esac
 }

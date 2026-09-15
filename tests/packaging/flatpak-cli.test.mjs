@@ -204,6 +204,7 @@ for (const args of [
 	["--no-heicc"],
 	["--no-hiec"],
 	["--no-HEIC"],
+	["--no-heif"],
 ]) {
 	test(`HEIC Flatpak package rejects invalid Mote arguments: ${args.join(" ")}`, () => {
 		const fixtureDirectory = flatpakFixture();
