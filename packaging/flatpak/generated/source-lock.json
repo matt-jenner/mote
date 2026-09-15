@@ -6,7 +6,7 @@
   "cargoGenerator": "scripts/flatpak-source-lock.mjs",
   "lockfiles": {
     "package-lock.json": "099a092687ed6019e28a04aa093c556ab55b8abe4e4acebae047d184159be254",
-    "Cargo.lock": "4352eaadd3819f8e6cf9bf8f4b9ee6988beb938292b71f3e9f8cd022c6c84d53",
+    "Cargo.lock": "c4ef35fdde3fb03322fcd9c09c915e1a9c64f29490a48d22fbe5aa5785ef40f9",
     "apps/desktop/src-tauri/Cargo.lock": "469e308cabc44e021787ef7c1ba7fb86165e04b4b08d2613153bb5e8bfece706",
     "packaging/heic/versions.env": "29fd3e8fbb85816a5eaac80f48392b26fa21961b5f8cf8c1e9e1ee0db5c89eef"
   },

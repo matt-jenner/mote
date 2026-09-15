@@ -1,6 +1,6 @@
 # libde265 1.1.1
 
-Copyright (c) 2013-2014 Struktur AG  
+Copyright (c) 2013-2014 Struktur AG
 Copyright (c) 2013-2026 Dirk Farin
 
 The release's `AUTHORS` file names Dirk Farin and Joachim Bauch. The library is

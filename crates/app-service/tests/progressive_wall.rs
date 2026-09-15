@@ -1,4 +1,6 @@
 use std::collections::BTreeSet;
+#[cfg(feature = "heic")]
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -21,6 +23,8 @@ use photo_domain::{
     MediaKind, RelativePathKey,
 };
 use photo_metadata::{MetadataBundle, MetadataCandidate, MetadataReadWarning, MetadataSource};
+#[cfg(feature = "heic")]
+use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
 struct BlockingReader {
@@ -116,6 +120,64 @@ struct ProgressiveFixture {
     temp: tempfile::TempDir,
     source: PathBuf,
     config: AppConfig,
+}
+
+#[cfg(feature = "heic")]
+#[derive(Debug, Eq, PartialEq)]
+enum SourcePermissions {
+    #[cfg(unix)]
+    UnixMode(u32),
+    #[cfg(not(unix))]
+    ReadOnly(bool),
+}
+
+#[cfg(feature = "heic")]
+#[derive(Debug, Eq, PartialEq)]
+struct SourceFileSnapshot {
+    name: OsString,
+    sha256: [u8; 32],
+    size: u64,
+    modified: std::time::SystemTime,
+    permissions: SourcePermissions,
+}
+
+#[cfg(feature = "heic")]
+fn source_file_snapshots(root: &Path) -> Vec<SourceFileSnapshot> {
+    let mut paths = std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let metadata = std::fs::metadata(&path).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            #[cfg(unix)]
+            let permissions = {
+                use std::os::unix::fs::PermissionsExt;
+                SourcePermissions::UnixMode(metadata.permissions().mode())
+            };
+            #[cfg(not(unix))]
+            let permissions = SourcePermissions::ReadOnly(metadata.permissions().readonly());
+            SourceFileSnapshot {
+                name: path.file_name().unwrap().to_owned(),
+                sha256: Sha256::digest(bytes).into(),
+                size: metadata.len(),
+                // Compare the filesystem's native SystemTime value directly so
+                // its own timestamp precision is preserved on every platform.
+                modified: metadata.modified().unwrap(),
+                permissions,
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "heic")]
+fn heif_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../codec/tests/fixtures/heif")
+        .join(name)
 }
 
 fn managed_cache_files(root: &Path) -> BTreeSet<PathBuf> {
@@ -487,6 +549,17 @@ fn query(direction: SortDirection) -> WallQueryRequest {
         limit: 50,
         direction,
     }
+}
+
+#[cfg(feature = "heic")]
+async fn wait_for_scan_cleanup(service: &AppService) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while service.active_scan_count_test() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("settled scan did not release its active scan state");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2392,6 +2465,178 @@ async fn assert_compiled_photo_capability(expect_heif: bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enabled_build_presents_and_generates_derivatives_for_heif() {
     assert_compiled_photo_capability(true).await;
+}
+
+#[cfg(feature = "heic")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn corrupt_heif_is_isolated_while_healthy_jpeg_and_heif_finish_without_source_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("photos");
+    std::fs::create_dir(&source).unwrap();
+    ImageBuffer::from_pixel(16, 12, Rgb([20_u8, 40, 60]))
+        .save(source.join("healthy.jpg"))
+        .unwrap();
+    std::fs::copy(
+        heif_fixture("iphone-8bit.heic"),
+        source.join("healthy.heic"),
+    )
+    .unwrap();
+    std::fs::copy(heif_fixture("truncated.heic"), source.join("corrupt.heic")).unwrap();
+    let source_before = source_file_snapshots(&source);
+    assert_eq!(
+        source_before
+            .iter()
+            .map(|file| file.name.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        ["corrupt.heic", "healthy.heic", "healthy.jpg"]
+    );
+
+    let config = AppConfig::new(temp.path().join("data"), temp.path().join("cache"));
+    let service = AppService::open_with_reader(
+        config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service
+        .set_interaction(photo_app_service::InteractionState::Active)
+        .await;
+    let bootstrap = service.start_scan(&source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    wait_for_scan_cleanup(&service).await;
+
+    let library_id =
+        LibraryId::from_uuid(uuid::Uuid::parse_str(&bootstrap.active_source.unwrap().id).unwrap());
+    let asset_id = |name: &str| {
+        AssetId::for_path(
+            library_id,
+            &RelativePathKey::from_relative_path(Path::new(name)).unwrap(),
+        )
+    };
+    let corrupt_id = asset_id("corrupt.heic");
+    let healthy_ids = [asset_id("healthy.heic"), asset_id("healthy.jpg")];
+    let all_ids = [corrupt_id, healthy_ids[0], healthy_ids[1]]
+        .into_iter()
+        .map(|id| id.as_uuid().hyphenated().to_string())
+        .collect::<Vec<_>>();
+
+    let failure = tokio::time::timeout(
+        Duration::from_secs(10),
+        service.request_derivatives(DerivativeRequest::visible(all_ids)),
+    )
+    .await
+    .expect("corrupt HEIF must not stall the derivative batch")
+    .expect_err("the corrupt HEIF must fail its wall derivative");
+    assert_eq!(
+        failure.to_string(),
+        "one or more requested previews could not be generated"
+    );
+    let corrupt_text = corrupt_id.as_uuid().hyphenated().to_string();
+    let warning = recv_until(&mut updates, |event| {
+        matches!(
+            event,
+            WallUpdate::Warning {
+                asset_id: Some(id),
+                warning: WallWarningState {
+                    code,
+                    retryable: false,
+                },
+                ..
+            } if id == &corrupt_text && code == "wallThumbnailUnavailable"
+        )
+    })
+    .await;
+    assert!(matches!(
+        warning,
+        WallUpdate::Warning {
+            asset_id: Some(id),
+            warning: WallWarningState { code, retryable: false },
+            ..
+        } if id == corrupt_text && code == "wallThumbnailUnavailable"
+    ));
+
+    let healthy_text = healthy_ids
+        .iter()
+        .map(|id| id.as_uuid().hyphenated().to_string())
+        .collect::<Vec<_>>();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        service.request_derivatives(DerivativeRequest::visible_screen_preview(healthy_text)),
+    )
+    .await
+    .expect("healthy screen derivatives must not stall behind corrupt HEIF")
+    .unwrap();
+    service.wait_for_derivative_tasks_quiescent_test().await;
+
+    let page = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    let mut names = page
+        .items
+        .iter()
+        .map(|asset| asset.display_name.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, ["healthy.heic", "healthy.jpg"]);
+    assert_eq!(page.total_count, 2);
+    for asset in &page.items {
+        for reference in [
+            asset.wall_thumbnail.as_ref().unwrap(),
+            asset.screen_preview.as_ref().unwrap(),
+        ] {
+            let bytes = service
+                .read_derivative(&reference.asset_id, reference.kind, &reference.key)
+                .unwrap();
+            assert_eq!(
+                image::guess_format(&bytes).unwrap(),
+                image::ImageFormat::Jpeg
+            );
+        }
+    }
+
+    let catalog = Catalog::open(&config.catalog_path()).unwrap();
+    let corrupt = catalog.find_asset(corrupt_id).unwrap().unwrap();
+    let corrupt_key = wall_cache_key(&corrupt);
+    let terminal = catalog
+        .find_terminal_derivative_failure(
+            corrupt_id,
+            "wall_thumbnail",
+            &corrupt_key,
+            corrupt.availability,
+        )
+        .unwrap()
+        .expect("corrupt HEIF terminal failure must persist");
+    assert_eq!(terminal.failure_code, "derivative_generation_terminal");
+    assert!(catalog.warning_count().unwrap() > 0);
+    assert!(
+        catalog
+            .derivatives_for_assets(&[corrupt_id], "wall_thumbnail")
+            .unwrap()
+            .is_empty()
+    );
+    for healthy_id in healthy_ids {
+        assert_eq!(
+            catalog
+                .derivatives_for_assets(&[healthy_id], "wall_thumbnail")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            catalog
+                .derivatives_for_assets(&[healthy_id], "screen_preview")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    drop(catalog);
+
+    assert_eq!(source_file_snapshots(&source), source_before);
 }
 
 #[cfg(not(feature = "heic"))]

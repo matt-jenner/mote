@@ -98,6 +98,7 @@ jobs:
           node-version: 24.18.0
           cache: npm
       - run: npm ci
+      - run: npm run test:build
       - run: npm exec -- playwright install --with-deps chromium
       - run: npm run check
       - run: npm run test:flatpak

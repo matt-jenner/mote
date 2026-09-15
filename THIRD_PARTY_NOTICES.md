@@ -9,7 +9,7 @@ notice.
 
 ## libheif 1.23.4
 
-Copyright (c) 2017-2020 Struktur AG  
+Copyright (c) 2017-2020 Struktur AG
 Copyright (c) 2017-2026 Dirk Farin
 
 - Licence: LGPL-3.0-or-later
@@ -20,7 +20,7 @@ Copyright (c) 2017-2026 Dirk Farin
 
 ## libde265 1.1.1
 
-Copyright (c) 2013-2014 Struktur AG  
+Copyright (c) 2013-2014 Struktur AG
 Copyright (c) 2013-2026 Dirk Farin
 
 Authors named by the release include Dirk Farin and Joachim Bauch.

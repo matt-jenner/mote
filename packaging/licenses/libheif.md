@@ -1,6 +1,6 @@
 # libheif 1.23.4
 
-Copyright (c) 2017-2020 Struktur AG  
+Copyright (c) 2017-2020 Struktur AG
 Copyright (c) 2017-2026 Dirk Farin
 
 The library is distributed under `LGPL-3.0-or-later`. See

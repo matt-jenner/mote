@@ -19,6 +19,16 @@ function buildJob() {
 	return workflow().jobs["build-flatpak"];
 }
 
+test("interface CI runs build contract tests immediately after installing dependencies", () => {
+	const ci = parse(
+		fs.readFileSync(path.join(root, ".github/workflows/ci.yml"), "utf8"),
+	);
+	const steps = ci.jobs.interface.steps;
+	const installIndex = steps.findIndex((step) => step.run === "npm ci");
+	assert.ok(installIndex >= 0, "interface CI must install dependencies");
+	assert.equal(steps[installIndex + 1]?.run, "npm run test:build");
+});
+
 test("release validates the disabled package as well as the default package", () => {
 	const step = buildJob().steps.find((step) =>
 		step.run?.includes("package --no-heic"),
