@@ -64,6 +64,12 @@ scripts/hosted-smoke.sh --no-heic
 The build helpers consume this flag before passing any remaining arguments to
 Tauri, Flatpak Builder, or the selected container engine.
 
+Enabled release packages include the libheif/libde265 notices, full LGPL text,
+verified source pins, and shared-library replacement instructions. The
+repository copies are [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the
+[HEIC native decoder source and replacement guide](packaging/heic/README.md).
+Mote's own licence remains separate and unchanged.
+
 ## Install and verify the interface
 
 Install the locked Node dependencies and Playwright's browser for the current

@@ -1090,7 +1090,18 @@ test("Windows builder publishes discoverable DLL metadata and cleans failed or i
 	);
 	try {
 		const packaging = path.join(repository, "packaging/heic");
+		const licenses = path.join(repository, "packaging/licenses");
 		fs.mkdirSync(packaging, { recursive: true });
+		fs.mkdirSync(licenses, { recursive: true });
+		fs.copyFileSync(
+			path.join(root, "THIRD_PARTY_NOTICES.md"),
+			path.join(repository, "THIRD_PARTY_NOTICES.md"),
+		);
+		for (const name of ["LGPL-3.0-or-later.txt", "libheif.md", "libde265.md"])
+			fs.copyFileSync(
+				path.join(root, "packaging/licenses", name),
+				path.join(licenses, name),
+			);
 		for (const name of [
 			"versions.env",
 			"build-windows.ps1",
@@ -1098,6 +1109,7 @@ test("Windows builder publishes discoverable DLL metadata and cleans failed or i
 			"decode-only.cmake",
 			"verify-decoder.c",
 			"compiler-path-maps.cmake",
+			"README.md",
 		])
 			fs.copyFileSync(
 				path.join(root, "packaging/heic", name),
@@ -1120,6 +1132,37 @@ test("Windows builder publishes discoverable DLL metadata and cleans failed or i
 		);
 		assert.match(status, /Package: libheif/);
 		assert.match(status, /Depends: libde265/);
+		for (const name of [
+			"THIRD_PARTY_NOTICES.md",
+			"LGPL-3.0-or-later.txt",
+			"libheif.md",
+			"libde265.md",
+			"HEIC-REBUILD.md",
+			"decode-only.cmake",
+		])
+			assert.ok(
+				fs.existsSync(
+					path.join(
+						repository,
+						"build/heic-native/windows-x64/installed/x64-windows/share/licenses/mote",
+						name,
+					),
+				),
+				name,
+			);
+		assert.equal(
+			fs.readFileSync(
+				path.join(
+					repository,
+					"build/heic-native/windows-x64/installed/x64-windows/share/licenses/mote/decode-only.cmake",
+				),
+				"utf8",
+			),
+			fs.readFileSync(
+				path.join(repository, "packaging/heic/decode-only.cmake"),
+				"utf8",
+			),
+		);
 		for (const [name, version, importLibrary, runtimeLibrary] of [
 			["libheif", versions.LIBHEIF_VERSION, "heif", "heif"],
 			["libde265", versions.LIBDE265_VERSION, "de265", "libde265"],

@@ -105,6 +105,15 @@ try {
     Invoke-Native 'cmake' @('--build', $heifBuild, '--target', 'heif', '--config', 'Release')
     Invoke-Native 'cmake' @('--install', $heifBuild, '--config', 'Release')
 
+    $licenseDestination = Join-Path $prefix 'share/licenses/mote'
+    New-Item -ItemType Directory -Force $licenseDestination | Out-Null
+    Copy-Item (Join-Path $repositoryRoot 'THIRD_PARTY_NOTICES.md') (Join-Path $licenseDestination 'THIRD_PARTY_NOTICES.md')
+    Copy-Item (Join-Path $repositoryRoot 'packaging/licenses/LGPL-3.0-or-later.txt') (Join-Path $licenseDestination 'LGPL-3.0-or-later.txt')
+    Copy-Item (Join-Path $repositoryRoot 'packaging/licenses/libheif.md') (Join-Path $licenseDestination 'libheif.md')
+    Copy-Item (Join-Path $repositoryRoot 'packaging/licenses/libde265.md') (Join-Path $licenseDestination 'libde265.md')
+    Copy-Item (Join-Path $PSScriptRoot 'README.md') (Join-Path $licenseDestination 'HEIC-REBUILD.md')
+    Copy-Item (Join-Path $PSScriptRoot 'decode-only.cmake') (Join-Path $licenseDestination 'decode-only.cmake')
+
     # libheif-sys on MSVC uses vcpkg-rs, not pkg-config. Register these exact
     # shared builds using its installed/status and info manifests. No vcpkg
     # global installation, package selection, or embedded source is involved.

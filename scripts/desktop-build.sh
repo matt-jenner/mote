@@ -136,9 +136,16 @@ validate_app "$staging_app"
 
 if [ "$MOTE_HEIC_MODE" = enabled ]; then
 	frameworks="$staging_app/Contents/Frameworks"
-	mkdir -p "$frameworks"
+	licenses="$staging_app/Contents/Resources/licenses"
+	mkdir -p "$frameworks" "$licenses"
 	cp -L "$MOTE_HEIC_PREFIX/lib/libheif.dylib" "$frameworks/libheif.dylib"
 	cp -L "$MOTE_HEIC_PREFIX/lib/libde265.dylib" "$frameworks/libde265.dylib"
+	cp "$repository_root/THIRD_PARTY_NOTICES.md" "$licenses/THIRD_PARTY_NOTICES.md"
+	cp "$repository_root/packaging/licenses/LGPL-3.0-or-later.txt" "$licenses/LGPL-3.0-or-later.txt"
+	cp "$repository_root/packaging/licenses/libheif.md" "$licenses/libheif.md"
+	cp "$repository_root/packaging/licenses/libde265.md" "$licenses/libde265.md"
+	cp "$repository_root/packaging/heic/README.md" "$licenses/HEIC-REBUILD.md"
+	cp "$repository_root/packaging/heic/decode-only.cmake" "$licenses/decode-only.cmake"
 	executable=$(find "$staging_app/Contents/MacOS" -type f -perm -111 -print)
 	install_name_tool -id @rpath/libheif.dylib "$frameworks/libheif.dylib"
 	install_name_tool -id @rpath/libde265.dylib "$frameworks/libde265.dylib"

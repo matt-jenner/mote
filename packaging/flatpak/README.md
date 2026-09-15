@@ -91,11 +91,15 @@ The concrete JSON manifest lives in the managed temporary build directory and
 is removed on success, failure, or interruption. YAML does not rely on host
 environment expansion. The checked-in enabled manifest is the template.
 
-Task 11 installs `THIRD_PARTY_NOTICES.md` and `packaging/licenses/*` under
-`/app/share/licenses/io.github.matt_jenner.mote/`. These compliance files are
-deferred under the implementation ledger's ordering ruling; they must be
-installed before distributing enabled release artifacts. The OCI hook uses
-`/usr/share/licenses/mote/`.
+Enabled builds install `THIRD_PARTY_NOTICES.md`, the full LGPL text, the two
+dependency records, `HEIC-REBUILD.md`, and the literal `decode-only.cmake`
+patch under
+`/app/share/licenses/io.github.matt_jenner.mote/`. Because the compliance files
+belong to the libheif module, `--no-heic` omits them with both native modules.
+The hosted image installs the same set under `/usr/share/licenses/mote/` only
+when HEIC is enabled. See the [native decoder source and replacement
+guide](../heic/README.md) for source pins, patches, build switches, inspection,
+and library replacement instructions.
 
 After a Cargo lock or native pin change, refresh offline:
 

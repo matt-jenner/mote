@@ -12,6 +12,8 @@ RUN npm run web:build
 FROM rust:1.97.1-bookworm AS native-build
 ARG MOTE_HEIC=enabled
 WORKDIR /build
+COPY THIRD_PARTY_NOTICES.md THIRD_PARTY_NOTICES.md
+COPY packaging/licenses packaging/licenses
 COPY packaging/heic packaging/heic
 COPY scripts/build-lifecycle.sh scripts/build-lifecycle.sh
 RUN case "$MOTE_HEIC" in enabled|disabled) ;; *) exit 2 ;; esac \
@@ -35,12 +37,16 @@ RUN if [ "$MOTE_HEIC" = enabled ]; then \
 
 FROM rust AS runtime-copy
 ARG MOTE_HEIC=enabled
-# Task 11 adds THIRD_PARTY_NOTICES.md and packaging/licenses/* to
-# /runtime/usr/share/licenses/mote/ in enabled mode.
 RUN install -Dm0755 target/release/photo-server /runtime/usr/local/bin/photo-server \
     && if [ "$MOTE_HEIC" = enabled ]; then \
       install -d /runtime/usr/local/lib /runtime/etc/ld.so.conf.d; \
       cp -a build/heic-native/linux-*/lib/libheif.so.* build/heic-native/linux-*/lib/libde265.so.* /runtime/usr/local/lib/; \
+      install -Dm0644 THIRD_PARTY_NOTICES.md /runtime/usr/share/licenses/mote/THIRD_PARTY_NOTICES.md; \
+      install -Dm0644 packaging/licenses/LGPL-3.0-or-later.txt /runtime/usr/share/licenses/mote/LGPL-3.0-or-later.txt; \
+      install -Dm0644 packaging/licenses/libheif.md /runtime/usr/share/licenses/mote/libheif.md; \
+      install -Dm0644 packaging/licenses/libde265.md /runtime/usr/share/licenses/mote/libde265.md; \
+      install -Dm0644 packaging/heic/README.md /runtime/usr/share/licenses/mote/HEIC-REBUILD.md; \
+      install -Dm0644 packaging/heic/decode-only.cmake /runtime/usr/share/licenses/mote/decode-only.cmake; \
       printf '%s\n' /usr/local/lib > /runtime/etc/ld.so.conf.d/mote.conf; \
     fi
 RUN LD_LIBRARY_PATH=/runtime/usr/local/lib sh packaging/heic/verify-linux-runtime.sh \

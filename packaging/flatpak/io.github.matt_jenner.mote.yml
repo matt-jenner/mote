@@ -102,6 +102,12 @@ modules:
     post-install:
       - cc /run/build/libheif/verify-decoder.c -I/app/include -L/app/lib -lheif -lde265 -o verify-decoder
       - LD_LIBRARY_PATH=/app/lib ./verify-decoder 1.23.4 1.1.1
+      - install -Dm0644 /run/build/libheif/THIRD_PARTY_NOTICES.md /app/share/licenses/io.github.matt_jenner.mote/THIRD_PARTY_NOTICES.md
+      - install -Dm0644 /run/build/libheif/LGPL-3.0-or-later.txt /app/share/licenses/io.github.matt_jenner.mote/LGPL-3.0-or-later.txt
+      - install -Dm0644 /run/build/libheif/libheif.md /app/share/licenses/io.github.matt_jenner.mote/libheif.md
+      - install -Dm0644 /run/build/libheif/libde265.md /app/share/licenses/io.github.matt_jenner.mote/libde265.md
+      - install -Dm0644 /run/build/libheif/HEIC-REBUILD.md /app/share/licenses/io.github.matt_jenner.mote/HEIC-REBUILD.md
+      - install -Dm0644 /run/build/libheif/decode-only.cmake /app/share/licenses/io.github.matt_jenner.mote/decode-only.cmake
     cleanup: [/include, /lib/pkgconfig, /lib/cmake, /lib/*.a, /lib/*.la, /lib/libheif.so, /share/man]
     sources:
       - type: archive
@@ -111,11 +117,20 @@ modules:
         path: ../heic/decode-only.cmake
       - type: file
         path: ../heic/verify-decoder.c
+      - type: file
+        path: ../../THIRD_PARTY_NOTICES.md
+      - type: file
+        path: ../licenses/LGPL-3.0-or-later.txt
+      - type: file
+        path: ../licenses/libheif.md
+      - type: file
+        path: ../licenses/libde265.md
+      - type: file
+        path: ../heic/README.md
+        dest-filename: HEIC-REBUILD.md
       - type: shell
         commands:
           - cmake -DSOURCE_DIR=. -P decode-only.cmake
-  # Task 11 installs THIRD_PARTY_NOTICES.md and packaging/licenses/* under
-  # /app/share/licenses/io.github.matt_jenner.mote/ for enabled builds.
   - name: mote
     buildsystem: simple
     build-options:

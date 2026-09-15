@@ -240,7 +240,23 @@ function desktopFixture({
 	}
 	const stable = path.join(repository, "dist/macos/Mote.app");
 	const heicPackaging = path.join(repository, "packaging/heic");
+	const licensePackaging = path.join(repository, "packaging/licenses");
 	fs.mkdirSync(heicPackaging, { recursive: true });
+	fs.mkdirSync(licensePackaging, { recursive: true });
+	fs.copyFileSync(
+		path.join(root, "THIRD_PARTY_NOTICES.md"),
+		path.join(repository, "THIRD_PARTY_NOTICES.md"),
+	);
+	for (const name of ["LGPL-3.0-or-later.txt", "libheif.md", "libde265.md"])
+		fs.copyFileSync(
+			path.join(root, "packaging/licenses", name),
+			path.join(licensePackaging, name),
+		);
+	for (const name of ["README.md", "decode-only.cmake"])
+		fs.copyFileSync(
+			path.join(root, "packaging/heic", name),
+			path.join(heicPackaging, name),
+		);
 	fs.writeFileSync(
 		path.join(heicPackaging, "build-unix.sh"),
 		`#!/bin/sh
@@ -471,6 +487,37 @@ test("enabled desktop bundle stages and signs decoder dylibs before publication"
 				),
 			);
 		}
+		for (const name of [
+			"THIRD_PARTY_NOTICES.md",
+			"LGPL-3.0-or-later.txt",
+			"libheif.md",
+			"libde265.md",
+			"HEIC-REBUILD.md",
+			"decode-only.cmake",
+		])
+			assert.ok(
+				fs.existsSync(
+					path.join(
+						repository,
+						"dist/macos/Mote.app/Contents/Resources/licenses",
+						name,
+					),
+				),
+				name,
+			);
+		assert.equal(
+			fs.readFileSync(
+				path.join(
+					repository,
+					"dist/macos/Mote.app/Contents/Resources/licenses/decode-only.cmake",
+				),
+				"utf8",
+			),
+			fs.readFileSync(
+				path.join(repository, "packaging/heic/decode-only.cmake"),
+				"utf8",
+			),
+		);
 		assert.match(
 			fs.readFileSync(path.join(repository, "native-inspection-log"), "utf8"),
 			/--app .*\.Mote\.app\.next.*--arch universal/,
@@ -501,6 +548,15 @@ test("disabled desktop builds skip native compilation and inspect the staged app
 		assert.match(
 			fs.readFileSync(path.join(repository, "native-inspection-log"), "utf8"),
 			/--app .*--no-heic/,
+		);
+		assert.equal(
+			fs.existsSync(
+				path.join(
+					repository,
+					"dist/macos/Mote.app/Contents/Resources/licenses",
+				),
+			),
+			false,
 		);
 	} finally {
 		fs.rmSync(repository, { recursive: true, force: true });
