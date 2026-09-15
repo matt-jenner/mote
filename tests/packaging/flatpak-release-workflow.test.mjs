@@ -19,6 +19,32 @@ function buildJob() {
 	return workflow().jobs["build-flatpak"];
 }
 
+test("release validates the disabled package as well as the default package", () => {
+	const step = buildJob().steps.find((step) =>
+		step.run?.includes("package --no-heic"),
+	);
+	assert.ok(step, "missing disabled package inspection build");
+	const ci = parse(
+		fs.readFileSync(path.join(root, ".github/workflows/ci.yml"), "utf8"),
+	);
+	assert.ok(
+		ci.jobs.interface.steps.some((step) => step.run === "npm run test:flatpak"),
+	);
+	assert.deepEqual(ci.jobs["hosted-container"].strategy.matrix.heic, [
+		"enabled",
+		"disabled",
+	]);
+	assert.deepEqual(ci.jobs["hosted-container"].strategy.matrix.os, [
+		"ubuntu-latest",
+		"ubuntu-24.04-arm",
+	]);
+	assert.ok(
+		ci.jobs["hosted-container"].steps.some((step) =>
+			step.run?.includes("hosted-smoke.sh --no-heic"),
+		),
+	);
+});
+
 test("Flatpak release builds run only when a GitHub Release is published", () => {
 	const releaseWorkflow = workflow();
 

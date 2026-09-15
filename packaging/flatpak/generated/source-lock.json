@@ -3,8 +3,23 @@
     "repository": "https://github.com/flatpak/flatpak-builder-tools.git",
     "commit": "de2225a6dee4818c1339b3cdbf29f90c471fcb7e"
   },
+  "cargoGenerator": "scripts/flatpak-source-lock.mjs",
   "lockfiles": {
     "package-lock.json": "099a092687ed6019e28a04aa093c556ab55b8abe4e4acebae047d184159be254",
-    "apps/desktop/src-tauri/Cargo.lock": "75a579e4a54225d925060d6d734fa32fc4d28c91c3d21ef7571fea9186ce7306"
+    "Cargo.lock": "4352eaadd3819f8e6cf9bf8f4b9ee6988beb938292b71f3e9f8cd022c6c84d53",
+    "apps/desktop/src-tauri/Cargo.lock": "469e308cabc44e021787ef7c1ba7fb86165e04b4b08d2613153bb5e8bfece706",
+    "packaging/heic/versions.env": "29fd3e8fbb85816a5eaac80f48392b26fa21961b5f8cf8c1e9e1ee0db5c89eef"
+  },
+  "native": {
+    "libde265": {
+      "version": "1.1.1",
+      "url": "https://github.com/strukturag/libde265/releases/download/v1.1.1/libde265-1.1.1.tar.gz",
+      "sha256": "fd48a927e94ed74fc7ce8829d222b9d8599fcbfe8b6448ba66705babc56ab219"
+    },
+    "libheif": {
+      "version": "1.23.4",
+      "url": "https://github.com/strukturag/libheif/releases/download/v1.23.4/libheif-1.23.4.tar.gz",
+      "sha256": "d0c02b4b0e978f34a1974b6f3eea7975a537bf7a9195ffeea38e7242ff316fdd"
+    }
   }
 }

@@ -74,6 +74,7 @@ function flatpakFixture(bundleStatus = 0) {
 printf '%s|%s\n' "\${MOTE_HEIC:-}" "$*" >> "$MOTE_FLATPAK_TEST_LOG"
 for argument in "$@"; do
   case "$argument" in
+    *.json) cp "$argument" "$MOTE_FLATPAK_TEST_LOG.manifest" ;;
     --repo=*) repo=$(printf '%s' "$argument" | cut -c 8-); mkdir -p "$repo" ;;
     */build) mkdir -p "$argument" ;;
   esac
@@ -169,12 +170,69 @@ test("failed Flatpak package preserves the previous bundle", () => {
 	}
 });
 
+for (const failure of ["render", "inspection", "interrupt"]) {
+	test(`HEIC Flatpak ${failure} failure preserves the accepted bundle and removes temporary manifests`, () => {
+		const fixtureDirectory = flatpakFixture();
+		const oldBundle = path.join(
+			fixtureDirectory.bundles,
+			"Mote-0.0.9-x86_64.flatpak",
+		);
+		fs.writeFileSync(oldBundle, "accepted");
+		if (failure === "render")
+			fs.writeFileSync(
+				path.join(fixtureDirectory.bin, "node"),
+				`#!/bin/sh\ncase "$1" in */render-flatpak-manifest.mjs) exit 46 ;; esac\nexec '${process.execPath}' "$@"\n`,
+				{ mode: 0o755 },
+			);
+		else {
+			const builder = path.join(fixtureDirectory.bin, "flatpak-builder");
+			const source = fs.readFileSync(builder, "utf8");
+			const action =
+				failure === "inspection"
+					? 'if [ "$1" = --run ]; then exit 47; fi'
+					: 'if [ "$1" != --show-manifest ]; then kill -TERM "$PPID"; exit 48; fi';
+			fs.writeFileSync(
+				builder,
+				source.replace("#!/bin/sh", `#!/bin/sh\n${action}`),
+			);
+		}
+		try {
+			const result = runFlatpakFixture(fixtureDirectory);
+			assert.notEqual(result.status, 0);
+			assert.equal(fs.readFileSync(oldBundle, "utf8"), "accepted");
+			assert.deepEqual(
+				fs
+					.readdirSync(fixtureDirectory.tmpdir)
+					.filter((entry) => entry.startsWith("mote-build-")),
+				[],
+			);
+			assert.deepEqual(fs.readdirSync(fixtureDirectory.bundles), [
+				path.basename(oldBundle),
+			]);
+		} finally {
+			fs.rmSync(fixtureDirectory.directory, { recursive: true, force: true });
+		}
+	});
+}
+
 test("HEIC Flatpak package passes the default mode explicitly", () => {
 	const fixtureDirectory = flatpakFixture();
 	try {
 		const result = runFlatpakFixture(fixtureDirectory);
 		assert.equal(result.status, 0, result.stderr);
 		assert.match(flatpakBuildCall(fixtureDirectory), /^enabled\|/);
+		for (const call of fs
+			.readFileSync(fixtureDirectory.log, "utf8")
+			.trim()
+			.split("\n"))
+			assert.match(call, /--state-dir=/);
+		const manifest = JSON.parse(
+			fs.readFileSync(`${fixtureDirectory.log}.manifest`, "utf8"),
+		);
+		assert.deepEqual(
+			manifest.modules.map(({ name }) => name),
+			["libde265", "libheif", "mote"],
+		);
 	} finally {
 		fs.rmSync(fixtureDirectory.directory, { recursive: true, force: true });
 	}
@@ -194,6 +252,17 @@ test("HEIC Flatpak package consumes the Mote flag and preserves builder argument
 		assert.doesNotMatch(buildCall, /--no-heic/);
 		assert.match(buildCall, /--disable-rofiles-fuse/);
 		assert.match(buildCall, /--stop-at=libheif/);
+		const manifest = JSON.parse(
+			fs.readFileSync(`${fixtureDirectory.log}.manifest`, "utf8"),
+		);
+		assert.deepEqual(
+			manifest.modules.map(({ name }) => name),
+			["mote"],
+		);
+		assert.match(
+			manifest.modules[0]["build-commands"].join("\n"),
+			/--no-default-features --features mote-defaults/,
+		);
 	} finally {
 		fs.rmSync(fixtureDirectory.directory, { recursive: true, force: true });
 	}

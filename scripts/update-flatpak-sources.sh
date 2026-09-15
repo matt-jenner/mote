@@ -2,65 +2,54 @@
 set -euo pipefail
 
 repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-
-if [[ $# -ne 1 ]]; then
-  echo "usage: scripts/update-flatpak-sources.sh /path/to/flatpak-builder-tools" >&2
-  exit 2
-fi
-
-tools_root="$(cd -- "$1" && pwd)"
-cargo_generator="$tools_root/cargo/flatpak-cargo-generator.py"
+. "$repository_root/scripts/build-lifecycle.sh"
+[[ $# = 1 ]] || { echo 'usage: update-flatpak-sources.sh --offline | /path/to/flatpak-builder-tools' >&2; exit 2; }
 output_root="$repository_root/packaging/flatpak/generated"
-
-command -v flatpak-node-generator >/dev/null || {
-  echo "flatpak-node-generator is required" >&2
-  exit 1
-}
-[[ -f "$cargo_generator" ]] || {
-  echo "flatpak-cargo-generator.py was not found below $tools_root" >&2
-  exit 1
-}
-
-generator_commit="$(git -C "$tools_root" rev-parse HEAD)"
-generator_repository="$(git -C "$tools_root" remote get-url origin)"
-temporary_root="$(mktemp -d)"
+stage="$repository_root/packaging/flatpak/.generated.next.$$"
+backup="$repository_root/packaging/flatpak/.generated.previous.$$"
+active=false
+complete=false
+mote_create_build_dir flatpak-sources
 cleanup() {
-  rm -rf -- "$temporary_root"
+  status=$?
+  trap - EXIT HUP INT TERM
+  if [[ "$active" = true && "$complete" = false && -d "$backup" ]]; then
+    [[ ! -e "$output_root" ]] || mote_remove_managed_path "$output_root" "$repository_root/packaging/flatpak"
+    mv "$backup" "$output_root"
+  fi
+  for candidate in "$stage" "$backup"; do
+    [[ ! -e "$candidate" ]] || mote_remove_managed_path "$candidate" "$repository_root/packaging/flatpak"
+  done
+  mote_cleanup_build_dir
+  exit "$status"
 }
 trap cleanup EXIT
-
-mkdir -p "$temporary_root/apps/desktop" "$temporary_root/apps/interface" "$output_root"
-install -m 0644 "$repository_root/package.json" "$temporary_root/package.json"
-install -m 0644 "$repository_root/package-lock.json" "$temporary_root/package-lock.json"
-install -m 0644 "$repository_root/apps/desktop/package.json" "$temporary_root/apps/desktop/package.json"
-install -m 0644 "$repository_root/apps/interface/package.json" "$temporary_root/apps/interface/package.json"
-
-flatpak-node-generator \
-  --no-requests-cache \
-  --node-sdk-extension org.freedesktop.Sdk.Extension.node24//25.08 \
-  --output "$output_root/node-sources.json" \
-  npm "$temporary_root/package-lock.json"
-
-python3 "$cargo_generator" \
-  "$repository_root/apps/desktop/src-tauri/Cargo.lock" \
-  --output "$output_root/cargo-sources.json"
-
-node --input-type=module - "$repository_root" "$generator_repository" "$generator_commit" <<'NODE'
-import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
-import path from "node:path";
-
-const [root, repository, commit] = process.argv.slice(2);
-const digest = (filename) => createHash("sha256").update(readFileSync(path.join(root, filename))).digest("hex");
-const lock = {
-  generator: { repository, commit },
-  lockfiles: {
-    "package-lock.json": digest("package-lock.json"),
-    "apps/desktop/src-tauri/Cargo.lock": digest("apps/desktop/src-tauri/Cargo.lock"),
-  },
-};
-writeFileSync(
-  path.join(root, "packaging/flatpak/generated/source-lock.json"),
-  `${JSON.stringify(lock, null, 2)}\n`,
-);
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+candidate_root="$MOTE_BUILD_DIR/generated"
+cp -R "$output_root" "$candidate_root"
+if [[ "$1" != --offline ]]; then
+  tools_root="$(cd -- "$1" && pwd)"
+  [[ -f "$tools_root/cargo/flatpak-cargo-generator.py" ]]
+  command -v flatpak-node-generator >/dev/null
+  mkdir -p "$MOTE_BUILD_DIR/apps/desktop" "$MOTE_BUILD_DIR/apps/interface"
+  for file in package.json package-lock.json apps/desktop/package.json apps/interface/package.json; do
+    install -m0644 "$repository_root/$file" "$MOTE_BUILD_DIR/$file"
+  done
+  flatpak-node-generator --no-requests-cache \
+    --node-sdk-extension org.freedesktop.Sdk.Extension.node24//25.08 \
+    --output "$candidate_root/node-sources.json" npm "$MOTE_BUILD_DIR/package-lock.json"
+  node --input-type=module - "$candidate_root/source-lock.json" "$(git -C "$tools_root" remote get-url origin)" "$(git -C "$tools_root" rev-parse HEAD)" <<'NODE'
+import fs from "node:fs";
+const [file, repository, commit] = process.argv.slice(2);
+fs.writeFileSync(file, JSON.stringify({ generator: { repository, commit } }));
 NODE
+fi
+node "$repository_root/scripts/flatpak-source-lock.mjs" "$repository_root" "$candidate_root"
+cp -R "$candidate_root" "$stage"
+active=true
+mv "$output_root" "$backup"
+mv "$stage" "$output_root"
+complete=true
+printf '%s\n' 'updated Flatpak sources from both Cargo locks, npm lock, and native pins'

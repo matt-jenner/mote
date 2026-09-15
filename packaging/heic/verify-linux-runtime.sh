@@ -1,0 +1,44 @@
+#!/bin/sh
+set -eu
+
+[ "$#" = 3 ] || { echo 'usage: verify-linux-runtime.sh ROOT BINARY enabled|disabled' >&2; exit 2; }
+runtime_root=$1
+runtime_binary=$2
+runtime_mode=$3
+case "$runtime_mode" in enabled|disabled) ;; *) exit 2 ;; esac
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+[ -d "$runtime_root" ] && [ -f "$runtime_binary" ] || fail 'missing runtime root or binary'
+runtime_files=$(find "$runtime_root" \( -type f -o -type l \) -print)
+forbidden='x265|x264|kvazaar|rav1e|svt.?av1|vvenc|uvg266|heif-enc|enc265|libheif/plugins'
+if printf '%s\n' "$runtime_files" | grep -Ei "$forbidden|/include/|/pkgconfig/|/cmake/|\.a$|/lib(heif|de265)\.so$"; then
+	fail 'unexpected encoder or development file in runtime'
+fi
+if [ "$runtime_mode" = disabled ]; then
+	if printf '%s\n' "$runtime_files" | grep -Ei 'libheif|libde265'; then fail 'disabled runtime contains decoder files'; fi
+else
+	for library in libheif libde265; do
+		printf '%s\n' "$runtime_files" | grep -E "/$library\.so\.[0-9]" >/dev/null || fail "missing runtime library: $library"
+	done
+fi
+inspect_runtime_file() {
+	runtime_dependencies=$(ldd "$1" 2>&1) || fail "cannot inspect dependencies: $1"
+	if printf '%s\n' "$runtime_dependencies" | grep -Ei "$forbidden|not found"; then fail 'forbidden or unresolved runtime dependency'; fi
+	if [ "$runtime_mode" = disabled ]; then
+		if printf '%s\n' "$runtime_dependencies" | grep -Ei 'libheif|libde265'; then fail 'disabled binary references decoder'; fi
+	fi
+	# The build SDK/CI host supplies readelf. The slim runtime deliberately has
+	# no binutils; the smoke still verifies actual loader resolution there.
+	if command -v readelf >/dev/null 2>&1; then
+		runtime_dynamic=$(readelf -d "$1") || fail "cannot inspect ELF metadata: $1"
+		if printf '%s\n' "$runtime_dynamic" | grep -E '\((NEEDED|SONAME)\).*\[[^]]*/'; then fail 'absolute ELF dependency'; fi
+		if [ "$runtime_mode" = disabled ] && printf '%s\n' "$runtime_dynamic" | grep -Ei 'libheif|libde265'; then fail 'disabled ELF references decoder'; fi
+	fi
+}
+inspect_runtime_file "$runtime_binary"
+if [ "$runtime_mode" = enabled ]; then
+	for library in libheif libde265; do
+		printf '%s\n' "$runtime_dependencies" | grep -F "$library.so." >/dev/null || fail "binary does not load $library"
+	done
+	find "$runtime_root" -type f \( -name 'libheif.so.*' -o -name 'libde265.so.*' \) -print | while IFS= read -r library; do inspect_runtime_file "$library"; done
+fi
+printf '%s\n' "Linux $runtime_mode runtime inspection passed"

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -153,7 +154,7 @@ test("manifest builds npm and Cargo offline and installs matching metadata", () 
 	assert.match(module["build-options"]["append-path"], /rust-stable/);
 	const commands = module["build-commands"].join("\n");
 	assert.match(commands, /npm ci --offline/);
-	assert.match(commands, /desktop:build -- --no-bundle --ci/);
+	assert.match(commands, /tauri build --no-bundle --ci/);
 	assert.match(commands, /target\/release\/photo-viewer-desktop/);
 	assert.ok(commands.includes(`${APP_ID}.desktop`));
 	assert.ok(commands.includes(`${APP_ID}.metainfo.xml`));
@@ -180,6 +181,57 @@ test("manifest builds npm and Cargo offline and installs matching metadata", () 
 	);
 });
 
+test("HEIC Flatpak builds the pinned decoder pair offline and patches out the mask encoder", () => {
+	const manifest = parse(read(`${APP_ID}.yml`));
+	assert.deepEqual(
+		manifest.modules.map(({ name }) => name),
+		["libde265", "libheif", "mote"],
+	);
+	for (const module of manifest.modules.slice(0, 2)) {
+		assert.equal(module.buildsystem, "cmake-ninja");
+		assert.ok(module["config-opts"].includes("-DBUILD_SHARED_LIBS=ON"));
+		assert.match(module.sources[0].url, /^https:\/\/github.com\/strukturag\//);
+		assert.match(module.sources[0].sha256, /^[0-9a-f]{64}$/);
+	}
+	const heif = manifest.modules[1];
+	for (const option of [
+		"-DWITH_LIBDE265=ON",
+		"-DWITH_LIBDE265_PLUGIN=OFF",
+		"-DWITH_X265=OFF",
+		"-DENABLE_PLUGIN_LOADING=OFF",
+		"-DWITH_EXAMPLES=OFF",
+	])
+		assert.ok(heif["config-opts"].includes(option), option);
+	assert.match((heif["post-install"] ?? []).join("\n"), /verify-decoder/);
+	assert.match(heif.sources.at(-1).commands.join("\n"), /decode-only.cmake/);
+});
+
+test("HEIC manifest rendering disables native modules and resolves offline source paths", () => {
+	const result = spawnSync(
+		process.execPath,
+		[path.join(root, "scripts/render-flatpak-manifest.mjs"), "disabled"],
+		{ encoding: "utf8" },
+	);
+	assert.equal(result.status, 0, result.stderr);
+	const manifest = JSON.parse(result.stdout);
+	assert.deepEqual(
+		manifest.modules.map(({ name }) => name),
+		["mote"],
+	);
+	assert.match(
+		manifest.modules[0]["build-commands"].join("\n"),
+		/--no-default-features --features mote-defaults/,
+	);
+	assert.equal(manifest.modules[0].sources[0].path, root);
+	assert.doesNotMatch(result.stdout, /MOTE_HEIC|libheif|libde265/);
+	const again = spawnSync(
+		process.execPath,
+		[path.join(root, "scripts/render-flatpak-manifest.mjs"), "disabled"],
+		{ encoding: "utf8" },
+	);
+	assert.equal(again.stdout, result.stdout);
+});
+
 test("generated Flatpak sources are nonempty and match both lockfiles", () => {
 	const generated = path.join(packaging, "generated");
 	const sourceLock = JSON.parse(
@@ -193,6 +245,18 @@ test("generated Flatpak sources are nonempty and match both lockfiles", () => {
 		sourceLock.lockfiles["apps/desktop/src-tauri/Cargo.lock"],
 		sha256(path.join(root, "apps/desktop/src-tauri/Cargo.lock")),
 	);
+	for (const file of ["Cargo.lock", "packaging/heic/versions.env"])
+		assert.equal(sourceLock.lockfiles[file], sha256(path.join(root, file)));
+	assert.equal(sourceLock.native.libheif.version, "1.23.4");
+	assert.equal(sourceLock.native.libde265.version, "1.1.1");
+	const manifest = parse(read(`${APP_ID}.yml`));
+	for (const module of manifest.modules.slice(0, 2)) {
+		assert.equal(module.sources[0].url, sourceLock.native[module.name].url);
+		assert.equal(
+			module.sources[0].sha256,
+			sourceLock.native[module.name].sha256,
+		);
+	}
 	assert.match(
 		sourceLock.generator.repository,
 		/^https:\/\/github\.com\/flatpak\/flatpak-builder-tools(?:\.git)?$/,

@@ -629,6 +629,11 @@ test("legacy build assets cleanup is strictly repository-scoped", () => {
 		".worktrees/example/apps/interface/node_modules/.vite",
 		".worktrees/example/apps/interface/node_modules/.vite-temp",
 		".worktrees/example/build/heic-native",
+		".worktrees/example/build/flatpak",
+		".worktrees/example/.flatpak-builder",
+		"packaging/flatpak/.generated.next.999999999",
+		"packaging/flatpak/.generated.previous.999999999",
+		"runtime/photo-viewer-smoke-100-999999999",
 	];
 	for (const relative of removable) {
 		fs.mkdirSync(path.join(repository, relative), { recursive: true });
@@ -659,6 +664,13 @@ test("legacy build assets cleanup is strictly repository-scoped", () => {
 		fs.writeFileSync(path.join(repository, relative), "generated");
 	}
 	const stableApp = path.join(repository, "dist/macos/Mote.app");
+	fs.mkdirSync(path.join(repository, "packaging/flatpak/generated"), {
+		recursive: true,
+	});
+	fs.writeFileSync(
+		path.join(repository, "packaging/flatpak/generated/source-lock.json"),
+		"keep source lock",
+	);
 	const stableFlatpak = path.join(
 		repository,
 		"dist/flatpak/Mote-0.1.0-x86_64.flatpak",
@@ -711,6 +723,13 @@ test("legacy build assets cleanup is strictly repository-scoped", () => {
 			);
 		}
 		assert.equal(fs.existsSync(stableApp), true);
+		assert.equal(
+			fs.readFileSync(
+				path.join(repository, "packaging/flatpak/generated/source-lock.json"),
+				"utf8",
+			),
+			"keep source lock",
+		);
 		assert.equal(fs.readFileSync(stableFlatpak, "utf8"), "keep");
 		assert.equal(fs.readFileSync(sourcePhoto, "utf8"), "source bytes");
 		assert.equal(

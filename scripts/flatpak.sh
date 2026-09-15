@@ -45,7 +45,7 @@ bundle_path() {
   printf '%s/Mote-%s-%s.flatpak\n' "$bundle_dir" "$(app_version)" "$(flatpak_arch)"
 }
 
-check_requirements() {
+check_requirements() (
   for command in flatpak flatpak-builder node desktop-file-validate appstreamcli; do
     require_command "$command"
   done
@@ -59,14 +59,18 @@ check_requirements() {
       exit 1
     }
   done
-  MOTE_HEIC="$MOTE_HEIC_MODE" flatpak-builder --show-manifest "$manifest" >/dev/null
+  mote_create_build_dir flatpak
+  mote_install_cleanup_traps
+  manifest="$MOTE_BUILD_DIR/manifest.json"
+  node "$repository_root/scripts/render-flatpak-manifest.mjs" "$MOTE_HEIC_MODE" > "$manifest"
+  MOTE_HEIC="$MOTE_HEIC_MODE" flatpak-builder --show-manifest --state-dir="$MOTE_BUILD_DIR/state" "$manifest" >/dev/null
   desktop-file-validate "$repository_root/packaging/flatpak/$app_id.desktop"
   appstreamcli validate --no-net "$repository_root/packaging/flatpak/$app_id.metainfo.xml"
   (
     cd -- "$repository_root"
     npm run test:flatpak
   )
-}
+)
 
 package_bundle() {
   check_requirements
@@ -109,11 +113,16 @@ package_bundle() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
+  manifest="$MOTE_BUILD_DIR/manifest.json"
+  node "$repository_root/scripts/render-flatpak-manifest.mjs" "$MOTE_HEIC_MODE" > "$manifest"
   mkdir -p "$build_dir" "$repo_dir" "$state_dir" "$bundle_dir"
   MOTE_HEIC="$MOTE_HEIC_MODE" flatpak-builder "$@" --force-clean --delete-build-dirs \
     --state-dir="$state_dir" \
     --repo="$repo_dir" \
     "$build_dir" "$manifest"
+  flatpak-builder --run --state-dir="$state_dir" "$build_dir" "$manifest" sh -s -- \
+    /app /app/bin/mote "$MOTE_HEIC_MODE" \
+    < "$repository_root/packaging/heic/verify-linux-runtime.sh"
   flatpak build-bundle \
     --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
     --arch="$(flatpak_arch)" \

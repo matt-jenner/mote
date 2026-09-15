@@ -16,6 +16,106 @@ finish-args:
   - --share=ipc
 
 modules:
+  - name: libde265
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DCMAKE_INSTALL_LIBDIR=lib
+      - -DBUILD_SHARED_LIBS=ON
+      - -DENABLE_DECODER=OFF
+      - -DENABLE_ENCODER=OFF
+      - -DENABLE_SDL=OFF
+      - -DENABLE_SHERLOCK265=OFF
+      - -DENABLE_INTERNAL_DEVELOPMENT_TOOLS=OFF
+      - -DWITH_FUZZERS=OFF
+      - -DUSE_IWYU=OFF
+      - -DFORCE_FULL_VISIBILITY=OFF
+    cleanup: [/include, /lib/pkgconfig, /lib/cmake, /lib/*.a, /lib/*.la, /lib/libde265.so]
+    sources:
+      - type: archive
+        url: https://github.com/strukturag/libde265/releases/download/v1.1.1/libde265-1.1.1.tar.gz
+        sha256: fd48a927e94ed74fc7ce8829d222b9d8599fcbfe8b6448ba66705babc56ab219
+  - name: libheif
+    buildsystem: cmake-ninja
+    builddir: true
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DCMAKE_INSTALL_LIBDIR=lib
+      - -DBUILD_SHARED_LIBS=ON
+      - -DBUILD_TESTING=OFF
+      - -DBUILD_DOCUMENTATION=OFF
+      - -DBUILD_DEVELOPMENT_TOOLS=OFF
+      - -DENABLE_COVERAGE=OFF
+      - -DENABLE_EXPERIMENTAL_FEATURES=OFF
+      - -DENABLE_MULTITHREADING_SUPPORT=ON
+      - -DENABLE_PARALLEL_TILE_DECODING=ON
+      - -DENABLE_PLUGIN_LOADING=OFF
+      - -DWITH_LIBDE265=ON
+      - -DWITH_LIBDE265_PLUGIN=OFF
+      - -DWITH_X265=OFF
+      - -DWITH_X265_PLUGIN=OFF
+      - -DWITH_KVAZAAR=OFF
+      - -DWITH_KVAZAAR_PLUGIN=OFF
+      - -DWITH_UVG266=OFF
+      - -DWITH_UVG266_PLUGIN=OFF
+      - -DWITH_VVDEC=OFF
+      - -DWITH_VVDEC_PLUGIN=OFF
+      - -DWITH_VVENC=OFF
+      - -DWITH_VVENC_PLUGIN=OFF
+      - -DWITH_X264=OFF
+      - -DWITH_X264_PLUGIN=OFF
+      - -DWITH_OpenH264_DECODER=OFF
+      - -DWITH_OpenH264_DECODER_PLUGIN=OFF
+      - -DWITH_DAV1D=OFF
+      - -DWITH_DAV1D_PLUGIN=OFF
+      - -DWITH_AOM_DECODER=OFF
+      - -DWITH_AOM_DECODER_PLUGIN=OFF
+      - -DWITH_AOM_ENCODER=OFF
+      - -DWITH_AOM_ENCODER_PLUGIN=OFF
+      - -DWITH_SvtEnc=OFF
+      - -DWITH_SvtEnc_PLUGIN=OFF
+      - -DWITH_RAV1E=OFF
+      - -DWITH_RAV1E_PLUGIN=OFF
+      - -DWITH_JPEG_DECODER=OFF
+      - -DWITH_JPEG_DECODER_PLUGIN=OFF
+      - -DWITH_JPEG_ENCODER=OFF
+      - -DWITH_JPEG_ENCODER_PLUGIN=OFF
+      - -DWITH_OpenJPEG_DECODER=OFF
+      - -DWITH_OpenJPEG_DECODER_PLUGIN=OFF
+      - -DWITH_OpenJPEG_ENCODER=OFF
+      - -DWITH_OpenJPEG_ENCODER_PLUGIN=OFF
+      - -DWITH_FFMPEG_DECODER=OFF
+      - -DWITH_FFMPEG_DECODER_PLUGIN=OFF
+      - -DWITH_OPENJPH_ENCODER=OFF
+      - -DWITH_OPENJPH_ENCODER_PLUGIN=OFF
+      - -DWITH_UNCOMPRESSED_CODEC=OFF
+      - -DWITH_WEBCODECS=OFF
+      - -DWITH_LIBSHARPYUV=OFF
+      - -DWITH_LIBSHARPYUV_INTERNAL=OFF
+      - -DWITH_HEADER_COMPRESSION=OFF
+      - -DWITH_EXAMPLES=OFF
+      - -DWITH_EXAMPLE_HEIF_THUMB=OFF
+      - -DWITH_EXAMPLE_HEIF_VIEW=OFF
+      - -DWITH_GDK_PIXBUF=OFF
+      - -DWITH_FUZZERS=OFF
+      - -DWITH_REDUCED_VISIBILITY=ON
+    post-install:
+      - cc /run/build/libheif/verify-decoder.c -I/app/include -L/app/lib -lheif -lde265 -o verify-decoder
+      - LD_LIBRARY_PATH=/app/lib ./verify-decoder 1.23.4 1.1.1
+    cleanup: [/include, /lib/pkgconfig, /lib/cmake, /lib/*.a, /lib/*.la, /lib/libheif.so, /share/man]
+    sources:
+      - type: archive
+        url: https://github.com/strukturag/libheif/releases/download/v1.23.4/libheif-1.23.4.tar.gz
+        sha256: d0c02b4b0e978f34a1974b6f3eea7975a537bf7a9195ffeea38e7242ff316fdd
+      - type: file
+        path: ../heic/decode-only.cmake
+      - type: file
+        path: ../heic/verify-decoder.c
+      - type: shell
+        commands:
+          - cmake -DSOURCE_DIR=. -P decode-only.cmake
+  # Task 11 installs THIRD_PARTY_NOTICES.md and packaging/licenses/* under
+  # /app/share/licenses/io.github.matt_jenner.mote/ for enabled builds.
   - name: mote
     buildsystem: simple
     build-options:
@@ -31,7 +131,7 @@ modules:
     build-commands:
       - install -Dm0644 cargo/config .cargo/config.toml
       - npm ci --offline
-      - npm run desktop:build -- --no-bundle --ci
+      - npm exec --workspace @photo-viewer/desktop -- tauri build --no-bundle --ci
       - install -Dm0755 apps/desktop/src-tauri/target/release/photo-viewer-desktop /app/bin/mote
       - install -Dm0644 packaging/flatpak/io.github.matt_jenner.mote.desktop /app/share/applications/io.github.matt_jenner.mote.desktop
       - install -Dm0644 packaging/flatpak/io.github.matt_jenner.mote.metainfo.xml /app/share/metainfo/io.github.matt_jenner.mote.metainfo.xml
@@ -47,6 +147,10 @@ modules:
         skip:
           - .flatpak-builder
           - .git
+          - .worktrees
+          - .superpowers
+          - build
+          - runtime
           - node_modules
           - target
           - apps/desktop/src-tauri/target

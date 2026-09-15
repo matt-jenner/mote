@@ -100,13 +100,18 @@ jobs:
       - run: npm ci
       - run: npm exec -- playwright install --with-deps chromium
       - run: npm run check
+      - run: npm run test:flatpak
       - run: npm run typecheck
       - run: npm test
       - run: npm run test:browser
       - run: npm run --workspace @photo-viewer/interface build
 
   hosted-container:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        heic: [enabled, disabled]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -119,5 +124,10 @@ jobs:
         env:
           CONTAINER_ENGINE: docker
       - run: ./scripts/hosted-smoke.sh
+        if: matrix.heic == 'enabled'
+        env:
+          CONTAINER_ENGINE: docker
+      - run: ./scripts/hosted-smoke.sh --no-heic
+        if: matrix.heic == 'disabled'
         env:
           CONTAINER_ENGINE: docker

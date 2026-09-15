@@ -211,6 +211,8 @@ run_browser_phase() {
 	PHOTO_VIEWER_PHASE="$phase_name" \
 	PHOTO_VIEWER_STATE_DIR="$state_dir" \
 	PHOTO_VIEWER_WEB_ROOT="$browser_web_root" \
+	PHOTO_VIEWER_HEIC_MODE="$MOTE_HEIC_MODE" \
+	PHOTO_VIEWER_CATALOG_PATH="$data_dir/catalog.sqlite" \
 		npm run test:hosted
 }
 
@@ -253,12 +255,14 @@ mote_reap_stale_smoke_assets "$container_engine"
 mkdir -p \
 	"$source_dir/A/child" \
 	"$source_dir/B" \
+	"$source_dir/HEIC" \
 	"$source_dir/Nested/Album/grandchild" \
 	"$state_dir" \
 	"$data_dir" \
 	"$cache_dir"
 chmod 0777 "$data_dir" "$cache_dir"
 cp "$project_dir/apps/interface/public/demo-photos/mountain.jpg" "$source_dir/A/a-01.jpg"
+cp "$project_dir/crates/codec/tests/fixtures/heif/iphone-8bit.heic" "$source_dir/HEIC/iphone-8bit.heic"
 cp "$project_dir/apps/interface/public/demo-photos/coast.jpg" "$source_dir/A/a-02.jpg"
 cp "$project_dir/apps/interface/public/demo-photos/forest.jpg" "$source_dir/A/child/a-child-uncached.jpg"
 cp "$project_dir/apps/interface/public/demo-photos/interior.jpg" "$source_dir/B/b-01.jpg"
@@ -291,6 +295,11 @@ esac
 	--tag "$image_name" \
 	--file Containerfile .
 assert_image_runtime_user
+"$container_engine" run --rm --interactive --name "$container_name" \
+	--label "$asset_label" --label "$owner_label" --network=none --read-only \
+	--entrypoint sh "$image_name" \
+	-s -- /usr/local /usr/local/bin/photo-server "$MOTE_HEIC_MODE" \
+	< "$project_dir/packaging/heic/verify-linux-runtime.sh"
 
 browser_web_root="$temporary_root/web"
 sh "$project_dir/scripts/with-ephemeral-interface-assets.sh" \

@@ -79,7 +79,40 @@ the system picker. Installed permissions must not contain `filesystems` or
 
 ## Refresh locked sources
 
-After either lockfile changes, use an isolated checkout and virtual environment:
+The enabled manifest builds pinned libde265 followed by libheif. The libheif
+source patch removes its built-in mask encoder, and a post-install runtime
+probe requires exactly the libde265 decoder and zero encoders. Only versioned
+shared libraries survive cleanup. Package creation runs loader and filesystem
+inspection before replacing a bundle.
+
+`npm run flatpak -- package --no-heic` renders a manifest with neither native
+module and passes `--no-default-features --features mote-defaults` to Tauri.
+The concrete JSON manifest lives in the managed temporary build directory and
+is removed on success, failure, or interruption. YAML does not rely on host
+environment expansion. The checked-in enabled manifest is the template.
+
+Task 11 installs `THIRD_PARTY_NOTICES.md` and `packaging/licenses/*` under
+`/app/share/licenses/io.github.matt_jenner.mote/`. These compliance files are
+deferred under the implementation ledger's ordering ruling; they must be
+installed before distributing enabled release artifacts. The OCI hook uses
+`/usr/share/licenses/mote/`.
+
+After a Cargo lock or native pin change, refresh offline:
+
+```bash
+bash scripts/update-flatpak-sources.sh --offline
+```
+
+The refresh unions the root and desktop Cargo locks, verifies existing npm
+archive entries against `package-lock.json`, and records all three lockfile
+digests plus `packaging/heic/versions.env`. It refuses an incomplete npm cache.
+Candidate sources are validated before the generated directory is replaced;
+failure restores the old directory. `npm run clean:build` reaps stale source
+refresh staging, Flatpak work directories, native builds and smoke runtime
+directories while preserving committed locks, source media and release files.
+
+If npm dependencies change, regenerate npm sources in an isolated checkout and
+virtual environment:
 
 ```bash
 generator_root="$(mktemp -d /tmp/mote-flatpak-generators.XXXXXX)"
@@ -99,5 +132,7 @@ Publishing a GitHub Release whose tag exactly matches `v` plus the version in
 `.github/workflows/release-flatpak.yml`. The workflow validates the tag before
 installing the Flatpak runtimes, builds the bundle with the same non-interactive
 helper used locally, and attaches the `.flatpak` to the existing GitHub Release.
+It first builds and inspects the disabled variant in the runner's temporary
+directory. Hosted CI runs enabled and disabled smoke tests on AMD64 and ARM64.
 It has no manual trigger, so ordinary pushes and draft releases do not consume a
 Flatpak build.

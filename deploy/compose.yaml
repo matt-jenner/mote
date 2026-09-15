@@ -4,6 +4,8 @@ services:
     build:
       context: ..
       dockerfile: Containerfile
+      args:
+        MOTE_HEIC: "${MOTE_HEIC:-enabled}"
     restart: unless-stopped
     ports:
       - "127.0.0.1:8080:8080"

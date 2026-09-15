@@ -17,6 +17,89 @@ const repositoryRoot = path.resolve(import.meta.dirname, "../..");
 const smokeScript = path.join(repositoryRoot, "scripts/hosted-smoke.sh");
 const smokeAssets = path.join(repositoryRoot, "scripts/hosted-smoke-assets.sh");
 
+test("HEIC container separates native build and runtime copies and supports disabled builds", () => {
+	const source = readFileSync(
+		path.join(repositoryRoot, "Containerfile"),
+		"utf8",
+	);
+	assert.match(source, /AS native-build/);
+	assert.match(source, /AS runtime-copy/);
+	assert.match(source, /ARG MOTE_HEIC=enabled/);
+	assert.match(source, /build-unix.sh --platform linux/);
+	assert.match(source, /--no-default-features --features mote-defaults/);
+	assert.match(source, /COPY --from=runtime-copy \/runtime\//);
+	assert.doesNotMatch(source, /apt-get install[^\n]*(?:x265|heif-enc|libheif)/);
+});
+
+test("HEIC hosted smoke uses cleared source media and inspects both package modes", () => {
+	const source = readFileSync(smokeScript, "utf8");
+	assert.match(source, /fixtures\/heif\/iphone-8bit.heic/);
+	assert.match(source, /PHOTO_VIEWER_HEIC_MODE="\$MOTE_HEIC_MODE"/);
+	assert.match(source, /verify-linux-runtime.sh/);
+	assert.match(source, /run --rm --interactive --name "\$container_name"/);
+	const browser = readFileSync(
+		path.join(repositoryRoot, "tests/hosted/heic.spec.ts"),
+		"utf8",
+	);
+	for (const contract of [
+		/wallThumbnail/,
+		/screenPreview/,
+		/afterRestart/,
+		/image\/jpeg/,
+		/totalAssets/,
+		/totalPhotos/,
+	])
+		assert.match(browser, contract);
+});
+
+test("HEIC container Cargo command builds defaults or only mote-defaults", () => {
+	const source = readFileSync(
+		path.join(repositoryRoot, "Containerfile"),
+		"utf8",
+	).replaceAll(/\\\n/g, "");
+	const command = source
+		.split("\n")
+		.find((line) => line.startsWith("RUN if") && line.includes("cargo build"))
+		?.slice(4);
+	assert.ok(command);
+	const directory = mkdtempSync(
+		path.join(os.tmpdir(), "mote-container-command-"),
+	);
+	try {
+		writeFileSync(
+			path.join(directory, "cargo"),
+			"#!/bin/sh\nprintf '%s\\n' \"$@\"\n",
+			{ mode: 0o755 },
+		);
+		for (const [mode, expected] of [
+			["enabled", []],
+			["disabled", ["--no-default-features", "--features", "mote-defaults"]],
+		]) {
+			const result = spawnSync("sh", ["-c", command], {
+				encoding: "utf8",
+				env: {
+					...process.env,
+					PATH: `${directory}:${process.env.PATH}`,
+					MOTE_HEIC: mode,
+				},
+			});
+			assert.equal(result.status, 0, result.stderr);
+			assert.deepEqual(result.stdout.trim().split("\n"), [
+				"build",
+				"--locked",
+				"--release",
+				"--jobs",
+				"2",
+				"-p",
+				"photo-server",
+				...expected,
+			]);
+		}
+	} finally {
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
+
 test("hosted smoke gives standalone browser fixtures an isolated web root", () => {
 	const script = readFileSync(smokeScript, "utf8");
 	assert.match(

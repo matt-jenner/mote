@@ -43,6 +43,30 @@ clean_checkout() {
 	remove_generated_path "$checkout/apps/interface/node_modules/.vite-temp" "$checkout"
 	remove_generated_path "$checkout/apps/interface/tsconfig.tsbuildinfo" "$checkout"
 	remove_generated_path "$checkout/build/heic-native" "$checkout"
+	remove_generated_path "$checkout/build/flatpak" "$checkout"
+	remove_generated_path "$checkout/.flatpak-builder" "$checkout"
+	remove_generated_path "$checkout/dist/flatpak/repo" "$checkout"
+	for leftover in "$checkout/packaging/flatpak/".generated.previous.* "$checkout/packaging/flatpak/".generated.next.*; do
+		[ -e "$leftover" ] || continue
+		owner=${leftover##*.}
+		case "$owner" in ''|*[!0-9]*) continue ;; esac
+		if kill -0 "$owner" 2>/dev/null; then continue; fi
+		case "$leftover" in
+			*/.generated.previous.*)
+				if [ ! -e "$checkout/packaging/flatpak/generated" ]; then
+					mv "$leftover" "$checkout/packaging/flatpak/generated"
+					continue
+				fi ;;
+		esac
+		remove_generated_path "$leftover" "$checkout"
+	done
+	for leftover in "$checkout/runtime/"photo-viewer-smoke-*; do
+		[ -d "$leftover" ] || continue
+		owner=${leftover##*-}
+		case "$owner" in ''|*[!0-9]*) continue ;; esac
+		if kill -0 "$owner" 2>/dev/null; then continue; fi
+		remove_generated_path "$leftover" "$checkout"
+	done
 }
 
 clean_checkout "$repository_root"
@@ -53,9 +77,6 @@ if [ -d "$repository_root/.worktrees" ]; then
 	done
 fi
 
-remove_generated_path "$repository_root/build/flatpak" "$repository_root"
-remove_generated_path "$repository_root/.flatpak-builder" "$repository_root"
-remove_generated_path "$repository_root/dist/flatpak/repo" "$repository_root"
 mote_reap_stale_builds
 
 container_engine=${CONTAINER_ENGINE:-podman}
