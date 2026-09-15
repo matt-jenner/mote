@@ -20,6 +20,53 @@ use photo_metadata::{
 #[derive(Clone, Default)]
 struct NoopMetadataReader;
 
+#[test]
+fn heif_access_failure_preserves_known_geometry_without_changing_other_format_fallbacks() {
+    for code in ["source_missing", "source_unreadable", "source_check_failed"] {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let library = catalog
+            .add_library(&NewLibrary::configured("Photos", Path::new("/Photos")))
+            .unwrap();
+        let generation = catalog.begin_generation(library.id).unwrap();
+        for (name, kind, expected) in [
+            ("photo.heic", MediaKind::Heif, (100, 28)),
+            ("photo.jpg", MediaKind::Jpeg, (4, 3)),
+        ] {
+            let asset = NewAsset::minimal(
+                library.id,
+                RelativePathKey::from_relative_path(Path::new(name)).unwrap(),
+                name,
+                kind,
+                1,
+            );
+            CatalogWriter::new(&mut catalog, library.id, generation)
+                .apply_batch(&[
+                    IndexEvent::Discovered {
+                        asset: asset.clone(),
+                    },
+                    IndexEvent::ShapeReady {
+                        asset_id: asset.id,
+                        width: 100,
+                        height: 28,
+                        orientation: 1,
+                    },
+                ])
+                .unwrap();
+            CatalogWriter::new(&mut catalog, library.id, generation)
+                .apply_batch(&[IndexEvent::ShapeFallback {
+                    asset_id: asset.id,
+                    width: 4,
+                    height: 3,
+                    code,
+                    message: "gone".into(),
+                }])
+                .unwrap();
+            let stored = catalog.find_asset(asset.id).unwrap().unwrap();
+            assert_eq!((stored.width.unwrap(), stored.height.unwrap()), expected);
+        }
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn root_first_unreadable_file_is_an_asset_warning_and_scan_continues() {

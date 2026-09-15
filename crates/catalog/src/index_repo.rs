@@ -176,6 +176,17 @@ fn apply_record(
 ) -> Result<(), CatalogError> {
     match record {
         CatalogIndexRecord::Discovered(asset) => {
+            if cfg!(feature = "heic") && asset.media_kind == photo_domain::MediaKind::Heif {
+                connection.execute(
+                    "DELETE FROM warnings WHERE asset_id = ?1 AND code IN (
+                       'shape_read_failed', 'image_open_failed', 'image_decode_failed', 'empty_image',
+                       'exif_open_failed', 'exif_read_failed', 'invalid_exif_date',
+                       'xmp_open_failed', 'xmp_read_failed', 'oversized_xmp', 'oversized_xmp_value',
+                       'malformed_xmp', 'invalid_rating', 'invalid_xmp_date', 'empty_keyword',
+                       'source_missing', 'source_unreadable', 'source_check_failed')",
+                    [asset.id.as_uuid().as_bytes()],
+                )?;
+            }
             if let Some((library_id, generation)) = generation {
                 if asset.library_id != library_id {
                     return Err(CatalogError::InvalidData(
@@ -203,6 +214,7 @@ fn apply_record(
         }
         CatalogIndexRecord::Shaped(shape) => {
             ensure_asset_library(connection, shape.asset_id, generation)?;
+            invalidate_disabled_heif_metadata(connection, shape.asset_id)?;
             connection.execute(
                 "UPDATE assets SET width = CASE WHEN ?2 > 0 THEN ?2 ELSE width END, height = CASE WHEN ?3 > 0 THEN ?3 ELSE height END, orientation = COALESCE(?4, orientation), representative_rgb = COALESCE(?5, representative_rgb), shape_status = ?6 \
                  WHERE id = ?1",
@@ -233,6 +245,27 @@ fn apply_record(
             apply_metadata(connection, metadata)
         }
         CatalogIndexRecord::Warning(warning) => {
+            if let (Some(asset_id), Some((library, generation))) = (warning.asset_id, generation)
+                && matches!(
+                    warning.code.as_str(),
+                    "source_missing"
+                        | "source_unreadable"
+                        | "source_check_failed"
+                        | "image_open_failed"
+                        | "exif_open_failed"
+                        | "xmp_open_failed"
+                        | "xmp_read_failed"
+                )
+            {
+                // Keep generation-local failure even when a newer overlapping scan
+                // suppresses this warning's stale shared-asset availability write.
+                connection.execute(
+                    "UPDATE scan_generations SET heif_metadata_retry_required = 1
+                     WHERE library_id = ?1 AND generation = ?2 AND completed_at IS NULL
+                       AND EXISTS (SELECT 1 FROM assets WHERE id = ?3 AND library_id = ?1 AND media_kind = 'heif')",
+                    params![library.as_uuid().as_bytes(), generation, asset_id.as_uuid().as_bytes()],
+                )?;
+            }
             if let (Some(asset_id), Some((library, generation))) = (warning.asset_id, generation) {
                 let availability = match warning.code.as_str() {
                     "source_missing" => Some("missing"),
@@ -311,6 +344,13 @@ fn apply_metadata(
     connection: &Connection,
     metadata: &AssetMetadataUpdate,
 ) -> Result<(), CatalogError> {
+    invalidate_disabled_heif_metadata(connection, metadata.asset_id)?;
+    for table in ["metadata_provenance", "asset_keywords"] {
+        connection.execute(
+            &format!("DELETE FROM {table} WHERE asset_id = ?1 AND EXISTS (SELECT 1 FROM assets WHERE id = ?1 AND media_kind = 'heif')"),
+            [metadata.asset_id.as_uuid().as_bytes()],
+        )?;
+    }
     connection.execute(
         "UPDATE assets SET captured_at_utc = ?2, rating = ?3 WHERE id = ?1",
         params![
@@ -347,6 +387,20 @@ fn apply_metadata(
                 provenance.raw_value,
                 i64::from(provenance.chosen),
             ],
+        )?;
+    }
+    Ok(())
+}
+
+fn invalidate_disabled_heif_metadata(
+    connection: &Connection,
+    asset: AssetId,
+) -> Result<(), CatalogError> {
+    if !cfg!(feature = "heic") {
+        connection.execute(
+            "UPDATE folder_groups SET heif_metadata_revision = 0
+             WHERE id IN (SELECT folder_group_id FROM folder_group_heif_assets WHERE asset_id = ?1)",
+            [asset.as_uuid().as_bytes()],
         )?;
     }
     Ok(())

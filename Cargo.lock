@@ -1198,6 +1198,7 @@ dependencies = [
  "photo-domain",
  "photo-indexer",
  "photo-metadata",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",

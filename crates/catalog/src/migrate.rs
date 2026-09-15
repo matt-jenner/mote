@@ -22,6 +22,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0012_saved_folders.sql"),
     include_str!("../migrations/0013_photo_picks.sql"),
     include_str!("../migrations/0014_preview_counts_by_media.sql"),
+    include_str!("../migrations/0015_heif_metadata_revision.sql"),
 ];
 
 pub(crate) fn migrate_with(path: &Path, migrations: &[&str]) -> Result<Connection, CatalogError> {
@@ -336,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn media_preview_count_migration_backfills_feature_neutral_rows() {
+    fn media_preview_count_and_heif_capability_migrations_backfill_feature_neutral_rows() {
         let mut connection = Connection::open_in_memory().unwrap();
         apply_migrations(&mut connection, &MIGRATIONS[..13]).unwrap();
         let library = vec![11_u8; 16];
@@ -417,6 +418,34 @@ mod tests {
         }
 
         apply_migrations(&mut connection, MIGRATIONS).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT heif_metadata_revision FROM folder_groups WHERE id = ?1",
+                    [&group],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "legacy completed groups must not be certified without an enabled scan"
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT COUNT(*) FROM folder_group_heif_assets WHERE folder_group_id = ?1 AND asset_id = ?2",
+                params![&group, vec![21_u8; 16]], |row| row.get::<_, i64>(0),
+            ).unwrap(),
+            1,
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM folder_group_heif_assets", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1,
+            "only legacy HEIF memberships belong in the startup subset"
+        );
 
         let rows = connection
             .prepare(

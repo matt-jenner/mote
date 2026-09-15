@@ -4,6 +4,12 @@ use rusqlite::{OptionalExtension, params};
 use crate::asset_repo::upsert_asset_on;
 use crate::{AssetRecord, Catalog, CatalogError, NewAsset};
 
+const HEIF_METADATA_REFRESH_REQUIRED: &str = "SELECT EXISTS (
+    SELECT 1 FROM folder_groups g
+    WHERE g.id = ?1 AND g.library_id = ?2 AND g.heif_metadata_revision = 0
+      AND EXISTS (SELECT 1 FROM folder_group_heif_assets h WHERE h.folder_group_id = g.id)
+)";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GenerationCompletion {
     pub marked_missing: u64,
@@ -16,6 +22,23 @@ pub struct FolderGroupRecoveryState {
 }
 
 impl Catalog {
+    pub fn heif_metadata_refresh_required(
+        &self,
+        library: LibraryId,
+        group: FolderGroupId,
+    ) -> Result<bool, CatalogError> {
+        if !cfg!(feature = "heic") {
+            return Ok(false);
+        }
+        self.connection
+            .query_row(
+                HEIF_METADATA_REFRESH_REQUIRED,
+                params![group.as_uuid().as_bytes(), library.as_uuid().as_bytes()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn has_completed_generation_for_library(
         &self,
         library: LibraryId,
@@ -159,6 +182,12 @@ impl Catalog {
                 recovery_token,
             ],
         )?;
+        if let Some(group) = folder_group {
+            transaction.execute(
+                "UPDATE folder_groups SET heif_metadata_revision = 0 WHERE id = ?1",
+                [group.as_uuid().as_bytes()],
+            )?;
+        }
         transaction.commit()?;
         u64::try_from(generation).map_err(|_| CatalogError::ValueOutOfRange)
     }
@@ -534,5 +563,370 @@ fn ensure_generation_group(
         Err(CatalogError::InvalidData(format!(
             "scan generation {generation} is missing for folder group"
         )))
+    }
+}
+
+#[cfg(test)]
+mod heif_metadata_tests {
+    use super::*;
+    use crate::{AssetMetadataUpdate, CatalogIndexRecord, NewFolderGroup, NewLibrary};
+    use photo_domain::{MediaKind, RelativePathKey};
+    use std::path::Path;
+
+    fn group(catalog: &mut Catalog, library: LibraryId, name: &str) -> FolderGroupId {
+        catalog
+            .upsert_folder_group(&NewFolderGroup {
+                id: FolderGroupId::new(),
+                library_id: library,
+                relative_path: RelativePathKey::from_relative_path(Path::new(name)).unwrap(),
+                display_path: name.into(),
+                last_viewed_at: None,
+            })
+            .unwrap()
+    }
+
+    fn fixture() -> (Catalog, LibraryId, FolderGroupId, NewAsset) {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let library = catalog
+            .add_library(&NewLibrary::configured("Photos", Path::new("/Photos")))
+            .unwrap()
+            .id;
+        let group = group(&mut catalog, library, "");
+        let mut asset = NewAsset::minimal(
+            library,
+            RelativePathKey::from_relative_path(Path::new("photo.heic")).unwrap(),
+            "photo.heic",
+            MediaKind::Heif,
+            123,
+        );
+        asset.folder_group_id = Some(group);
+        catalog.upsert_asset(&asset).unwrap();
+        (catalog, library, group, asset)
+    }
+
+    fn revision(catalog: &Catalog, group: FolderGroupId) -> i64 {
+        catalog
+            .connection
+            .query_row(
+                "SELECT heif_metadata_revision FROM folder_groups WHERE id = ?1",
+                [group.as_uuid().as_bytes()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn only_online_settlement_certifies_metadata_and_scan_admission_resets_it() {
+        let (mut catalog, library, group, asset) = fixture();
+        assert_eq!(
+            catalog
+                .heif_metadata_refresh_required(library, group)
+                .unwrap(),
+            cfg!(feature = "heic")
+        );
+        let generation = catalog.begin_generation_for_group(library, group).unwrap();
+        catalog
+            .record_generation_assets(library, generation, std::slice::from_ref(&asset))
+            .unwrap();
+        catalog
+            .complete_generation_for_group(library, group, generation)
+            .unwrap();
+        assert_eq!(revision(&catalog, group), i64::from(cfg!(feature = "heic")));
+        let generation = catalog.begin_generation_for_group(library, group).unwrap();
+        assert_eq!(revision(&catalog, group), 0);
+        catalog.mark_group_offline(library, group).unwrap();
+        catalog
+            .complete_generation_for_group(library, group, generation)
+            .unwrap();
+        assert_eq!(revision(&catalog, group), 0);
+    }
+
+    #[test]
+    fn signature_changes_and_disabled_writes_invalidate_all_shared_heif_groups() {
+        let (mut catalog, library, first, mut asset) = fixture();
+        let second = group(&mut catalog, library, "child");
+        asset.folder_group_id = Some(second);
+        catalog.upsert_asset(&asset).unwrap();
+        catalog
+            .connection
+            .execute("UPDATE folder_groups SET heif_metadata_revision = 1", [])
+            .unwrap();
+        asset.signature.modified_unix_ns = 42;
+        catalog.upsert_asset(&asset).unwrap();
+        assert_eq!(
+            (revision(&catalog, first), revision(&catalog, second)),
+            (0, 0)
+        );
+        catalog
+            .connection
+            .execute("UPDATE folder_groups SET heif_metadata_revision = 1", [])
+            .unwrap();
+        catalog
+            .apply_index_batch(&[CatalogIndexRecord::Metadata(AssetMetadataUpdate {
+                asset_id: asset.id,
+                captured_at_utc: None,
+                rating: None,
+                keywords: vec![],
+                provenance: vec![],
+            })])
+            .unwrap();
+        let expected = i64::from(cfg!(feature = "heic"));
+        assert_eq!(
+            (revision(&catalog, first), revision(&catalog, second)),
+            (expected, expected)
+        );
+    }
+
+    #[test]
+    fn only_current_generation_retryable_heif_warnings_prevent_certification() {
+        use crate::CatalogWarningRecord;
+        for code in [
+            "source_check_failed",
+            "source_missing",
+            "source_unreadable",
+            "image_open_failed",
+            "exif_open_failed",
+            "xmp_open_failed",
+            "xmp_read_failed",
+        ] {
+            let (mut catalog, library, group, asset) = fixture();
+            let generation = catalog.begin_generation_for_group(library, group).unwrap();
+            let warning = CatalogIndexRecord::Warning(CatalogWarningRecord {
+                library_id: library,
+                asset_id: Some(asset.id),
+                code: code.into(),
+                message: "temporary access failure".into(),
+            });
+            catalog
+                .apply_index_batch_for_generation(
+                    library,
+                    generation,
+                    std::slice::from_ref(&warning),
+                )
+                .unwrap();
+            catalog
+                .complete_generation_for_group(library, group, generation)
+                .unwrap();
+            assert_eq!(revision(&catalog, group), 0, "certified {code}");
+            assert_eq!(catalog.connection.query_row("SELECT heif_metadata_retry_required FROM scan_generations WHERE generation = ?1", [i64::try_from(generation).unwrap()], |row| row.get::<_, i64>(0)).unwrap(), 1, "missing durable failure state for {code}");
+
+            let retry = catalog.begin_generation_for_group(library, group).unwrap();
+            catalog
+                .record_generation_assets(library, retry, std::slice::from_ref(&asset))
+                .unwrap();
+            // Keep the old warning in history. It must not poison this clean pass.
+            assert_eq!(
+                catalog
+                    .connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM warnings WHERE code = ?1",
+                        [code],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                1
+            );
+            catalog
+                .complete_generation_for_group(library, group, retry)
+                .unwrap();
+            assert_eq!(
+                revision(&catalog, group),
+                i64::from(cfg!(feature = "heic")),
+                "historical {code} blocked clean retry"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_newer_asset_discovery_does_not_hide_older_generation_failure() {
+        use crate::CatalogWarningRecord;
+        for code in ["source_check_failed", "source_missing", "source_unreadable"] {
+            let (mut catalog, library, first, mut asset) = fixture();
+            let second = group(&mut catalog, library, "overlap");
+            let older = catalog.begin_generation_for_group(library, first).unwrap();
+            catalog
+                .record_generation_assets(library, older, std::slice::from_ref(&asset))
+                .unwrap();
+            let newer = catalog.begin_generation_for_group(library, second).unwrap();
+            asset.folder_group_id = Some(second);
+            catalog
+                .record_generation_assets(library, newer, std::slice::from_ref(&asset))
+                .unwrap();
+            // The newer overlapping scan remains interrupted after rediscovery.
+            catalog
+                .apply_index_batch_for_generation(
+                    library,
+                    older,
+                    &[CatalogIndexRecord::Warning(CatalogWarningRecord {
+                        library_id: library,
+                        asset_id: Some(asset.id),
+                        code: code.into(),
+                        message: "older scan encountered a transient device failure".into(),
+                    })],
+                )
+                .unwrap();
+            catalog
+                .complete_generation_for_group(library, first, older)
+                .unwrap();
+            assert_eq!(
+                revision(&catalog, first),
+                0,
+                "newer shared-asset discovery hid the older scan failure"
+            );
+            assert_eq!(catalog.connection.query_row("SELECT heif_metadata_retry_required FROM scan_generations WHERE generation = ?1", [i64::try_from(older).unwrap()], |row| row.get::<_, i64>(0)).unwrap(), 1);
+            assert_eq!(
+                catalog
+                    .connection
+                    .query_row(
+                        "SELECT last_seen_generation, availability FROM assets WHERE id = ?1",
+                        [asset.id.as_uuid().as_bytes()],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                    )
+                    .unwrap(),
+                (i64::try_from(newer).unwrap(), "available".into())
+            );
+            assert_eq!(catalog.connection.query_row("SELECT completed_at, heif_metadata_retry_required FROM scan_generations WHERE generation = ?1", [i64::try_from(newer).unwrap()], |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?))).unwrap(), (None, 0));
+            assert_eq!(revision(&catalog, second), 0);
+        }
+    }
+
+    #[test]
+    fn retryable_warning_state_rolls_back_with_the_batch_and_excludes_other_formats() {
+        use crate::CatalogWarningRecord;
+        let (mut catalog, library, group, mut asset) = fixture();
+        let generation = catalog.begin_generation_for_group(library, group).unwrap();
+        let warning = CatalogIndexRecord::Warning(CatalogWarningRecord {
+            library_id: library,
+            asset_id: Some(asset.id),
+            code: "source_check_failed".into(),
+            message: "temporary access failure".into(),
+        });
+        let foreign = NewAsset::minimal(
+            LibraryId::new(),
+            asset.relative_path.clone(),
+            "foreign.heic",
+            MediaKind::Heif,
+            1,
+        );
+        assert!(
+            catalog
+                .apply_index_batch_for_generation(
+                    library,
+                    generation,
+                    &[warning.clone(), CatalogIndexRecord::Discovered(foreign)]
+                )
+                .is_err()
+        );
+        assert_eq!(catalog.connection.query_row("SELECT heif_metadata_retry_required FROM scan_generations WHERE generation = ?1", [i64::try_from(generation).unwrap()], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        asset.media_kind = MediaKind::Jpeg;
+        catalog
+            .record_generation_assets(library, generation, std::slice::from_ref(&asset))
+            .unwrap();
+        catalog
+            .apply_index_batch_for_generation(library, generation, &[warning])
+            .unwrap();
+        assert_eq!(catalog.connection.query_row("SELECT heif_metadata_retry_required FROM scan_generations WHERE generation = ?1", [i64::try_from(generation).unwrap()], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn terminal_decode_warning_does_not_prevent_heif_certification() {
+        use crate::CatalogWarningRecord;
+        let (mut catalog, library, group, asset) = fixture();
+        let generation = catalog.begin_generation_for_group(library, group).unwrap();
+        catalog
+            .record_generation_assets(library, generation, std::slice::from_ref(&asset))
+            .unwrap();
+        catalog
+            .apply_index_batch_for_generation(
+                library,
+                generation,
+                &[CatalogIndexRecord::Warning(CatalogWarningRecord {
+                    library_id: library,
+                    asset_id: Some(asset.id),
+                    code: "image_decode_failed".into(),
+                    message: "invalid input".into(),
+                })],
+            )
+            .unwrap();
+        catalog
+            .complete_generation_for_group(library, group, generation)
+            .unwrap();
+        assert_eq!(revision(&catalog, group), i64::from(cfg!(feature = "heic")));
+    }
+
+    #[test]
+    fn heif_membership_subset_tracks_kind_changes_and_cascaded_deletions() {
+        let (mut catalog, library, group, mut asset) = fixture();
+        asset.media_kind = MediaKind::Jpeg;
+        catalog.upsert_asset(&asset).unwrap();
+        assert!(
+            !catalog
+                .heif_metadata_refresh_required(library, group)
+                .unwrap()
+        );
+        asset.media_kind = MediaKind::Heif;
+        catalog.upsert_asset(&asset).unwrap();
+        assert_eq!(
+            catalog
+                .heif_metadata_refresh_required(library, group)
+                .unwrap(),
+            cfg!(feature = "heic")
+        );
+        catalog
+            .connection
+            .execute(
+                "DELETE FROM assets WHERE id = ?1",
+                [asset.id.as_uuid().as_bytes()],
+            )
+            .unwrap();
+        assert_eq!(
+            catalog
+                .connection
+                .query_row("SELECT COUNT(*) FROM folder_group_heif_assets", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert!(
+            !catalog
+                .heif_metadata_refresh_required(library, group)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn startup_probe_cost_does_not_grow_with_130000_heif_assets_in_another_group() {
+        let (mut catalog, library, populated, _) = fixture();
+        let empty = group(&mut catalog, library, "empty");
+        let steps = |catalog: &Catalog, target: FolderGroupId| {
+            let mut statement = catalog
+                .connection
+                .prepare(HEIF_METADATA_REFRESH_REQUIRED)
+                .unwrap();
+            let _: bool = statement
+                .query_row(
+                    params![target.as_uuid().as_bytes(), library.as_uuid().as_bytes()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            statement.get_status(rusqlite::StatementStatus::VmStep)
+        };
+        let before = (steps(&catalog, empty), steps(&catalog, populated));
+        catalog.connection.execute(
+            "WITH RECURSIVE n(value) AS (VALUES(1) UNION ALL SELECT value + 1 FROM n WHERE value < 130000)
+             INSERT INTO assets(id, library_id, relative_path_key, display_path, media_kind, size_bytes, modified_unix_ns, availability, provisional_order, shape_status, relative_parent_key)
+             SELECT CAST(printf('%016d', value) AS BLOB), ?1, CAST(printf('bulk/%d.heic', value) AS BLOB), printf('bulk/%d.heic', value), 'heif', 1, '1', 'available', value + 1, 'pending', X'' FROM n",
+            [library.as_uuid().as_bytes()],
+        ).unwrap();
+        catalog.connection.execute("INSERT INTO folder_group_assets SELECT ?1, id, 0 FROM assets WHERE display_path LIKE 'bulk/%'", [populated.as_uuid().as_bytes()]).unwrap();
+        let after = (steps(&catalog, empty), steps(&catalog, populated));
+        assert_eq!(after, before);
+        assert!(after.0 < 80 && after.1 < 80, "startup VM steps: {after:?}");
+        assert!(
+            !catalog
+                .heif_metadata_refresh_required(library, empty)
+                .unwrap()
+        );
     }
 }

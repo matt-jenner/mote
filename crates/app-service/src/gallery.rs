@@ -1100,7 +1100,13 @@ impl GalleryEngine {
                                     selection.library_id,
                                     selection.group_id,
                                 )
-                                .ok()?;
+                                .ok()?
+                                && !catalog
+                                    .heif_metadata_refresh_required(
+                                        selection.library_id,
+                                        selection.group_id,
+                                    )
+                                    .ok()?;
                             let reconciled = if self.hosted_library_id == Some(selection.library_id)
                             {
                                 catalog

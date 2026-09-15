@@ -17,7 +17,19 @@ impl MetadataReader for DefaultMetadataReader {
         media_path: &Path,
         sidecar_path: Option<&Path>,
     ) -> Result<MetadataBundle, MetadataReadWarning> {
-        let mut bundle = EmbeddedExifReader::read(media_path).unwrap_or_default();
+        let mut bundle = match EmbeddedExifReader::read(media_path) {
+            Err(error)
+                if photo_domain::MediaKind::from_path(media_path)
+                    == Some(photo_domain::MediaKind::Heif)
+                    && matches!(
+                        error.code,
+                        "source_missing" | "source_unreadable" | "source_check_failed"
+                    ) =>
+            {
+                return Err(error);
+            }
+            result => result.unwrap_or_default(),
+        };
         if let Some(sidecar) = sidecar_path {
             match XmpSidecarReader::read_path(sidecar) {
                 Ok(value) => bundle.extend(value),
@@ -56,4 +68,25 @@ impl MetadataReader for DefaultMetadataReader {
 fn to_datetime(value: SystemTime) -> Option<chrono::DateTime<chrono::FixedOffset>> {
     let seconds = value.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
     chrono::DateTime::from_timestamp(seconds, 0).map(|value| value.fixed_offset())
+}
+
+#[cfg(all(test, feature = "heic", unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_time_io_is_retryable_for_heif_without_changing_jpeg_tolerance() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["photo.heic", "photo.jpg"] {
+            let path = temp.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::File::open(&path).unwrap().metadata().unwrap();
+            let result = DefaultMetadataReader.read(&path, None);
+            if name.ends_with("heic") {
+                assert_eq!(result.unwrap_err().code, "source_check_failed");
+            } else {
+                assert!(!result.unwrap().capture_dates.is_empty());
+            }
+        }
+    }
 }

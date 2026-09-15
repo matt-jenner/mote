@@ -151,16 +151,16 @@ impl Catalog {
             i64::try_from(expected_recovery_token).map_err(|_| CatalogError::ValueOutOfRange)?;
         let transaction = self.connection.transaction()?;
         ensure_group_library(&transaction, library, group)?;
-        let (source_online, stored_recovery_token): (i64, i64) = transaction
+        let (source_online, stored_recovery_token, heif_metadata_retry_required): (i64, i64, i64) = transaction
             .query_row(
-                "SELECT source_was_online, recovery_token FROM scan_generations
+                "SELECT source_was_online, recovery_token, heif_metadata_retry_required FROM scan_generations
                  WHERE library_id = ?1 AND folder_group_id = ?2 AND generation = ?3",
                 params![
                     library.as_uuid().as_bytes(),
                     group.as_uuid().as_bytes(),
                     generation
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?
             .ok_or_else(|| {
@@ -214,12 +214,18 @@ impl Catalog {
             )?;
             let advanced = transaction.execute(
                 "UPDATE folder_groups
-                 SET recovery_reconciled = MAX(recovery_reconciled, ?3)
+                 SET recovery_reconciled = MAX(recovery_reconciled, ?3),
+                     heif_metadata_revision = CASE WHEN ?4 = 1 AND ?5 = 0 AND NOT EXISTS (
+                       SELECT 1 FROM folder_group_heif_assets h JOIN assets a ON a.id = h.asset_id
+                       WHERE h.folder_group_id = ?1 AND a.availability <> 'available'
+                     ) THEN 1 ELSE 0 END
                  WHERE id = ?1 AND library_id = ?2 AND recovery_requested >= ?3",
                 params![
                     group.as_uuid().as_bytes(),
                     library.as_uuid().as_bytes(),
                     stored_recovery_token,
+                    i64::from(cfg!(feature = "heic")),
+                    heif_metadata_retry_required,
                 ],
             )?;
             if advanced != 1 {

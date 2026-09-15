@@ -28,10 +28,24 @@ impl<'a> CatalogWriter<'a> {
     }
 
     pub fn apply_batch(&mut self, events: &[IndexEvent]) -> Result<(), CatalogError> {
-        let records = events
-            .iter()
-            .filter_map(|event| to_catalog_record(event, self.library_id))
-            .collect::<Vec<_>>();
+        let mut records = Vec::new();
+        for event in events {
+            if let IndexEvent::ShapeFallback {
+                asset_id,
+                code: "source_missing" | "source_unreadable" | "source_check_failed",
+                ..
+            } = event
+                && self.catalog.find_asset(*asset_id)?.is_some_and(|asset| {
+                    asset.library_id == self.library_id
+                        && asset.media_kind == photo_domain::MediaKind::Heif
+                })
+            {
+                continue;
+            }
+            if let Some(record) = to_catalog_record(event, self.library_id) {
+                records.push(record);
+            }
+        }
         self.catalog
             .apply_index_batch_for_generation(self.library_id, self.generation, &records)
     }

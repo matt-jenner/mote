@@ -20,7 +20,14 @@ pub struct RepresentativeRgb {
 
 impl MediaProbe {
     pub fn shape(path: &Path) -> Result<ImageShape, MetadataReadWarning> {
-        let shape = display_shape(path, media_kind(path)).map_err(shape_warning)?;
+        let kind = media_kind(path);
+        let shape = display_shape(path, kind).map_err(|error| {
+            if kind == MediaKind::Heif {
+                crate::heif_codec_warning(error, "shape_read_failed")
+            } else {
+                shape_warning(error)
+            }
+        })?;
         Ok(ImageShape {
             width: shape.width,
             height: shape.height,

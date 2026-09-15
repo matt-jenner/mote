@@ -304,23 +304,7 @@ impl<R: MetadataReader> Indexer<R> {
                         }
                         let path = item.source_path.clone();
                         let shape_result = tokio::task::spawn_blocking(move || {
-                            check_asset_access(&path)?;
-                            let kind = MediaKind::from_path(&path).unwrap_or(MediaKind::Unknown);
-                            let shape = MediaProbe::shape(&path)?;
-                            let orientation = if kind == MediaKind::Heif {
-                                1
-                            } else {
-                                EmbeddedExifReader::read(&path)
-                                    .ok()
-                                    .and_then(|bundle| bundle.orientation)
-                                    .unwrap_or(1)
-                            };
-                            let rotated = matches!(orientation, 5..=8);
-                            Ok::<_, MetadataReadWarning>((
-                                if rotated { shape.height } else { shape.width },
-                                if rotated { shape.width } else { shape.height },
-                                orientation,
-                            ))
+                            probe_display_shape(&path, MediaProbe::shape)
                         })
                         .await;
                         scheduler.release_folder_enrichment(folder_key);
@@ -353,8 +337,10 @@ impl<R: MetadataReader> Indexer<R> {
                                 }
                             }
                             Ok(Err(w)) => {
-                                let inaccessible =
-                                    matches!(w.code, "source_missing" | "source_unreadable");
+                                let inaccessible = matches!(
+                                    w.code,
+                                    "source_missing" | "source_unreadable" | "source_check_failed"
+                                );
                                 summary.lock().await.failed += 1;
                                 let _ = events
                                     .send(IndexEvent::ShapeFallback {
@@ -649,11 +635,67 @@ fn process_asset<R: MetadataReader>(
     check_asset_access(&item.source_path)?;
     let colour = MediaProbe::representative_rgb(&item.source_path);
     let metadata = reader.read(&item.source_path, item.sidecar_path.as_deref())?;
+    if item.asset.media_kind == MediaKind::Heif
+        && let Some(warning) = metadata.warnings.iter().find(|warning| {
+            matches!(
+                warning.code,
+                "source_missing"
+                    | "source_unreadable"
+                    | "source_check_failed"
+                    | "image_open_failed"
+                    | "exif_open_failed"
+                    | "xmp_open_failed"
+                    | "xmp_read_failed"
+            )
+        })
+    {
+        return Err(MetadataReadWarning::new(
+            warning.code,
+            warning.message.clone(),
+        ));
+    }
+    // EXIF readers may return an empty bundle when a file disappears during
+    // their read. Keep the catalog's known metadata on a transient access loss.
+    if item.asset.media_kind == MediaKind::Heif {
+        check_asset_access(&item.source_path)?;
+    }
     Ok(ProcessedAsset {
         representative_rgb: colour.as_ref().ok().copied(),
         colour_warning: colour.err(),
         metadata,
     })
+}
+
+fn probe_display_shape(
+    path: &Path,
+    probe: impl FnOnce(&Path) -> Result<photo_metadata::ImageShape, MetadataReadWarning>,
+) -> Result<(u32, u32, u16), MetadataReadWarning> {
+    check_asset_access(path)?;
+    let kind = MediaKind::from_path(path).unwrap_or(MediaKind::Unknown);
+    let shape = probe(path).map_err(|warning| {
+        // The decoder may flatten an access failure into a shape warning.
+        // Distinguish source loss from a terminal corrupt-image outcome.
+        if kind == MediaKind::Heif
+            && let Err(access) = check_asset_access(path)
+        {
+            return access;
+        }
+        warning
+    })?;
+    let orientation = if kind == MediaKind::Heif {
+        1
+    } else {
+        EmbeddedExifReader::read(path)
+            .ok()
+            .and_then(|bundle| bundle.orientation)
+            .unwrap_or(1)
+    };
+    let rotated = matches!(orientation, 5..=8);
+    Ok((
+        if rotated { shape.height } else { shape.width },
+        if rotated { shape.width } else { shape.height },
+        orientation,
+    ))
 }
 
 fn check_asset_access(path: &Path) -> Result<(), MetadataReadWarning> {
@@ -776,6 +818,239 @@ fn discover_for_scan(
 mod tests {
     use super::{PhotoInventory, validate_completed_inventory};
     use crate::{IndexError, IndexScheduler, InteractionMode, SchedulerConfig};
+
+    #[test]
+    fn heif_disappearing_between_access_check_and_shape_probe_keeps_cached_geometry() {
+        use crate::{CatalogWriter, IndexEvent};
+        use photo_catalog::{Catalog, NewAsset, NewLibrary};
+        use photo_domain::{Availability, MediaKind, RelativePathKey};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("portrait.heic");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../codec/tests/fixtures/heif/portrait-rotated.heic"),
+            &path,
+        )
+        .unwrap();
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let library = catalog
+            .add_library(&NewLibrary::configured("Photos", temp.path()))
+            .unwrap();
+        let generation = catalog.begin_generation(library.id).unwrap();
+        let asset = NewAsset::minimal(
+            library.id,
+            RelativePathKey::from_relative_path(std::path::Path::new("portrait.heic")).unwrap(),
+            "portrait.heic",
+            MediaKind::Heif,
+            path.metadata().unwrap().len(),
+        );
+        CatalogWriter::new(&mut catalog, library.id, generation)
+            .apply_batch(&[
+                IndexEvent::Discovered {
+                    asset: asset.clone(),
+                },
+                IndexEvent::ShapeReady {
+                    asset_id: asset.id,
+                    width: 100,
+                    height: 28,
+                    orientation: 1,
+                },
+            ])
+            .unwrap();
+        let error = super::probe_display_shape(&path, |path| {
+            // This dependency is invoked only after the production access check.
+            std::fs::rename(path, path.with_extension("away")).unwrap();
+            photo_metadata::MediaProbe::shape(path)
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.code, "source_missing",
+            "lost source was treated as a corrupt image"
+        );
+        CatalogWriter::new(&mut catalog, library.id, generation)
+            .apply_batch(&[
+                IndexEvent::ShapeFallback {
+                    asset_id: asset.id,
+                    width: 4,
+                    height: 3,
+                    code: error.code,
+                    message: error.message.clone(),
+                },
+                IndexEvent::Warning {
+                    asset_id: Some(asset.id),
+                    code: error.code,
+                    message: error.message,
+                },
+            ])
+            .unwrap();
+        let stored = catalog.find_asset(asset.id).unwrap().unwrap();
+        assert_eq!((stored.width, stored.height), (Some(100), Some(28)));
+        assert_eq!(stored.availability, Availability::Missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn heif_access_errors_after_the_initial_check_keep_their_source_semantics() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        for expected in ["source_unreadable", "source_check_failed"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("portrait.heic");
+            std::fs::copy(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../codec/tests/fixtures/heif/portrait-rotated.heic"),
+                &path,
+            )
+            .unwrap();
+            let error = super::probe_display_shape(&path, |path| {
+                if expected == "source_unreadable" {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+                } else {
+                    std::fs::rename(path, path.with_extension("away")).unwrap();
+                    symlink(path, path).unwrap();
+                }
+                photo_metadata::MediaProbe::shape(path)
+            })
+            .unwrap_err();
+            assert_eq!(error.code, expected);
+        }
+    }
+
+    #[test]
+    fn accessible_corrupt_heif_shape_remains_a_terminal_shape_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("corrupt.heic");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../codec/tests/fixtures/heif/truncated.heic"),
+            &path,
+        )
+        .unwrap();
+        let error =
+            super::probe_display_shape(&path, photo_metadata::MediaProbe::shape).unwrap_err();
+        assert_eq!(error.code, "shape_read_failed");
+    }
+
+    #[test]
+    fn missing_jpeg_sidecar_keeps_existing_partial_metadata_behavior() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("photo.jpg");
+        image::RgbImage::new(8, 6).save(&path).unwrap();
+        let item = super::DiscoveredAsset {
+            asset: photo_catalog::NewAsset::minimal(
+                photo_domain::LibraryId::new(),
+                photo_domain::RelativePathKey::from_relative_path(std::path::Path::new(
+                    "photo.jpg",
+                ))
+                .unwrap(),
+                "photo.jpg",
+                photo_domain::MediaKind::Jpeg,
+                1,
+            ),
+            source_path: path,
+            sidecar_path: Some(temp.path().join("missing.xmp")),
+        };
+        let processed =
+            super::process_asset(std::sync::Arc::new(crate::DefaultMetadataReader), item).unwrap();
+        assert!(!processed.metadata.capture_dates.is_empty());
+        assert!(
+            processed
+                .metadata
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "xmp_open_failed")
+        );
+    }
+
+    #[cfg(all(feature = "heic", unix))]
+    #[test]
+    fn heif_shape_read_time_io_preserves_geometry_and_prevents_certification() {
+        use crate::{CatalogWriter, IndexEvent};
+        use photo_catalog::{Catalog, NewAsset, NewFolderGroup, NewLibrary};
+        use photo_domain::{FolderGroupId, MediaKind, RelativePathKey};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("portrait.heic");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../codec/tests/fixtures/heif/portrait-rotated.heic"),
+            &path,
+        )
+        .unwrap();
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let library = catalog
+            .add_library(&NewLibrary::configured("Photos", temp.path()))
+            .unwrap();
+        let group = catalog
+            .upsert_folder_group(&NewFolderGroup {
+                id: FolderGroupId::new(),
+                library_id: library.id,
+                relative_path: RelativePathKey::from_relative_path(std::path::Path::new(""))
+                    .unwrap(),
+                display_path: "".into(),
+                last_viewed_at: None,
+            })
+            .unwrap();
+        let generation = catalog
+            .begin_generation_for_group(library.id, group)
+            .unwrap();
+        let mut asset = NewAsset::minimal(
+            library.id,
+            RelativePathKey::from_relative_path(std::path::Path::new("portrait.heic")).unwrap(),
+            "portrait.heic",
+            MediaKind::Heif,
+            path.metadata().unwrap().len(),
+        );
+        asset.folder_group_id = Some(group);
+        CatalogWriter::new(&mut catalog, library.id, generation)
+            .apply_batch(&[
+                IndexEvent::Discovered {
+                    asset: asset.clone(),
+                },
+                IndexEvent::ShapeReady {
+                    asset_id: asset.id,
+                    width: 100,
+                    height: 28,
+                    orientation: 1,
+                },
+            ])
+            .unwrap();
+        let error = super::probe_display_shape(&path, |path| {
+            std::fs::rename(path, path.with_extension("away")).unwrap();
+            std::fs::create_dir(path).unwrap();
+            photo_metadata::MediaProbe::shape(path)
+        })
+        .unwrap_err();
+        super::check_asset_access(&path).unwrap();
+        assert_eq!(
+            error.code, "source_check_failed",
+            "read-time typed I/O was flattened despite successful access checks"
+        );
+        CatalogWriter::new(&mut catalog, library.id, generation)
+            .apply_batch(&[
+                IndexEvent::ShapeFallback {
+                    asset_id: asset.id,
+                    width: 4,
+                    height: 3,
+                    code: error.code,
+                    message: error.message.clone(),
+                },
+                IndexEvent::Warning {
+                    asset_id: Some(asset.id),
+                    code: error.code,
+                    message: error.message,
+                },
+            ])
+            .unwrap();
+        catalog
+            .complete_generation_for_group(library.id, group, generation)
+            .unwrap();
+        let stored = catalog.find_asset(asset.id).unwrap().unwrap();
+        assert_eq!((stored.width, stored.height), (Some(100), Some(28)));
+        assert!(
+            catalog
+                .heif_metadata_refresh_required(library.id, group)
+                .unwrap()
+        );
+    }
 
     #[tokio::test]
     async fn disappeared_discovery_joins_and_settles_surviving_assets() {
