@@ -212,12 +212,15 @@ impl Catalog {
                  WHERE id = ?1",
                 [library.as_uuid().as_bytes()],
             )?;
+            // A newer overlapping discovery may have invalidated metadata without
+            // enriching it yet. This older scan cannot certify that newer state.
             let advanced = transaction.execute(
                 "UPDATE folder_groups
                  SET recovery_reconciled = MAX(recovery_reconciled, ?3),
                      heif_metadata_revision = CASE WHEN ?4 = 1 AND ?5 = 0 AND NOT EXISTS (
                        SELECT 1 FROM folder_group_heif_assets h JOIN assets a ON a.id = h.asset_id
-                       WHERE h.folder_group_id = ?1 AND a.availability <> 'available'
+                       WHERE h.folder_group_id = ?1
+                         AND (a.availability <> 'available' OR a.last_seen_generation > ?6)
                      ) THEN 1 ELSE 0 END
                  WHERE id = ?1 AND library_id = ?2 AND recovery_requested >= ?3",
                 params![
@@ -226,6 +229,7 @@ impl Catalog {
                     stored_recovery_token,
                     i64::from(cfg!(feature = "heic")),
                     heif_metadata_retry_required,
+                    generation,
                 ],
             )?;
             if advanced != 1 {

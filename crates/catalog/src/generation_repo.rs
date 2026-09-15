@@ -791,6 +791,123 @@ mod heif_metadata_tests {
     }
 
     #[test]
+    fn newer_cancelled_signature_discovery_prevents_older_group_certification() {
+        for sidecar_changed in [false, true] {
+            let (mut catalog, library, parent, _) = fixture();
+            let child = group(&mut catalog, library, "child");
+            let mut asset = NewAsset::minimal(
+                library,
+                RelativePathKey::from_relative_path(Path::new("child/photo.heic")).unwrap(),
+                "child/photo.heic",
+                MediaKind::Heif,
+                123,
+            );
+            asset.folder_group_id = Some(parent);
+            let metadata = CatalogIndexRecord::Metadata(AssetMetadataUpdate {
+                asset_id: asset.id,
+                captured_at_utc: Some("2024-01-02T03:04:05Z".into()),
+                rating: None,
+                keywords: vec![],
+                provenance: vec![],
+            });
+            let seed = catalog.begin_generation_for_group(library, parent).unwrap();
+            catalog
+                .apply_index_batch_for_generation(
+                    library,
+                    seed,
+                    &[
+                        CatalogIndexRecord::Discovered(asset.clone()),
+                        metadata.clone(),
+                    ],
+                )
+                .unwrap();
+            catalog
+                .complete_generation_for_group(library, parent, seed)
+                .unwrap();
+            assert_eq!(
+                revision(&catalog, parent),
+                i64::from(cfg!(feature = "heic"))
+            );
+
+            let older = catalog.begin_generation_for_group(library, parent).unwrap();
+            catalog
+                .apply_index_batch_for_generation(
+                    library,
+                    older,
+                    &[
+                        CatalogIndexRecord::Discovered(asset.clone()),
+                        metadata.clone(),
+                    ],
+                )
+                .unwrap();
+            let newer = catalog.begin_generation_for_group(library, child).unwrap();
+            asset.folder_group_id = Some(child);
+            if sidecar_changed {
+                asset.signature.sidecar_modified_unix_ns = Some(42);
+            } else {
+                asset.signature.modified_unix_ns = 42;
+            }
+            catalog
+                .apply_index_batch_for_generation(
+                    library,
+                    newer,
+                    &[CatalogIndexRecord::Discovered(asset.clone())],
+                )
+                .unwrap();
+            // Cancellation leaves the newer generation incomplete, before enrichment.
+            let cached = catalog.find_asset(asset.id).unwrap().unwrap();
+            assert_eq!(cached.signature, asset.signature);
+            assert_eq!(
+                cached.captured_at_utc.as_deref(),
+                Some("2024-01-02T03:04:05Z")
+            );
+            assert_eq!(cached.availability, photo_domain::Availability::Available);
+            assert_eq!(revision(&catalog, parent), 0);
+            catalog
+                .complete_generation_for_group(library, parent, older)
+                .unwrap();
+            assert_eq!(
+                revision(&catalog, parent),
+                0,
+                "older completion certified newer unenriched signature"
+            );
+            assert_eq!(
+                catalog
+                    .heif_metadata_refresh_required(library, parent)
+                    .unwrap(),
+                cfg!(feature = "heic")
+            );
+            assert!(
+                !catalog
+                    .has_completed_group_generation(library, child, newer)
+                    .unwrap()
+            );
+
+            let retry = catalog.begin_generation_for_group(library, parent).unwrap();
+            asset.folder_group_id = Some(parent);
+            catalog
+                .apply_index_batch_for_generation(
+                    library,
+                    retry,
+                    &[CatalogIndexRecord::Discovered(asset.clone()), metadata],
+                )
+                .unwrap();
+            catalog
+                .complete_generation_for_group(library, parent, retry)
+                .unwrap();
+            assert_eq!(
+                revision(&catalog, parent),
+                i64::from(cfg!(feature = "heic"))
+            );
+            assert!(
+                !catalog
+                    .heif_metadata_refresh_required(library, parent)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn retryable_warning_state_rolls_back_with_the_batch_and_excludes_other_formats() {
         use crate::CatalogWarningRecord;
         let (mut catalog, library, group, mut asset) = fixture();
