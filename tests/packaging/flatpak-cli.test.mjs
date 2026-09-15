@@ -59,6 +59,7 @@ function flatpakFixture(bundleStatus = 0) {
 	const bin = path.join(directory, "bin");
 	const tmpdir = path.join(directory, "tmp");
 	const bundles = path.join(directory, "bundles");
+	const log = path.join(directory, "calls.log");
 	fs.mkdirSync(bin);
 	fs.mkdirSync(tmpdir);
 	fs.mkdirSync(bundles);
@@ -69,7 +70,16 @@ function flatpakFixture(bundleStatus = 0) {
 	};
 	executable(
 		"flatpak-builder",
-		'#!/bin/sh\nfor argument in "$@"; do\n  case "$argument" in\n    --repo=*) repo=$(printf \'%s\' "$argument" | cut -c 8-); mkdir -p "$repo" ;;\n    */build) mkdir -p "$argument" ;;\n  esac\ndone\nexit 0\n',
+		`#!/bin/sh
+printf '%s|%s\n' "\${MOTE_HEIC:-}" "$*" >> "$MOTE_FLATPAK_TEST_LOG"
+for argument in "$@"; do
+  case "$argument" in
+    --repo=*) repo=$(printf '%s' "$argument" | cut -c 8-); mkdir -p "$repo" ;;
+    */build) mkdir -p "$argument" ;;
+  esac
+done
+exit 0
+`,
 	);
 	executable(
 		"flatpak",
@@ -82,11 +92,11 @@ function flatpakFixture(bundleStatus = 0) {
 	for (const tool of ["desktop-file-validate", "appstreamcli", "npm"]) {
 		executable(tool, "#!/bin/sh\nexit 0\n");
 	}
-	return { directory, bin, tmpdir, bundles };
+	return { directory, bin, tmpdir, bundles, log };
 }
 
-function runFlatpakFixture(fixtureDirectory) {
-	return spawnSync("bash", [script, "package"], {
+function runFlatpakFixture(fixtureDirectory, args = []) {
+	return spawnSync("bash", [script, "package", ...args], {
 		cwd: root,
 		env: {
 			...process.env,
@@ -94,9 +104,18 @@ function runFlatpakFixture(fixtureDirectory) {
 			TMPDIR: fixtureDirectory.tmpdir,
 			MOTE_FLATPAK_BUNDLE_DIR: fixtureDirectory.bundles,
 			MOTE_FLATPAK_ARCH: "x86_64",
+			MOTE_FLATPAK_TEST_LOG: fixtureDirectory.log,
 		},
 		encoding: "utf8",
 	});
+}
+
+function flatpakBuildCall(fixtureDirectory) {
+	return fs
+		.readFileSync(fixtureDirectory.log, "utf8")
+		.trimEnd()
+		.split("\n")
+		.find((line) => line.includes("--force-clean"));
 }
 
 test("Flatpak package retains one bundle and removes intermediates", () => {
@@ -149,6 +168,51 @@ test("failed Flatpak package preserves the previous bundle", () => {
 		fs.rmSync(fixtureDirectory.directory, { recursive: true, force: true });
 	}
 });
+
+test("HEIC Flatpak package passes the default mode explicitly", () => {
+	const fixtureDirectory = flatpakFixture();
+	try {
+		const result = runFlatpakFixture(fixtureDirectory);
+		assert.equal(result.status, 0, result.stderr);
+		assert.match(flatpakBuildCall(fixtureDirectory), /^enabled\|/);
+	} finally {
+		fs.rmSync(fixtureDirectory.directory, { recursive: true, force: true });
+	}
+});
+
+test("HEIC Flatpak package consumes the Mote flag and preserves builder arguments", () => {
+	const fixtureDirectory = flatpakFixture();
+	try {
+		const result = runFlatpakFixture(fixtureDirectory, [
+			"--no-heic",
+			"--disable-rofiles-fuse",
+		]);
+		assert.equal(result.status, 0, result.stderr);
+		const buildCall = flatpakBuildCall(fixtureDirectory);
+		assert.match(buildCall, /^disabled\|/);
+		assert.doesNotMatch(buildCall, /--no-heic/);
+		assert.match(buildCall, /--disable-rofiles-fuse/);
+	} finally {
+		fs.rmSync(fixtureDirectory.directory, { recursive: true, force: true });
+	}
+});
+
+for (const args of [["--no-heic", "--no-heic"], ["--no-heicc"]]) {
+	test(`HEIC Flatpak package rejects invalid Mote arguments: ${args.join(" ")}`, () => {
+		const fixtureDirectory = flatpakFixture();
+		try {
+			const result = runFlatpakFixture(fixtureDirectory, args);
+			assert.equal(result.status, 2);
+			assert.match(result.stderr, /usage:/);
+			assert.equal(fs.existsSync(fixtureDirectory.log), false);
+		} finally {
+			fs.rmSync(fixtureDirectory.directory, {
+				recursive: true,
+				force: true,
+			});
+		}
+	});
+}
 
 test("Flatpak documentation exposes only the managed package command", () => {
 	const documentation = fs.readFileSync(

@@ -3,13 +3,14 @@ set -euo pipefail
 
 repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$repository_root/scripts/build-lifecycle.sh"
+. "$repository_root/scripts/cargo-feature-mode.sh"
 app_id="io.github.matt_jenner.mote"
 manifest="$repository_root/packaging/flatpak/$app_id.yml"
 bundle_dir="${MOTE_FLATPAK_BUNDLE_DIR:-$repository_root/dist/flatpak}"
 
 usage() {
   cat <<'EOF'
-usage: scripts/flatpak.sh COMMAND
+usage: scripts/flatpak.sh COMMAND [--no-heic] [FLATPAK_BUILDER_ARGS ...]
 
   check    validate tools, runtimes, manifest, and desktop metadata
   package  build one bundle and remove all intermediate assets
@@ -58,7 +59,7 @@ check_requirements() {
       exit 1
     }
   done
-  flatpak-builder --show-manifest "$manifest" >/dev/null
+  MOTE_HEIC="$MOTE_HEIC_MODE" flatpak-builder --show-manifest "$manifest" >/dev/null
   desktop-file-validate "$repository_root/packaging/flatpak/$app_id.desktop"
   appstreamcli validate --no-net "$repository_root/packaging/flatpak/$app_id.metainfo.xml"
   (
@@ -109,7 +110,7 @@ package_bundle() {
   trap 'exit 143' TERM
 
   mkdir -p "$build_dir" "$repo_dir" "$state_dir" "$bundle_dir"
-  flatpak-builder --force-clean --delete-build-dirs \
+  MOTE_HEIC="$MOTE_HEIC_MODE" flatpak-builder "$@" --force-clean --delete-build-dirs \
     --state-dir="$state_dir" \
     --repo="$repo_dir" \
     "$build_dir" "$manifest"
@@ -140,16 +141,44 @@ install_bundle() {
   flatpak install --user --noninteractive --or-update -y "$(bundle_path)"
 }
 
-case "${1:-help}" in
-  check) check_requirements ;;
-  package) package_bundle ;;
-  install) install_bundle ;;
-  run) require_command flatpak; flatpak run "$app_id" ;;
+command=${1:-help}
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+if [[ ${1:-} == --no-heic ]]; then
+  mote_disable_heic
+  shift
+fi
+for argument in "$@"; do
+  case "$argument" in
+    --*heic* | --*heif*) usage >&2; exit 2 ;;
+  esac
+done
+
+case "$command" in
+  check)
+    [[ $# -eq 0 ]] || { usage >&2; exit 2; }
+    check_requirements
+    ;;
+  package) package_bundle "$@" ;;
+  install)
+    [[ $# -eq 0 ]] || { usage >&2; exit 2; }
+    install_bundle
+    ;;
+  run)
+    [[ $# -eq 0 ]] || { usage >&2; exit 2; }
+    require_command flatpak
+    flatpak run "$app_id"
+    ;;
   inspect)
+    [[ $# -eq 0 ]] || { usage >&2; exit 2; }
     require_command flatpak
     flatpak info "$app_id"
     flatpak info --show-permissions "$app_id"
     ;;
-  help|-h|--help) usage ;;
+  help|-h|--help)
+    [[ $# -eq 0 ]] || { usage >&2; exit 2; }
+    usage
+    ;;
   *) usage >&2; exit 2 ;;
 esac

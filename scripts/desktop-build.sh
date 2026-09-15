@@ -4,12 +4,40 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repository_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 . "$script_dir/build-lifecycle.sh"
+. "$script_dir/cargo-feature-mode.sh"
+
+usage() {
+	printf '%s\n' "usage: $0 native|universal [--no-heic] [TAURI_ARGS ...]" >&2
+}
 
 mode=${1:-}
 case "$mode" in
 	native | universal) shift ;;
 	*)
-		printf '%s\n' "usage: $0 native|universal [TAURI_ARGS ...]" >&2
+		usage
+		exit 2
+		;;
+esac
+
+if [ "${1:-}" = --no-heic ]; then
+	mote_disable_heic
+	shift
+fi
+for argument in "$@"; do
+	case "$argument" in
+		--*heic* | --*heif*)
+			usage
+			exit 2
+			;;
+	esac
+done
+case "$MOTE_CARGO_FEATURE_ARGS" in
+	'') ;;
+	'--no-default-features --features mote-defaults')
+		set -- --no-default-features --features mote-defaults "$@"
+		;;
+	*)
+		printf '%s\n' "unsupported Mote Cargo feature mode" >&2
 		exit 2
 		;;
 esac

@@ -40,9 +40,29 @@ npm run rust:verify
 CI runs these checks, plus the 10,000-asset benchmark smoke test, on Ubuntu, macOS, and Windows.
 The managed local command shares one temporary Cargo target across the checks
 and removes it afterward, including after a failed or interrupted run. Direct
-Cargo commands can leave large `target/` trees; `npm run clean:build-assets`
-removes those known repository leftovers without touching retained packages or
-application data.
+Cargo commands can leave large `target/` trees; `npm run clean:build` removes
+those known repository leftovers and `build/heic-native`, including its
+download cache and partial staging trees. The `clean:build-assets` alias does
+the same job. Neither command touches source media, retained packages, the rest
+of `dist/`, or application data.
+
+## Choose the HEIC build mode
+
+Normal builds include HEIC and HEIF decoding. Pass one `--no-heic` immediately
+after the Mote build command to omit only HEIC support while retaining every
+other default feature:
+
+```bash
+npm run desktop:build
+npm run desktop:build -- --no-heic
+npm run flatpak -- package
+npm run flatpak -- package --no-heic
+scripts/hosted-smoke.sh
+scripts/hosted-smoke.sh --no-heic
+```
+
+The build helpers consume this flag before passing any remaining arguments to
+Tauri, Flatpak Builder, or the selected container engine.
 
 ## Install and verify the interface
 

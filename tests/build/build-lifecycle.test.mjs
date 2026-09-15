@@ -225,7 +225,12 @@ function desktopFixture({
 	const bin = path.join(repository, "bin");
 	fs.mkdirSync(scripts);
 	fs.mkdirSync(bin);
-	fs.copyFileSync(lifecycle, path.join(scripts, "build-lifecycle.sh"));
+	for (const name of ["build-lifecycle.sh", "cargo-feature-mode.sh"]) {
+		const source = path.join(root, "scripts", name);
+		if (fs.existsSync(source)) {
+			fs.copyFileSync(source, path.join(scripts, name));
+		}
+	}
 	const desktopBuild = path.join(root, "scripts/desktop-build.sh");
 	if (fs.existsSync(desktopBuild)) {
 		fs.copyFileSync(desktopBuild, path.join(scripts, "desktop-build.sh"));
@@ -238,6 +243,7 @@ function desktopFixture({
 		path.join(bin, "npm"),
 		`#!/bin/sh
 printf '%s' "$CARGO_TARGET_DIR" > "$TMPDIR/cargo-path"
+printf '%s\n' "$@" > "$TMPDIR/npm-argv"
 if [ "${buildStatus}" -ne 0 ]; then exit "${buildStatus}"; fi
 case " $* " in
   *" --target universal-apple-darwin "*) bundle="$CARGO_TARGET_DIR/universal-apple-darwin/release/bundle/macos/Mote.app" ;;
@@ -267,16 +273,27 @@ fi
 	return repository;
 }
 
-function runDesktopBuild(repository, mode) {
-	return spawnSync(path.join(repository, "scripts/desktop-build.sh"), [mode], {
-		cwd: repository,
-		env: {
-			...process.env,
-			TMPDIR: repository,
-			PATH: `${path.join(repository, "bin")}:${process.env.PATH}`,
+function runDesktopBuild(repository, mode, args = []) {
+	return spawnSync(
+		path.join(repository, "scripts/desktop-build.sh"),
+		[mode, ...args],
+		{
+			cwd: repository,
+			env: {
+				...process.env,
+				TMPDIR: repository,
+				PATH: `${path.join(repository, "bin")}:${process.env.PATH}`,
+			},
+			encoding: "utf8",
 		},
-		encoding: "utf8",
-	});
+	);
+}
+
+function desktopBuildArguments(repository) {
+	return fs
+		.readFileSync(path.join(repository, "npm-argv"), "utf8")
+		.trimEnd()
+		.split("\n");
 }
 
 function assertDesktopTempsRemoved(repository) {
@@ -342,6 +359,64 @@ for (const mode of ["native", "universal"]) {
 				"new",
 			);
 			assertDesktopTempsRemoved(repository);
+		} finally {
+			fs.rmSync(repository, { recursive: true, force: true });
+		}
+	});
+}
+
+for (const mode of ["native", "universal"]) {
+	test(`HEIC ${mode} desktop mode translates the Mote flag and keeps Tauri arguments`, () => {
+		const repository = desktopFixture();
+		try {
+			const result = runDesktopBuild(repository, mode, ["--no-heic", "--ci"]);
+			assert.equal(result.status, 0, result.stderr);
+			const arguments_ = desktopBuildArguments(repository);
+			assert.equal(arguments_.includes("--no-heic"), false);
+			assert.deepEqual(
+				arguments_.filter((argument) =>
+					["--no-default-features", "--features", "mote-defaults"].includes(
+						argument,
+					),
+				),
+				["--no-default-features", "--features", "mote-defaults"],
+			);
+			assert.equal(arguments_.at(-1), "--ci");
+			assertDesktopTempsRemoved(repository);
+		} finally {
+			fs.rmSync(repository, { recursive: true, force: true });
+		}
+	});
+}
+
+test("HEIC default desktop mode adds no Cargo feature arguments", () => {
+	const repository = desktopFixture();
+	try {
+		const result = runDesktopBuild(repository, "native", ["--ci"]);
+		assert.equal(result.status, 0, result.stderr);
+		const arguments_ = desktopBuildArguments(repository);
+		assert.deepEqual(
+			arguments_.filter((argument) =>
+				["--no-default-features", "--features", "mote-defaults"].includes(
+					argument,
+				),
+			),
+			[],
+		);
+		assert.equal(arguments_.at(-1), "--ci");
+	} finally {
+		fs.rmSync(repository, { recursive: true, force: true });
+	}
+});
+
+for (const args of [["--no-heic", "--no-heic"], ["--no-heicc"]]) {
+	test(`HEIC desktop mode rejects invalid Mote arguments: ${args.join(" ")}`, () => {
+		const repository = desktopFixture();
+		try {
+			const result = runDesktopBuild(repository, "native", args);
+			assert.equal(result.status, 2);
+			assert.match(result.stderr, /usage:/);
+			assert.equal(fs.existsSync(path.join(repository, "npm-argv")), false);
 		} finally {
 			fs.rmSync(repository, { recursive: true, force: true });
 		}
@@ -420,6 +495,20 @@ test("legacy build assets cleanup is strictly repository-scoped", () => {
 		});
 		fs.writeFileSync(path.join(repository, relative), "build");
 	}
+	for (const relative of [
+		"build/heic-native/cache/download.partial",
+		"build/heic-native/extracted/source.c",
+		"build/heic-native/.macos-arm64.stage/library",
+		"build/heic-native/.macos-arm64.backup/library",
+		"build/heic-native/macos-arm64/lib/libheif.dylib",
+		".worktrees/example/build/heic-native/cache/download.partial",
+		".worktrees/example/build/heic-native/linux-x86_64/lib/libheif.so",
+	]) {
+		fs.mkdirSync(path.dirname(path.join(repository, relative)), {
+			recursive: true,
+		});
+		fs.writeFileSync(path.join(repository, relative), "generated");
+	}
 	const stableApp = path.join(repository, "dist/macos/Mote.app");
 	const stableFlatpak = path.join(
 		repository,
@@ -428,6 +517,11 @@ test("legacy build assets cleanup is strictly repository-scoped", () => {
 	fs.mkdirSync(stableApp, { recursive: true });
 	fs.writeFileSync(path.join(stableApp, "installed-copy"), "keep");
 	fs.writeFileSync(stableFlatpak, "keep");
+	const sourcePhoto = path.join(repository, "source-media/iphone.heic");
+	const untrackedDistFile = path.join(repository, "dist/user-owned-photo.heic");
+	fs.mkdirSync(path.dirname(sourcePhoto), { recursive: true });
+	fs.writeFileSync(sourcePhoto, "source bytes");
+	fs.writeFileSync(untrackedDistFile, "untracked dist bytes");
 	fs.writeFileSync(path.join(outside, "application-data"), "keep");
 	const deadBuild = path.join(tmpdir, "mote-build-unit.dead");
 	const liveBuild = path.join(tmpdir, "mote-build-unit.live");
@@ -469,6 +563,11 @@ test("legacy build assets cleanup is strictly repository-scoped", () => {
 		}
 		assert.equal(fs.existsSync(stableApp), true);
 		assert.equal(fs.readFileSync(stableFlatpak, "utf8"), "keep");
+		assert.equal(fs.readFileSync(sourcePhoto, "utf8"), "source bytes");
+		assert.equal(
+			fs.readFileSync(untrackedDistFile, "utf8"),
+			"untracked dist bytes",
+		);
 		assert.equal(
 			fs.readFileSync(path.join(outside, "application-data"), "utf8"),
 			"keep",

@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
 	chmodSync,
+	existsSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
@@ -69,12 +71,12 @@ test("hosted smoke rejects Docker daemon user-namespace remapping", () => {
 	}
 });
 
-test("hosted smoke removes its unique image after a failed build", () => {
-	const fixtureDirectory = mkdtempSync(path.join(os.tmpdir(), "mote-engine-"));
-	const fakeEngine = path.join(fixtureDirectory, "podman");
-	const log = path.join(fixtureDirectory, "calls.log");
+function failingBuildEngineFixture() {
+	const directory = mkdtempSync(path.join(os.tmpdir(), "mote-engine-"));
+	const engine = path.join(directory, "podman");
+	const log = path.join(directory, "calls.log");
 	writeFileSync(
-		fakeEngine,
+		engine,
 		`#!/bin/sh
 printf '%s\n' "$*" >>"${log}"
 if [ "$1" = info ]; then printf '%s\n' '[]'; exit 0; fi
@@ -82,24 +84,75 @@ if [ "$1" = build ]; then exit 31; fi
 exit 0
 `,
 	);
-	chmodSync(fakeEngine, 0o755);
+	chmodSync(engine, 0o755);
+	return { directory, engine, log };
+}
+
+function runFailingSmokeBuild(fixture, args = []) {
+	return spawnSync(smokeScript, args, {
+		cwd: repositoryRoot,
+		env: {
+			...process.env,
+			CONTAINER_ENGINE: fixture.engine,
+			TMPDIR: fixture.directory,
+		},
+		encoding: "utf8",
+	});
+}
+
+test("hosted smoke removes its unique image after a failed build", () => {
+	const fixture = failingBuildEngineFixture();
 	try {
-		const result = spawnSync(smokeScript, [], {
-			cwd: repositoryRoot,
-			env: { ...process.env, CONTAINER_ENGINE: fakeEngine },
-			encoding: "utf8",
-		});
+		const result = runFailingSmokeBuild(fixture);
 		assert.equal(result.status, 31, result.stderr);
-		const calls = readFileSync(log, "utf8");
+		const calls = readFileSync(fixture.log, "utf8");
 		const tag = calls.match(/--tag (localhost\/mote-smoke:[^ ]+)/)?.[1];
 		assert.ok(tag);
 		assert.match(calls, /build .*--layers=false/);
+		assert.match(calls, /build .*--build-arg MOTE_HEIC=enabled/);
 		assert.match(calls, new RegExp(`image rm ${tag.replaceAll("-", "\\-")}`));
 		assert.doesNotMatch(calls, /system prune|volume prune|image prune/);
+		assert.deepEqual(
+			readdirSync(fixture.directory).filter((entry) =>
+				entry.startsWith("photo-viewer-smoke-"),
+			),
+			[],
+		);
 	} finally {
-		rmSync(fixtureDirectory, { recursive: true, force: true });
+		rmSync(fixture.directory, { recursive: true, force: true });
 	}
 });
+
+test("HEIC hosted smoke consumes the Mote flag and preserves build arguments", () => {
+	const fixture = failingBuildEngineFixture();
+	try {
+		const result = runFailingSmokeBuild(fixture, ["--no-heic", "--pull=never"]);
+		assert.equal(result.status, 31, result.stderr);
+		const buildCall = readFileSync(fixture.log, "utf8")
+			.split("\n")
+			.find((line) => line.startsWith("build "));
+		assert.ok(buildCall);
+		assert.match(buildCall, /--build-arg MOTE_HEIC=disabled/);
+		assert.match(buildCall, /--pull=never/);
+		assert.doesNotMatch(buildCall, /--no-heic/);
+	} finally {
+		rmSync(fixture.directory, { recursive: true, force: true });
+	}
+});
+
+for (const args of [["--no-heic", "--no-heic"], ["--no-heicc"]]) {
+	test(`HEIC hosted smoke rejects invalid Mote arguments: ${args.join(" ")}`, () => {
+		const fixture = failingBuildEngineFixture();
+		try {
+			const result = runFailingSmokeBuild(fixture, args);
+			assert.equal(result.status, 2);
+			assert.match(result.stderr, /usage:/);
+			assert.equal(existsSync(fixture.log), false);
+		} finally {
+			rmSync(fixture.directory, { recursive: true, force: true });
+		}
+	});
+}
 
 test("stale smoke cleanup removes only dead-owner assets", () => {
 	const fixtureDirectory = mkdtempSync(path.join(os.tmpdir(), "mote-engine-"));

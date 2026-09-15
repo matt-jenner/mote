@@ -28,11 +28,37 @@ const internalManifests = [
 	["codec", codecManifest],
 ];
 
+function featureMembers(manifest, feature) {
+	const featureSection = manifest.match(
+		/^\[features\]\s*$([\s\S]*?)(?=^\[|(?![\s\S]))/m,
+	)?.[1];
+	assert.ok(featureSection, "manifest must contain a [features] section");
+	const escapedFeature = feature.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const members = featureSection.match(
+		new RegExp(`^${escapedFeature}\\s*=\\s*\\[([^\\]]*)\\]`, "m"),
+	)?.[1];
+	assert.notEqual(members, undefined, `feature is not declared: ${feature}`);
+	return [...members.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+}
+
 test("HEIC is a default feature with a stable non-HEIC bundle", () => {
 	for (const manifest of [serverManifest, desktopManifest]) {
 		assert.match(manifest, /default\s*=\s*\["mote-defaults",\s*"heic"\]/);
 		assert.match(manifest, /mote-defaults\s*=\s*\[/);
 		assert.match(manifest, /heic\s*=\s*\[/);
+	}
+});
+
+test("mote-defaults mirrors every non-HEIC entry-crate default", () => {
+	for (const [name, manifest] of [
+		["server", serverManifest],
+		["desktop", desktopManifest],
+	]) {
+		const expected = featureMembers(manifest, "default")
+			.filter((feature) => feature !== "heic" && feature !== "mote-defaults")
+			.toSorted();
+		const actual = featureMembers(manifest, "mote-defaults").toSorted();
+		assert.deepEqual(actual, expected, `${name} non-HEIC defaults drifted`);
 	}
 });
 

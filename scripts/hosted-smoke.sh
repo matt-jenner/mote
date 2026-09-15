@@ -3,6 +3,25 @@ set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$project_dir/scripts/hosted-smoke-assets.sh"
+. "$project_dir/scripts/cargo-feature-mode.sh"
+
+usage() {
+	printf '%s\n' "usage: $0 [--no-heic] [CONTAINER_BUILD_ARGS ...]" >&2
+}
+
+if [ "${1:-}" = --no-heic ]; then
+	mote_disable_heic
+	shift
+fi
+for argument in "$@"; do
+	case "$argument" in
+		--*heic* | --*heif*)
+			usage
+			exit 2
+			;;
+	esac
+done
+
 container_engine=${CONTAINER_ENGINE:-podman}
 container_engine_name=${container_engine##*/}
 runtime_uid=$(id -u)
@@ -263,11 +282,12 @@ hash_manifest "$baseline_hashes"
 
 cd "$project_dir"
 printf '%s\n' "building $image_name with $container_engine"
-set -- --rm --force-rm
+set -- --rm --force-rm "$@"
 case "$container_engine_name" in
 	podman | podman-remote) set -- "$@" --layers=false ;;
 esac
 "$container_engine" build "$@" \
+	--build-arg MOTE_HEIC="$MOTE_HEIC_MODE" \
 	--label "$asset_label" \
 	--label "$owner_label" \
 	--tag "$image_name" \
