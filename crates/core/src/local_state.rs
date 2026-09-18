@@ -81,7 +81,11 @@ impl LocalStatePaths {
         let cache = resolve_for_comparison(&self.cache_dir)?;
         let catalog = resolve_for_comparison(&self.catalog_path())?;
         for source in sources {
-            let source = resolve_for_comparison(source)?;
+            let source = match resolve_for_comparison(source) {
+                Ok(source) => source,
+                Err(error) if is_unavailable_source_error(&error) => continue,
+                Err(error) => return Err(error.into()),
+            };
             if paths_overlap(&data, &source)
                 || paths_overlap(&cache, &source)
                 || paths_overlap(&catalog, &source)
@@ -222,4 +226,34 @@ fn create_private_directory(path: &Path) -> Result<(), std::io::Error> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+fn is_unavailable_source_error(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::Other
+    ) {
+        return true;
+    }
+
+    #[cfg(target_os = "linux")]
+    return matches!(error.raw_os_error(), Some(19 | 107 | 116));
+
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_unavailable_source_error;
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnected_source_errors_are_treated_as_unavailable() {
+        let error = std::io::Error::from_raw_os_error(19);
+
+        assert!(is_unavailable_source_error(&error));
+    }
 }
