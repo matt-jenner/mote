@@ -896,9 +896,10 @@ test("every CI platform has enabled fixtures and inspected disabled binaries", (
 		macos,
 		/uses: swatinem\/rust-cache@v2\n\s+with:\n\s+workspaces: apps\/desktop\/src-tauri -> target/,
 	);
-	assert.match(macos, /heic: \[enabled, disabled\]/);
+	assert.doesNotMatch(macos, /strategy:/);
 	assert.match(macos, /build-unix\.sh[^\n]*--arch universal/);
-	assert.match(macos, /desktop:build:universal[^\n]*--no-heic/);
+	assert.match(macos, /desktop:build:universal[^\n]*--ci/);
+	assert.doesNotMatch(macos, /desktop:build:universal[^\n]*--no-heic/);
 	assert.match(macos, /verify-native-deps\.sh/);
 });
 

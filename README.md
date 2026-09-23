@@ -232,7 +232,7 @@ locate/reconnect is a named follow-up, and the hosted web interface must not
 offer local folder selection. Until that capability exists, such a desktop
 item has no in-viewer recovery path.
 
-To create an unsigned macOS application bundle:
+To create an ad-hoc-signed macOS application bundle:
 
 ```bash
 npm run desktop:build
@@ -240,8 +240,9 @@ npm run desktop:build
 
 The bundle is written to `dist/macos/Mote.app`. A successful build replaces the
 previous repository copy only after the new bundle has been validated. All
-Cargo intermediates are then removed. Because it is unsigned, macOS may require
-you to approve it through the normal local-app security flow before first launch.
+Cargo intermediates are then removed. The ad-hoc signature protects the bundle
+from accidental changes, but it does not identify an Apple Developer account and
+the app is not notarized. macOS may therefore require approval before first launch.
 
 To build one `.app` containing both Apple Silicon and Intel executables, run
 these commands on a Mac with the Xcode Command Line Tools installed:
@@ -263,25 +264,33 @@ bundle's architectures with:
 lipo -archs dist/macos/Mote.app/Contents/MacOS/photo-viewer-desktop
 ```
 
-The output must include both `x86_64` and `arm64`. To copy the app to another
-Mac while preserving the bundle's permissions and metadata, archive it first:
+The output must include both `x86_64` and `arm64`. To create the same kind of disk
+image used for releases:
 
 ```bash
-mkdir -p dist/macos
-ditto -c -k --sequesterRsrc --keepParent \
-  dist/macos/Mote.app \
-  dist/macos/Mote-universal-macos.zip
+version="$(node -p 'require("./apps/desktop/src-tauri/tauri.conf.json").version')"
+stage="$(mktemp -d)"
+trap 'rm -rf "$stage"' EXIT
+ditto dist/macos/Mote.app "$stage/Mote.app"
+ln -s /Applications "$stage/Applications"
+hdiutil create -volname Mote -srcfolder "$stage" -format UDZO \
+  "dist/macos/Mote-${version}-macOS.dmg"
+hdiutil verify "dist/macos/Mote-${version}-macOS.dmg"
+rm -rf "$stage"
+trap - EXIT
 ```
 
-Unzip it on the destination Mac and move `Mote.app` into Applications. These
-builds are not Developer ID signed or notarized. If macOS blocks first launch,
-use its Privacy & Security settings to approve the app.
+Open the DMG and drag `Mote.app` into Applications. All distributed macOS builds
+are intentionally ad-hoc signed rather than Developer ID signed or notarized, so
+Gatekeeper's first-launch warning is expected. See the
+[macOS installation guide](docs/deployment/macos.md) for the safe approval steps.
 
-The separate [macOS workflow](.github/workflows/build-macos.yml) runs on pushes,
-pull requests, and manual dispatch. It checks the desktop crate, builds both
-architectures, verifies them with `lipo`, and uploads `Mote-universal-macos.zip`
-as a downloadable Actions artifact. It runs independently of the Linux
-Flatpak release workflow. Local builds do not use GitHub Actions minutes.
+The separate [macOS workflow](.github/workflows/build-macos.yml) runs only when a
+GitHub Release is published or when it is deliberately dispatched by hand. One
+job builds the HEIC-enabled universal app, verifies both architectures and its
+ad-hoc signature, mounts and checks the DMG, then attaches the DMG to the release.
+A manual check retains its DMG as an Actions artifact for one day. Pushes and pull
+requests do not consume macOS Actions minutes, and local builds use none.
 
 The permanent identifier `io.github.matt-jenner.mote` changes the macOS data
 and cache directories from those used by older `app.photoviewer.desktop`

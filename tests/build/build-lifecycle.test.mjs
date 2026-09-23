@@ -974,7 +974,7 @@ test("package commands route local builds through managed asset lifecycles", () 
 	}
 });
 
-test("macOS workflow archives the stable repository app", () => {
+test("macOS workflow packages the stable repository app as a short-lived manual DMG", () => {
 	const workflow = fs.readFileSync(
 		path.join(root, ".github/workflows/build-macos.yml"),
 		"utf8",
@@ -982,7 +982,9 @@ test("macOS workflow archives the stable repository app", () => {
 	assert.match(workflow, /app="dist\/macos\/Mote\.app"/);
 	assert.doesNotMatch(workflow, /target\/.*Mote\.app/);
 	assert.match(workflow, /lipo .* -verify_arch arm64 x86_64/);
-	assert.match(workflow, /retention-days: 14/);
+	assert.match(workflow, /hdiutil create/);
+	assert.match(workflow, /retention-days: 1/);
+	assert.doesNotMatch(workflow, /\.zip/);
 });
 
 test("interface command wrapper removes generated caches and preserves status", () => {
