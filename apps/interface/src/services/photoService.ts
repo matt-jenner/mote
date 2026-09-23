@@ -144,6 +144,8 @@ export interface WallPage {
 export interface WallPreviewCounts {
 	wallReady: number;
 	screenReady: number;
+	wallFailed: number;
+	screenFailed: number;
 }
 
 export interface WallQueryRequest {

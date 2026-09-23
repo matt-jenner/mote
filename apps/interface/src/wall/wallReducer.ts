@@ -202,13 +202,27 @@ function mergePreviewCounts(
 	return {
 		wallReady: Math.max(current.wallReady, incoming.wallReady),
 		screenReady: Math.max(current.screenReady, incoming.screenReady),
+		wallFailed: incoming.wallFailed,
+		screenFailed: incoming.screenFailed,
 	};
+}
+
+function terminalFailureKind(asset: WallAsset): "wall" | "screen" | null {
+	if (asset.warning?.retryable !== false) return null;
+	if (asset.warning.code === "wallThumbnailUnavailable") return "wall";
+	if (asset.warning.code === "screenPreviewUnavailable") return "screen";
+	if (asset.warning.code !== "derivativeUnavailable") return null;
+	return asset.wallThumbnail === null ? "wall" : "screen";
 }
 
 function observedPreviewCounts(items: readonly WallAsset[]): WallPreviewCounts {
 	return {
 		wallReady: items.filter((item) => item.wallThumbnail !== null).length,
 		screenReady: items.filter((item) => item.screenPreview !== null).length,
+		wallFailed: items.filter((item) => terminalFailureKind(item) === "wall")
+			.length,
+		screenFailed: items.filter((item) => terminalFailureKind(item) === "screen")
+			.length,
 	};
 }
 
@@ -221,7 +235,9 @@ function samePreviewCounts(
 		(left !== null &&
 			right !== null &&
 			left.wallReady === right.wallReady &&
-			left.screenReady === right.screenReady)
+			left.screenReady === right.screenReady &&
+			left.wallFailed === right.wallFailed &&
+			left.screenFailed === right.screenFailed)
 	);
 }
 
@@ -232,7 +248,14 @@ function pagePreviewCounts(
 	if (!incoming) return state.previewCounts;
 	if (state.activeRequest?.previewCountVersion === state.previewCountVersion)
 		return incoming;
-	return mergePreviewCounts(state.previewCounts, incoming);
+	const merged = mergePreviewCounts(state.previewCounts, incoming);
+	return merged && state.previewCounts
+		? {
+				...merged,
+				wallFailed: state.previewCounts.wallFailed,
+				screenFailed: state.previewCounts.screenFailed,
+			}
+		: merged;
 }
 
 function matchesActiveRequest(
@@ -629,6 +652,11 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 		}
 		case "catalogBatch": {
 			if (!matchesSelection(state, action.selectionId)) return state;
+			const startsNewProvisionalGeneration =
+				action.orderState === "provisional" &&
+				action.generation !== undefined &&
+				state.settledGeneration !== null &&
+				action.generation > state.settledGeneration;
 			const streamed = rememberStreamedAssets(
 				state.streamedAssetGeneration,
 				state.streamedAssetIds,
@@ -652,8 +680,11 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				false,
 			);
 			const merged = mergeAssets(state.items, remembered.assets);
-			const orderState =
-				state.settledGeneration !== null ? "settled" : action.orderState;
+			const orderState = startsNewProvisionalGeneration
+				? "provisional"
+				: state.settledGeneration !== null
+					? "settled"
+					: action.orderState;
 			const acceptsProgress =
 				action.progress !== undefined &&
 				(action.generation === undefined ||
@@ -673,7 +704,8 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			)
 				return state;
 			const sorted =
-				state.settledGeneration === null && action.orderState === "provisional"
+				action.orderState === "provisional" &&
+				(state.settledGeneration === null || startsNewProvisionalGeneration)
 					? sortProgressive(merged.items, state.direction)
 					: merged.items;
 			const items = reuseSequence(state.items, sorted);
@@ -758,6 +790,10 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				return state;
 			const firstPage = action.requestCursor === null;
 			const settledPage = action.orderState === "settled";
+			const hasNewerProvisionalGeneration =
+				state.streamedAssetGeneration !== null &&
+				state.settledGeneration !== null &&
+				state.streamedAssetGeneration > state.settledGeneration;
 			const recoveredWarnings = clearRecoveredSourceWarnings(
 				state.assetWarnings,
 				action.assets,
@@ -792,14 +828,16 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 				firstPage && !preservesSettledRemainder
 					? mergeAssets([], replacementPage)
 					: mergeAssets(state.items, remembered.assets);
-			const orderState =
-				state.settledGeneration !== null || settledPage
+			const orderState = hasNewerProvisionalGeneration
+				? "provisional"
+				: state.settledGeneration !== null || settledPage
 					? "settled"
 					: action.orderState;
 			const sorted =
-				state.settledGeneration === null &&
-				!settledPage &&
-				action.orderState === "provisional"
+				hasNewerProvisionalGeneration ||
+				(state.settledGeneration === null &&
+					!settledPage &&
+					action.orderState === "provisional")
 					? sortProgressive(merged.items, state.direction)
 					: merged.items;
 			const items = reuseSequence(state.items, sorted);
@@ -1112,41 +1150,6 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 					sourceWarningTombstones,
 				};
 			}
-			if (
-				action.warning.code === "wallThumbnailUnavailable" &&
-				!action.warning.retryable
-			) {
-				const removed = state.items.find(
-					(asset) => asset.id === action.assetId,
-				);
-				if (!removed) return state;
-				const assetWarnings = { ...state.assetWarnings };
-				delete assetWarnings[action.assetId];
-				return {
-					...state,
-					items: state.items.filter((asset) => asset.id !== action.assetId),
-					totalCount:
-						state.totalCount === null
-							? null
-							: Math.max(0, state.totalCount - 1),
-					previewCounts:
-						state.previewCounts === null
-							? null
-							: {
-									wallReady: Math.max(
-										0,
-										state.previewCounts.wallReady -
-											(removed.wallThumbnail === null ? 0 : 1),
-									),
-									screenReady: Math.max(
-										0,
-										state.previewCounts.screenReady -
-											(removed.screenPreview === null ? 0 : 1),
-									),
-								},
-					assetWarnings,
-				};
-			}
 			const assetWarnings = {
 				...state.assetWarnings,
 				[action.assetId]: action.warning,
@@ -1158,7 +1161,34 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 					? { ...asset, warning: action.warning }
 					: asset,
 			);
-			return { ...state, assetWarnings, warningTombstones, items };
+			const newTerminalWallFailure =
+				action.warning.code === "wallThumbnailUnavailable" &&
+				!action.warning.retryable &&
+				state.assetWarnings[action.assetId]?.retryable !== false;
+			const newTerminalScreenFailure =
+				action.warning.code === "screenPreviewUnavailable" &&
+				!action.warning.retryable &&
+				state.assetWarnings[action.assetId]?.retryable !== false;
+			const previewCounts =
+				(newTerminalWallFailure || newTerminalScreenFailure) &&
+				state.previewCounts
+					? {
+							...state.previewCounts,
+							wallFailed:
+								state.previewCounts.wallFailed +
+								(newTerminalWallFailure ? 1 : 0),
+							screenFailed:
+								state.previewCounts.screenFailed +
+								(newTerminalScreenFailure ? 1 : 0),
+						}
+					: state.previewCounts;
+			return {
+				...state,
+				assetWarnings,
+				warningTombstones,
+				items,
+				previewCounts,
+			};
 		}
 		case "warningCleared": {
 			if (!matchesSelection(state, action.selectionId)) return state;
@@ -1174,18 +1204,53 @@ export function wallReducer(state: WallState, action: WallAction): WallState {
 			}
 			const current = state.assetWarnings[action.assetId];
 			const assetWarnings = { ...state.assetWarnings };
-			if (current?.code === action.code) delete assetWarnings[action.assetId];
+			const clearsCurrent =
+				current?.code === action.code ||
+				(action.code === "derivativeUnavailable" &&
+					current?.retryable === false);
+			if (clearsCurrent) delete assetWarnings[action.assetId];
 			const warningTombstones = addBoundedTombstone(
 				state.warningTombstones,
 				warningKey(action.assetId, action.code),
 				requestToken(state.activeRequest),
 			);
 			const items = state.items.map((asset) =>
-				asset.id === action.assetId && asset.warning?.code === action.code
+				asset.id === action.assetId &&
+				(asset.warning?.code === action.code ||
+					(action.code === "derivativeUnavailable" &&
+						asset.warning?.retryable === false))
 					? { ...asset, warning: null }
 					: asset,
 			);
-			return { ...state, assetWarnings, warningTombstones, items };
+			const currentAsset = state.items.find(
+				(asset) => asset.id === action.assetId,
+			);
+			const clearedFailureKind = currentAsset
+				? terminalFailureKind(currentAsset)
+				: null;
+			const previewCounts =
+				clearsCurrent && current?.retryable === false && state.previewCounts
+					? {
+							...state.previewCounts,
+							wallFailed: Math.max(
+								0,
+								state.previewCounts.wallFailed -
+									(clearedFailureKind === "wall" ? 1 : 0),
+							),
+							screenFailed: Math.max(
+								0,
+								state.previewCounts.screenFailed -
+									(clearedFailureKind === "screen" ? 1 : 0),
+							),
+						}
+					: state.previewCounts;
+			return {
+				...state,
+				assetWarnings,
+				warningTombstones,
+				items,
+				previewCounts,
+			};
 		}
 		case "resyncRequired":
 			return {

@@ -346,7 +346,12 @@ function previewService(
 			sourceWarnings: [],
 			totalCount: 0,
 			indexedCount: 0,
-			previewCounts: { wallReady: 0, screenReady: 0 },
+			previewCounts: {
+				wallReady: 0,
+				screenReady: 0,
+				wallFailed: 0,
+				screenFailed: 0,
+			},
 		}),
 		requestDerivatives,
 		setWallInteraction: async () => undefined,

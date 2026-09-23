@@ -74,7 +74,7 @@ export function WallToolbar({
 			<div aria-live="polite" className={styles.progress} role="status">
 				{status}
 			</div>
-			{progress && status ? (
+			{progress?.busy && status ? (
 				<progress
 					aria-label="Photo preview progress"
 					className={styles.progressTrack}

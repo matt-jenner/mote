@@ -23,6 +23,7 @@ use photo_domain::{
     MediaKind, RelativePathKey,
 };
 use photo_metadata::{MetadataBundle, MetadataCandidate, MetadataReadWarning, MetadataSource};
+use rusqlite::Connection;
 #[cfg(feature = "heic")]
 use sha2::{Digest, Sha256};
 
@@ -563,7 +564,7 @@ async fn wait_for_scan_cleanup(service: &AppService) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn settled_wall_total_excludes_terminal_thumbnail_failures() {
+async fn settled_wall_total_includes_terminal_thumbnail_failures() {
     let fixture = ProgressiveFixture::new(1);
     let service = AppService::open_with_reader(
         fixture.config.clone(),
@@ -598,8 +599,84 @@ async fn settled_wall_total_excludes_terminal_thumbnail_failures() {
         .query_wall(query(SortDirection::OldestFirst))
         .await
         .unwrap();
-    assert!(filtered.items.is_empty());
-    assert_eq!(filtered.total_count, 0);
+    assert_eq!(filtered.items.len(), 1);
+    assert_eq!(filtered.total_count, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reopening_clears_failures_from_an_older_decoder_key() {
+    let fixture = ProgressiveFixture::new(1);
+    let service = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let page = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    let asset_id = AssetId::from_uuid(uuid::Uuid::parse_str(&page.items[0].id).unwrap());
+    let selection = Catalog::open(&fixture.config.catalog_path())
+        .unwrap()
+        .load_app_state()
+        .unwrap()
+        .active_selection
+        .unwrap();
+    drop(service);
+
+    let mut catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    catalog
+        .record_terminal_derivative_failure(&TerminalDerivativeFailure {
+            asset_id,
+            kind: "wall_thumbnail".to_owned(),
+            cache_key: "legacy-decoder-key".to_owned(),
+            availability: Availability::Available,
+            failure_code: "derivative_generation_terminal".to_owned(),
+            occurred_at: 1,
+        })
+        .unwrap();
+    catalog
+        .record_warning_once(&CatalogWarningRecord {
+            library_id: selection.library_id,
+            asset_id: Some(asset_id),
+            code: "derivative_generation_terminal".to_owned(),
+            message: "legacy decoder failure".to_owned(),
+        })
+        .unwrap();
+    drop(catalog);
+
+    let reopened = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let recovered = reopened
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+
+    assert_eq!(recovered.total_count, 1);
+    assert_eq!(recovered.preview_counts.wall_failed, 0);
+    assert!(recovered.items[0].warning.is_none());
+    let catalog = Catalog::open(&fixture.config.catalog_path()).unwrap();
+    assert_eq!(catalog.warning_count().unwrap(), 0);
+    assert!(
+        catalog
+            .find_terminal_derivative_failure(
+                asset_id,
+                "wall_thumbnail",
+                "legacy-decoder-key",
+                Availability::Available,
+            )
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -2581,9 +2658,35 @@ async fn corrupt_heif_is_isolated_while_healthy_jpeg_and_heif_finish_without_sou
         .map(|asset| asset.display_name.as_str())
         .collect::<Vec<_>>();
     names.sort_unstable();
-    assert_eq!(names, ["healthy.heic", "healthy.jpg"]);
-    assert_eq!(page.total_count, 2);
-    for asset in &page.items {
+    assert_eq!(names, ["corrupt.heic", "healthy.heic", "healthy.jpg"]);
+    assert_eq!(page.total_count, 3);
+    assert_eq!(page.preview_counts.wall_failed, 1);
+    let corrupt_asset = page
+        .items
+        .iter()
+        .find(|asset| asset.display_name == "corrupt.heic")
+        .unwrap();
+    assert!(corrupt_asset.wall_thumbnail.is_none());
+    assert!(corrupt_asset.screen_preview.is_none());
+    assert_eq!(
+        corrupt_asset
+            .warning
+            .as_ref()
+            .map(|warning| warning.code.as_str()),
+        Some("derivativeUnavailable")
+    );
+    assert_eq!(
+        corrupt_asset
+            .warning
+            .as_ref()
+            .map(|warning| warning.retryable),
+        Some(false)
+    );
+    for asset in page
+        .items
+        .iter()
+        .filter(|asset| asset.display_name != "corrupt.heic")
+    {
         for reference in [
             asset.wall_thumbnail.as_ref().unwrap(),
             asset.screen_preview.as_ref().unwrap(),
@@ -2931,12 +3034,32 @@ async fn derivative_failure_records_and_publishes_a_terminal_asset_warning() {
             ..
         } if id == asset_id
     ));
+    let diagnostic: String = Connection::open(fixture.config.catalog_path())
+        .unwrap()
+        .query_row(
+            "SELECT message FROM warnings WHERE code = 'derivative_generation_terminal' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        diagnostic.contains("source image could not be decoded"),
+        "terminal diagnostics must retain the decoder reason: {diagnostic}"
+    );
     let page = service
         .query_wall(query(SortDirection::OldestFirst))
         .await
         .unwrap();
-    assert!(page.items.is_empty());
-    assert_eq!(page.total_count, 0);
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.total_count, 1);
+    assert_eq!(page.preview_counts.wall_failed, 1);
+    assert_eq!(
+        page.items[0]
+            .warning
+            .as_ref()
+            .map(|warning| warning.retryable),
+        Some(false)
+    );
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         photo_catalog::Catalog::open(&fixture.config.catalog_path())
@@ -3051,6 +3174,19 @@ async fn terminal_failure_retries_only_after_derivative_key_changes() {
         matches!(event, WallUpdate::MetadataSettled { .. })
     })
     .await;
+    let pending = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    assert_eq!(pending.preview_counts.wall_failed, 0);
+    assert_eq!(pending.preview_counts.wall_ready, 0);
+    assert!(
+        pending.items[0]
+            .warning
+            .as_ref()
+            .is_none_or(|warning| warning.retryable),
+        "a changed source must re-enter pending work instead of retaining a terminal failure"
+    );
     service
         .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
         .await
@@ -3065,6 +3201,8 @@ async fn terminal_failure_retries_only_after_derivative_key_changes() {
             preview_counts: Some(photo_app_service::WallPreviewCounts {
                 wall_ready: 1,
                 screen_ready: 0,
+                wall_failed: 0,
+                screen_failed: 0,
             }),
             ..
         }
@@ -5390,9 +5528,10 @@ async fn terminal_photo_failures_and_videos_do_not_starve_healthy_previews() {
             .iter()
             .map(|asset| asset.display_name.as_str())
             .collect::<Vec<_>>(),
-        ["a.jpg", "b.jpg"]
+        ["a.jpg", "b.jpg", "corrupt.jpg", "offline.jpg"]
     );
-    assert_eq!(wall.total_count, 2);
+    assert_eq!(wall.total_count, 4);
+    assert_eq!(wall.preview_counts.wall_failed, 2);
     assert!(
         wall.items
             .iter()
@@ -5504,6 +5643,26 @@ async fn terminal_failure_retries_when_availability_changes_without_a_new_key() 
         matches!(event, WallUpdate::MetadataSettled { .. })
     })
     .await;
+    let pending = service
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    assert_eq!(pending.preview_counts.wall_failed, 0);
+    assert_eq!(pending.preview_counts.wall_ready, 0);
+    assert!(
+        pending.items[0]
+            .warning
+            .as_ref()
+            .is_none_or(|warning| warning.retryable),
+        "an available source must re-enter pending work instead of retaining an offline terminal failure"
+    );
+    assert!(
+        Catalog::open(&fixture.config.catalog_path())
+            .unwrap()
+            .terminal_derivative_failures()
+            .unwrap()
+            .is_empty()
+    );
     service
         .request_derivatives(DerivativeRequest::visible(vec![asset_id.clone()]))
         .await

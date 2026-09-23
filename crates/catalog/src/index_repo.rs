@@ -2,7 +2,7 @@ use photo_domain::{AssetId, LibraryId};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::ShapeStatus;
-use crate::asset_repo::upsert_asset_on;
+use crate::asset_repo::{encode_media_kind, upsert_asset_on};
 use crate::{Catalog, CatalogError, NewAsset};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,6 +176,33 @@ fn apply_record(
 ) -> Result<(), CatalogError> {
     match record {
         CatalogIndexRecord::Discovered(asset) => {
+            let size_bytes = i64::try_from(asset.signature.size_bytes)
+                .map_err(|_| CatalogError::ValueOutOfRange)?;
+            let source_changed: bool = connection.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM assets
+                   WHERE id = ?1
+                     AND (media_kind <> ?2
+                       OR size_bytes <> ?3
+                       OR modified_unix_ns <> ?4
+                       OR sidecar_modified_unix_ns IS NOT ?5
+                       OR availability <> 'available')
+                 )",
+                params![
+                    asset.id.as_uuid().as_bytes(),
+                    encode_media_kind(asset.media_kind),
+                    size_bytes,
+                    asset.signature.modified_unix_ns.to_string(),
+                    asset
+                        .signature
+                        .sidecar_modified_unix_ns
+                        .map(|timestamp| timestamp.to_string()),
+                ],
+                |row| row.get(0),
+            )?;
+            if source_changed {
+                clear_terminal_derivative_state(connection, asset.id)?;
+            }
             if cfg!(feature = "heic") && asset.media_kind == photo_domain::MediaKind::Heif {
                 connection.execute(
                     "DELETE FROM warnings WHERE asset_id = ?1 AND code IN (
@@ -215,6 +242,21 @@ fn apply_record(
         CatalogIndexRecord::Shaped(shape) => {
             ensure_asset_library(connection, shape.asset_id, generation)?;
             invalidate_disabled_heif_metadata(connection, shape.asset_id)?;
+            let orientation_changed = if let Some(orientation) = shape.orientation {
+                connection.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM assets
+                       WHERE id = ?1 AND orientation IS NOT ?2
+                     )",
+                    params![shape.asset_id.as_uuid().as_bytes(), i64::from(orientation)],
+                    |row| row.get(0),
+                )?
+            } else {
+                false
+            };
+            if orientation_changed {
+                clear_terminal_derivative_state(connection, shape.asset_id)?;
+            }
             connection.execute(
                 "UPDATE assets SET width = CASE WHEN ?2 > 0 THEN ?2 ELSE width END, height = CASE WHEN ?3 > 0 THEN ?3 ELSE height END, orientation = COALESCE(?4, orientation), representative_rgb = COALESCE(?5, representative_rgb), shape_status = ?6 \
                  WHERE id = ?1",
@@ -310,6 +352,21 @@ fn apply_record(
             Ok(())
         }
     }
+}
+
+fn clear_terminal_derivative_state(
+    connection: &Connection,
+    asset_id: AssetId,
+) -> Result<(), CatalogError> {
+    connection.execute(
+        "DELETE FROM derivative_failures WHERE asset_id = ?1",
+        [asset_id.as_uuid().as_bytes()],
+    )?;
+    connection.execute(
+        "DELETE FROM warnings WHERE asset_id = ?1 AND code = 'derivative_generation_terminal'",
+        [asset_id.as_uuid().as_bytes()],
+    )?;
+    Ok(())
 }
 
 fn ensure_asset_library(

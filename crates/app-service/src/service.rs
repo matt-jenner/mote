@@ -10,7 +10,7 @@ use photo_core::{
 };
 use photo_domain::{Appearance, AssetId, Availability, GalleryScope, MediaKind};
 use photo_indexer::{DefaultMetadataReader, IndexScheduler, MetadataReader};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 #[cfg(any(test, debug_assertions))]
 use std::sync::atomic::AtomicUsize;
@@ -28,6 +28,61 @@ pub(crate) struct ServiceState {
     pub(crate) selection_epoch: u64,
     pub(crate) published_wall_cache_warning: Option<SelectionToken>,
     pub(crate) published_screen_cache_warning: Option<SelectionToken>,
+}
+
+pub(crate) fn reconcile_stale_terminal_derivative_failures(
+    catalog: &mut Catalog,
+) -> Result<(), CatalogError> {
+    let failures = catalog.terminal_derivative_failures()?;
+    let mut affected_assets = HashSet::new();
+    for failure in failures {
+        let Some(asset) = catalog.find_asset(failure.asset_id)? else {
+            catalog.clear_terminal_derivative_failure(failure.asset_id, &failure.kind)?;
+            continue;
+        };
+        let class = match failure.kind.as_str() {
+            "wall_thumbnail" => DerivativeClass::WallThumbnail,
+            "screen_preview" => DerivativeClass::ScreenPreview,
+            _ => continue,
+        };
+        let current_key = photo_cache::DerivativeKey::compute(
+            &crate::derivatives::derivative_spec(&asset, class),
+        );
+        if failure.cache_key != current_key.as_str() || failure.availability != asset.availability {
+            catalog.clear_terminal_derivative_failure(asset.id, &failure.kind)?;
+            affected_assets.insert(asset.id);
+        }
+    }
+
+    for asset_id in affected_assets {
+        let Some(asset) = catalog.find_asset(asset_id)? else {
+            continue;
+        };
+        let mut still_failed = false;
+        for (class, kind) in [
+            (DerivativeClass::WallThumbnail, "wall_thumbnail"),
+            (DerivativeClass::ScreenPreview, "screen_preview"),
+        ] {
+            let key = photo_cache::DerivativeKey::compute(&crate::derivatives::derivative_spec(
+                &asset, class,
+            ));
+            if catalog
+                .find_terminal_derivative_failure(asset.id, kind, key.as_str(), asset.availability)?
+                .is_some()
+            {
+                still_failed = true;
+                break;
+            }
+        }
+        if !still_failed {
+            catalog.clear_warning(
+                asset.library_id,
+                Some(asset.id),
+                crate::derivatives::TERMINAL_ASSET_DERIVATIVE_WARNING,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -567,6 +622,7 @@ impl AppService {
         config.prepare(&cataloged_roots)?;
         let mut catalog = Catalog::open(&config.catalog_path())?;
         CacheWriter::new(config.cache_dir())?.reconcile_catalog(&mut catalog)?;
+        reconcile_stale_terminal_derivative_failures(&mut catalog)?;
         let should_reconcile = catalog.load_app_state()?.active_selection.is_some();
         let libraries = LibraryService::new(
             catalog,
@@ -1159,14 +1215,22 @@ pub(crate) fn wall_asset_from_record(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "Photo".to_owned());
-    let warning = if item.shape_status == photo_catalog::ShapeStatus::Fallback {
-        Some(crate::WallWarningState {
-            code: "shapeFallback".to_owned(),
-            retryable: true,
-        })
-    } else if item.availability != Availability::Available {
+    let derivative_warning = item.warning_code.as_deref().filter(|code| {
+        matches!(
+            *code,
+            "derivative_generation_failed" | "derivative_generation_terminal"
+        )
+    });
+    let warning = if item.availability != Availability::Available {
         Some(crate::WallWarningState {
             code: "sourceUnavailable".to_owned(),
+            retryable: true,
+        })
+    } else if let Some(code) = derivative_warning {
+        Some(map_asset_warning_code(code))
+    } else if item.shape_status == photo_catalog::ShapeStatus::Fallback {
+        Some(crate::WallWarningState {
+            code: "shapeFallback".to_owned(),
             retryable: true,
         })
     } else if item.has_warning {

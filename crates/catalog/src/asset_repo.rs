@@ -251,7 +251,7 @@ fn conversion_error(
     rusqlite::Error::FromSqlConversionFailure(column, data_type, Box::new(error))
 }
 
-fn encode_media_kind(kind: MediaKind) -> &'static str {
+pub(crate) fn encode_media_kind(kind: MediaKind) -> &'static str {
     match kind {
         MediaKind::Jpeg => "jpeg",
         MediaKind::Png => "png",

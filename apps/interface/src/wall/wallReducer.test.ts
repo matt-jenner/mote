@@ -207,7 +207,12 @@ describe("wallReducer", () => {
 			type: "pageLoaded",
 			assets: [],
 			totalCount: 0,
-			previewCounts: { wallReady: 0, screenReady: 0 },
+			previewCounts: {
+				wallReady: 0,
+				screenReady: 0,
+				wallFailed: 0,
+				screenFailed: 0,
+			},
 			orderState: "settled",
 			nextCursor: null,
 			requestCursor: null,
@@ -222,7 +227,12 @@ describe("wallReducer", () => {
 	it("does not regress a live preview count when an older wall page arrives", () => {
 		const initial = {
 			...activeState(),
-			previewCounts: { wallReady: 1_033, screenReady: 149 },
+			previewCounts: {
+				wallReady: 1_033,
+				screenReady: 149,
+				wallFailed: 0,
+				screenFailed: 0,
+			},
 		};
 		const requested = reduce(initial, {
 			type: "pageRequestStarted",
@@ -233,7 +243,12 @@ describe("wallReducer", () => {
 		const live = reduce(requested, {
 			type: "derivativesReady",
 			derivatives: [],
-			previewCounts: { wallReady: 1_034, screenReady: 149 },
+			previewCounts: {
+				wallReady: 1_034,
+				screenReady: 149,
+				wallFailed: 0,
+				screenFailed: 0,
+			},
 		});
 		const paged = reduce(live, {
 			type: "pageLoaded",
@@ -243,12 +258,19 @@ describe("wallReducer", () => {
 			requestCursor: null,
 			requestEpoch: live.scrollEpoch,
 			requestId: "stale-count-page",
-			previewCounts: { wallReady: 1_033, screenReady: 149 },
+			previewCounts: {
+				wallReady: 1_033,
+				screenReady: 149,
+				wallFailed: 0,
+				screenFailed: 0,
+			},
 		});
 
 		expect(paged.previewCounts).toEqual({
 			wallReady: 1_034,
 			screenReady: 149,
+			wallFailed: 0,
+			screenFailed: 0,
 		});
 	});
 
@@ -256,12 +278,22 @@ describe("wallReducer", () => {
 		const live = reduce(
 			{
 				...activeState(),
-				previewCounts: { wallReady: 1_033, screenReady: 149 },
+				previewCounts: {
+					wallReady: 1_033,
+					screenReady: 149,
+					wallFailed: 0,
+					screenFailed: 0,
+				},
 			},
 			{
 				type: "derivativesReady",
 				derivatives: [],
-				previewCounts: { wallReady: 1_034, screenReady: 149 },
+				previewCounts: {
+					wallReady: 1_034,
+					screenReady: 149,
+					wallFailed: 0,
+					screenFailed: 0,
+				},
 			},
 		);
 		const requested = reduce(live, {
@@ -278,12 +310,19 @@ describe("wallReducer", () => {
 			requestCursor: null,
 			requestEpoch: requested.scrollEpoch,
 			requestId: "newer-count-page",
-			previewCounts: { wallReady: 1_000, screenReady: 140 },
+			previewCounts: {
+				wallReady: 1_000,
+				screenReady: 140,
+				wallFailed: 0,
+				screenFailed: 0,
+			},
 		});
 
 		expect(paged.previewCounts).toEqual({
 			wallReady: 1_000,
 			screenReady: 140,
+			wallFailed: 0,
+			screenFailed: 0,
 		});
 	});
 
@@ -1881,6 +1920,95 @@ describe("wallReducer", () => {
 		expect(paged.items.map((item) => item.id)).toEqual(["b", "a", "c", "d"]);
 	});
 
+	it("date-sorts a newer provisional generation into settled assets", () => {
+		const january = {
+			...wallAsset("january", 1, 1),
+			capturedAtUtc: "2024-01-10T12:00:00Z",
+		};
+		const march = {
+			...wallAsset("march", 1, 2),
+			capturedAtUtc: "2024-03-10T12:00:00Z",
+		};
+		const heic = {
+			...wallAsset("february-heic", 1, 3),
+			displayName: "february.heic",
+			mediaKind: "heif" as const,
+			capturedAtUtc: "2024-02-10T12:00:00Z",
+		};
+		const settled = {
+			...activeState(),
+			items: [january, march],
+			orderState: "settled" as const,
+			settledGeneration: 4,
+			scanComplete: true,
+			pagesExhausted: true,
+		};
+
+		const rescanning = reduce(settled, {
+			type: "catalogBatch",
+			assets: [heic],
+			orderState: "provisional",
+			selectionId: "selection-a",
+			generation: 5,
+		});
+
+		expect(rescanning.orderState).toBe("provisional");
+		expect(rescanning.items.map((item) => item.id)).toEqual([
+			"january",
+			"february-heic",
+			"march",
+		]);
+	});
+
+	it("keeps a newer provisional generation sorted after an older page loads", () => {
+		const datedAsset = (id: string, capturedAtUtc: string, order: number) => ({
+			...wallAsset(id, 1, order),
+			capturedAtUtc,
+		});
+		const settled = {
+			...activeState(),
+			items: [
+				datedAsset("january", "2024-01-10T12:00:00Z", 1),
+				datedAsset("march", "2024-03-10T12:00:00Z", 2),
+			],
+			orderState: "settled" as const,
+			settledGeneration: 4,
+			scanComplete: true,
+			cursor: "old-page-2",
+		};
+		const rescanning = reduce(settled, {
+			type: "catalogBatch",
+			assets: [datedAsset("february-10-heic", "2024-02-10T12:00:00Z", 3)],
+			orderState: "provisional",
+			selectionId: "selection-a",
+			generation: 5,
+		});
+		const requested = reduce(rescanning, {
+			type: "pageRequestStarted",
+			requestId: "older-settled-page",
+			requestCursor: "old-page-2",
+			requestEpoch: rescanning.scrollEpoch,
+		});
+
+		const paged = reduce(requested, {
+			type: "pageLoaded",
+			assets: [datedAsset("february-20-jpeg", "2024-02-20T12:00:00Z", 4)],
+			orderState: "settled",
+			nextCursor: null,
+			requestCursor: "old-page-2",
+			requestEpoch: rescanning.scrollEpoch,
+			requestId: "older-settled-page",
+		});
+
+		expect(paged.orderState).toBe("provisional");
+		expect(paged.items.map((item) => item.id)).toEqual([
+			"january",
+			"february-10-heic",
+			"february-20-jpeg",
+			"march",
+		]);
+	});
+
 	it("replaces each newer complete scan generation and patches the current one", () => {
 		const firstRequest = reduce(initialWallState, {
 			type: "pageRequestStarted",
@@ -1986,6 +2114,86 @@ describe("wallReducer", () => {
 			orderState: "provisional",
 		});
 		expect(materialized.items[0]?.warning?.code).toBe("derivativeUnavailable");
+	});
+
+	it("counts terminal thumbnail warnings without removing their assets", () => {
+		const loaded = {
+			...reduce(initialWallState, {
+				type: "catalogBatch" as const,
+				assets: [wallAsset("failed", 1, 1)],
+				orderState: "provisional" as const,
+			}),
+			totalCount: 1,
+			previewCounts: {
+				wallReady: 0,
+				screenReady: 0,
+				wallFailed: 0,
+				screenFailed: 0,
+			},
+		};
+		const failed = reduce(loaded, {
+			type: "warning",
+			sourceId: "source",
+			assetId: "failed",
+			warning: { code: "wallThumbnailUnavailable", retryable: false },
+		});
+
+		expect(failed.items.map((item) => item.id)).toEqual(["failed"]);
+		expect(failed.totalCount).toBe(1);
+		expect(failed.previewCounts?.wallFailed).toBe(1);
+
+		const recovered = reduce(failed, {
+			type: "warningCleared",
+			sourceId: "source",
+			assetId: "failed",
+			code: "derivativeUnavailable",
+		});
+		expect(recovered.items[0]?.warning).toBeNull();
+		expect(recovered.previewCounts?.wallFailed).toBe(0);
+	});
+
+	it("counts and clears terminal larger-preview warnings independently", () => {
+		const ready = wallAsset("failed-screen", 1, 1);
+		ready.wallThumbnail = {
+			assetId: "failed-screen",
+			kind: "wallThumbnail",
+			key: "wall-key",
+		};
+		const loaded = {
+			...reduce(initialWallState, {
+				type: "catalogBatch" as const,
+				assets: [ready],
+				orderState: "provisional" as const,
+			}),
+			totalCount: 1,
+			previewCounts: {
+				wallReady: 1,
+				screenReady: 0,
+				wallFailed: 0,
+				screenFailed: 0,
+			},
+		};
+		const failed = reduce(loaded, {
+			type: "warning",
+			sourceId: "source",
+			assetId: "failed-screen",
+			warning: { code: "screenPreviewUnavailable", retryable: false },
+		});
+
+		expect(failed.previewCounts).toMatchObject({
+			wallFailed: 0,
+			screenFailed: 1,
+		});
+		const recovered = reduce(failed, {
+			type: "warningCleared",
+			sourceId: "source",
+			assetId: "failed-screen",
+			code: "derivativeUnavailable",
+		});
+		expect(recovered.previewCounts).toMatchObject({
+			wallFailed: 0,
+			screenFailed: 0,
+		});
 	});
 
 	it("keeps source warning codes independent", () => {

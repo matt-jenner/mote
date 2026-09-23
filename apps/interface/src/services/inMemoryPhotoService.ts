@@ -401,6 +401,16 @@ export function createInMemoryPhotoService(
 						.length,
 					screenReady: ordered.filter((item) => item.screenPreview !== null)
 						.length,
+					wallFailed: ordered.filter(
+						(item) =>
+							item.warning?.retryable === false && item.wallThumbnail === null,
+					).length,
+					screenFailed: ordered.filter(
+						(item) =>
+							item.warning?.retryable === false &&
+							item.wallThumbnail !== null &&
+							item.screenPreview === null,
+					).length,
 				},
 			};
 		},

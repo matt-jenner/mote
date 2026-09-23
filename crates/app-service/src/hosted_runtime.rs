@@ -935,6 +935,8 @@ impl SelectionEventSubscription {
                         .map(|counts| crate::WallPreviewCounts {
                             wall_ready: counts.wall_ready,
                             screen_ready: counts.screen_ready,
+                            wall_failed: counts.wall_failed,
+                            screen_failed: counts.screen_failed,
                         });
                     Some(event)
                 }

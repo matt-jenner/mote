@@ -171,10 +171,34 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 		state.previewCounts?.screenReady ??
 			state.items.filter((item) => item.screenPreview).length,
 	);
-	const missingWall = total - wallReady;
-	const missingScreen = total - screenReady;
+	const wallFailed = Math.min(
+		Math.max(0, total - wallReady),
+		state.previewCounts?.wallFailed ??
+			state.items.filter(
+				(item) =>
+					item.warning?.retryable === false && item.wallThumbnail === null,
+			).length,
+	);
+	const screenFailed = Math.min(
+		Math.max(0, total - screenReady - wallFailed),
+		state.previewCounts?.screenFailed ??
+			state.items.filter(
+				(item) =>
+					item.warning?.retryable === false &&
+					item.wallThumbnail !== null &&
+					item.screenPreview === null,
+			).length,
+	);
+	const missingWall = Math.max(0, total - wallReady - wallFailed);
+	const missingScreen = Math.max(
+		0,
+		total - screenReady - wallFailed - screenFailed,
+	);
 	const busy =
-		state.activeRequest !== null || missingWall > 0 || state.sortPending;
+		state.activeRequest !== null ||
+		missingWall > 0 ||
+		missingScreen > 0 ||
+		state.sortPending;
 	if (!state.scanComplete) {
 		const progress = state.scanProgress;
 		const indexingTotal = Math.max(total, progress?.total ?? 0);
@@ -202,7 +226,7 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 	}
 	if (
 		Object.keys(state.sourceWarnings).length > 0 ||
-		state.items.some((item) => item.warning !== null)
+		state.items.some((item) => item.warning?.retryable === true)
 	)
 		return {
 			status: "Some previews need attention",
@@ -224,12 +248,26 @@ function wallProgress(state: typeof initialWallState): WallProgress {
 			max: total > 0 ? total : null,
 			busy: true,
 		};
+	if (wallFailed > 0)
+		return {
+			status: `${countFormatter.format(wallReady)} photos ready · ${countFormatter.format(wallFailed)} failed`,
+			value: null,
+			max: null,
+			busy,
+		};
 	if (missingScreen > 0)
 		return {
 			status: `Photos ready · preparing larger previews · ${countFormatter.format(screenReady)} of ${countFormatter.format(total)}`,
 			value: screenReady,
 			max: total > 0 ? total : null,
 			busy,
+		};
+	if (screenFailed > 0)
+		return {
+			status: `Photos ready · ${countFormatter.format(screenFailed)} larger previews failed`,
+			value: null,
+			max: null,
+			busy: false,
 		};
 	if (known === 0 && state.pagesExhausted && !state.activeRequest)
 		return { status: "No photos found", value: null, max: null, busy: false };
@@ -547,6 +585,8 @@ export function usePhotoWall(
 											stateRef.current.totalCount ?? Number.MAX_SAFE_INTEGER,
 											currentCounts.screenReady + backgroundScreenReady,
 										),
+										wallFailed: currentCounts.wallFailed,
+										screenFailed: currentCounts.screenFailed,
 									}
 								: null;
 						dispatch({

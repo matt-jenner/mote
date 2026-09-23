@@ -363,10 +363,17 @@ function decodeResolvedAssets(value: unknown): Array<WallAsset | null> {
 }
 
 function decodePreviewCounts(value: unknown) {
-	const counts = record(value, ["wallReady", "screenReady"]);
+	const counts = record(value, [
+		"wallReady",
+		"screenReady",
+		"wallFailed",
+		"screenFailed",
+	]);
 	return {
 		wallReady: integerValue(counts.wallReady),
 		screenReady: integerValue(counts.screenReady),
+		wallFailed: integerValue(counts.wallFailed),
+		screenFailed: integerValue(counts.screenFailed),
 	};
 }
 

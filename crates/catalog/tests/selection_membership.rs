@@ -260,6 +260,8 @@ fn cached_preview_counts_cover_the_whole_scope_without_counting_old_versions_twi
         photo_catalog::WallPreviewCounts {
             wall_ready: 1,
             screen_ready: 0,
+            wall_failed: 0,
+            screen_failed: 0,
         }
     );
     assert_eq!(
@@ -269,6 +271,8 @@ fn cached_preview_counts_cover_the_whole_scope_without_counting_old_versions_twi
         photo_catalog::WallPreviewCounts {
             wall_ready: 2,
             screen_ready: 1,
+            wall_failed: 0,
+            screen_failed: 0,
         }
     );
 

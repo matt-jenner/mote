@@ -31,7 +31,7 @@ use crate::{
 };
 
 const ASSET_DERIVATIVE_WARNING: &str = "derivative_generation_failed";
-const TERMINAL_ASSET_DERIVATIVE_WARNING: &str = "derivative_generation_terminal";
+pub(crate) const TERMINAL_ASSET_DERIVATIVE_WARNING: &str = "derivative_generation_terminal";
 const WALL_CACHE_DERIVATIVE_WARNING: &str = "wall_thumbnail_cache_unavailable";
 const SCREEN_CACHE_DERIVATIVE_WARNING: &str = "screen_preview_cache_unavailable";
 const MAX_DERIVATIVE_WORKERS: usize = 2;
@@ -98,6 +98,18 @@ impl DerivativeWorkError {
             | Self::WallThumbnailRequired => DerivativeFailureScope::CacheWide,
         }
     }
+}
+
+fn terminal_derivative_diagnostic(error: &DerivativeWorkError) -> String {
+    let message = match error {
+        DerivativeWorkError::Image(error) => error.to_string(),
+        DerivativeWorkError::WorkerUnavailable => "preview worker unavailable".to_owned(),
+        DerivativeWorkError::PreviewSuperseded => "preview request superseded".to_owned(),
+        DerivativeWorkError::WallThumbnailRequired => {
+            "wall thumbnail prerequisite unavailable".to_owned()
+        }
+    };
+    message.chars().take(1024).collect()
 }
 
 #[derive(Clone)]
@@ -839,6 +851,7 @@ impl AppService {
                         class,
                         &failure_key.cache_key,
                         failure_key.availability,
+                        Some(&error),
                     );
                 if terminal {
                     if let Some(permit) = permit {
@@ -923,6 +936,7 @@ impl AppService {
                         class,
                         &cache_key,
                         availability,
+                        Some(&error),
                     )
                 {
                     self.coordinator.terminal_commit(permit).await;
@@ -2486,6 +2500,7 @@ impl AppService {
                 DerivativeClass::WallThumbnail,
                 &cache_key,
                 availability,
+                None,
             ));
         }
         Ok(false)
@@ -2559,6 +2574,7 @@ impl AppService {
         class: DerivativeClass,
         cache_key: &str,
         expected_availability: Availability,
+        error: Option<&DerivativeWorkError>,
     ) -> bool {
         let result = self.state().and_then(|mut state| {
             if !self.derivative_selection_matches(&state, selection) {
@@ -2569,7 +2585,11 @@ impl AppService {
                 .catalog()
                 .find_asset(asset_id)?
                 .filter(|asset| {
-                    state.libraries.catalog().asset_is_member(selection.group_id, asset.id).unwrap_or(false)
+                    state
+                        .libraries
+                        .catalog()
+                        .asset_is_member(selection.group_id, asset.id)
+                        .unwrap_or(false)
                         && asset.media_kind.is_wall_viewable()
                 });
             let Some(asset) = asset else {
@@ -2583,6 +2603,11 @@ impl AppService {
                 return Ok(false);
             }
             let kind = derivative_kind_name(class);
+            let diagnostic = error
+                .map(terminal_derivative_diagnostic)
+                .unwrap_or_else(|| {
+                    "The source file is unavailable for preview generation.".to_owned()
+                });
             state
                 .libraries
                 .catalog_mut()
@@ -2609,28 +2634,38 @@ impl AppService {
                     library_id: selection.library_id,
                     asset_id: Some(asset_id),
                     code: TERMINAL_ASSET_DERIVATIVE_WARNING.to_owned(),
-                    message: "A preview could not be generated for this source version. It will retry when the source changes or becomes available.".to_owned(),
+                    message: diagnostic.clone(),
                 },
             )?;
             if inserted {
-                let _ = self.publish_derivative_update(&state, selection, WallUpdate::Warning {
-                    selection_id: selection.selection_id(),
-                    source_id: selection.library_id.as_uuid().hyphenated().to_string(),
-                    asset_id: Some(asset_id.as_uuid().hyphenated().to_string()),
-                    warning: crate::WallWarningState {
-                        code: match (class, asset.availability) {
-                            (DerivativeClass::WallThumbnail, Availability::Available) => {
-                                "wallThumbnailUnavailable"
+                tracing::warn!(
+                    asset_id = %asset.id.as_uuid().hyphenated(),
+                    derivative_kind = kind,
+                    diagnostic,
+                    "preview generation reached a terminal failure"
+                );
+                let _ = self.publish_derivative_update(
+                    &state,
+                    selection,
+                    WallUpdate::Warning {
+                        selection_id: selection.selection_id(),
+                        source_id: selection.library_id.as_uuid().hyphenated().to_string(),
+                        asset_id: Some(asset_id.as_uuid().hyphenated().to_string()),
+                        warning: crate::WallWarningState {
+                            code: match (class, asset.availability) {
+                                (DerivativeClass::WallThumbnail, Availability::Available) => {
+                                    "wallThumbnailUnavailable"
+                                }
+                                (DerivativeClass::ScreenPreview, Availability::Available) => {
+                                    "screenPreviewUnavailable"
+                                }
+                                _ => "derivativeUnavailable",
                             }
-                            (DerivativeClass::ScreenPreview, Availability::Available) => {
-                                "screenPreviewUnavailable"
-                            }
-                            _ => "derivativeUnavailable",
-                        }
-                        .to_owned(),
-                        retryable: false,
+                            .to_owned(),
+                            retryable: false,
+                        },
                     },
-                });
+                );
             }
             Ok(true)
         });
@@ -2901,6 +2936,8 @@ impl AppService {
             .map(|counts| crate::WallPreviewCounts {
                 wall_ready: counts.wall_ready,
                 screen_ready: counts.screen_ready,
+                wall_failed: counts.wall_failed,
+                screen_failed: counts.screen_failed,
             });
         let publication_started = std::time::Instant::now();
         let result = self.updates.send(WallUpdate::DerivativesReady {
@@ -3203,7 +3240,10 @@ fn validate_requested_assets(
     Ok(photo_ids)
 }
 
-fn derivative_spec(asset: &photo_catalog::AssetRecord, class: DerivativeClass) -> DerivativeSpec {
+pub(crate) fn derivative_spec(
+    asset: &photo_catalog::AssetRecord,
+    class: DerivativeClass,
+) -> DerivativeSpec {
     let (kind, edge) = match class {
         DerivativeClass::WallThumbnail => (DerivativeKind::WallThumbnail, 1024),
         DerivativeClass::ScreenPreview => (DerivativeKind::ScreenPreview, 4096),

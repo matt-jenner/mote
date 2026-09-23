@@ -162,7 +162,12 @@ const emptyWallPage = {
 	sourceWarnings: [],
 	totalCount: 0,
 	indexedCount: 0,
-	previewCounts: { wallReady: 0, screenReady: 0 },
+	previewCounts: {
+		wallReady: 0,
+		screenReady: 0,
+		wallFailed: 0,
+		screenFailed: 0,
+	},
 };
 
 function json(value: unknown, status = 200): Response {
@@ -1296,7 +1301,12 @@ describe("HTTP PhotoService", () => {
 					sourceWarnings: [{ code: "sourceOffline", retryable: true }],
 					totalCount: 1,
 					indexedCount: 1,
-					previewCounts: { wallReady: 1, screenReady: 1 },
+					previewCounts: {
+						wallReady: 1,
+						screenReady: 1,
+						wallFailed: 0,
+						screenFailed: 0,
+					},
 				});
 			throw new Error(`unexpected request ${url}`);
 		});
@@ -1350,7 +1360,12 @@ describe("HTTP PhotoService", () => {
 			orderState: "settled",
 			totalCount: 1,
 			indexedCount: 1,
-			previewCounts: { wallReady: 1, screenReady: 1 },
+			previewCounts: {
+				wallReady: 1,
+				screenReady: 1,
+				wallFailed: 0,
+				screenFailed: 0,
+			},
 			sourceWarnings: [{ code: "sourceOffline", retryable: true }],
 		});
 		expect(received).toEqual([

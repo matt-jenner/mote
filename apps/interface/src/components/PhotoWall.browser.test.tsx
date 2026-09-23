@@ -382,6 +382,9 @@ const pageOf = (
 	previewCounts = {
 		wallReady: items.filter((item) => item.wallThumbnail !== null).length,
 		screenReady: items.filter((item) => item.screenPreview !== null).length,
+		wallFailed: items.filter((item) => item.warning?.retryable === false)
+			.length,
+		screenFailed: 0,
 	},
 ): WallPage => ({
 	items: [...items],
@@ -1057,6 +1060,8 @@ describe("progressive photo wall", () => {
 			pageOf(ready, "settled", "cursor-2", [], 222, {
 				wallReady: 2,
 				screenReady: 0,
+				wallFailed: 0,
+				screenFailed: 0,
 			}),
 		);
 
@@ -1071,6 +1076,8 @@ describe("progressive photo wall", () => {
 			pageOf(ready, "settled", "cursor-2", [], 222, {
 				wallReady: 2,
 				screenReady: 0,
+				wallFailed: 0,
+				screenFailed: 0,
 			}),
 		);
 		await expect.poll(() => service.queryRequests.length).toBe(3);
@@ -1080,6 +1087,8 @@ describe("progressive photo wall", () => {
 			pageOf(waiting, "settled", null, [], 222, {
 				wallReady: 2,
 				screenReady: 0,
+				wallFailed: 0,
+				screenFailed: 0,
 			}),
 		);
 
@@ -1113,7 +1122,12 @@ describe("progressive photo wall", () => {
 		await expect.poll(() => service.queryRequests.length).toBe(1);
 		const firstPage = settledFixtures.slice(0, 2);
 		const secondPage = settledFixtures.slice(2, 4);
-		const counts = { wallReady: 4, screenReady: 0 };
+		const counts = {
+			wallReady: 4,
+			screenReady: 0,
+			wallFailed: 0,
+			screenFailed: 0,
+		};
 		service.releaseQuery(
 			0,
 			pageOf(firstPage, "settled", "cursor-2", [], 4, counts),
@@ -3233,6 +3247,46 @@ describe("progressive photo wall", () => {
 		);
 	});
 
+	it("settles with explicit ready and failed preview totals", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(
+			0,
+			pageOf(realFixtureAssets.slice(0, 4), "settled", null, [], 4, {
+				wallReady: 3,
+				screenReady: 3,
+				wallFailed: 1,
+				screenFailed: 0,
+			}),
+		);
+
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("3 photos ready · 1 failed");
+		expect(screen.getByRole("progressbar").query()).toBeNull();
+	});
+
+	it("settles when a larger preview has terminally failed", async () => {
+		const service = new ControlledWallService();
+		const screen = await renderWall(service);
+		await expect.poll(() => service.queryRequests.length).toBe(1);
+		service.releaseQuery(
+			0,
+			pageOf(realFixtureAssets.slice(0, 4), "settled", null, [], 4, {
+				wallReady: 4,
+				screenReady: 3,
+				wallFailed: 0,
+				screenFailed: 1,
+			}),
+		);
+
+		await expect
+			.element(screen.getByRole("status"))
+			.toHaveTextContent("Photos ready · 1 larger previews failed");
+		expect(screen.getByRole("progressbar").query()).toBeNull();
+	});
+
 	it("keeps active indexing status ahead of preview warnings", async () => {
 		const service = new ControlledWallService();
 		const screen = await renderWall(service);
@@ -3418,6 +3472,8 @@ describe("progressive photo wall", () => {
 			pageOf(realFixtureAssets.slice(0, 4), "settled", "cursor-2", [], 2_092, {
 				wallReady: 1_033,
 				screenReady: 149,
+				wallFailed: 0,
+				screenFailed: 0,
 			}),
 		);
 		await expect
@@ -3432,6 +3488,8 @@ describe("progressive photo wall", () => {
 			pageOf(settledFixtures, "settled", null, [], 2_092, {
 				wallReady: 1_033,
 				screenReady: 149,
+				wallFailed: 0,
+				screenFailed: 0,
 			}),
 		);
 		await expect
@@ -3894,12 +3952,7 @@ describe("progressive photo wall", () => {
 					.getByText("No photos found", { exact: true }),
 			)
 			.toBeVisible();
-		expect(screen.getByRole("progressbar").element()).not.toHaveAttribute(
-			"max",
-		);
-		expect(screen.getByRole("progressbar").element()).not.toHaveAttribute(
-			"value",
-		);
+		expect(screen.getByRole("progressbar").query()).toBeNull();
 	});
 
 	it("reports interaction quieting, retry, and source swaps without stale assets", async () => {
@@ -4176,7 +4229,7 @@ describe("progressive photo wall", () => {
 			.toBeVisible();
 	});
 
-	it("removes an asset after its wall thumbnail becomes permanently unavailable", async () => {
+	it("keeps an asset visible after its wall thumbnail becomes permanently unavailable", async () => {
 		const service = new ControlledWallService();
 		const screen = await renderWall(service);
 		await expect.poll(() => service.queryRequests.length).toBe(1);
@@ -4195,7 +4248,10 @@ describe("progressive photo wall", () => {
 
 		await expect
 			.poll(() => screen.getByRole("button", { name: "Open Coast" }).query())
-			.toBeNull();
+			.not.toBeNull();
+		await expect
+			.element(screen.getByLabelText("Photo preview warning").first())
+			.toBeVisible();
 		expect(service.queryRequests).toHaveLength(1);
 	});
 

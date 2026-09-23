@@ -131,6 +131,8 @@ pub struct WallWarningState {
 pub struct WallPreviewCounts {
     pub wall_ready: u64,
     pub screen_ready: u64,
+    pub wall_failed: u64,
+    pub screen_failed: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -307,6 +309,8 @@ mod tests {
         let counts = WallPreviewCounts {
             wall_ready: 1033,
             screen_ready: 149,
+            wall_failed: 7,
+            screen_failed: 11,
         };
         let page = WallPage {
             items: Vec::new(),
@@ -321,6 +325,8 @@ mod tests {
         assert_eq!(page_value["indexedCount"], 2092);
         assert_eq!(page_value["previewCounts"]["wallReady"], 1033);
         assert_eq!(page_value["previewCounts"]["screenReady"], 149);
+        assert_eq!(page_value["previewCounts"]["wallFailed"], 7);
+        assert_eq!(page_value["previewCounts"]["screenFailed"], 11);
 
         let update = WallUpdate::DerivativesReady {
             selection_id: "selection-opaque".to_owned(),

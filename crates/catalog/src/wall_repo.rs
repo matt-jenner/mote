@@ -105,6 +105,8 @@ pub struct PhotoAssetIdPage {
 pub struct WallPreviewCounts {
     pub wall_ready: u64,
     pub screen_ready: u64,
+    pub wall_failed: u64,
+    pub screen_failed: u64,
 }
 
 impl Catalog {
@@ -117,12 +119,7 @@ impl Catalog {
             "SELECT COUNT(*) \
              FROM assets JOIN folder_group_assets fga ON fga.asset_id = assets.id \
              WHERE fga.folder_group_id = ?1 \
-               AND media_kind IN {WALL_MEDIA_KINDS} \
-               AND NOT EXISTS (SELECT 1 FROM derivative_failures \
-                               WHERE derivative_failures.asset_id = assets.id \
-                                 AND derivative_failures.kind = 'wall_thumbnail' \
-                                 AND derivative_failures.availability = 'available' \
-                                 AND derivative_failures.availability = assets.availability)",
+               AND media_kind IN {WALL_MEDIA_KINDS}",
         );
         if scope == GalleryScope::CurrentFolder {
             sql.push_str(
@@ -146,9 +143,36 @@ impl Catalog {
                 .query_row(&sql, [group.as_uuid().as_bytes()], |row| {
                     Ok((row.get(0)?, row.get(1)?))
                 })?;
+        let failure_count = |kind: &str| -> Result<i64, CatalogError> {
+            let mut sql = format!(
+                "SELECT COUNT(*) \
+                 FROM derivative_failures \
+                 JOIN assets ON assets.id = derivative_failures.asset_id \
+                 JOIN folder_group_assets fga ON fga.asset_id = assets.id \
+                 WHERE fga.folder_group_id = ?1 \
+                   AND assets.media_kind IN {WALL_MEDIA_KINDS} \
+                   AND derivative_failures.kind = ?2 \
+                   AND derivative_failures.availability = assets.availability"
+            );
+            if scope == GalleryScope::CurrentFolder {
+                sql.push_str(
+                    " AND relative_parent_key = (SELECT relative_path_key FROM folder_groups WHERE id = ?1)",
+                );
+            }
+            Ok(self.connection.query_row(
+                &sql,
+                params![group.as_uuid().as_bytes(), kind],
+                |row| row.get(0),
+            )?)
+        };
+        let wall_failed = failure_count("wall_thumbnail")?;
+        let screen_failed = failure_count("screen_preview")?;
         Ok(WallPreviewCounts {
             wall_ready: u64::try_from(wall_ready).map_err(|_| CatalogError::ValueOutOfRange)?,
             screen_ready: u64::try_from(screen_ready).map_err(|_| CatalogError::ValueOutOfRange)?,
+            wall_failed: u64::try_from(wall_failed).map_err(|_| CatalogError::ValueOutOfRange)?,
+            screen_failed: u64::try_from(screen_failed)
+                .map_err(|_| CatalogError::ValueOutOfRange)?,
         })
     }
 
@@ -169,15 +193,10 @@ impl Catalog {
         let mut sql = format!(
             "SELECT id, display_path, media_kind, provisional_order, captured_at_utc, width, height, representative_rgb, availability, shape_status, rating, \
                     EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id), \
-                    (SELECT code FROM warnings WHERE warnings.asset_id = assets.id ORDER BY CASE code WHEN 'derivative_generation_failed' THEN 0 ELSE 1 END, occurred_at DESC, id DESC LIMIT 1) \
+                    (SELECT code FROM warnings WHERE warnings.asset_id = assets.id ORDER BY CASE code WHEN 'derivative_generation_terminal' THEN 0 WHEN 'derivative_generation_failed' THEN 1 ELSE 2 END, occurred_at DESC, id DESC LIMIT 1) \
              FROM assets JOIN folder_group_assets fga ON fga.asset_id = assets.id \
              WHERE fga.folder_group_id = ?1 AND assets.id = ?2 \
                AND media_kind IN {WALL_MEDIA_KINDS} \
-               AND NOT EXISTS (SELECT 1 FROM derivative_failures \
-                               WHERE derivative_failures.asset_id = assets.id \
-                                 AND derivative_failures.kind = 'wall_thumbnail' \
-                                 AND derivative_failures.availability = 'available' \
-                                 AND derivative_failures.availability = assets.availability) \
                AND shape_status IN ('ready','fallback') AND width IS NOT NULL AND height IS NOT NULL",
         );
         if scope == GalleryScope::CurrentFolder {
@@ -234,15 +253,10 @@ impl Catalog {
         let mut sql = format!(
             "SELECT id, display_path, media_kind, provisional_order, captured_at_utc, width, height, representative_rgb, availability, shape_status, rating, \
                     EXISTS(SELECT 1 FROM warnings WHERE warnings.asset_id = assets.id), \
-                    (SELECT code FROM warnings WHERE warnings.asset_id = assets.id ORDER BY CASE code WHEN 'derivative_generation_failed' THEN 0 ELSE 1 END, occurred_at DESC, id DESC LIMIT 1) \
+                    (SELECT code FROM warnings WHERE warnings.asset_id = assets.id ORDER BY CASE code WHEN 'derivative_generation_terminal' THEN 0 WHEN 'derivative_generation_failed' THEN 1 ELSE 2 END, occurred_at DESC, id DESC LIMIT 1) \
              FROM assets JOIN folder_group_assets fga ON fga.asset_id = assets.id \
              WHERE fga.folder_group_id = ?1 \
                AND media_kind IN {WALL_MEDIA_KINDS} \
-               AND NOT EXISTS (SELECT 1 FROM derivative_failures \
-                               WHERE derivative_failures.asset_id = assets.id \
-                                 AND derivative_failures.kind = 'wall_thumbnail' \
-                                 AND derivative_failures.availability = 'available' \
-                                 AND derivative_failures.availability = assets.availability) \
                AND shape_status IN ('ready','fallback') AND width IS NOT NULL AND height IS NOT NULL",
         );
         if scope == GalleryScope::CurrentFolder {

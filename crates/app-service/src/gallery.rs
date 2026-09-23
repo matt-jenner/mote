@@ -574,6 +574,7 @@ impl GalleryEngine {
         config.prepare(&cataloged_roots)?;
         let mut catalog = Catalog::open(&config.catalog_path())?;
         CacheWriter::new(config.cache_dir())?.reconcile_catalog(&mut catalog)?;
+        crate::service::reconcile_stale_terminal_derivative_failures(&mut catalog)?;
         let mut libraries = LibraryService::new(
             catalog,
             RealSourceFs,
@@ -639,6 +640,7 @@ impl GalleryEngine {
         config.prepare_prevalidated_source_keys(&source_keys)?;
         let mut catalog = Catalog::open(&config.catalog_path())?;
         CacheWriter::new(config.cache_dir())?.reconcile_catalog(&mut catalog)?;
+        crate::service::reconcile_stale_terminal_derivative_failures(&mut catalog)?;
         let mut libraries = LibraryService::new(
             catalog,
             RealSourceFs,
@@ -1448,6 +1450,8 @@ impl GalleryEngine {
             preview_counts: WallPreviewCounts {
                 wall_ready: preview_counts.wall_ready,
                 screen_ready: preview_counts.screen_ready,
+                wall_failed: preview_counts.wall_failed,
+                screen_failed: preview_counts.screen_failed,
             },
         })
     }

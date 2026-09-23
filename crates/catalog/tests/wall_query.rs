@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use photo_catalog::{
-    AssetMetadataUpdate, AssetShapeUpdate, Catalog, CatalogError, CatalogIndexRecord, NewAsset,
-    NewDerivative, NewFolderGroup, NewLibrary, ShapeStatus, TerminalDerivativeFailure,
-    WallCursorKey, WallOrder,
+    AssetMetadataUpdate, AssetShapeUpdate, Catalog, CatalogError, CatalogIndexRecord,
+    CatalogWarningRecord, NewAsset, NewDerivative, NewFolderGroup, NewLibrary, ShapeStatus,
+    TerminalDerivativeFailure, WallCursorKey, WallOrder,
 };
 use photo_domain::{
     AssetId, Availability, DerivativeId, FolderGroupId, GalleryScope, MediaKind, RelativePathKey,
@@ -313,6 +313,8 @@ fn assert_preview_counts_use_compiled_capability(expected: u64) {
         photo_catalog::WallPreviewCounts {
             wall_ready: expected,
             screen_ready: expected,
+            wall_failed: 0,
+            screen_failed: 0,
         }
     );
 }
@@ -330,7 +332,7 @@ fn disabled_preview_counts_exclude_retained_heif_and_unsupported_formats() {
 }
 
 #[test]
-fn wall_pages_and_counts_skip_terminal_thumbnail_failures() {
+fn wall_pages_and_counts_include_terminal_thumbnail_failures() {
     let mut fixture = WallFixture::with_assets([
         asset("loadable.jpg", MediaKind::Jpeg, 1),
         asset("broken.jpg", MediaKind::Jpeg, 2),
@@ -402,15 +404,81 @@ fn wall_pages_and_counts_skip_terminal_thumbnail_failures() {
 
     assert_eq!(
         display_paths(&page.items),
-        ["loadable.jpg", "screen-only.jpg", "cached-offline.jpg"]
+        [
+            "loadable.jpg",
+            "broken.jpg",
+            "screen-only.jpg",
+            "cached-offline.jpg"
+        ]
     );
     assert_eq!(
         fixture
             .catalog
             .wall_photo_count_scoped(fixture.group, GalleryScope::IncludeSubfolders)
             .unwrap(),
-        3
+        4
     );
+
+    let counts = fixture
+        .catalog
+        .wall_preview_counts_scoped(fixture.group, GalleryScope::IncludeSubfolders)
+        .unwrap();
+    assert_eq!(counts.wall_failed, 1);
+    assert_eq!(counts.screen_failed, 1);
+}
+
+#[test]
+fn orientation_changes_clear_terminal_derivative_state() {
+    let mut fixture = WallFixture::with_assets([asset("rotated.jpg", MediaKind::Jpeg, 1)]);
+    let asset = fixture
+        .catalog
+        .find_asset(AssetId::for_path(
+            fixture.library,
+            &RelativePathKey::from_relative_path(Path::new("rotated.jpg")).unwrap(),
+        ))
+        .unwrap()
+        .unwrap();
+    fixture
+        .catalog
+        .record_terminal_derivative_failure(&TerminalDerivativeFailure {
+            asset_id: asset.id,
+            kind: "wall_thumbnail".into(),
+            cache_key: "orientation-1".into(),
+            availability: Availability::Available,
+            failure_code: "derivative_generation_terminal".into(),
+            occurred_at: 1,
+        })
+        .unwrap();
+    fixture
+        .catalog
+        .record_warning_once(&CatalogWarningRecord {
+            library_id: fixture.library,
+            asset_id: Some(asset.id),
+            code: "derivative_generation_terminal".into(),
+            message: "decoder failed before orientation was corrected".into(),
+        })
+        .unwrap();
+
+    fixture
+        .catalog
+        .apply_index_batch(&[CatalogIndexRecord::Shaped(AssetShapeUpdate {
+            asset_id: asset.id,
+            width: 16,
+            height: 9,
+            orientation: Some(8),
+            representative_rgb: None,
+            shape_status: ShapeStatus::Ready,
+        })])
+        .unwrap();
+
+    assert!(
+        fixture
+            .catalog
+            .terminal_derivative_failures()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fixture.catalog.warning_count().unwrap(), 0);
 }
 
 #[test]

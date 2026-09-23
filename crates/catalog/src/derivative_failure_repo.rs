@@ -14,6 +14,19 @@ pub struct TerminalDerivativeFailure {
 }
 
 impl Catalog {
+    pub fn terminal_derivative_failures(
+        &self,
+    ) -> Result<Vec<TerminalDerivativeFailure>, CatalogError> {
+        let mut statement = self.connection.prepare(
+            "SELECT asset_id, kind, cache_key, availability, failure_code, occurred_at \
+             FROM derivative_failures",
+        )?;
+        statement
+            .query_map([], decode_terminal_failure)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(CatalogError::from)
+    }
+
     pub fn find_terminal_derivative_failure(
         &self,
         asset_id: AssetId,
