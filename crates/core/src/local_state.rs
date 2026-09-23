@@ -241,7 +241,10 @@ fn is_unavailable_source_error(error: &std::io::Error) -> bool {
     #[cfg(target_os = "linux")]
     return matches!(error.raw_os_error(), Some(19 | 107 | 116));
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    return matches!(error.raw_os_error(), Some(6 | 19 | 57 | 70));
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     false
 }
 
@@ -249,11 +252,23 @@ fn is_unavailable_source_error(error: &std::io::Error) -> bool {
 mod tests {
     use super::is_unavailable_source_error;
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
-    fn disconnected_source_errors_are_treated_as_unavailable() {
-        let error = std::io::Error::from_raw_os_error(19);
+    fn linux_disconnected_source_errors_are_treated_as_unavailable() {
+        for code in [19, 107, 116] {
+            let error = std::io::Error::from_raw_os_error(code);
 
-        assert!(is_unavailable_source_error(&error));
+            assert!(is_unavailable_source_error(&error), "errno {code}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_disconnected_source_errors_are_treated_as_unavailable() {
+        for code in [6, 19, 57, 70] {
+            let error = std::io::Error::from_raw_os_error(code);
+
+            assert!(is_unavailable_source_error(&error), "errno {code}");
+        }
     }
 }
