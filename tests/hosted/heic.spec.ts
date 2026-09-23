@@ -70,7 +70,12 @@ test(`HEIC hosted ${enabled ? "enabled" : "disabled"} ${phase}`, async ({
 		expect(wall.indexedCount).toBe(enabled ? 1 : 0);
 		if (!enabled) {
 			expect(wall.items).toEqual([]);
-			expect(wall.previewCounts).toEqual({ wallReady: 0, screenReady: 0 });
+			expect(wall.previewCounts).toEqual({
+				wallReady: 0,
+				screenReady: 0,
+				wallFailed: 0,
+				screenFailed: 0,
+			});
 			await expect(page.getByAltText(filename, { exact: true })).toHaveCount(0);
 			for (const kind of ["wallThumbnail", "screenPreview"]) {
 				const response = await request.post(

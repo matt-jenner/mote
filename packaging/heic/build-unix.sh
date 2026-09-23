@@ -52,6 +52,13 @@ case "$arch" in
 		exit 2
 		;;
 esac
+heic_build_jobs=${MOTE_HEIC_BUILD_JOBS:-2}
+case "$heic_build_jobs" in
+	'' | 0 | *[!0-9]*)
+		printf '%s\n' "invalid native build job count: $heic_build_jobs" >&2
+		exit 2
+		;;
+esac
 
 host_system=$(uname -s)
 host_arch=$(uname -m)
@@ -195,7 +202,7 @@ configure_cmake() {
 		"-DCMAKE_PROJECT_INCLUDE=$script_dir/compiler-path-maps.cmake" \
 		"-DMOTE_HEIC_WORK_ROOT=$MOTE_BUILD_DIR" \
 		"-DMOTE_HEIC_STAGE_ROOT=$heic_publish_stage_root"
-	cmake --warn-uninitialized -Werror=dev "$@" >"$heic_configure_log" 2>&1 || heic_configure_status=$?
+	cmake --warn-uninitialized "$@" >"$heic_configure_log" 2>&1 || heic_configure_status=$?
 	cat "$heic_configure_log" >&2
 	if grep -E 'Manually-specified variables were not used by the project|Unknown CMake command|Unknown argument' "$heic_configure_log" >/dev/null; then
 		printf '%s\n' "CMake rejected or ignored a requested build switch for $heic_configure_name" >&2
@@ -236,7 +243,7 @@ configure_cmake libde265 \
 	-DWITH_FUZZERS=OFF \
 	-DUSE_IWYU=OFF \
 	-DFORCE_FULL_VISIBILITY=OFF
-cmake --build "$heic_de265_build" --target de265 --parallel >&2
+cmake --build "$heic_de265_build" --target de265 --parallel "$heic_build_jobs" >&2
 DESTDIR="$heic_stage_root" cmake --install "$heic_de265_build" >&2
 
 case "$platform" in
@@ -323,7 +330,7 @@ grep -E 'x265 HEVC encoder[[:space:]]*: - disabled' "$MOTE_BUILD_DIR/libheif-con
 	exit 1
 }
 
-cmake --build "$heic_heif_build" --target heif --parallel >&2
+cmake --build "$heic_heif_build" --target heif --parallel "$heic_build_jobs" >&2
 DESTDIR="$heic_stage_root" cmake --install "$heic_heif_build" >&2
 mote_remove_managed_path "$heic_de265_build" "$MOTE_BUILD_DIR"
 mote_remove_managed_path "$heic_heif_build" "$MOTE_BUILD_DIR"

@@ -206,6 +206,15 @@ case "$1" in
     case "$build" in
       *"\${FAKE_CMAKE_FAIL_BUILD:-never}") exit 31 ;;
     esac
+    if [ -n "\${FAKE_EXPECT_BUILD_PARALLEL:-}" ]; then
+      parallel=
+      previous=
+      for argument in "$@"; do
+        if [ "$previous" = parallel ]; then parallel=$argument; break; fi
+        [ "$argument" != --parallel ] || previous=parallel
+      done
+      [ "$parallel" = "$FAKE_EXPECT_BUILD_PARALLEL" ] || exit 47
+    fi
     exit 0
     ;;
   --install)
@@ -237,6 +246,14 @@ for argument in "$@"; do
     -DCMAKE_INSTALL_PREFIX=*) prefix=\${argument#*=} ;;
   esac
 done
+if [ "\${FAKE_UPSTREAM_DEV_WARNING:-0}" = 1 ]; then
+  for argument in "$@"; do
+    if [ "$argument" = -Werror=dev ]; then
+      printf '%s\n' 'upstream developer warning promoted to an error' >&2
+      exit 46
+    fi
+  done
+fi
 mkdir -p "$build"
 printf '%s' "$prefix" > "$build/install-prefix"
 printf '%s\n' 'libde265 HEVC decoder                 : + built-in'
@@ -631,6 +648,34 @@ test("native decoder sources are exactly pinned and integrity checked", () => {
 	}
 });
 
+test("upstream developer warnings do not abort the native decoder build", () => {
+	const fixture = nativeFixture();
+	try {
+		const result = runNativeBuilder(fixture, {
+			FAKE_UPSTREAM_DEV_WARNING: "1",
+		});
+
+		assert.equal(result.status, 0, result.stderr);
+		assertNoEphemeralNativePaths(fixture);
+	} finally {
+		fs.rmSync(fixture.repository, { recursive: true, force: true });
+	}
+});
+
+test("native decoder compilation defaults to two parallel jobs", () => {
+	const fixture = nativeFixture();
+	try {
+		const result = runNativeBuilder(fixture, {
+			FAKE_EXPECT_BUILD_PARALLEL: "2",
+		});
+
+		assert.equal(result.status, 0, result.stderr);
+		assertNoEphemeralNativePaths(fixture);
+	} finally {
+		fs.rmSync(fixture.repository, { recursive: true, force: true });
+	}
+});
+
 test("Unix builder prints platform-specific caller environment", () => {
 	const script = readRepoFile("packaging", "heic", "build-unix.sh");
 	assert.match(script, /build\/heic-native\/\$\{platform\}-\$\{arch\}/);
@@ -678,7 +723,6 @@ test("Unix builder configures only an in-process HEVC decoder", () => {
 	}
 
 	assert.match(script, /--warn-uninitialized/);
-	assert.match(script, /-Werror=dev/);
 	assert.match(script, /Manually-specified variables were not used/);
 });
 
