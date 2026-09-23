@@ -11,3 +11,4 @@ build/flatpak/
 build/heic-native/
 dist/flatpak/
 dist/macos/
+dist/windows/

@@ -1,8 +1,8 @@
 # Mote
 
-This repository implements the catalog foundation and the second macOS desktop checkpoint for a cross-platform photo viewer. It indexes local folders and mounted network shares into a local SQLite catalog, normalizes useful metadata, tracks offline sources without discarding their records, schedules progressive background work, and manages local derivative-cache accounting.
+This repository implements a cross-platform photo viewer for local folders and mounted network shares. It indexes photos into a local SQLite catalog, normalizes useful metadata, tracks offline sources without discarding their records, schedules progressive background work, and manages local derivative-cache accounting.
 
-Run the native app with the [macOS desktop development workflow](#run-the-macos-desktop-app), or package the same interface and API with the [hosted deployment guide](docs/deployment/hosted.md).
+Build the native app with the [Windows, macOS, and Linux build guide](docs/deployment/building.md), or package the same interface and API with the [hosted deployment guide](docs/deployment/hosted.md).
 
 Source media is read-only. Production code never writes, renames, or deletes files under a configured photo root. SQLite state and generated derivatives stay in explicit local data and cache directories; do not place either directory inside a photo source.
 
@@ -55,6 +55,8 @@ other default feature:
 ```bash
 npm run desktop:build
 npm run desktop:build -- --no-heic
+npm run desktop:build:windows
+npm run desktop:build:windows -- --no-heic
 npm run flatpak -- package
 npm run flatpak -- package --no-heic
 scripts/hosted-smoke.sh
@@ -291,6 +293,35 @@ job builds the HEIC-enabled universal app, verifies both architectures and its
 ad-hoc signature, mounts and checks the DMG, then attaches the DMG to the release.
 A manual check retains its DMG as an Actions artifact for one day. Pushes and pull
 requests do not consume macOS Actions minutes, and local builds use none.
+
+## Build the Windows installer
+
+Windows x64 builds use the pinned MSVC HEIC decoder path and produce an NSIS
+installer at `dist/windows/Mote-<version>-windows-x64-setup.exe`:
+
+```powershell
+npm ci
+npm run desktop:build:windows
+```
+
+Run this from an x64 MSVC developer shell with PowerShell 7, CMake, Rust 1.97.1,
+Node.js 24.18.0, and npm 11.16.0 available. The builder verifies the executable
+and decoder DLLs, removes Cargo and interface intermediates on success or
+failure, and replaces the prior installer only after validation. The native
+decoder cache remains bounded to the pinned archives and accepted prefix so a
+later build can reuse it.
+
+Windows release installers are unsigned. Microsoft Defender SmartScreen may
+therefore require **More info > Run anyway** on first installation. Only approve
+an installer downloaded from this project's official GitHub Release or built
+from a reviewed checkout. See the [complete platform build guide](docs/deployment/building.md)
+for prerequisites, cleanup, release behavior, and the VM acceptance checklist.
+
+The [Windows release workflow](.github/workflows/build-windows.yml) runs only for
+a published GitHub Release or a deliberate manual dispatch. It creates one
+HEIC-enabled x64 installer. Release runs attach it to the release; manual checks
+retain it as an Actions artifact for one day. Pushes and pull requests do not
+consume Windows Actions minutes.
 
 The permanent identifier `io.github.matt-jenner.mote` changes the macOS data
 and cache directories from those used by older `app.photoviewer.desktop`

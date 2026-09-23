@@ -22,4 +22,4 @@ warning is therefore expected.
 
 Only approve a copy downloaded from the project's official GitHub Release. If
 you do not want to approve an ad-hoc-signed binary, build Mote from source using
-the macOS instructions in the project [README](../../README.md).
+the [macOS source-build instructions](building.md#macos).
