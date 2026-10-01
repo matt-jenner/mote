@@ -7,7 +7,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-const JPEG: &[u8] = include_bytes!("../../../apps/interface/public/demo-photos/mountain.jpg");
+mod common;
 
 fn make_app() -> (TempDir, axum::Router) {
     let temp = tempfile::tempdir().unwrap();
@@ -16,9 +16,10 @@ fn make_app() -> (TempDir, axum::Router) {
     std::fs::create_dir_all(source.join("Family")).unwrap();
     std::fs::create_dir_all(source.join("Trips")).unwrap();
     std::fs::create_dir(&web).unwrap();
-    std::fs::write(source.join("Family/one.jpg"), JPEG).unwrap();
-    std::fs::write(source.join("Family/two.jpg"), JPEG).unwrap();
-    std::fs::write(source.join("Trips/foreign.jpg"), JPEG).unwrap();
+    let jpeg = common::jpeg_bytes([72, 96, 128]);
+    std::fs::write(source.join("Family/one.jpg"), &jpeg).unwrap();
+    std::fs::write(source.join("Family/two.jpg"), &jpeg).unwrap();
+    std::fs::write(source.join("Trips/foreign.jpg"), jpeg).unwrap();
     let config = ServerConfig::new(
         temp.path().join("data"),
         temp.path().join("cache"),

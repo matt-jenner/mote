@@ -1,9 +1,9 @@
 # Mote shared interface design QA
 
-- Source visual truth: [`docs/design-qa/mote-shared-ui/source-in-context.jpg`](docs/design-qa/mote-shared-ui/source-in-context.jpg)
-- Implementation screenshot: [`docs/design-qa/mote-shared-ui/implementation-light-final.jpg`](docs/design-qa/mote-shared-ui/implementation-light-final.jpg)
-- Combined comparison: [`docs/design-qa/mote-shared-ui/comparison-light.jpg`](docs/design-qa/mote-shared-ui/comparison-light.jpg)
-- Dark-mode implementation: [`docs/design-qa/mote-shared-ui/implementation-dark.jpg`](docs/design-qa/mote-shared-ui/implementation-dark.jpg)
+- Source visual truth: [`mote-shared-ui/source-in-context.jpg`](mote-shared-ui/source-in-context.jpg)
+- Implementation screenshot: [`mote-shared-ui/implementation-light-final.jpg`](mote-shared-ui/implementation-light-final.jpg)
+- Combined comparison: [`mote-shared-ui/comparison-light.jpg`](mote-shared-ui/comparison-light.jpg)
+- Dark-mode implementation: [`mote-shared-ui/implementation-dark.jpg`](mote-shared-ui/implementation-dark.jpg)
 - Viewport: 1280 x 720 CSS pixels
 - Source pixels: 1280 x 720
 - Implementation pixels: 1280 x 720

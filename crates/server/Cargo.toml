@@ -31,6 +31,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
+image.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

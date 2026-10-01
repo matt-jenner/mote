@@ -728,21 +728,26 @@ fn shared_screen_repair_failure_preserves_bytes_and_existing_group_link() {
 
 #[test]
 fn controlled_demo_fixture_generation_leaves_source_unchanged() {
-    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../apps/interface/public/demo-photos/city.jpg");
-    let before = std::fs::read(&source).unwrap();
-    let before_modified = std::fs::metadata(&source).unwrap().modified().unwrap();
+    let source = fixture();
+    let before = std::fs::read(source.path()).unwrap();
+    let before_modified = std::fs::metadata(source.path())
+        .unwrap()
+        .modified()
+        .unwrap();
     let cache = tempfile::tempdir().unwrap();
     let generator = ImageDerivativeGenerator::new(cache.path()).unwrap();
 
     let generated = generator
-        .generate(&source, &spec(DerivativeKind::WallThumbnail, 1024, 1))
+        .generate(source.path(), &spec(DerivativeKind::WallThumbnail, 1024, 1))
         .unwrap();
 
     assert!(cache.path().join(generated.relative_path).is_file());
-    assert_eq!(std::fs::read(&source).unwrap(), before);
+    assert_eq!(std::fs::read(source.path()).unwrap(), before);
     assert_eq!(
-        std::fs::metadata(&source).unwrap().modified().unwrap(),
+        std::fs::metadata(source.path())
+            .unwrap()
+            .modified()
+            .unwrap(),
         before_modified
     );
 }

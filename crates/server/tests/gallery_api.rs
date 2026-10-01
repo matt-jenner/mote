@@ -9,7 +9,7 @@ use std::path::Path;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-const MOUNTAIN: &[u8] = include_bytes!("../../../apps/interface/public/demo-photos/mountain.jpg");
+mod common;
 
 fn app() -> (TempDir, axum::Router) {
     let temp = tempfile::tempdir().unwrap();
@@ -81,11 +81,12 @@ fn jpeg_with_capture_date(captured_at: &str) -> Vec<u8> {
     assert_eq!(exif.len(), 70);
 
     let segment_length = u16::try_from(exif.len() + 2).unwrap();
-    let mut jpeg = Vec::with_capacity(MOUNTAIN.len() + exif.len() + 6);
+    let base = common::jpeg_bytes([72, 96, 128]);
+    let mut jpeg = Vec::with_capacity(base.len() + exif.len() + 6);
     jpeg.extend_from_slice(&[0xff, 0xd8, 0xff, 0xe1]);
     jpeg.extend_from_slice(&segment_length.to_be_bytes());
     jpeg.extend_from_slice(&exif);
-    jpeg.extend_from_slice(&MOUNTAIN[2..]);
+    jpeg.extend_from_slice(&base[2..]);
     jpeg
 }
 

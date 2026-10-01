@@ -249,6 +249,7 @@ wait_for_degraded_health() {
 command -v "$container_engine" >/dev/null 2>&1 || { printf '%s\n' "$container_engine is required" >&2; exit 1; }
 command -v curl >/dev/null 2>&1 || { printf '%s\n' "curl is required" >&2; exit 1; }
 command -v node >/dev/null 2>&1 || { printf '%s\n' "node is required" >&2; exit 1; }
+node "$project_dir/scripts/generate-test-photos.mjs" >/dev/null
 assert_supported_engine
 mote_reap_stale_smoke_assets "$container_engine"
 
@@ -261,14 +262,15 @@ mkdir -p \
 	"$data_dir" \
 	"$cache_dir"
 chmod 0777 "$data_dir" "$cache_dir"
-cp "$project_dir/apps/interface/public/demo-photos/mountain.jpg" "$source_dir/A/a-01.jpg"
+test_photos="$project_dir/runtime/test-photos/demo-photos"
+cp "$test_photos/mountain.jpg" "$source_dir/A/a-01.jpg"
 cp "$project_dir/crates/codec/tests/fixtures/heif/iphone-8bit.heic" "$source_dir/HEIC/iphone-8bit.heic"
-cp "$project_dir/apps/interface/public/demo-photos/coast.jpg" "$source_dir/A/a-02.jpg"
-cp "$project_dir/apps/interface/public/demo-photos/forest.jpg" "$source_dir/A/child/a-child-uncached.jpg"
-cp "$project_dir/apps/interface/public/demo-photos/interior.jpg" "$source_dir/B/b-01.jpg"
-cp "$project_dir/apps/interface/public/demo-photos/portrait.jpg" "$source_dir/B/b-02.jpg"
-cp "$project_dir/apps/interface/public/demo-photos/city.jpg" "$source_dir/Nested/Album/album-current.jpg"
-cp "$project_dir/apps/interface/public/demo-photos/mountain.jpg" "$source_dir/Nested/Album/grandchild/album-descendant.jpg"
+cp "$test_photos/coast.jpg" "$source_dir/A/a-02.jpg"
+cp "$test_photos/forest.jpg" "$source_dir/A/child/a-child-uncached.jpg"
+cp "$test_photos/interior.jpg" "$source_dir/B/b-01.jpg"
+cp "$test_photos/portrait.jpg" "$source_dir/B/b-02.jpg"
+cp "$test_photos/city.jpg" "$source_dir/Nested/Album/album-current.jpg"
+cp "$test_photos/mountain.jpg" "$source_dir/Nested/Album/grandchild/album-descendant.jpg"
 touch -t 202001010101 "$source_dir/A/a-01.jpg"
 touch -t 202001020101 "$source_dir/A/a-02.jpg"
 touch -t 202001030101 "$source_dir/A/child/a-child-uncached.jpg"

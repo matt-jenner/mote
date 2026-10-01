@@ -9,7 +9,7 @@
 		"build": "tsc -b && vite build",
 		"typecheck": "tsc -b --pretty false",
 		"test": "vitest run --project unit",
-		"test:browser": "vitest run --project browser --project browser-motion --project browser-contrast"
+		"test:browser": "node ../../scripts/generate-test-photos.mjs && vitest run --project browser --project browser-motion --project browser-contrast"
 	},
 	"dependencies": {
 		"@tanstack/react-query": "5.102.2",

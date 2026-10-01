@@ -7,6 +7,8 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use tower::ServiceExt;
 
+mod common;
+
 async fn next_sse_frame(body: &mut Body) -> String {
     loop {
         let frame = body.frame().await.unwrap().unwrap();
@@ -62,12 +64,12 @@ fn nested_state() -> (tempfile::TempDir, AppState, axum::Router) {
     std::fs::create_dir_all(source.join("Parent/Child")).unwrap();
     std::fs::write(
         source.join("Parent/parent.jpg"),
-        include_bytes!("../../../apps/interface/public/demo-photos/mountain.jpg"),
+        common::jpeg_bytes([72, 96, 128]),
     )
     .unwrap();
     std::fs::write(
         source.join("Parent/Child/child.jpg"),
-        include_bytes!("../../../apps/interface/public/demo-photos/coast.jpg"),
+        common::jpeg_bytes([32, 112, 148]),
     )
     .unwrap();
     let config = ServerConfig::new(

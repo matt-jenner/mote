@@ -23,13 +23,27 @@ struct SourceSnapshot {
     content_digest: [u8; 32],
 }
 
-fn demo_source_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("app-service has a workspace parent")
-        .parent()
-        .expect("workspace has a repository parent")
-        .join("apps/interface/public/demo-photos")
+fn demo_source_fixture() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().unwrap();
+    for (index, name) in [
+        "city.jpg",
+        "coast.jpg",
+        "forest.jpg",
+        "interior.jpg",
+        "mountain.jpg",
+        "portrait.jpg",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let image = image::RgbImage::from_fn(32, 24, |x, y| {
+            image::Rgb([index as u8 * 24, x as u8 * 4, y as u8 * 6])
+        });
+        image
+            .save_with_format(directory.path().join(name), image::ImageFormat::Jpeg)
+            .unwrap();
+    }
+    directory
 }
 
 fn source_snapshot(root: &Path) -> SourceSnapshot {
@@ -154,7 +168,8 @@ fn assert_photo_page(page: &photo_app_service::WallPage, expected: usize) {
 }
 
 async fn run_task7_source_safety_sequence() {
-    let source = demo_source_root();
+    let source_fixture = demo_source_fixture();
+    let source = source_fixture.path().to_owned();
     let before = source_snapshot(&source);
     assert_eq!(
         before.entries.len(),

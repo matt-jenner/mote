@@ -71,7 +71,8 @@ GNOME Platform 49 if Fedora does not already have it.
 
 ## Portal acceptance test
 
-Choose `apps/interface/public/demo-photos` in Mote's system folder picker,
+Run `npm run test:photos`, then choose `runtime/test-photos/demo-photos` in
+Mote's system folder picker,
 confirm that the photo wall and viewer load, quit Mote, and confirm the same
 library works after relaunch. Repeat with a mounted NAS photo folder visible in
 the system picker. Installed permissions must not contain `filesystems` or

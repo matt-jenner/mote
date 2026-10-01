@@ -8,7 +8,11 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-const JPEG: &[u8] = include_bytes!("../../../apps/interface/public/demo-photos/mountain.jpg");
+mod common;
+
+fn jpeg() -> Vec<u8> {
+    common::jpeg_bytes([72, 96, 128])
+}
 
 fn make_app() -> (TempDir, axum::Router) {
     let (temp, app, _) = make_app_with_gallery();
@@ -25,7 +29,7 @@ fn make_app_with_gallery() -> (
     let web = temp.path().join("web");
     std::fs::create_dir(&source).unwrap();
     std::fs::create_dir(&web).unwrap();
-    std::fs::write(source.join("photo.jpg"), JPEG).unwrap();
+    std::fs::write(source.join("photo.jpg"), jpeg()).unwrap();
     let config = ServerConfig::new(
         temp.path().join("data"),
         temp.path().join("cache"),
@@ -431,7 +435,7 @@ async fn derivative_route_delivers_managed_jpeg_with_immutable_headers() {
     #[cfg(unix)]
     {
         let outside = temp.path().join("outside.jpg");
-        std::fs::write(&outside, JPEG).unwrap();
+        std::fs::write(&outside, jpeg()).unwrap();
         std::os::unix::fs::symlink(&outside, &managed_path).unwrap();
         let response = app
             .clone()
@@ -450,7 +454,7 @@ async fn derivative_route_delivers_managed_jpeg_with_immutable_headers() {
     // primitive. Bypass the typed catalog writer to model a legacy/corrupt row
     // and prove the HTTP boundary still refuses to open outside the cache.
     let outside = temp.path().join("outside-row.jpg");
-    std::fs::write(&outside, JPEG).unwrap();
+    std::fs::write(&outside, jpeg()).unwrap();
     drop(catalog);
     let connection = rusqlite::Connection::open(temp.path().join("data/catalog.sqlite")).unwrap();
     connection
@@ -469,7 +473,7 @@ async fn derivative_route_delivers_managed_jpeg_with_immutable_headers() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    assert_eq!(std::fs::read(&outside).unwrap(), JPEG);
+    assert_eq!(std::fs::read(&outside).unwrap(), jpeg());
 }
 
 #[cfg(unix)]
@@ -711,7 +715,7 @@ async fn root_folder_outage_serializes_a_concurrent_stable_selection_scan() {
     let web = temp.path().join("web");
     std::fs::create_dir(&source).unwrap();
     std::fs::create_dir(&web).unwrap();
-    std::fs::write(source.join("photo.jpg"), JPEG).unwrap();
+    std::fs::write(source.join("photo.jpg"), jpeg()).unwrap();
     let config = ServerConfig::new(
         temp.path().join("data"),
         temp.path().join("cache"),
@@ -1132,7 +1136,7 @@ async fn admitted_generation_failure_warns_and_successful_retry_clears_it() {
         "the warning-triggered retry rejoined the already failed attempt"
     );
 
-    std::fs::write(&source, JPEG).unwrap();
+    std::fs::write(&source, jpeg()).unwrap();
     let retried = app
         .clone()
         .oneshot(wall_thumbnail_request(

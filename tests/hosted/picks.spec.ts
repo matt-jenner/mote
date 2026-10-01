@@ -20,7 +20,7 @@ async function hostedFixture(downloads: boolean) {
 	for (const folder of ["A", "B"]) {
 		await mkdir(path.join(directory, "photos", folder), { recursive: true });
 		await copyFile(
-			path.join(project, "apps/interface/public/demo-photos/coast.jpg"),
+			path.join(project, "runtime/test-photos/demo-photos/coast.jpg"),
 			path.join(directory, "photos", folder, `${folder}.jpg`),
 		);
 	}

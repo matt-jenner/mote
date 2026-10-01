@@ -1,4 +1,6 @@
 import { existsSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import { playwright } from "@vitest/browser-playwright";
 import { defineConfig } from "vitest/config";
@@ -6,6 +8,10 @@ import { defineConfig } from "vitest/config";
 const browserOptimizeDeps = {
 	include: ["@tauri-apps/api/core", "lucide-react", "react-dom/client"],
 };
+const testPublicDir = path.resolve(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"../../runtime/test-photos",
+);
 const browser = process.platform === "darwin" ? "webkit" : "chromium";
 const chromiumExecutablePath =
 	browser === "chromium"
@@ -18,6 +24,7 @@ const chromiumExecutablePath =
 		: undefined;
 
 export default defineConfig({
+	publicDir: testPublicDir,
 	plugins: [react()],
 	test: {
 		projects: [

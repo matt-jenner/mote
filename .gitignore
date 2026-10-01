@@ -4,11 +4,11 @@ target/
 node_modules/
 apps/interface/dist/
 apps/interface/.vite/
+apps/interface/.vitest-attachments/
+apps/interface/src/components/__screenshots__/
 apps/interface/tsconfig.tsbuildinfo
 runtime/
 .flatpak-builder/
 build/flatpak/
 build/heic-native/
-dist/flatpak/
-dist/macos/
-dist/windows/
+dist/

@@ -1324,6 +1324,7 @@ dependencies = [
  "axum",
  "futures-util",
  "http-body-util",
+ "image",
  "libc",
  "photo-app-service",
  "photo-cache",

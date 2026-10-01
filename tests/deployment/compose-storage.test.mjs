@@ -19,7 +19,7 @@ function renderCompose(extraEnvironment = {}) {
 				...process.env,
 				PHOTO_PATH: path.join(
 					repositoryRoot,
-					"apps/interface/public/demo-photos",
+					"runtime/test-photos/demo-photos",
 				),
 				...extraEnvironment,
 			},
@@ -82,7 +82,7 @@ test("hosted Compose bind-mounts the catalogue and derivative cache", () => {
 		"photo-viewer"
 	].volumes;
 	const expectedMounts = new Map([
-		["/photos", path.join(repositoryRoot, "apps/interface/public/demo-photos")],
+		["/photos", path.join(repositoryRoot, "runtime/test-photos/demo-photos")],
 		["/var/lib/photo-viewer", dataPath],
 		["/var/cache/photo-viewer", cachePath],
 	]);
