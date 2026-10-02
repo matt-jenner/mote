@@ -107,6 +107,15 @@ jobs:
       - run: npm run test:browser
       - run: npm run --workspace @photo-viewer/interface build
 
+  macos-launch-verification:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.18.0
+      - run: node --test tests/build/macos-launch-verification.test.mjs
+
   hosted-container:
     strategy:
       matrix:

@@ -39,6 +39,7 @@
 		"targets": ["app"],
 		"icon": ["icons/icon.png", "icons/icon.icns"],
 		"macOS": {
+			"entitlements": "Entitlements.plist",
 			"minimumSystemVersion": "11.0"
 		}
 	}

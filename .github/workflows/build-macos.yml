@@ -94,6 +94,7 @@ jobs:
           mounted_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$mounted_app/Contents/Info.plist")"
           lipo "$mounted_app/Contents/MacOS/$mounted_executable" -verify_arch arm64 x86_64
           codesign --verify --deep --strict "$mounted_app"
+          scripts/verify-macos-app-launch.sh "$mounted_app"
           hdiutil detach "$mountpoint"
           mounted=false
       - name: Upload DMG to release

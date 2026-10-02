@@ -6,6 +6,7 @@ import { parse } from "yaml";
 
 const root = path.resolve(import.meta.dirname, "../..");
 const workflowPath = path.join(root, ".github/workflows/build-macos.yml");
+const ciWorkflowPath = path.join(root, ".github/workflows/ci.yml");
 const githubTokenExpression = ["$", "{{ github.token }}"].join("");
 const releaseTagExpression = ["$", "{{ github.event.release.tag_name }}"].join(
 	"",
@@ -21,6 +22,10 @@ function workflow() {
 
 function releaseJob() {
 	return workflow().jobs["macos-release"];
+}
+
+function ciWorkflow() {
+	return parse(fs.readFileSync(ciWorkflowPath, "utf8"));
 }
 
 test("macOS builds run only for a published release or deliberate manual dispatch", () => {
@@ -78,8 +83,44 @@ test("one HEIC-enabled universal app is ad-hoc signed and packaged as a verified
 	assert.match(packageStep.run, /hdiutil attach/);
 	assert.match(packageStep.run, /lipo .* -verify_arch arm64 x86_64/);
 	assert.match(packageStep.run, /codesign --verify --deep --strict/);
+	assert.match(
+		packageStep.run,
+		/scripts\/verify-macos-app-launch\.sh "\$mounted_app"/,
+	);
 	assert.match(packageStep.run, /Mote-\$\{APP_VERSION\}-macOS\.dmg/);
 	assert.match(packageStep.run, /rm -rf "\$stage" "\$mountpoint"/);
+});
+
+test("macOS bundle enables bundled ad-hoc native libraries", () => {
+	const config = JSON.parse(
+		fs.readFileSync(
+			path.join(root, "apps/desktop/src-tauri/tauri.conf.json"),
+			"utf8",
+		),
+	);
+	const entitlements = fs.readFileSync(
+		path.join(root, "apps/desktop/src-tauri/Entitlements.plist"),
+		"utf8",
+	);
+
+	assert.equal(config.bundle.macOS.entitlements, "Entitlements.plist");
+	assert.match(
+		entitlements,
+		/<key>com\.apple\.security\.cs\.disable-library-validation<\/key>\s*<true\/>/,
+	);
+});
+
+test("macOS CI exercises launch verification behavior", () => {
+	const job = ciWorkflow().jobs["macos-launch-verification"];
+
+	assert.equal(job["runs-on"], "macos-latest");
+	assert.ok(
+		job.steps.some(
+			(step) =>
+				step.run ===
+				"node --test tests/build/macos-launch-verification.test.mjs",
+		),
+	);
 });
 
 test("published releases receive the raw DMG while manual checks retain one short-lived artifact", () => {
