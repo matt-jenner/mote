@@ -2,7 +2,7 @@
 
 Date: 2026-10-02
 
-Status: behavior approved in conversation; pending written-spec review
+Status: approved in conversation
 
 ## Purpose
 
