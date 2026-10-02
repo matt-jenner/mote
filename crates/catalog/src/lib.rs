@@ -22,7 +22,9 @@ pub use cache_repo::{
     CacheEvictionGroup, DerivativeGroupLinkRemoval, DerivativeRecord, NewDerivative, NewFolderGroup,
 };
 pub use derivative_failure_repo::TerminalDerivativeFailure;
-pub use generation_repo::{FolderGroupRecoveryState, GenerationCompletion};
+pub use generation_repo::{
+    FolderGroupRecoveryState, GenerationCompletion, ReconciliationAssetRecord,
+};
 pub use health_repo::CatalogHealthSnapshot;
 pub use index_repo::{
     AssetColourUpdate, AssetMetadataUpdate, AssetShapeUpdate, CatalogIndexRecord, CatalogKeyword,

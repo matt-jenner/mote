@@ -1,7 +1,12 @@
 use std::path::Path;
 
-use photo_catalog::{Catalog, CatalogError, NewFolderGroup, NewLibrary};
-use photo_domain::{Availability, FolderGroupId, LibraryId, RelativePathKey};
+use photo_catalog::{
+    AssetShapeUpdate, Catalog, CatalogError, CatalogIndexRecord, NewAsset, NewFolderGroup,
+    NewLibrary, ShapeStatus,
+};
+use photo_domain::{
+    Availability, FileSignature, FolderGroupId, LibraryId, MediaKind, RelativePathKey,
+};
 use rusqlite::{Connection, params};
 
 fn add_group(catalog: &mut Catalog, library: LibraryId, path: &str) -> FolderGroupId {
@@ -14,6 +19,205 @@ fn add_group(catalog: &mut Catalog, library: LibraryId, path: &str) -> FolderGro
             last_viewed_at: None,
         })
         .unwrap()
+}
+
+fn add_asset(
+    catalog: &mut Catalog,
+    library: LibraryId,
+    group: FolderGroupId,
+    path: &str,
+) -> photo_domain::AssetId {
+    let relative = RelativePathKey::from_relative_path(Path::new(path)).unwrap();
+    let mut asset = NewAsset::minimal(library, relative, path, MediaKind::Jpeg, 10);
+    asset.folder_group_id = Some(group);
+    let id = asset.id;
+    catalog.upsert_asset(&asset).unwrap();
+    id
+}
+
+#[test]
+fn availability_recovery_root_clears_only_root_offline_assets() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("catalog.sqlite");
+    let mut catalog = Catalog::open(&path).unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured("Photos", Path::new("/Photos")))
+        .unwrap();
+    let group = add_group(&mut catalog, library.id, "");
+    let recovered = add_asset(&mut catalog, library.id, group, "recovered.jpg");
+    let missing = add_asset(&mut catalog, library.id, group, "missing.jpg");
+    let unreadable = add_asset(&mut catalog, library.id, group, "unreadable.jpg");
+    catalog.mark_root_offline(library.id).unwrap();
+    drop(catalog);
+
+    let connection = Connection::open(&path).unwrap();
+    for (asset, availability) in [(missing, "missing"), (unreadable, "unreadable")] {
+        connection
+            .execute(
+                "UPDATE assets SET availability = ?2 WHERE id = ?1",
+                params![asset.as_uuid().as_bytes(), availability],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let mut catalog = Catalog::open(&path).unwrap();
+    assert_eq!(catalog.mark_root_available(library.id).unwrap(), 1);
+    assert_eq!(
+        catalog
+            .find_library(library.id)
+            .unwrap()
+            .unwrap()
+            .availability,
+        Availability::Available
+    );
+    assert_eq!(
+        catalog.find_asset(recovered).unwrap().unwrap().availability,
+        Availability::Available
+    );
+    assert_eq!(
+        catalog.find_asset(missing).unwrap().unwrap().availability,
+        Availability::Missing
+    );
+    assert_eq!(
+        catalog
+            .find_asset(unreadable)
+            .unwrap()
+            .unwrap()
+            .availability,
+        Availability::Unreadable
+    );
+}
+
+#[test]
+fn availability_recovery_child_is_scoped_to_its_membership() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured("Photos", Path::new("/Photos")))
+        .unwrap();
+    let recovered_group = add_group(&mut catalog, library.id, "recovered");
+    let offline_group = add_group(&mut catalog, library.id, "offline");
+    let recovered = add_asset(
+        &mut catalog,
+        library.id,
+        recovered_group,
+        "recovered/photo.jpg",
+    );
+    let offline = add_asset(&mut catalog, library.id, offline_group, "offline/photo.jpg");
+    catalog
+        .mark_group_offline(library.id, recovered_group)
+        .unwrap();
+    catalog
+        .mark_group_offline(library.id, offline_group)
+        .unwrap();
+    catalog
+        .set_library_availability(library.id, Availability::RootOffline)
+        .unwrap();
+
+    assert_eq!(
+        catalog
+            .mark_group_available(library.id, recovered_group)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        catalog
+            .find_library(library.id)
+            .unwrap()
+            .unwrap()
+            .availability,
+        Availability::Available
+    );
+    assert_eq!(
+        catalog.find_asset(recovered).unwrap().unwrap().availability,
+        Availability::Available
+    );
+    assert_eq!(
+        catalog.find_asset(offline).unwrap().unwrap().availability,
+        Availability::RootOffline
+    );
+}
+
+#[test]
+fn reconciliation_snapshot_contains_only_assets_from_the_latest_completed_group_generation() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured("Photos", Path::new("/Photos")))
+        .unwrap();
+    let group = add_group(&mut catalog, library.id, "");
+    let make_asset = |path: &str, signature: FileSignature| {
+        let relative = RelativePathKey::from_relative_path(Path::new(path)).unwrap();
+        let mut asset = NewAsset::minimal(library.id, relative, path, MediaKind::Jpeg, 0);
+        asset.signature = signature;
+        asset.folder_group_id = Some(group);
+        asset
+    };
+    let settled_signature = FileSignature {
+        size_bytes: 111,
+        modified_unix_ns: 222,
+        sidecar_modified_unix_ns: Some(333),
+    };
+    let advanced_signature = FileSignature {
+        size_bytes: 444,
+        modified_unix_ns: 555,
+        sidecar_modified_unix_ns: None,
+    };
+    let settled = make_asset("settled.jpg", settled_signature);
+    let advanced = make_asset("advanced.jpg", advanced_signature);
+    let generation = catalog
+        .begin_generation_for_group(library.id, group)
+        .unwrap();
+    catalog
+        .apply_index_batch_for_generation(
+            library.id,
+            generation,
+            &[
+                CatalogIndexRecord::Discovered(settled.clone()),
+                CatalogIndexRecord::Shaped(AssetShapeUpdate {
+                    asset_id: settled.id,
+                    width: 12,
+                    height: 8,
+                    orientation: Some(1),
+                    representative_rgb: None,
+                    shape_status: ShapeStatus::Ready,
+                }),
+                CatalogIndexRecord::Discovered(advanced.clone()),
+                CatalogIndexRecord::Shaped(AssetShapeUpdate {
+                    asset_id: advanced.id,
+                    width: 12,
+                    height: 8,
+                    orientation: Some(1),
+                    representative_rgb: None,
+                    shape_status: ShapeStatus::Ready,
+                }),
+            ],
+        )
+        .unwrap();
+    catalog
+        .complete_generation_for_group(library.id, group, generation)
+        .unwrap();
+
+    let incomplete = catalog
+        .begin_generation_for_group(library.id, group)
+        .unwrap();
+    let mut changed = advanced;
+    changed.signature.modified_unix_ns += 1;
+    catalog
+        .apply_index_batch_for_generation(
+            library.id,
+            incomplete,
+            &[CatalogIndexRecord::Discovered(changed)],
+        )
+        .unwrap();
+
+    let snapshot = catalog
+        .reconciliation_assets_for_group(library.id, group)
+        .unwrap();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].id, settled.id);
+    assert_eq!(snapshot[0].media_kind, MediaKind::Jpeg);
+    assert_eq!(snapshot[0].signature, settled_signature);
+    assert_eq!(snapshot[0].shape_status, ShapeStatus::Ready);
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use photo_domain::{FolderGroupId, LibraryId};
+use photo_domain::{AssetId, FileSignature, FolderGroupId, LibraryId, MediaKind};
 use rusqlite::{OptionalExtension, params};
 
 use crate::asset_repo::upsert_asset_on;
@@ -19,6 +19,14 @@ pub struct GenerationCompletion {
 pub struct FolderGroupRecoveryState {
     pub requested: u64,
     pub reconciled: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconciliationAssetRecord {
+    pub id: AssetId,
+    pub media_kind: MediaKind,
+    pub signature: FileSignature,
+    pub shape_status: crate::ShapeStatus,
 }
 
 impl Catalog {
@@ -399,6 +407,28 @@ impl Catalog {
         Ok(retained as u64)
     }
 
+    pub fn mark_root_available(&mut self, library: LibraryId) -> Result<u64, CatalogError> {
+        let transaction = self.connection.transaction()?;
+        let root = transaction.execute(
+            "UPDATE library_roots
+             SET availability = 'available', last_seen_at = unixepoch()
+             WHERE id = ?1",
+            [library.as_uuid().as_bytes()],
+        )?;
+        if root != 1 {
+            return Err(CatalogError::InvalidData(
+                "library does not exist".to_owned(),
+            ));
+        }
+        let recovered = transaction.execute(
+            "UPDATE assets SET availability = 'available'
+             WHERE library_id = ?1 AND availability = 'root_offline'",
+            [library.as_uuid().as_bytes()],
+        )?;
+        transaction.commit()?;
+        Ok(recovered as u64)
+    }
+
     pub fn mark_group_offline(
         &mut self,
         library: LibraryId,
@@ -444,6 +474,94 @@ impl Catalog {
         )?;
         transaction.commit()?;
         Ok(retained as u64)
+    }
+
+    pub fn mark_group_available(
+        &mut self,
+        library: LibraryId,
+        folder_group: FolderGroupId,
+    ) -> Result<u64, CatalogError> {
+        let transaction = self.connection.transaction()?;
+        ensure_group_belongs_to_library(&transaction, library, folder_group)?;
+        transaction.execute(
+            "UPDATE library_roots
+             SET availability = 'available', last_seen_at = unixepoch()
+             WHERE id = ?1",
+            [library.as_uuid().as_bytes()],
+        )?;
+        let recovered = transaction.execute(
+            "UPDATE assets SET availability = 'available'
+             WHERE library_id = ?1 AND availability = 'root_offline'
+               AND EXISTS (
+                 SELECT 1 FROM folder_group_assets fga
+                 WHERE fga.asset_id = assets.id AND fga.folder_group_id = ?2
+               )",
+            params![
+                library.as_uuid().as_bytes(),
+                folder_group.as_uuid().as_bytes()
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(recovered as u64)
+    }
+
+    pub fn reconciliation_assets_for_group(
+        &self,
+        library: LibraryId,
+        folder_group: FolderGroupId,
+    ) -> Result<Vec<ReconciliationAssetRecord>, CatalogError> {
+        ensure_group_belongs_to_library(&self.connection, library, folder_group)?;
+        let mut statement = self.connection.prepare(
+            "SELECT a.id, a.media_kind, a.size_bytes, a.modified_unix_ns,
+                    a.sidecar_modified_unix_ns, a.shape_status
+             FROM folder_group_assets fga
+             JOIN assets a ON a.id = fga.asset_id AND a.library_id = ?1
+             WHERE fga.folder_group_id = ?2
+               AND fga.last_seen_generation <= (
+                 SELECT MAX(generation) FROM scan_generations
+                 WHERE library_id = ?1 AND folder_group_id = ?2
+                   AND completed_at IS NOT NULL
+               )
+             ORDER BY a.id",
+        )?;
+        statement
+            .query_map(
+                params![
+                    library.as_uuid().as_bytes(),
+                    folder_group.as_uuid().as_bytes()
+                ],
+                |row| {
+                    let id = AssetId::from_uuid(crate::library_repo::decode_uuid(row.get(0)?, 0)?);
+                    let media_kind =
+                        crate::asset_repo::decode_media_kind(row.get::<_, String>(1)?.as_str(), 1)?;
+                    let size_bytes = u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })?;
+                    let modified_unix_ns = crate::parse_i128(row.get(3)?)?;
+                    let sidecar_modified_unix_ns = row
+                        .get::<_, Option<String>>(4)?
+                        .map(crate::parse_i128)
+                        .transpose()?;
+                    let shape_status =
+                        crate::ShapeStatus::decode(row.get::<_, String>(5)?.as_str(), 5)?;
+                    Ok(ReconciliationAssetRecord {
+                        id,
+                        media_kind,
+                        signature: FileSignature {
+                            size_bytes,
+                            modified_unix_ns,
+                            sidecar_modified_unix_ns,
+                        },
+                        shape_status,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(CatalogError::from)
     }
 
     pub fn folder_group_recovery_state(
