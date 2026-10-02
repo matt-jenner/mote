@@ -24,3 +24,11 @@ export const imageSourceUnavailable = (
 	context === true ||
 	(asset.availability !== "available" &&
 		(context !== false || asset.warning?.code !== "sourceUnavailable"));
+
+export const visibleImageWarning = (
+	context: boolean | null,
+	asset: WallAsset,
+) =>
+	context === false && asset.warning?.code === "sourceUnavailable"
+		? null
+		: asset.warning;

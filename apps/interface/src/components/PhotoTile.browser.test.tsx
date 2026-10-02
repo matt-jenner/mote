@@ -3,6 +3,7 @@ import { flushSync } from "react-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { page } from "vitest/browser";
 import { render } from "vitest-browser-react";
+import { SourceUnavailableContext } from "../folders/SourceAvailabilityContext";
 import { createInMemoryPhotoService } from "../services/inMemoryPhotoService";
 import type { PhotoService, WallAsset } from "../services/photoService";
 import "../styles/tokens.css";
@@ -241,5 +242,69 @@ describe("photo tile pick lifecycle", () => {
 			.click();
 		await expect.element(screen.getByTestId("photo-fallback")).toBeVisible();
 		await expect.element(remove()).toBeVisible();
+	});
+
+	it("hides a stale source warning after the folder becomes available", async () => {
+		const screen = await render(
+			<SourceUnavailableContext value={false}>
+				<PhotoTile
+					positioned={positioned(
+						asset({
+							warning: { code: "sourceUnavailable", retryable: true },
+						}),
+					)}
+					service={photoService()}
+				/>
+			</SourceUnavailableContext>,
+		);
+
+		expect(
+			screen
+				.getByRole("img", { name: "Source unavailable. Showing cached image." })
+				.query(),
+		).toBeNull();
+		expect(
+			screen.getByRole("img", { name: "Photo preview warning" }).query(),
+		).toBeNull();
+	});
+
+	it("keeps item warnings after the folder becomes available", async () => {
+		const derivative = await render(
+			<SourceUnavailableContext value={false}>
+				<PhotoTile
+					positioned={positioned(
+						asset({
+							warning: { code: "derivativeUnavailable", retryable: true },
+						}),
+					)}
+					service={photoService()}
+				/>
+			</SourceUnavailableContext>,
+		);
+		await expect
+			.element(derivative.getByRole("img", { name: "Photo preview warning" }))
+			.toBeVisible();
+		await derivative.unmount();
+
+		const unreadable = await render(
+			<SourceUnavailableContext value={false}>
+				<PhotoTile
+					positioned={positioned(
+						asset({
+							availability: "unreadable",
+							warning: { code: "sourceUnreadable", retryable: true },
+						}),
+					)}
+					service={photoService()}
+				/>
+			</SourceUnavailableContext>,
+		);
+		await expect
+			.element(
+				unreadable.getByRole("img", {
+					name: "Source unavailable. Showing cached image.",
+				}),
+			)
+			.toBeVisible();
 	});
 });

@@ -1,6 +1,11 @@
 import { AlertTriangle, Folder, X } from "lucide-react";
 import type { ReactNode } from "react";
 import { usePhotoService } from "../app/PhotoServiceContext";
+import {
+	imageSourceUnavailable,
+	useSourceUnavailable,
+	visibleImageWarning,
+} from "../folders/SourceAvailabilityContext";
 import type { PickItem } from "../picks/pickList";
 import styles from "../styles/picksPanel.module.css";
 
@@ -27,13 +32,16 @@ function thumbnailUrl(
 export function PickRow({ item, onOpen, onRemove, action }: PickRowProps) {
 	const service = usePhotoService();
 	const url = thumbnailUrl(item, service.derivativeUrl);
+	const sourceUnavailableContext = useSourceUnavailable();
 	const sourceUnavailable =
 		item.asset === null ||
-		item.asset.availability !== "available" ||
-		item.asset.warning?.code === "sourceUnavailable";
+		imageSourceUnavailable(sourceUnavailableContext, item.asset);
+	const visibleWarning = item.asset
+		? visibleImageWarning(sourceUnavailableContext, item.asset)
+		: null;
 	const warning = sourceUnavailable
 		? "Source unavailable"
-		: item.asset?.warning
+		: visibleWarning
 			? "Preview unavailable"
 			: null;
 	const downloadUrl =

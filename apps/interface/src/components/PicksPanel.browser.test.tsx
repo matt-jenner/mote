@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { PhotoServiceProvider } from "../app/PhotoServiceContext";
+import { SourceUnavailableContext } from "../folders/SourceAvailabilityContext";
 import type { PickListSnapshot } from "../picks/pickList";
 import { createHttpPhotoService } from "../services/httpPhotoService";
 import {
@@ -19,6 +20,7 @@ import type {
 import "../styles/global.css";
 import "../styles/tokens.css";
 import { AppShell } from "./AppShell";
+import { PickRow } from "./PickRow";
 import { PickToast } from "./PickToast";
 
 const safeAreaProperties = [
@@ -78,12 +80,20 @@ const unavailable: WallAsset = {
 	displayName: "IMG_3094.jpg",
 	provisionalOrder: 2,
 	availability: "missing",
-	warning: { code: "sourceUnavailable", retryable: true },
+	warning: null,
 	wallThumbnail: {
 		assetId: "offline",
 		kind: "wallThumbnail",
 		key: "offline-wall",
 	},
+};
+
+const staleSourceWarning: WallAsset = {
+	...coast,
+	id: "stale-source-warning",
+	displayName: "IMG_3094.jpg",
+	provisionalOrder: 2,
+	warning: { code: "sourceUnavailable", retryable: true },
 };
 
 const unpicked: WallAsset = {
@@ -1053,6 +1063,28 @@ describe("responsive Picks panel", () => {
 		const panel = screen.getByRole("complementary", { name: "Picks" });
 		await expect.element(panel.getByText("Preview unavailable")).toBeVisible();
 		await expect.element(panel.getByText("Source unavailable")).toBeVisible();
+	});
+
+	it("hides a stale pick-row source warning after the folder becomes available", async () => {
+		const screen = await render(
+			<PhotoServiceProvider service={createInMemoryPhotoService()}>
+				<SourceUnavailableContext value={false}>
+					<ul>
+						<PickRow
+							item={{
+								asset: staleSourceWarning,
+								assetId: staleSourceWarning.id,
+								sourceFolderId: "Archive",
+								sourceLabel: "Mountain archive",
+							}}
+							onRemove={() => undefined}
+						/>
+					</ul>
+				</SourceUnavailableContext>
+			</PhotoServiceProvider>,
+		);
+
+		expect(screen.getByText("Source unavailable").query()).toBeNull();
 	});
 
 	it("opens an immersive review from the ordered pick list", async () => {

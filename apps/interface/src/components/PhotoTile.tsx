@@ -4,6 +4,7 @@ import {
 	imageSourceUnavailable,
 	SourceWarningBadge,
 	useSourceUnavailable,
+	visibleImageWarning,
 } from "../folders/SourceAvailabilityContext";
 import type { PhotoService } from "../services/photoService";
 import styles from "../styles/photoWall.module.css";
@@ -59,10 +60,12 @@ export function PhotoTile({
 	highlighted = false,
 }: PhotoTileProps) {
 	const { asset } = positioned;
+	const sourceUnavailableContext = useSourceUnavailable();
 	const sourceUnavailable = imageSourceUnavailable(
-		useSourceUnavailable(),
+		sourceUnavailableContext,
 		asset,
 	);
+	const visibleWarning = visibleImageWarning(sourceUnavailableContext, asset);
 	const [phase, setPhase] = useState<TilePaintPhase>("placeholder");
 	const [previewFailed, setPreviewFailed] = useState(false);
 	const imageRef = useRef<HTMLImageElement | null>(null);
@@ -279,7 +282,7 @@ export function PhotoTile({
 					}}
 				/>
 			) : null}
-			{!sourceUnavailable && (previewFailed || asset.warning) ? (
+			{!sourceUnavailable && (previewFailed || visibleWarning) ? (
 				<span
 					aria-label={
 						previewFailed
