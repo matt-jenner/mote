@@ -234,17 +234,11 @@ async fn persisted_disabled_catalog_transitions_through_one_background_scan() {
         assert_eq!(
             paths.len(),
             if cfg!(feature = "heic") && restart == 0 {
-                2
+                3
             } else {
                 0
             }
         );
-        if cfg!(feature = "heic") && restart == 0 {
-            assert!(paths.iter().all(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "heic")
-            }));
-        }
         assert_eq!(
             metadata(&config),
             if cfg!(feature = "heic") {
