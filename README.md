@@ -1,31 +1,34 @@
 # Mote
 
-Mote is a fast, private photo viewer for folders you already have. Point it at
-a local directory, external drive, NAS mount, or server share and browse the
+Mote is a fast, simple photo viewer for all those many nested photo folders you already have. 
+Point it at a local directory, external drive, NAS mount, or server share and browse the
 collection without importing, rearranging, or uploading the originals.
 
+It was built to fit a particular need my wife had, looking through our photo archives to select
+photos for photobooks or frames - it's also a really nice way to quickly show people your photos.
+
 Mote builds a local catalogue and creates its own thumbnails and previews. Your
-photo folders stay read-only. If a drive or network share disconnects, Mote
-keeps its catalogue and any cached previews so the collection does not simply
-disappear.
+photo folders stay read-only, it's a totally non-destructive view only experience.
 
 ## Why use Mote?
 
-- Keep your existing folder layout. There is no library migration.
+- Keep your existing folder layout. No opinionated library folder structure or migration.
 - Browse large collections while indexing continues in the background.
+- You want to view ALL the photos in nested folders at once.
 - View JPEG, PNG, WebP, TIFF, and HEIC or HEIF photos.
 - Collect photos from several folders in Picks, then copy the originals on the
   desktop without overwriting existing files.
-- Run the same interface as a desktop app or a private hosted service.
+- Run the same interface as a desktop app or a private hosted service for browser based mobile
+or desktop browsing.
 
 Mote is a good fit for photo archives on disks and network shares. It is not a
-cloud sync service, editor, or replacement for your existing files.
+cloud-sync service, editor, or replacement for your existing files.
 
 ## Choose a version
 
 | Version | Best for | How it works |
 | --- | --- | --- |
-| Windows | A Windows 10 or 11 photo workstation | Native x64 installer with local folder access |
+| Windows | Windows 10 or 11 | Native x64 installer with local folder access |
 | macOS | Apple Silicon and Intel Macs | Universal app with the macOS folder picker |
 | Linux | Linux desktops | Sandboxed x86-64 Flatpak with portal-based folder access |
 | Hosted | A group sharing one photo archive | Web interface backed by a Podman or Docker container |
@@ -33,6 +36,8 @@ cloud sync service, editor, or replacement for your existing files.
 All four versions use the same gallery and viewer. Desktop versions let each
 person choose folders from the machine. The hosted version exposes only the
 read-only photo root selected by its administrator.
+
+_NOTE: the hosted version is NOT suitable for direct exposure to the internet, local networks only!_
 
 ## Get started
 
