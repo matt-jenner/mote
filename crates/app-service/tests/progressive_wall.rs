@@ -1477,7 +1477,7 @@ async fn root_first_missing_selected_root_marks_library_offline() {
 }
 
 #[tokio::test]
-async fn root_first_readable_folders_return_cached_rows_while_asset_metadata_is_blocked() {
+async fn root_first_readable_folders_return_cached_rows_without_rereading_metadata() {
     let fixture = ProgressiveFixture::new(2);
     let service = AppService::open(fixture.config.clone()).unwrap();
     let mut updates = service.subscribe_wall_updates();
@@ -1489,14 +1489,10 @@ async fn root_first_readable_folders_return_cached_rows_while_asset_metadata_is_
     service.wait_for_collection_drivers_quiescent_test().await;
     service.wait_for_derivative_tasks_quiescent_test().await;
     drop(service);
-    let (reader, release) = BlockingReader::new();
-    let reopened = fixture.service(reader);
-    let mut updates = reopened.subscribe_wall_updates();
+    let reader = CountingReader::default();
+    let reopened =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(reader.clone())).unwrap();
     reopened.desktop_bootstrap().await.unwrap();
-    recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::CatalogBatch { .. })
-    })
-    .await;
     let page = tokio::time::timeout(
         Duration::from_millis(100),
         reopened.query_wall(query(SortDirection::OldestFirst)),
@@ -1505,11 +1501,8 @@ async fn root_first_readable_folders_return_cached_rows_while_asset_metadata_is_
     .expect("cached wall query must not wait for asset metadata")
     .unwrap();
     assert_eq!(page.items.len(), 2);
-    release.release();
-    recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::MetadataSettled { .. })
-    })
-    .await;
+    wait_for_scan_cleanup(&reopened).await;
+    assert_eq!(reader.count(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5297,7 +5290,7 @@ async fn desktop_bootstrap_offline_reopen_keeps_cached_references() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reconciliation_batches_preserve_cached_wall_and_screen_references_online_and_offline() {
+async fn reconciliation_preserves_cached_wall_and_screen_references_online_and_offline() {
     let fixture = ProgressiveFixture::new(2);
     let service = AppService::open_with_reader(
         fixture.config.clone(),
@@ -5325,23 +5318,21 @@ async fn reconciliation_batches_preserve_cached_wall_and_screen_references_onlin
     let _ = recv_derivatives_until(&mut updates, DerivativeClass::ScreenPreview, 2).await;
     drop(service);
 
-    let (reader, release) = BlockingReader::new();
-    let online = AppService::open_with_reader(fixture.config.clone(), Arc::new(reader)).unwrap();
-    let mut updates = online.subscribe_wall_updates();
-    let batch = recv_until(
-        &mut updates,
-        |event| matches!(event, WallUpdate::CatalogBatch { assets, .. } if !assets.is_empty()),
-    )
-    .await;
-    assert!(matches!(batch, WallUpdate::CatalogBatch { assets, .. } if
-        assets.len() == 2
-        && assets.iter().all(|asset|
-            asset.wall_thumbnail.is_some() && asset.screen_preview.is_some())));
-    release.release();
-    recv_until(&mut updates, |event| {
-        matches!(event, WallUpdate::MetadataSettled { .. })
-    })
-    .await;
+    let reader = CountingReader::default();
+    let online =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(reader.clone())).unwrap();
+    let page = online
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 2);
+    assert!(
+        page.items
+            .iter()
+            .all(|asset| asset.wall_thumbnail.is_some() && asset.screen_preview.is_some())
+    );
+    wait_for_scan_cleanup(&online).await;
+    assert_eq!(reader.count(), 0);
     drop(online);
 
     let unavailable = fixture.temp.path().join("photos-offline-with-derivatives");
