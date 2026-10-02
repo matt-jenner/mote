@@ -19,7 +19,9 @@ use photo_catalog::{Catalog, CatalogError, NewDerivative, NewFolderGroup, WallOr
 use photo_core::{AddLibraryError, PrevalidatedSourceKeys, normalize_prevalidated_source_key};
 use photo_core::{LibraryService, RealSourceFs};
 use photo_domain::{FolderGroupId, GalleryScope, LibraryId, RelativePathKey};
-use photo_indexer::{DefaultMetadataReader, IndexEvent, Indexer, MetadataReader, ScanRequest};
+use photo_indexer::{
+    DefaultMetadataReader, IndexEvent, Indexer, KnownAsset, MetadataReader, ScanRequest,
+};
 
 use crate::derivative_coordinator::{
     HostedAttemptLease, HostedCancellationDecision, WorkKey, WorkLane, WorkResultReceiver,
@@ -3213,14 +3215,13 @@ impl GalleryEngine {
         if !self.ensure_runtime_source(&runtime).await? {
             return Ok(());
         }
-        let (root, selected) = {
+        let (root, selected, known_assets) = {
             let state = self
                 .state
                 .lock()
                 .map_err(|_| AppServiceError::StatePoisoned)?;
-            let library = state
-                .libraries
-                .catalog()
+            let catalog = state.libraries.catalog();
+            let library = catalog
                 .find_library(runtime.selection.library_id)?
                 .ok_or(AppServiceError::StatePoisoned)?;
             let root = library
@@ -3232,7 +3233,24 @@ impl GalleryEngine {
                 .relative_folder
                 .to_path_buf()
                 .map_err(|e| CatalogError::InvalidData(e.to_string()))?;
-            (root, selected)
+            let heif_refresh = catalog.heif_metadata_refresh_required(
+                runtime.selection.library_id,
+                runtime.selection.group_id,
+            )?;
+            let known_assets = catalog
+                .reconciliation_assets_for_group(
+                    runtime.selection.library_id,
+                    runtime.selection.group_id,
+                )?
+                .into_iter()
+                .map(|asset| KnownAsset {
+                    id: asset.id,
+                    signature: asset.signature,
+                    enrichment_required: asset.shape_status != photo_catalog::ShapeStatus::Ready
+                        || (heif_refresh && asset.media_kind == photo_domain::MediaKind::Heif),
+                })
+                .collect::<Vec<_>>();
+            (root, selected, known_assets)
         };
         // An unavailable source is a normal cached-browsing state. Check
         // lexical existence before canonicalization so a missing root can
@@ -3349,7 +3367,8 @@ impl GalleryEngine {
             ScanRequest::new(selection_root.clone())
                 .for_library(runtime.selection.library_id)
                 .roots(root, selection_root)
-                .for_folder_group(runtime.selection.group_id),
+                .for_folder_group(runtime.selection.group_id)
+                .with_known_assets(known_assets),
         ) {
             Ok(handle) => handle,
             Err(error) => {

@@ -230,14 +230,21 @@ async fn persisted_disabled_catalog_transitions_through_one_background_scan() {
         } else {
             engine.ensure_running(&selected).await.unwrap();
         }
+        let paths = reader.paths.lock().unwrap().clone();
         assert_eq!(
-            reader.paths.lock().unwrap().len(),
+            paths.len(),
             if cfg!(feature = "heic") && restart == 0 {
-                3
+                2
             } else {
                 0
             }
         );
+        if cfg!(feature = "heic") && restart == 0 {
+            assert!(paths.iter().all(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "heic")
+            }));
+        }
         assert_eq!(
             metadata(&config),
             if cfg!(feature = "heic") {

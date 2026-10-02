@@ -552,6 +552,109 @@ fn query(direction: SortDirection) -> WallQueryRequest {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remounted_unchanged_folder_finishes_without_metadata_reads() {
+    let fixture = ProgressiveFixture::new(2);
+    let reader = CountingReader::default();
+    let service =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(reader.clone())).unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    let first = service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let first_reads = reader.count();
+    assert_eq!(first_reads, 2);
+
+    let selection = Catalog::open(&fixture.config.catalog_path())
+        .unwrap()
+        .load_app_state()
+        .unwrap()
+        .active_selection
+        .unwrap();
+    Catalog::open(&fixture.config.catalog_path())
+        .unwrap()
+        .mark_root_offline(selection.library_id)
+        .unwrap();
+    service
+        .check_saved_folders(&[first.saved_folders.active_entry_id.unwrap()])
+        .await
+        .unwrap();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+
+    assert_eq!(reader.count(), first_reads);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remounted_scan_marks_a_removed_asset_missing_only_on_completion() {
+    let fixture = ProgressiveFixture::new(2);
+    let first = AppService::open_with_reader(
+        fixture.config.clone(),
+        Arc::new(photo_indexer::DefaultMetadataReader),
+    )
+    .unwrap();
+    let mut updates = first.subscribe_wall_updates();
+    first.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    let page = first
+        .query_wall(query(SortDirection::OldestFirst))
+        .await
+        .unwrap();
+    let removed = page
+        .items
+        .iter()
+        .find(|asset| asset.display_name == "photo-000.jpg")
+        .unwrap();
+    let removed_id = AssetId::from_uuid(uuid::Uuid::parse_str(&removed.id).unwrap());
+    drop(first);
+
+    std::fs::remove_file(fixture.source.join("photo-000.jpg")).unwrap();
+    ImageBuffer::from_pixel(16, 12, Rgb([90_u8, 80, 70]))
+        .save(fixture.source.join("new.jpg"))
+        .unwrap();
+    let (reader, release) = BlockingReader::new();
+    let service = AppService::open_with_reader(fixture.config.clone(), Arc::new(reader)).unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::CatalogBatch { assets, .. }
+            if assets.iter().any(|asset| asset.display_name == "new.jpg"))
+    })
+    .await;
+    assert_eq!(
+        Catalog::open(&fixture.config.catalog_path())
+            .unwrap()
+            .find_asset(removed_id)
+            .unwrap()
+            .unwrap()
+            .availability,
+        Availability::Available
+    );
+
+    release.release();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    assert_eq!(
+        Catalog::open(&fixture.config.catalog_path())
+            .unwrap()
+            .find_asset(removed_id)
+            .unwrap()
+            .unwrap()
+            .availability,
+        Availability::Missing
+    );
+}
+
 #[cfg(feature = "heic")]
 async fn wait_for_scan_cleanup(service: &AppService) {
     tokio::time::timeout(Duration::from_secs(2), async {

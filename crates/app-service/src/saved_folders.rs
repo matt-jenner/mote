@@ -174,52 +174,54 @@ impl AppService {
             .find_saved_folder(id(entry)?)?
             .is_some()
         {
-            if matches!(
-                &reply,
-                AccessReply::Complete {
-                    outcome,
-                    ..
-                } if matches!(outcome, FolderProbeOutcome::Missing | FolderProbeOutcome::Unreadable | FolderProbeOutcome::RootOffline)
-            ) {
-                if root_selection
-                    || matches!(
-                        &reply,
-                        AccessReply::Complete {
-                            outcome: FolderProbeOutcome::RootOffline,
-                            ..
-                        }
-                    )
-                {
-                    state.libraries.catalog_mut().mark_root_offline(library)?;
-                    inaccessible = Some(None);
-                } else {
-                    state
-                        .libraries
-                        .catalog_mut()
-                        .mark_group_offline(library, group)?;
-                    inaccessible = Some(Some(group));
-                }
-                if let Some(selection) = selection
-                    && selection.library_id == library
-                    && state.selection_epoch == selection.epoch
-                    && (selection.group_id == group
-                        || root_selection
-                        || matches!(
-                            &reply,
-                            AccessReply::Complete {
-                                outcome: FolderProbeOutcome::RootOffline,
-                                ..
-                            }
-                        ))
-                {
-                    let _ = self.updates.send(crate::WallUpdate::SourceUnavailable {
-                        selection_id: selection.selection_id(),
-                        source_id: library.as_uuid().to_string(),
-                    });
-                }
-            }
             let old = state.folder_status.get(&access.folder_id);
             if old.is_none_or(|old| old.generation <= access.generation) {
+                match &reply {
+                    AccessReply::Complete {
+                        outcome: FolderProbeOutcome::Available(_),
+                        ..
+                    } => {
+                        if root_selection {
+                            state.libraries.catalog_mut().mark_root_available(library)?;
+                        } else {
+                            state
+                                .libraries
+                                .catalog_mut()
+                                .mark_group_available(library, group)?;
+                        }
+                    }
+                    AccessReply::Complete {
+                        outcome:
+                            outcome @ (FolderProbeOutcome::Missing
+                            | FolderProbeOutcome::Unreadable
+                            | FolderProbeOutcome::RootOffline),
+                        ..
+                    } => {
+                        if root_selection || matches!(outcome, FolderProbeOutcome::RootOffline) {
+                            state.libraries.catalog_mut().mark_root_offline(library)?;
+                            inaccessible = Some(None);
+                        } else {
+                            state
+                                .libraries
+                                .catalog_mut()
+                                .mark_group_offline(library, group)?;
+                            inaccessible = Some(Some(group));
+                        }
+                        if let Some(selection) = selection
+                            && selection.library_id == library
+                            && state.selection_epoch == selection.epoch
+                            && (selection.group_id == group
+                                || root_selection
+                                || matches!(outcome, FolderProbeOutcome::RootOffline))
+                        {
+                            let _ = self.updates.send(crate::WallUpdate::SourceUnavailable {
+                                selection_id: selection.selection_id(),
+                                source_id: library.as_uuid().to_string(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
                 state.folder_revision += 1;
                 state.folder_status.insert(access.folder_id.clone(), access);
             }
@@ -563,6 +565,148 @@ impl AppService {
 mod tests {
     use super::*;
     use std::sync::{Arc, atomic::AtomicUsize};
+
+    #[tokio::test]
+    async fn saved_folder_recovery_restores_catalog_before_scan_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let photos = temp.path().join("photos");
+        std::fs::create_dir(&photos).unwrap();
+        let service = AppService::open(crate::AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let (saved, _) = service.select_recent(&photos).unwrap();
+        let entry = saved.saved_folders.active_entry_id.unwrap();
+        let token = service.active_selection_token().unwrap();
+        service
+            .state()
+            .unwrap()
+            .libraries
+            .catalog_mut()
+            .mark_root_offline(token.library_id)
+            .unwrap();
+
+        let snapshot = service
+            .check_saved_folders(std::slice::from_ref(&entry))
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .state()
+                .unwrap()
+                .libraries
+                .catalog()
+                .find_library(token.library_id)
+                .unwrap()
+                .unwrap()
+                .availability,
+            photo_domain::Availability::Available
+        );
+        let folder_id = snapshot.entries[0].folder_id.clone();
+        assert_eq!(
+            snapshot.access[&folder_id].state,
+            crate::FolderAccessState::Available
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_folder_recovery_ignores_stale_success_and_failure() {
+        struct Missing;
+        impl crate::FolderProbe for Missing {
+            fn probe(&self, _: &FolderAccessTarget) -> FolderProbeOutcome {
+                FolderProbeOutcome::Missing
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let photos = temp.path().join("photos");
+        std::fs::create_dir(&photos).unwrap();
+        let service = AppService::open(crate::AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let (saved, _) = service.select_recent(&photos).unwrap();
+        let entry = saved.saved_folders.active_entry_id.unwrap();
+        let folder_id = saved.saved_folders.entries[0].folder_id.clone();
+        let token = service.active_selection_token().unwrap();
+        {
+            let mut state = service.state().unwrap();
+            state
+                .libraries
+                .catalog_mut()
+                .mark_root_offline(token.library_id)
+                .unwrap();
+            state.folder_status.insert(
+                folder_id.clone(),
+                crate::FolderAccess {
+                    folder_id: folder_id.clone(),
+                    state: crate::FolderAccessState::RootOffline,
+                    generation: 2,
+                    retry_after_ms: 0,
+                },
+            );
+        }
+        service
+            .check_saved_folders(std::slice::from_ref(&entry))
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .state()
+                .unwrap()
+                .libraries
+                .catalog()
+                .find_library(token.library_id)
+                .unwrap()
+                .unwrap()
+                .availability,
+            photo_domain::Availability::RootOffline,
+            "a generation-1 success must not override generation-2 failure"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let photos = temp.path().join("photos");
+        std::fs::create_dir(&photos).unwrap();
+        let mut service = AppService::open(crate::AppConfig::new(
+            temp.path().join("data"),
+            temp.path().join("cache"),
+        ))
+        .unwrap();
+        let (saved, _) = service.select_recent(&photos).unwrap();
+        let entry = saved.saved_folders.active_entry_id.unwrap();
+        let folder_id = saved.saved_folders.entries[0].folder_id.clone();
+        let token = service.active_selection_token().unwrap();
+        service.folder_access = crate::FolderAccessCoordinator::new(Arc::new(Missing));
+        service.state().unwrap().folder_status.insert(
+            folder_id.clone(),
+            crate::FolderAccess {
+                folder_id,
+                state: crate::FolderAccessState::Available,
+                generation: 2,
+                retry_after_ms: 0,
+            },
+        );
+        service
+            .check_saved_folders(std::slice::from_ref(&entry))
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .state()
+                .unwrap()
+                .libraries
+                .catalog()
+                .find_library(token.library_id)
+                .unwrap()
+                .unwrap()
+                .availability,
+            photo_domain::Availability::Available,
+            "a generation-1 failure must not override generation-2 success"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stale_saved_activation_cannot_replace_newer_foreground_priority() {
         let temp = tempfile::tempdir().unwrap();
