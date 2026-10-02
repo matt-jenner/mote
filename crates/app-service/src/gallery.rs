@@ -3233,23 +3233,28 @@ impl GalleryEngine {
                 .relative_folder
                 .to_path_buf()
                 .map_err(|e| CatalogError::InvalidData(e.to_string()))?;
-            let heif_refresh = catalog.heif_metadata_refresh_required(
-                runtime.selection.library_id,
-                runtime.selection.group_id,
-            )?;
-            let known_assets = catalog
-                .reconciliation_assets_for_group(
+            let known_assets = if self.hosted_library_id == Some(runtime.selection.library_id) {
+                Vec::new()
+            } else {
+                let heif_refresh = catalog.heif_metadata_refresh_required(
                     runtime.selection.library_id,
                     runtime.selection.group_id,
-                )?
-                .into_iter()
-                .map(|asset| KnownAsset {
-                    id: asset.id,
-                    signature: asset.signature,
-                    enrichment_required: asset.shape_status != photo_catalog::ShapeStatus::Ready
-                        || (heif_refresh && asset.media_kind == photo_domain::MediaKind::Heif),
-                })
-                .collect::<Vec<_>>();
+                )?;
+                catalog
+                    .reconciliation_assets_for_group(
+                        runtime.selection.library_id,
+                        runtime.selection.group_id,
+                    )?
+                    .into_iter()
+                    .map(|asset| KnownAsset {
+                        id: asset.id,
+                        signature: asset.signature,
+                        enrichment_required: asset.shape_status
+                            != photo_catalog::ShapeStatus::Ready
+                            || (heif_refresh && asset.media_kind == photo_domain::MediaKind::Heif),
+                    })
+                    .collect::<Vec<_>>()
+            };
             (root, selected, known_assets)
         };
         // An unavailable source is a normal cached-browsing state. Check
