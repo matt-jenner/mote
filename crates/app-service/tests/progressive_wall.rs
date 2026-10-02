@@ -84,7 +84,7 @@ impl MetadataReader for RecoveringReader {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.failing.load(Ordering::SeqCst) {
             return Err(MetadataReadWarning::new(
-                "source_check_failed",
+                "exif_io_failed",
                 "temporary metadata failure",
             ));
         }

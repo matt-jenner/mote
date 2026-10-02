@@ -519,7 +519,7 @@ impl Catalog {
                       SELECT 1 FROM warnings w
                       WHERE w.asset_id = a.id AND w.code IN (
                         'source_missing', 'source_unreadable', 'source_check_failed',
-                        'image_open_failed', 'exif_open_failed', 'xmp_open_failed',
+                        'image_open_failed', 'exif_open_failed', 'exif_io_failed', 'xmp_open_failed',
                         'xmp_read_failed'
                       )
                     )

@@ -671,6 +671,7 @@ fn process_asset<R: MetadataReader>(
                     | "source_check_failed"
                     | "image_open_failed"
                     | "exif_open_failed"
+                    | "exif_io_failed"
                     | "xmp_open_failed"
                     | "xmp_read_failed"
             )

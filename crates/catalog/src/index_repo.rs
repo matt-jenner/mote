@@ -206,7 +206,7 @@ fn apply_record(
             connection.execute(
                 "DELETE FROM warnings WHERE asset_id = ?1 AND code IN (
                    'source_missing', 'source_unreadable', 'source_check_failed',
-                   'image_open_failed', 'exif_open_failed', 'xmp_open_failed',
+                   'image_open_failed', 'exif_open_failed', 'exif_io_failed', 'xmp_open_failed',
                    'xmp_read_failed')",
                 [asset.id.as_uuid().as_bytes()],
             )?;
@@ -214,7 +214,7 @@ fn apply_record(
                 connection.execute(
                     "DELETE FROM warnings WHERE asset_id = ?1 AND code IN (
                        'shape_read_failed', 'image_open_failed', 'image_decode_failed', 'empty_image',
-                       'exif_open_failed', 'exif_read_failed', 'invalid_exif_date',
+                       'exif_open_failed', 'exif_io_failed', 'exif_read_failed', 'invalid_exif_date',
                        'xmp_open_failed', 'xmp_read_failed', 'oversized_xmp', 'oversized_xmp_value',
                        'malformed_xmp', 'invalid_rating', 'invalid_xmp_date', 'empty_keyword',
                        'source_missing', 'source_unreadable', 'source_check_failed')",
@@ -302,6 +302,7 @@ fn apply_record(
                         | "source_check_failed"
                         | "image_open_failed"
                         | "exif_open_failed"
+                        | "exif_io_failed"
                         | "xmp_open_failed"
                         | "xmp_read_failed"
                 )

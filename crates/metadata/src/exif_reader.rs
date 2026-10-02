@@ -21,9 +21,22 @@ impl EmbeddedExifReader {
         let file = std::fs::File::open(path)
             .map_err(|error| MetadataReadWarning::new("exif_open_failed", error.to_string()))?;
         let mut reader = BufReader::new(file);
-        let exif = exif::Reader::new()
-            .read_from_container(&mut reader)
-            .map_err(|error| MetadataReadWarning::new("exif_read_failed", error.to_string()))?;
+        let exif = match exif::Reader::new().read_from_container(&mut reader) {
+            Ok(exif) => exif,
+            Err(exif::Error::NotFound(_)) => return Ok(MetadataBundle::default()),
+            Err(exif::Error::Io(error)) => {
+                return Err(MetadataReadWarning::new(
+                    "exif_io_failed",
+                    error.to_string(),
+                ));
+            }
+            Err(error) => {
+                return Err(MetadataReadWarning::new(
+                    "exif_read_failed",
+                    error.to_string(),
+                ));
+            }
+        };
         Ok(bundle_from_exif(&exif))
     }
 
