@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use photo_core::{FolderPolicyEngine, FolderStructureSnapshot};
-use photo_domain::{FolderGroupId, LibraryId, MediaKind};
+use photo_domain::{AssetId, FileSignature, FolderGroupId, LibraryId, MediaKind};
 use photo_metadata::{
     EmbeddedExifReader, MediaProbe, MetadataBundle, MetadataReadWarning, MetadataResolver,
     RepresentativeRgb,
@@ -53,6 +54,14 @@ pub struct ScanRequest {
     pub library_root: Option<PathBuf>,
     pub selection_root: Option<PathBuf>,
     pub folder_group_id: Option<FolderGroupId>,
+    known_assets: Arc<HashMap<AssetId, KnownAsset>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KnownAsset {
+    pub id: AssetId,
+    pub signature: FileSignature,
+    pub enrichment_required: bool,
 }
 
 impl ScanRequest {
@@ -63,6 +72,7 @@ impl ScanRequest {
             library_root: None,
             selection_root: None,
             folder_group_id: None,
+            known_assets: Arc::new(HashMap::new()),
         }
     }
 
@@ -82,6 +92,11 @@ impl ScanRequest {
     }
     pub fn for_folder_group(mut self, folder_group_id: FolderGroupId) -> Self {
         self.folder_group_id = Some(folder_group_id);
+        self
+    }
+
+    pub fn with_known_assets(mut self, assets: impl IntoIterator<Item = KnownAsset>) -> Self {
+        self.known_assets = Arc::new(assets.into_iter().map(|asset| (asset.id, asset)).collect());
         self
     }
 }
@@ -184,6 +199,7 @@ impl<R: MetadataReader> Indexer<R> {
         let inventory_cancel = cancel_rx.clone();
         let library_id = request.library_id;
         let folder_group_id = request.folder_group_id;
+        let known_assets = request.known_assets;
         let folder_key = folder_group_id.map(|group| (library_id, group));
         let discovery_failures = Arc::new(AtomicU64::new(0));
         let failed_photos = Arc::new(AtomicU64::new(0));
@@ -261,6 +277,7 @@ impl<R: MetadataReader> Indexer<R> {
                 let inventory_total = inventory_total.clone();
                 let direct_inventory_total = direct_inventory_total.clone();
                 let scheduler = scheduler.clone();
+                let known_assets = known_assets.clone();
                 workers.push(tokio::spawn(async move {
                     loop {
                         let item = tokio::select! {
@@ -299,6 +316,16 @@ impl<R: MetadataReader> Indexer<R> {
                                 asset: item.asset.clone(),
                             })
                             .await;
+                        let unchanged = known_assets.get(&asset_id).is_some_and(|known| {
+                            !known.enrichment_required && known.signature == item.asset.signature
+                        });
+                        if unchanged {
+                            if counts_as_viewable_photo {
+                                progress.1.fetch_add(1, Ordering::Relaxed);
+                                progress.2.fetch_add(1, Ordering::Relaxed);
+                            }
+                            continue;
+                        }
                         if !admit_enrichment(&cancel, &scheduler, folder_key).await {
                             break;
                         }

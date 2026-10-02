@@ -1,16 +1,18 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 #[cfg(feature = "heic")]
 use photo_cache::{DerivativeKind, DerivativeSpec, DerivativeTarget, ImageDerivativeGenerator};
 use photo_catalog::{Catalog, NewAsset, NewFolderGroup, NewLibrary, ShapeStatus, WallOrder};
 use photo_core::FolderPolicyEngine;
-use photo_domain::{FolderGroupId, GalleryScope, MediaKind, RelativePathKey};
+use photo_domain::{
+    AssetId, FileSignature, FolderGroupId, GalleryScope, LibraryId, MediaKind, RelativePathKey,
+};
 use photo_indexer::{
     CatalogWriter, DefaultMetadataReader, IndexEvent, IndexScheduler, Indexer, InteractionMode,
-    MetadataReader, ScanProgress, ScanRequest, ScanStage, SchedulerConfig,
+    KnownAsset, MetadataReader, ScanProgress, ScanRequest, ScanStage, SchedulerConfig,
 };
 use photo_metadata::{
     Keyword, MetadataBundle, MetadataReadWarning, ProvenanceRecord, RepresentativeRgb,
@@ -264,6 +266,149 @@ impl MetadataReader for CountingMetadataReader {
         self.reads.fetch_add(1, Ordering::SeqCst);
         Ok(MetadataBundle::default())
     }
+}
+
+fn file_signature(path: &Path) -> FileSignature {
+    let metadata = path.metadata().unwrap();
+    FileSignature {
+        size_bytes: metadata.len(),
+        modified_unix_ns: metadata
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i128,
+        sidecar_modified_unix_ns: None,
+    }
+}
+
+#[tokio::test]
+async fn unchanged_known_asset_skips_shape_and_metadata_reads() {
+    let fixture = tempfile::tempdir().unwrap();
+    let path = fixture.path().join("known.png");
+    write_png(&path, [12, 34, 56]);
+    let library = LibraryId::new();
+    let relative = RelativePathKey::from_relative_path(Path::new("known.png")).unwrap();
+    let id = AssetId::for_path(library, &relative);
+    let reader = CountingMetadataReader::default();
+    let reads = reader.reads.clone();
+    let mut scan = Indexer::new(reader, empty_policy_engine())
+        .start(
+            ScanRequest::new(fixture.path())
+                .for_library(library)
+                .with_known_assets([KnownAsset {
+                    id,
+                    signature: file_signature(&path),
+                    enrichment_required: false,
+                }]),
+        )
+        .unwrap();
+    let mut discovered = false;
+    let mut content_event = false;
+    let mut completed_progress = None;
+    while let Some(event) = scan.events.recv().await {
+        match event {
+            IndexEvent::Discovered { asset } => discovered = asset.id == id,
+            IndexEvent::ShapeReady { .. }
+            | IndexEvent::ShapeFallback { .. }
+            | IndexEvent::ColourReady { .. }
+            | IndexEvent::MetadataReady { .. } => content_event = true,
+            IndexEvent::Progress(progress) if progress.stage == ScanStage::Completed => {
+                completed_progress = Some(progress)
+            }
+            IndexEvent::Completed(_) => break,
+            _ => {}
+        }
+    }
+    let summary = scan.join().await.unwrap();
+
+    assert!(discovered);
+    assert!(!content_event);
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    assert_eq!(summary.discovered, 1);
+    assert_eq!(
+        completed_progress,
+        Some(ScanProgress {
+            stage: ScanStage::Completed,
+            discovered: 1,
+            shaped: 1,
+            enriched: 1,
+            direct_total: Some(1),
+            total: Some(1),
+        })
+    );
+}
+
+#[tokio::test]
+async fn changed_or_forced_known_asset_uses_full_enrichment_pipeline() {
+    for (changed, enrichment_required) in [(true, false), (false, true)] {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("known.png");
+        write_png(&path, [12, 34, 56]);
+        let library = LibraryId::new();
+        let relative = RelativePathKey::from_relative_path(Path::new("known.png")).unwrap();
+        let id = AssetId::for_path(library, &relative);
+        let mut signature = file_signature(&path);
+        if changed {
+            signature.modified_unix_ns += 1;
+        }
+        let reader = CountingMetadataReader::default();
+        let reads = reader.reads.clone();
+        let scan = Indexer::new(reader, empty_policy_engine())
+            .start(
+                ScanRequest::new(fixture.path())
+                    .for_library(library)
+                    .with_known_assets([KnownAsset {
+                        id,
+                        signature,
+                        enrichment_required,
+                    }]),
+            )
+            .unwrap();
+
+        scan.join().await.unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+#[ignore = "local remount performance diagnostic"]
+async fn unchanged_5000_asset_reconciliation_reports_zero_content_reads() {
+    let fixture = tempfile::tempdir().unwrap();
+    let library = LibraryId::new();
+    let mut known = Vec::with_capacity(5_000);
+    for index in 0..5_000 {
+        let name = format!("{index:04}.jpg");
+        let path = fixture.path().join(&name);
+        std::fs::write(&path, b"catalogued").unwrap();
+        let relative = RelativePathKey::from_relative_path(Path::new(&name)).unwrap();
+        known.push(KnownAsset {
+            id: AssetId::for_path(library, &relative),
+            signature: file_signature(&path),
+            enrichment_required: false,
+        });
+    }
+    let reader = CountingMetadataReader::default();
+    let reads = reader.reads.clone();
+    let started = Instant::now();
+    let mut scan = Indexer::new(reader, empty_policy_engine())
+        .start(
+            ScanRequest::new(fixture.path())
+                .for_library(library)
+                .with_known_assets(known),
+        )
+        .unwrap();
+    while let Some(event) = scan.events.recv().await {
+        if matches!(event, IndexEvent::Completed(_)) {
+            break;
+        }
+    }
+    let summary = scan.join().await.unwrap();
+    let elapsed = started.elapsed();
+
+    eprintln!("reconciled 5,000 unchanged assets in {elapsed:?}");
+    assert_eq!(summary.discovered, 5_000);
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
 }
 
 impl BlockingMetadataReader {

@@ -16,7 +16,7 @@ pub use events::{IndexEvent, ScanProgress, ScanStage, ScanSummary};
 pub use reconcile::{
     RealReconcileSource, ReconcileError, ReconcileOutcome, ReconcileSource, Reconciler,
 };
-pub use scanner::{Indexer, MetadataReader, ScanHandle, ScanRequest};
+pub use scanner::{Indexer, KnownAsset, MetadataReader, ScanHandle, ScanRequest};
 pub use scheduler::{
     CancellationToken, FolderWorkPermit, FolderWorkScope, IndexJob, IndexScheduler,
     InteractionMode, JobPriority, SchedulerConfig,
