@@ -8,7 +8,7 @@ import {
 	useRef,
 } from "react";
 import { usePhotoService } from "../app/PhotoServiceContext";
-import { usePickList } from "../picks/PickListContext";
+import { usePickList, usePickListOrigin } from "../picks/PickListContext";
 import type { PickCopyFailureCode, PickCopyState } from "../picks/usePickList";
 import styles from "../styles/picksPanel.module.css";
 import { PickRow } from "./PickRow";
@@ -119,6 +119,7 @@ export function PicksPanel({
 	viewerOpen = false,
 }: PicksPanelProps) {
 	const picks = usePickList();
+	const activePickOrigin = usePickListOrigin();
 	const service = usePhotoService();
 	const dialogRef = useRef<HTMLElement>(null);
 	const closeRef = useRef<HTMLButtonElement>(null);
@@ -289,6 +290,7 @@ export function PicksPanel({
 					<ul className={styles.pickList}>
 						{items.map((item) => (
 							<PickRow
+								activeSourceFolderId={activePickOrigin?.sourceFolderId ?? null}
 								item={item}
 								key={item.assetId}
 								onOpen={onOpenPick}

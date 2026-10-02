@@ -203,6 +203,13 @@ fn apply_record(
             if source_changed {
                 clear_terminal_derivative_state(connection, asset.id)?;
             }
+            connection.execute(
+                "DELETE FROM warnings WHERE asset_id = ?1 AND code IN (
+                   'source_missing', 'source_unreadable', 'source_check_failed',
+                   'image_open_failed', 'exif_open_failed', 'xmp_open_failed',
+                   'xmp_read_failed')",
+                [asset.id.as_uuid().as_bytes()],
+            )?;
             if cfg!(feature = "heic") && asset.media_kind == photo_domain::MediaKind::Heif {
                 connection.execute(
                     "DELETE FROM warnings WHERE asset_id = ?1 AND code IN (

@@ -35,6 +35,12 @@ struct BlockingReader {
 #[derive(Clone, Default)]
 struct CountingReader(Arc<AtomicUsize>);
 
+#[derive(Clone, Default)]
+struct RecoveringReader {
+    calls: Arc<AtomicUsize>,
+    failing: Arc<AtomicBool>,
+}
+
 impl MetadataReader for CountingReader {
     fn read(
         &self,
@@ -52,6 +58,40 @@ impl MetadataReader for CountingReader {
 impl CountingReader {
     fn count(&self) -> usize {
         self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl RecoveringReader {
+    fn fail(&self) {
+        self.failing.store(true, Ordering::SeqCst);
+    }
+
+    fn recover(&self) {
+        self.failing.store(false, Ordering::SeqCst);
+    }
+
+    fn count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl MetadataReader for RecoveringReader {
+    fn read(
+        &self,
+        path: &Path,
+        sidecar: Option<&Path>,
+    ) -> Result<MetadataBundle, MetadataReadWarning> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(MetadataReadWarning::new(
+                "source_check_failed",
+                "temporary metadata failure",
+            ));
+        }
+        BlockingReader {
+            gate: Arc::new((Mutex::new(true), Condvar::new())),
+        }
+        .read(path, sidecar)
     }
 }
 
@@ -588,6 +628,54 @@ async fn remounted_unchanged_folder_finishes_without_metadata_reads() {
     .await;
 
     assert_eq!(reader.count(), first_reads);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matching_signature_retries_incomplete_metadata_then_becomes_eligible() {
+    let fixture = ProgressiveFixture::new(1);
+    let reader = RecoveringReader::default();
+    reader.fail();
+    let service =
+        AppService::open_with_reader(fixture.config.clone(), Arc::new(reader.clone())).unwrap();
+    let mut updates = service.subscribe_wall_updates();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    assert_eq!(reader.count(), 1);
+
+    reader.recover();
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    assert_eq!(
+        reader.count(),
+        2,
+        "the failed metadata read must be retried"
+    );
+    assert!(
+        service
+            .query_wall(query(SortDirection::OldestFirst))
+            .await
+            .unwrap()
+            .items[0]
+            .captured_at_utc
+            .is_some()
+    );
+
+    service.start_scan(&fixture.source).await.unwrap();
+    recv_until(&mut updates, |event| {
+        matches!(event, WallUpdate::MetadataSettled { .. })
+    })
+    .await;
+    assert_eq!(
+        reader.count(),
+        2,
+        "a later unchanged scan should use the fast path after recovery"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

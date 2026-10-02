@@ -1071,6 +1071,7 @@ describe("responsive Picks panel", () => {
 				<SourceUnavailableContext value={false}>
 					<ul>
 						<PickRow
+							activeSourceFolderId="Archive"
 							item={{
 								asset: staleSourceWarning,
 								assetId: staleSourceWarning.id,
@@ -1085,6 +1086,51 @@ describe("responsive Picks panel", () => {
 		);
 
 		expect(screen.getByText("Source unavailable").query()).toBeNull();
+	});
+
+	it("does not apply active-folder availability to cross-folder picks", async () => {
+		const availableFolder = await render(
+			<PhotoServiceProvider service={createInMemoryPhotoService()}>
+				<SourceUnavailableContext value={false}>
+					<ul>
+						<PickRow
+							activeSourceFolderId="Family"
+							item={{
+								asset: staleSourceWarning,
+								assetId: staleSourceWarning.id,
+								sourceFolderId: "Archive",
+								sourceLabel: "Mountain archive",
+							}}
+							onRemove={() => undefined}
+						/>
+					</ul>
+				</SourceUnavailableContext>
+			</PhotoServiceProvider>,
+		);
+		await expect
+			.element(availableFolder.getByText("Source unavailable"))
+			.toBeVisible();
+		await availableFolder.unmount();
+
+		const offlineFolder = await render(
+			<PhotoServiceProvider service={createInMemoryPhotoService()}>
+				<SourceUnavailableContext value={true}>
+					<ul>
+						<PickRow
+							activeSourceFolderId="Family"
+							item={{
+								asset: coast,
+								assetId: coast.id,
+								sourceFolderId: "Archive",
+								sourceLabel: "Mountain archive",
+							}}
+							onRemove={() => undefined}
+						/>
+					</ul>
+				</SourceUnavailableContext>
+			</PhotoServiceProvider>,
+		);
+		expect(offlineFolder.getByText("Source unavailable").query()).toBeNull();
 	});
 
 	it("opens an immersive review from the ordered pick list", async () => {

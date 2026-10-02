@@ -3249,8 +3249,8 @@ impl GalleryEngine {
                     .map(|asset| KnownAsset {
                         id: asset.id,
                         signature: asset.signature,
-                        enrichment_required: asset.shape_status
-                            != photo_catalog::ShapeStatus::Ready
+                        enrichment_required: asset.enrichment_required
+                            || asset.shape_status != photo_catalog::ShapeStatus::Ready
                             || (heif_refresh && asset.media_kind == photo_domain::MediaKind::Heif),
                     })
                     .collect::<Vec<_>>()

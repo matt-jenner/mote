@@ -221,6 +221,71 @@ fn reconciliation_snapshot_contains_only_assets_from_the_latest_completed_group_
 }
 
 #[test]
+fn reconciliation_snapshot_excludes_shared_asset_advanced_by_incomplete_child_scan() {
+    let mut catalog = Catalog::open_in_memory().unwrap();
+    let library = catalog
+        .add_library(&NewLibrary::configured("Photos", Path::new("/Photos")))
+        .unwrap();
+    let parent = add_group(&mut catalog, library.id, "");
+    let child = add_group(&mut catalog, library.id, "child");
+    let relative = RelativePathKey::from_relative_path(Path::new("child/photo.jpg")).unwrap();
+    let mut asset = NewAsset::minimal(
+        library.id,
+        relative.clone(),
+        "child/photo.jpg",
+        MediaKind::Jpeg,
+        10,
+    );
+    asset.folder_group_id = Some(parent);
+    let parent_generation = catalog
+        .begin_generation_for_group(library.id, parent)
+        .unwrap();
+    catalog
+        .apply_index_batch_for_generation(
+            library.id,
+            parent_generation,
+            &[
+                CatalogIndexRecord::Discovered(asset.clone()),
+                CatalogIndexRecord::Shaped(AssetShapeUpdate {
+                    asset_id: asset.id,
+                    width: 12,
+                    height: 8,
+                    orientation: Some(1),
+                    representative_rgb: None,
+                    shape_status: ShapeStatus::Ready,
+                }),
+            ],
+        )
+        .unwrap();
+    catalog
+        .complete_generation_for_group(library.id, parent, parent_generation)
+        .unwrap();
+
+    let child_generation = catalog
+        .begin_generation_for_group(library.id, child)
+        .unwrap();
+    let mut changed =
+        NewAsset::minimal(library.id, relative, "child/photo.jpg", MediaKind::Jpeg, 10);
+    changed.folder_group_id = Some(child);
+    changed.signature.modified_unix_ns = 1;
+    catalog
+        .apply_index_batch_for_generation(
+            library.id,
+            child_generation,
+            &[CatalogIndexRecord::Discovered(changed)],
+        )
+        .unwrap();
+
+    assert!(
+        catalog
+            .reconciliation_assets_for_group(library.id, parent)
+            .unwrap()
+            .is_empty(),
+        "an incomplete overlapping scan must not advance the parent's trusted signature"
+    );
+}
+
+#[test]
 fn root_and_group_outages_persist_checked_recovery_tokens() {
     let mut catalog = Catalog::open_in_memory().unwrap();
     let library = catalog

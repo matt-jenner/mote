@@ -10,6 +10,7 @@ import type { PickItem } from "../picks/pickList";
 import styles from "../styles/picksPanel.module.css";
 
 interface PickRowProps {
+	activeSourceFolderId: string | null;
 	item: PickItem;
 	onOpen?: (assetId: string, launchTarget: HTMLElement) => void;
 	onRemove: (assetId: string) => void;
@@ -29,15 +30,27 @@ function thumbnailUrl(
 	}
 }
 
-export function PickRow({ item, onOpen, onRemove, action }: PickRowProps) {
+export function PickRow({
+	activeSourceFolderId,
+	item,
+	onOpen,
+	onRemove,
+	action,
+}: PickRowProps) {
 	const service = usePhotoService();
 	const url = thumbnailUrl(item, service.derivativeUrl);
-	const sourceUnavailableContext = useSourceUnavailable();
+	const activeSourceUnavailable = useSourceUnavailable();
+	const activeContextApplies = activeSourceFolderId === item.sourceFolderId;
 	const sourceUnavailable =
 		item.asset === null ||
-		imageSourceUnavailable(sourceUnavailableContext, item.asset);
+		(activeContextApplies
+			? imageSourceUnavailable(activeSourceUnavailable, item.asset)
+			: item.asset.availability !== "available" ||
+				item.asset.warning?.code === "sourceUnavailable");
 	const visibleWarning = item.asset
-		? visibleImageWarning(sourceUnavailableContext, item.asset)
+		? activeContextApplies
+			? visibleImageWarning(activeSourceUnavailable, item.asset)
+			: item.asset.warning
 		: null;
 	const warning = sourceUnavailable
 		? "Source unavailable"

@@ -27,6 +27,7 @@ pub struct ReconciliationAssetRecord {
     pub media_kind: MediaKind,
     pub signature: FileSignature,
     pub shape_status: crate::ShapeStatus,
+    pub enrichment_required: bool,
 }
 
 impl Catalog {
@@ -513,11 +514,24 @@ impl Catalog {
         ensure_group_belongs_to_library(&self.connection, library, folder_group)?;
         let mut statement = self.connection.prepare(
             "SELECT a.id, a.media_kind, a.size_bytes, a.modified_unix_ns,
-                    a.sidecar_modified_unix_ns, a.shape_status
+                    a.sidecar_modified_unix_ns, a.shape_status,
+                    EXISTS (
+                      SELECT 1 FROM warnings w
+                      WHERE w.asset_id = a.id AND w.code IN (
+                        'source_missing', 'source_unreadable', 'source_check_failed',
+                        'image_open_failed', 'exif_open_failed', 'xmp_open_failed',
+                        'xmp_read_failed'
+                      )
+                    )
              FROM folder_group_assets fga
              JOIN assets a ON a.id = fga.asset_id AND a.library_id = ?1
              WHERE fga.folder_group_id = ?2
                AND fga.last_seen_generation <= (
+                 SELECT MAX(generation) FROM scan_generations
+                 WHERE library_id = ?1 AND folder_group_id = ?2
+                   AND completed_at IS NOT NULL
+               )
+               AND a.last_seen_generation <= (
                  SELECT MAX(generation) FROM scan_generations
                  WHERE library_id = ?1 AND folder_group_id = ?2
                    AND completed_at IS NOT NULL
@@ -548,6 +562,7 @@ impl Catalog {
                         .transpose()?;
                     let shape_status =
                         crate::ShapeStatus::decode(row.get::<_, String>(5)?.as_str(), 5)?;
+                    let enrichment_required = row.get(6)?;
                     Ok(ReconciliationAssetRecord {
                         id,
                         media_kind,
@@ -557,6 +572,7 @@ impl Catalog {
                             sidecar_modified_unix_ns,
                         },
                         shape_status,
+                        enrichment_required,
                     })
                 },
             )?
