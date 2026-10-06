@@ -156,6 +156,14 @@ test("manifest builds npm and Cargo offline and installs matching metadata", () 
 	assert.match(commands, /npm ci --offline/);
 	assert.match(commands, /tauri build --no-bundle --ci/);
 	assert.match(commands, /target\/release\/photo-viewer-desktop/);
+	assert.match(
+		commands,
+		/install -Dm0755 apps\/desktop\/src-tauri\/target\/release\/photo-viewer-desktop \/app\/bin\/mote-bin/,
+	);
+	assert.match(
+		commands,
+		/install -Dm0755 packaging\/flatpak\/mote\.sh \/app\/bin\/mote/,
+	);
 	assert.ok(commands.includes(`${APP_ID}.desktop`));
 	assert.ok(commands.includes(`${APP_ID}.metainfo.xml`));
 	assert.match(
@@ -221,6 +229,15 @@ test("HEIC manifest rendering disables native modules and resolves offline sourc
 	assert.match(
 		manifest.modules[0]["build-commands"].join("\n"),
 		/tauri build[^\n]* -- --no-default-features --features mote-defaults/,
+	);
+	const commands = manifest.modules[0]["build-commands"].join("\n");
+	assert.match(
+		commands,
+		/install -Dm0755 apps\/desktop\/src-tauri\/target\/release\/photo-viewer-desktop \/app\/bin\/mote-bin/,
+	);
+	assert.match(
+		commands,
+		/install -Dm0755 packaging\/flatpak\/mote\.sh \/app\/bin\/mote/,
 	);
 	assert.equal(manifest.modules[0].sources[0].path, root);
 	assert.doesNotMatch(result.stdout, /MOTE_HEIC|libheif|libde265/);

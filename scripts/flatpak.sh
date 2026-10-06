@@ -121,7 +121,7 @@ package_bundle() {
     --repo="$repo_dir" \
     "$build_dir" "$manifest"
   flatpak-builder --run "$build_dir" "$manifest" sh -s -- \
-    /app /app/bin/mote "$MOTE_HEIC_MODE" \
+    /app /app/bin/mote-bin "$MOTE_HEIC_MODE" \
     < "$repository_root/packaging/heic/verify-linux-runtime.sh"
   flatpak build-bundle \
     --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
