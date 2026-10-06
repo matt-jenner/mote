@@ -147,7 +147,8 @@ modules:
       - install -Dm0644 cargo/config .cargo/config.toml
       - npm ci --offline
       - npm exec --workspace @photo-viewer/desktop -- tauri build --no-bundle --ci
-      - install -Dm0755 apps/desktop/src-tauri/target/release/photo-viewer-desktop /app/bin/mote
+      - install -Dm0755 apps/desktop/src-tauri/target/release/photo-viewer-desktop /app/bin/mote-bin
+      - install -Dm0755 packaging/flatpak/mote.sh /app/bin/mote
       - install -Dm0644 packaging/flatpak/io.github.matt_jenner.mote.desktop /app/share/applications/io.github.matt_jenner.mote.desktop
       - install -Dm0644 packaging/flatpak/io.github.matt_jenner.mote.metainfo.xml /app/share/metainfo/io.github.matt_jenner.mote.metainfo.xml
       - |

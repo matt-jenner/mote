@@ -69,6 +69,27 @@ flatpak info --show-permissions io.github.matt_jenner.mote
 The bundle records Flathub as its runtime source. Flatpak may offer to download
 GNOME Platform 49 if Fedora does not already have it.
 
+## NVIDIA Wayland startup
+
+The Flatpak starts through `/app/bin/mote`, which sets
+`__NV_DISABLE_EXPLICIT_SYNC=1` when the variable is unset, then runs
+`/app/bin/mote-bin`. This avoids a startup protocol error observed with
+NVIDIA driver 615.71.09 on KDE Wayland. GPU acceleration and Flatpak display
+permissions remain enabled. An explicitly supplied value, including an empty
+value, takes precedence.
+
+To opt back into NVIDIA explicit sync for this app, set a per-app override:
+
+```bash
+flatpak override --user --env=__NV_DISABLE_EXPLICIT_SYNC=0 io.github.matt_jenner.mote
+```
+
+Remove that override to restore the launcher default:
+
+```bash
+flatpak override --user --unset-env=__NV_DISABLE_EXPLICIT_SYNC io.github.matt_jenner.mote
+```
+
 ## Portal acceptance test
 
 Run `npm run test:photos`, then choose `runtime/test-photos/demo-photos` in

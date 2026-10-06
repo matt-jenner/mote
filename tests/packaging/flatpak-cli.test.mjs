@@ -46,6 +46,11 @@ test("Flatpak helper updates the current user's installed bundle", () => {
 	assert.match(source, /flatpak install --user --noninteractive --or-update/);
 });
 
+test("Flatpak helper inspects the ELF executable behind the launcher", () => {
+	const source = fs.readFileSync(script, "utf8");
+	assert.match(source, /\/app \/app\/bin\/mote-bin "\$MOTE_HEIC_MODE"/);
+});
+
 test("Flatpak validation runs from the repository root", () => {
 	const source = fs.readFileSync(script, "utf8");
 	assert.match(source, /cd -- "\$repository_root"/);
