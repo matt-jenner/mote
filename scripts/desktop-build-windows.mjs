@@ -174,7 +174,14 @@ function main() {
 			environment.VCPKGRS_TRIPLET = "x64-windows";
 			environment.VCPKGRS_DYNAMIC = "1";
 			environment.MOTE_HEIC_PREFIX = nativePrefix;
-			environment.PATH = `${path.join(nativePrefix, "bin")}${path.delimiter}${environment.PATH}`;
+			const pathName =
+				Object.keys(environment).find(
+					(name) => name.toLowerCase() === "path",
+				) ?? "PATH";
+			const currentPath = environment[pathName];
+			environment[pathName] = currentPath
+				? `${path.join(nativePrefix, "bin")}${path.delimiter}${currentPath}`
+				: path.join(nativePrefix, "bin");
 			resources = buildResources(nativePrefix);
 			for (const source of Object.keys(resources)) requireFile(source);
 		}

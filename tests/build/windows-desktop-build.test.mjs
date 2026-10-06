@@ -18,6 +18,14 @@ test("package command exposes the managed Windows desktop build", () => {
 	);
 });
 
+test("Windows build preserves the runner Path while adding decoder DLLs", () => {
+	const source = fs.readFileSync(builder, "utf8");
+	assert.match(source, /Object\.keys\(environment\)\.find\(/);
+	assert.match(source, /name\.toLowerCase\(\) === "path"/);
+	assert.match(source, /const currentPath = environment\[pathName\]/);
+	assert.doesNotMatch(source, /environment\.PATH\s*=/);
+});
+
 function writeExecutable(file, contents) {
 	fs.writeFileSync(file, contents);
 	fs.chmodSync(file, 0o755);
