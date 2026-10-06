@@ -977,7 +977,7 @@ impl SecureBackend {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     fn filesystem_calls(&self) -> Arc<AtomicUsize> {
         self.filesystem_calls.clone()
     }
