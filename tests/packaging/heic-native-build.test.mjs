@@ -684,6 +684,11 @@ test("Unix builder prints platform-specific caller environment", () => {
 	assert.match(script, /LD_LIBRARY_PATH/);
 });
 
+test("Unix builder excludes staged link directories from installed runtime paths", () => {
+	const script = readRepoFile("packaging", "heic", "build-unix.sh");
+	assert.match(script, /-DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF/);
+});
+
 test("Unix builder configures only an in-process HEVC decoder", () => {
 	const script = readRepoFile("packaging", "heic", "build-unix.sh");
 

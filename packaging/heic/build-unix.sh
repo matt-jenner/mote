@@ -199,6 +199,7 @@ configure_cmake() {
 		set -- "$@" '-DCMAKE_INSTALL_RPATH=$ORIGIN'
 	fi
 	set -- "$@" -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+		-DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
 		"-DCMAKE_PROJECT_INCLUDE=$script_dir/compiler-path-maps.cmake" \
 		"-DMOTE_HEIC_WORK_ROOT=$MOTE_BUILD_DIR" \
 		"-DMOTE_HEIC_STAGE_ROOT=$heic_publish_stage_root"
