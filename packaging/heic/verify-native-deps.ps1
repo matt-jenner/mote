@@ -49,7 +49,7 @@ if ($Prefix) {
     if (-not (Test-Path -LiteralPath $Prefix -PathType Container)) { throw "Missing prefix: $Prefix" }
     $files = @(Get-ChildItem -LiteralPath $Prefix -Recurse -File)
     foreach ($file in $files) {
-        if ($file.Extension -in @('.dll', '.exe', '.lib', '.a') -and $file.Name -match "$forbidden|plugin|\.a$") {
+        if (-not $NoHeic -and $file.Extension -in @('.dll', '.exe', '.lib', '.a') -and $file.Name -match "$forbidden|plugin|\.a$") {
             throw "Forbidden native artifact: $($file.FullName)"
         }
         if ($NoHeic -and $file.Name -match '^(heif|libheif|de265|libde265)\.(dll|lib|a)$') {

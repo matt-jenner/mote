@@ -781,6 +781,10 @@ test("Windows contracts distinguish the de265 import library from its DLL", () =
 		inspector,
 		/\$NoHeic -and \$file\.Name -match '\^\(heif\|libheif\|de265\|libde265\)\\\.\(dll\|lib\|a\)\$'/,
 	);
+	assert.match(
+		inspector,
+		/if \(-not \$NoHeic -and \$file\.Extension -in @\('\.dll', '\.exe', '\.lib', '\.a'\)/,
+	);
 	assert.doesNotMatch(builder, /libde265\.lib/);
 	assert.match(builder, /'de265\.lib'/);
 	assert.match(builder, /'libde265\.dll'/);
