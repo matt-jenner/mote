@@ -63,7 +63,7 @@ check_requirements() (
   mote_install_cleanup_traps
   manifest="$MOTE_BUILD_DIR/manifest.json"
   node "$repository_root/scripts/render-flatpak-manifest.mjs" "$MOTE_HEIC_MODE" > "$manifest"
-  MOTE_HEIC="$MOTE_HEIC_MODE" flatpak-builder --show-manifest --state-dir="$MOTE_BUILD_DIR/state" "$manifest" >/dev/null
+  MOTE_HEIC="$MOTE_HEIC_MODE" flatpak-builder --show-manifest "$manifest" >/dev/null
   desktop-file-validate "$repository_root/packaging/flatpak/$app_id.desktop"
   appstreamcli validate --no-net "$repository_root/packaging/flatpak/$app_id.metainfo.xml"
   (
@@ -120,7 +120,7 @@ package_bundle() {
     --state-dir="$state_dir" \
     --repo="$repo_dir" \
     "$build_dir" "$manifest"
-  flatpak-builder --run --state-dir="$state_dir" "$build_dir" "$manifest" sh -s -- \
+  flatpak-builder --run "$build_dir" "$manifest" sh -s -- \
     /app /app/bin/mote "$MOTE_HEIC_MODE" \
     < "$repository_root/packaging/heic/verify-linux-runtime.sh"
   flatpak build-bundle \

@@ -191,11 +191,6 @@ function main() {
 			},
 		});
 		const tauriArguments = [
-			"exec",
-			"--workspace",
-			"@photo-viewer/desktop",
-			"--",
-			"tauri",
 			"build",
 			"--bundles",
 			"nsis",
@@ -210,14 +205,12 @@ function main() {
 			);
 		}
 		if (ci) tauriArguments.push("--ci");
-		if (process.platform === "win32" && !process.env.npm_execpath) {
-			throw new Error("Run the Windows builder through its npm script.");
-		}
-		const npmCommand = process.env.npm_execpath ? process.execPath : "npm";
-		const npmArguments = process.env.npm_execpath
-			? [process.env.npm_execpath, ...tauriArguments]
-			: tauriArguments;
-		run(npmCommand, npmArguments, environment);
+		const tauriCli = path.join(
+			repositoryRoot,
+			"node_modules/@tauri-apps/cli/tauri.js",
+		);
+		requireFile(tauriCli);
+		run(process.execPath, [tauriCli, ...tauriArguments], environment);
 
 		const binary = path.join(
 			environment.CARGO_TARGET_DIR,

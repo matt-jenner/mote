@@ -34,6 +34,7 @@ function fixture() {
 		"apps/desktop/src-tauri",
 		"docs/brand/icons/windows",
 		"apps/interface",
+		"node_modules/@tauri-apps/cli",
 		"bin",
 		"tmp",
 	]) {
@@ -81,11 +82,11 @@ esac
 `,
 	);
 	writeExecutable(
-		path.join(repository, "bin/npm"),
+		path.join(repository, "node_modules/@tauri-apps/cli/tauri.js"),
 		`#!/usr/bin/env node
 const fs = require("node:fs");
 const path = require("node:path");
-fs.appendFileSync(process.env.FAKE_TOOL_LOG, JSON.stringify({ tool: "npm", args: process.argv.slice(2) }) + "\\n");
+fs.appendFileSync(process.env.FAKE_TOOL_LOG, JSON.stringify({ tool: "tauri", args: process.argv.slice(2) }) + "\\n");
 const target = process.env.CARGO_TARGET_DIR;
 fs.mkdirSync(path.join(process.cwd(), "apps/interface/dist"), { recursive: true });
 fs.writeFileSync(path.join(process.cwd(), "apps/interface/dist/index.html"), "generated");
@@ -106,7 +107,7 @@ function runBuild(repository, log, arguments_ = [], extraEnv = {}) {
 			cwd: repository,
 			env: {
 				...process.env,
-				npm_execpath: "",
+				npm_execpath: path.join(repository, "missing-npm-cli.cjs"),
 				...extraEnv,
 				FAKE_TOOL_LOG: log,
 				MOTE_BUILD_TMP_ROOT: path.join(repository, "tmp"),
@@ -144,9 +145,9 @@ test("successful Windows build publishes the versioned installer and removes eph
 			false,
 		);
 		const commands = readCommands(log);
-		const npm = commands.find((command) => command.tool === "npm");
-		assert.ok(npm.args.includes("--ci"));
-		const override = JSON.parse(npm.args[npm.args.indexOf("--config") + 1]);
+		const tauri = commands.find((command) => command.tool === "tauri");
+		assert.ok(tauri.args.includes("--ci"));
+		const override = JSON.parse(tauri.args[tauri.args.indexOf("--config") + 1]);
 		assert.deepEqual(override.bundle.targets, ["nsis"]);
 		assert.deepEqual(override.bundle.windows, {
 			certificateThumbprint: null,
@@ -222,16 +223,16 @@ test("no-HEIC Windows build skips native compilation and verifies the disabled b
 			),
 			JSON.stringify(commands),
 		);
-		const npm = commands.find((command) => command.tool === "npm");
-		assert.ok(npm.args.includes("--no-default-features"));
+		const tauri = commands.find((command) => command.tool === "tauri");
+		assert.ok(tauri.args.includes("--no-default-features"));
 		assert.deepEqual(
-			npm.args.slice(
-				npm.args.indexOf("--features"),
-				npm.args.indexOf("--features") + 2,
+			tauri.args.slice(
+				tauri.args.indexOf("--features"),
+				tauri.args.indexOf("--features") + 2,
 			),
 			["--features", "mote-defaults"],
 		);
-		const override = JSON.parse(npm.args[npm.args.indexOf("--config") + 1]);
+		const override = JSON.parse(tauri.args[tauri.args.indexOf("--config") + 1]);
 		assert.equal(override.bundle.resources, undefined);
 	} finally {
 		fs.rmSync(repository, { recursive: true, force: true });
@@ -261,17 +262,18 @@ test("Windows build reaps abandoned managed directories and preserves a live bui
 	}
 });
 
-test("Windows build reuses npm's active CLI instead of launching npm.cmd", () => {
+test("Windows build invokes Tauri through Node without an npm command shim", () => {
 	assert.ok(fs.existsSync(builder), "Windows desktop builder is missing");
 	const { repository, log } = fixture();
-	const npmPath = path.join(repository, "bin/npm");
-	const npmCli = path.join(repository, "bin/npm-cli.cjs");
 	try {
-		fs.copyFileSync(npmPath, npmCli);
-		fs.rmSync(npmPath);
-		const result = runBuild(repository, log, [], { npm_execpath: npmCli });
+		const result = runBuild(repository, log);
 		assert.equal(result.status, 0, result.stdout + result.stderr);
-		assert.ok(readCommands(log).some((command) => command.tool === "npm"));
+		const commands = readCommands(log);
+		assert.ok(commands.some((command) => command.tool === "tauri"));
+		assert.equal(
+			commands.some((command) => command.tool === "npm"),
+			false,
+		);
 	} finally {
 		fs.rmSync(repository, { recursive: true, force: true });
 	}

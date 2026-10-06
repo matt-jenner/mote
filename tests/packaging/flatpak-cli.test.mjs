@@ -72,6 +72,15 @@ function flatpakFixture(bundleStatus = 0) {
 		"flatpak-builder",
 		`#!/bin/sh
 printf '%s|%s\n' "\${MOTE_HEIC:-}" "$*" >> "$MOTE_FLATPAK_TEST_LOG"
+case "$1" in
+  --show-manifest|--run)
+    for argument in "$@"; do
+      case "$argument" in
+        --state-dir=*) printf '%s\n' "unsupported state option for $1" >&2; exit 64 ;;
+      esac
+    done
+    ;;
+esac
 for argument in "$@"; do
   case "$argument" in
     *.json) cp "$argument" "$MOTE_FLATPAK_TEST_LOG.manifest" ;;
@@ -221,11 +230,19 @@ test("HEIC Flatpak package passes the default mode explicitly", () => {
 		const result = runFlatpakFixture(fixtureDirectory);
 		assert.equal(result.status, 0, result.stderr);
 		assert.match(flatpakBuildCall(fixtureDirectory), /^enabled\|/);
-		for (const call of fs
+		const calls = fs
 			.readFileSync(fixtureDirectory.log, "utf8")
 			.trim()
-			.split("\n"))
-			assert.match(call, /--state-dir=/);
+			.split("\n");
+		assert.match(flatpakBuildCall(fixtureDirectory), /--state-dir=/);
+		assert.doesNotMatch(
+			calls.find((call) => call.includes("--show-manifest")),
+			/--state-dir=/,
+		);
+		assert.doesNotMatch(
+			calls.find((call) => call.includes("--run")),
+			/--state-dir=/,
+		);
 		const manifest = JSON.parse(
 			fs.readFileSync(`${fixtureDirectory.log}.manifest`, "utf8"),
 		);
