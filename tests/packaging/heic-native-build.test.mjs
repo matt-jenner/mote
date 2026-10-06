@@ -1064,7 +1064,9 @@ test("inspection permits the upstream temporary filename template but rejects em
 			library,
 			"/private/tmp/mote-build-heic-native.abc/source.cc\n",
 		);
-		assert.notEqual(inspect().status, 0);
+		const rejected = inspect();
+		assert.notEqual(rejected.status, 0);
+		assert.match(rejected.stderr, /mote-build-heic-native\.abc\/source\.cc/);
 	} finally {
 		fs.rmSync(fixture.repository, { recursive: true, force: true });
 	}

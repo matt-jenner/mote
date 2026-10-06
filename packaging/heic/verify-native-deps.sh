@@ -136,8 +136,17 @@ inspect() {
 		fail "HEIF-disabled binary links a decoder: $inspect_file"
 	fi
 	# Release binaries must not retain source/build directory strings either.
-	if [ "$inspect_file" != "$binary" ] && strings "$inspect_file" | grep -v '^/tmp/libheif-XXXXXX$' | grep -E '/(Users|home|private/(tmp|var)|tmp)/|mote-build-heic-native\.' >/dev/null; then
-		fail "absolute build path in $inspect_file"
+	embedded_path=
+	if [ "$inspect_file" != "$binary" ]; then
+		embedded_path=$(strings "$inspect_file" | grep -v '^/tmp/libheif-XXXXXX$' | grep -E '/(Users|home|private/(tmp|var)|tmp)/|mote-build-heic-native\.' | head -n 1 || true)
+	fi
+	if [ -n "$embedded_path" ]; then
+		reported_path=$embedded_path
+		case "$reported_path" in "$PWD"/*) reported_path="<checkout>/${reported_path#"$PWD"/}" ;; esac
+		if [ -n "${MOTE_BUILD_DIR:-}" ]; then
+			case "$reported_path" in "$MOTE_BUILD_DIR"/*) reported_path="<native-work>/${reported_path#"$MOTE_BUILD_DIR"/}" ;; esac
+		fi
+		fail "absolute build path $reported_path in $inspect_file"
 	fi
 	if [ "$system" = Darwin ]; then
 		printf '%s\n' "$dependencies" | awk '/^[[:space:]]/{print $1}' | while IFS= read -r dependency; do
