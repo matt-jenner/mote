@@ -33,16 +33,19 @@ else
 fi
 inspect_runtime_file() {
 	runtime_dependencies=$(ldd "$1" 2>&1) || fail "cannot inspect dependencies: $1"
-	if printf '%s\n' "$runtime_dependencies" | grep -Ei "$forbidden|not found"; then fail 'forbidden or unresolved runtime dependency'; fi
-	if [ "$runtime_mode" = disabled ]; then
-		if printf '%s\n' "$runtime_dependencies" | grep -Ei 'libheif|libde265'; then fail 'disabled binary references decoder'; fi
-	fi
+	if printf '%s\n' "$runtime_dependencies" | grep -Ei 'not found'; then fail 'unresolved runtime dependency'; fi
 	# The build SDK/CI host supplies readelf. The slim runtime deliberately has
-	# no binutils; the smoke still verifies actual loader resolution there.
+	# no binutils; the smoke falls back to the resolved dependency list there.
+	# ldd includes transitive libraries supplied by the platform runtime, so use
+	# ELF metadata when available to enforce direct app-owned dependencies.
 	if command -v readelf >/dev/null 2>&1; then
 		runtime_dynamic=$(readelf -d "$1") || fail "cannot inspect ELF metadata: $1"
 		if printf '%s\n' "$runtime_dynamic" | grep -E '\((NEEDED|SONAME)\).*\[[^]]*/'; then fail 'absolute ELF dependency'; fi
+		if printf '%s\n' "$runtime_dynamic" | grep -Ei "$forbidden"; then fail 'forbidden direct ELF dependency'; fi
 		if [ "$runtime_mode" = disabled ] && printf '%s\n' "$runtime_dynamic" | grep -Ei 'libheif|libde265'; then fail 'disabled ELF references decoder'; fi
+	else
+		if printf '%s\n' "$runtime_dependencies" | grep -Ei "$forbidden"; then fail 'forbidden runtime dependency'; fi
+		if [ "$runtime_mode" = disabled ] && printf '%s\n' "$runtime_dependencies" | grep -Ei 'libheif|libde265'; then fail 'disabled binary references decoder'; fi
 	fi
 }
 inspect_runtime_file "$runtime_binary"

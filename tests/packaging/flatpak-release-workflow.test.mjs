@@ -7,9 +7,14 @@ import { parse } from "yaml";
 const root = path.resolve(import.meta.dirname, "../..");
 const workflowPath = path.join(root, ".github/workflows/release-flatpak.yml");
 const githubTokenExpression = ["$", "{{ github.token }}"].join("");
+const eventNameExpression = ["$", "{{ github.event_name }}"].join("");
 const releaseTagExpression = ["$", "{{ github.event.release.tag_name }}"].join(
 	"",
 );
+const checkoutRefExpression = [
+	"$",
+	"{{ github.event.release.tag_name || github.ref }}",
+].join("");
 
 function workflow() {
 	return parse(fs.readFileSync(workflowPath, "utf8"));
@@ -55,17 +60,21 @@ test("release validates the disabled package as well as the default package", ()
 	);
 });
 
-test("Flatpak release builds run only when a GitHub Release is published", () => {
+test("Flatpak builds run for a published release or deliberate manual dispatch", () => {
 	const releaseWorkflow = workflow();
 
 	assert.deepEqual(releaseWorkflow.on, {
 		release: { types: ["published"] },
+		workflow_dispatch: null,
 	});
 	assert.equal(buildJob()["timeout-minutes"], 90);
 });
 
 test("the release tag is checked before installing runtimes or building", () => {
 	const steps = buildJob().steps;
+	const checkout = steps.find((step) =>
+		step.uses?.startsWith("actions/checkout@"),
+	);
 	const validateIndex = steps.findIndex(
 		(step) => step.name === "Validate release tag",
 	);
@@ -77,8 +86,11 @@ test("the release tag is checked before installing runtimes or building", () => 
 	assert.ok(validateIndex >= 0);
 	assert.ok(validateIndex < dependenciesIndex);
 	assert.ok(dependenciesIndex < buildIndex);
+	assert.equal(checkout.with.ref, checkoutRefExpression);
 	assert.match(steps[validateIndex].run, /tauri\.conf\.json/);
 	assert.match(steps[validateIndex].run, /expected_tag="v\$\{app_version\}"/);
+	assert.match(steps[validateIndex].run, /EVENT_NAME.*release/);
+	assert.equal(steps[validateIndex].env.EVENT_NAME, eventNameExpression);
 	assert.equal(steps[validateIndex].env.RELEASE_TAG, releaseTagExpression);
 });
 
@@ -101,10 +113,13 @@ test("the existing packaging command builds with the locked Flatpak SDKs", () =>
 	assert.equal(build, "npm run flatpak -- package");
 });
 
-test("the bundle is attached to its existing GitHub Release", () => {
+test("published releases receive the bundle while manual checks retain one short-lived artifact", () => {
 	const releaseWorkflow = workflow();
 	const upload = buildJob().steps.find(
 		(step) => step.name === "Upload Flatpak to release",
+	);
+	const uploadManual = buildJob().steps.find(
+		(step) => step.name === "Upload manual-check artifact",
 	);
 
 	assert.equal(releaseWorkflow.permissions.contents, "write");
@@ -115,4 +130,7 @@ test("the bundle is attached to its existing GitHub Release", () => {
 	assert.doesNotMatch(upload.run, /--clobber/);
 	assert.equal(upload.env.GH_TOKEN, githubTokenExpression);
 	assert.equal(upload.env.RELEASE_TAG, releaseTagExpression);
+	assert.match(upload.if, /github\.event_name == 'release'/);
+	assert.match(uploadManual.if, /github\.event_name == 'workflow_dispatch'/);
+	assert.equal(uploadManual.with["retention-days"], 1);
 });

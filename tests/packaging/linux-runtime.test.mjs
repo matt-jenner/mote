@@ -107,7 +107,13 @@ for (const artifact of [
 		}
 	});
 }
-for (const [mode, dependency, artifact, success] of [
+for (const [
+	mode,
+	dependency,
+	artifact,
+	success,
+	dynamic = "(NEEDED) Shared library: [libc.so.6]",
+] of [
 	[
 		"enabled",
 		"libheif.so.1 => /usr/local/lib/libheif.so.1\nlibde265.so.0 => /usr/local/lib/libde265.so.0",
@@ -115,9 +121,22 @@ for (const [mode, dependency, artifact, success] of [
 		true,
 	],
 	["disabled", "libc.so.6 => /lib/libc.so.6", null, true],
-	["disabled", "libheif.so.1 => /usr/local/lib/libheif.so.1", null, false],
+	[
+		"disabled",
+		"libheif.so.1 => /usr/local/lib/libheif.so.1",
+		null,
+		false,
+		"(NEEDED) Shared library: [libheif.so.1]",
+	],
 	["disabled", "libc.so.6 => /lib/libc.so.6", "libde265.so.0", false],
 	["enabled", "libheif.so.1 => not found", "libheif.so.1", false],
+	[
+		"disabled",
+		"libSvtAv1Enc.so.3 => /usr/lib/libSvtAv1Enc.so.3",
+		null,
+		false,
+		"(NEEDED) Shared library: [libSvtAv1Enc.so.3]",
+	],
 	[
 		"enabled",
 		"libheif.so.1 => /usr/local/lib/libheif.so.1\nlibde265.so.0 => /usr/local/lib/libde265.so.0",
@@ -142,7 +161,7 @@ for (const [mode, dependency, artifact, success] of [
 				fs.writeFileSync(path.join(prefix, "lib", artifact), "library");
 			for (const [tool, output] of [
 				["ldd", dependency],
-				["readelf", "(NEEDED) Shared library: [libc.so.6]"],
+				["readelf", dynamic],
 			])
 				fs.writeFileSync(
 					path.join(bin, tool),
@@ -168,3 +187,44 @@ for (const [mode, dependency, artifact, success] of [
 		}
 	});
 }
+
+test("Linux runtime inspection ignores encoder libraries inherited from the platform runtime", () => {
+	const directory = fs.mkdtempSync(
+		path.join(os.tmpdir(), "mote-runtime-test-"),
+	);
+	try {
+		const bin = path.join(directory, "tools");
+		const prefix = path.join(directory, "app");
+		fs.mkdirSync(bin);
+		fs.mkdirSync(prefix);
+		fs.writeFileSync(path.join(prefix, "server"), "server");
+		for (const [tool, output] of [
+			[
+				"ldd",
+				"libc.so.6 => /usr/lib/libc.so.6\nlibSvtAv1Enc.so.3 => /usr/lib/libSvtAv1Enc.so.3",
+			],
+			["readelf", "(NEEDED) Shared library: [libc.so.6]"],
+		])
+			fs.writeFileSync(
+				path.join(bin, tool),
+				`#!/bin/sh\nprintf '%s\\n' '${output}'\n`,
+				{ mode: 0o755 },
+			);
+		const result = spawnSync(
+			"sh",
+			[
+				path.join(root, "packaging/heic/verify-linux-runtime.sh"),
+				prefix,
+				path.join(prefix, "server"),
+				"disabled",
+			],
+			{
+				encoding: "utf8",
+				env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+			},
+		);
+		assert.equal(result.status, 0, result.stderr);
+	} finally {
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
