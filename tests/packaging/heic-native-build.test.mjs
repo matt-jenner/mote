@@ -898,6 +898,18 @@ test("every CI platform has enabled fixtures and inspected disabled binaries", (
 	]) {
 		assert.match(ci, command);
 	}
+	assert.match(
+		ci,
+		/cargo test --workspace --all-features --exclude photo-server -- --test-threads=1/,
+	);
+	assert.match(
+		ci,
+		/cargo test -p photo-server --all-features --lib -- --test-threads=1/,
+	);
+	assert.match(
+		ci,
+		/cargo test -p photo-server --no-default-features --features mote-defaults --lib/,
+	);
 	const macos = readRepoFile(".github/workflows/build-macos.yml");
 	assert.match(
 		macos,

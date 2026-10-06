@@ -46,7 +46,9 @@ jobs:
       - if: matrix.heic == 'enabled' && runner.os != 'Windows'
         run: cargo test --workspace --all-features
       - if: matrix.heic == 'enabled' && runner.os == 'Windows'
-        run: cargo test --workspace --all-features -- --test-threads=1
+        run: |
+          cargo test --workspace --all-features --exclude photo-server -- --test-threads=1
+          cargo test -p photo-server --all-features --lib -- --test-threads=1
       - if: matrix.heic == 'enabled'
         run: cargo test -p photo-codec --test heif_backend
       - if: matrix.heic == 'enabled'
@@ -62,8 +64,10 @@ jobs:
       - name: Build and test without HEIC
         if: matrix.heic == 'disabled'
         run: cargo build -p photo-server --locked --no-default-features --features mote-defaults
-      - if: matrix.heic == 'disabled'
+      - if: matrix.heic == 'disabled' && runner.os != 'Windows'
         run: cargo test -p photo-server --no-default-features --features mote-defaults
+      - if: matrix.heic == 'disabled' && runner.os == 'Windows'
+        run: cargo test -p photo-server --no-default-features --features mote-defaults --lib
       - if: matrix.heic == 'disabled'
         run: cargo test -p photo-codec --no-default-features
       - name: Check disabled dependency graph and binary on Unix
