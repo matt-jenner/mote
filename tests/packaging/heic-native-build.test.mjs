@@ -1058,6 +1058,8 @@ test("inspection permits the upstream temporary filename template but rejects em
 				{ env: fixtureEnvironment(fixture), encoding: "utf8" },
 			);
 		assert.equal(inspect().status, 0);
+		fs.writeFileSync(library, "/tmp/lib\n");
+		assert.equal(inspect().status, 0);
 		fs.writeFileSync(
 			library,
 			"/private/tmp/mote-build-heic-native.abc/source.cc\n",
