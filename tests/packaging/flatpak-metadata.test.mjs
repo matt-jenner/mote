@@ -220,7 +220,7 @@ test("HEIC manifest rendering disables native modules and resolves offline sourc
 	);
 	assert.match(
 		manifest.modules[0]["build-commands"].join("\n"),
-		/--no-default-features --features mote-defaults/,
+		/tauri build[^\n]* -- --no-default-features --features mote-defaults/,
 	);
 	assert.equal(manifest.modules[0].sources[0].path, root);
 	assert.doesNotMatch(result.stdout, /MOTE_HEIC|libheif|libde265/);

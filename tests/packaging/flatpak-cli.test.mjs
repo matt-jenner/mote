@@ -278,7 +278,7 @@ test("HEIC Flatpak package consumes the Mote flag and preserves builder argument
 		);
 		assert.match(
 			manifest.modules[0]["build-commands"].join("\n"),
-			/--no-default-features --features mote-defaults/,
+			/tauri build[^\n]* -- --no-default-features --features mote-defaults/,
 		);
 	} finally {
 		fs.rmSync(fixtureDirectory.directory, { recursive: true, force: true });

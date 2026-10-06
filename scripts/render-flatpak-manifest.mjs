@@ -19,7 +19,7 @@ if (mode === "disabled") {
 	const app = manifest.modules[0];
 	app["build-commands"] = app["build-commands"].map((command) =>
 		command.startsWith("npm exec ")
-			? `${command} --no-default-features --features mote-defaults`
+			? `${command} -- --no-default-features --features mote-defaults`
 			: command,
 	);
 }
