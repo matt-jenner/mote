@@ -248,7 +248,7 @@ fn is_unavailable_source_error(error: &std::io::Error) -> bool {
     false
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::is_unavailable_source_error;
 
