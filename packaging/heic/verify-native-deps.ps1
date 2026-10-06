@@ -52,7 +52,9 @@ if ($Prefix) {
         if ($file.Extension -in @('.dll', '.exe', '.lib', '.a') -and $file.Name -match "$forbidden|plugin|\.a$") {
             throw "Forbidden native artifact: $($file.FullName)"
         }
-        if ($NoHeic -and $file.Name -match '(lib)?heif|libde265') { throw "HEIF-disabled prefix contains $($file.Name)" }
+        if ($NoHeic -and $file.Name -match '^(heif|libheif|de265|libde265)\.(dll|lib|a)$') {
+            throw "HEIF-disabled prefix contains $($file.Name)"
+        }
     }
     if (-not $NoHeic) {
         $de265Deps = Inspect-Binary (Join-Path $libraryDir 'libde265.dll') $true

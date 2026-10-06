@@ -777,6 +777,10 @@ test("Windows contracts distinguish the de265 import library from its DLL", () =
 	const builder = readRepoFile("packaging/heic/build-windows.ps1");
 	const inspector = readRepoFile("packaging/heic/verify-native-deps.ps1");
 	assert.match(builder, /'-DPLUGIN_DIRECTORY='/);
+	assert.match(
+		inspector,
+		/\$NoHeic -and \$file\.Name -match '\^\(heif\|libheif\|de265\|libde265\)\\\.\(dll\|lib\|a\)\$'/,
+	);
 	assert.doesNotMatch(builder, /libde265\.lib/);
 	assert.match(builder, /'de265\.lib'/);
 	assert.match(builder, /'libde265\.dll'/);
