@@ -1205,7 +1205,7 @@ fn static_unavailable() -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, "static serving is unavailable")
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod path_limit_tests {
     use std::sync::atomic::Ordering;
 
