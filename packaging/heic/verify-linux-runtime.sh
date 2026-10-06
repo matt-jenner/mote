@@ -11,14 +11,18 @@ fail() { printf '%s\n' "$*" >&2; exit 1; }
 runtime_root=$(CDPATH= cd -- "$runtime_root" && pwd -P)
 runtime_scan_prefix=${runtime_root%/}
 # Scan every shipped location, including /usr/lib, /lib, /usr/bin and /opt.
-# Do not follow symlinks or cross mounts, and prune virtual/transient trees
-# before descending. The same paths are relative to a staging root such as
-# /runtime; a trailing slash does not change the exclusions.
+# Do not follow symlinks or cross mounts, and prune virtual/transient and debug
+# trees before descending. Flatpak exports /app/lib/debug as a separate debug
+# extension; its source filenames are not part of the runnable app. The same
+# paths are relative to a staging root such as /runtime; a trailing slash does
+# not change the exclusions.
 runtime_files=$(find -P "$runtime_root" -xdev \
 	\( -path "$runtime_scan_prefix/proc" -o -path "$runtime_scan_prefix/sys" \
 	-o -path "$runtime_scan_prefix/dev" -o -path "$runtime_scan_prefix/run" \
 	-o -path "$runtime_scan_prefix/tmp" -o -path "$runtime_scan_prefix/var/run" \
-	-o -path "$runtime_scan_prefix/var/tmp" \) -prune -o \
+	-o -path "$runtime_scan_prefix/var/tmp" \
+	-o -path "$runtime_scan_prefix/lib/debug" \
+	-o -path "$runtime_scan_prefix/usr/lib/debug" \) -prune -o \
 	\( -type f -o -type l \) -print)
 forbidden='x265|x264|kvazaar|rav1e|svt.?av1|vvenc|uvg266|heif-enc|enc265|libheif/plugins'
 if printf '%s\n' "$runtime_files" | grep -Ei "$forbidden|/include/|/pkgconfig/|/cmake/|\.a$|/lib(heif|de265)\.so$"; then

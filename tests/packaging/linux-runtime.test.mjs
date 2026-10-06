@@ -198,6 +198,12 @@ test("Linux runtime inspection ignores encoder libraries inherited from the plat
 		fs.mkdirSync(bin);
 		fs.mkdirSync(prefix);
 		fs.writeFileSync(path.join(prefix, "server"), "server");
+		const debugSource = path.join(
+			prefix,
+			"lib/debug/source/libheif/libheif/plugins/decoder_libde265.cc",
+		);
+		fs.mkdirSync(path.dirname(debugSource), { recursive: true });
+		fs.writeFileSync(debugSource, "debug source");
 		for (const [tool, output] of [
 			[
 				"ldd",
