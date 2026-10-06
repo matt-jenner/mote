@@ -136,10 +136,7 @@ inspect() {
 		fail "HEIF-disabled binary links a decoder: $inspect_file"
 	fi
 	# Release binaries must not retain source/build directory strings either.
-	# x86 compilers can encode the approved libheif temporary filename as
-	# short instruction fragments such as "/tmp/lib". Ignore fragments that
-	# are too short to identify a leaked absolute build path.
-	if [ "$inspect_file" != "$binary" ] && strings -n 16 "$inspect_file" | grep -v '^/tmp/libheif-XXXXXX$' | grep -E '/(Users|home|private/(tmp|var)|tmp)/|mote-build-heic-native\.' >/dev/null; then
+	if [ "$inspect_file" != "$binary" ] && strings "$inspect_file" | grep -v '^/tmp/libheif-XXXXXX$' | grep -E '/(Users|home|private/(tmp|var)|tmp)/|mote-build-heic-native\.' >/dev/null; then
 		fail "absolute build path in $inspect_file"
 	fi
 	if [ "$system" = Darwin ]; then

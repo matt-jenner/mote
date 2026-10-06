@@ -704,6 +704,7 @@ test("Unix builder configures only an in-process HEVC decoder", () => {
 		"BUILD_TESTING=OFF",
 		"ENABLE_EXPERIMENTAL_FEATURES=OFF",
 		"ENABLE_PLUGIN_LOADING=OFF",
+		"PLUGIN_DIRECTORY=",
 		"WITH_AOM_DECODER=OFF",
 		"WITH_AOM_ENCODER=OFF",
 		"WITH_DAV1D=OFF",
@@ -775,6 +776,7 @@ test("Windows uses the same pins and decode-only dynamic policy as Unix", () => 
 test("Windows contracts distinguish the de265 import library from its DLL", () => {
 	const builder = readRepoFile("packaging/heic/build-windows.ps1");
 	const inspector = readRepoFile("packaging/heic/verify-native-deps.ps1");
+	assert.match(builder, /'-DPLUGIN_DIRECTORY='/);
 	assert.doesNotMatch(builder, /libde265\.lib/);
 	assert.match(builder, /'de265\.lib'/);
 	assert.match(builder, /'libde265\.dll'/);
@@ -1057,8 +1059,6 @@ test("inspection permits the upstream temporary filename template but rejects em
 				],
 				{ env: fixtureEnvironment(fixture), encoding: "utf8" },
 			);
-		assert.equal(inspect().status, 0);
-		fs.writeFileSync(library, "/tmp/lib\n");
 		assert.equal(inspect().status, 0);
 		fs.writeFileSync(
 			library,
