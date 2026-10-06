@@ -1,4 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { type Platform, platform } from "@tauri-apps/plugin-os";
 import {
 	cloneSavedFolders,
 	emptySavedFolders,
@@ -90,7 +91,12 @@ export function createTauriPhotoService(
 	copyChannelFactory: (
 		listener: (progress: CopyProgress) => void,
 	) => ServiceChannel<CopyProgress> = (listener) => new Channel(listener),
+	nativePlatform: Platform = platform(),
 ): PhotoService {
+	const derivativeOrigin =
+		nativePlatform === "windows"
+			? "http://photo-derivative.localhost"
+			: "photo-derivative://localhost";
 	let sortDirection: SortDirection = "oldestFirst";
 
 	let saved = emptySavedFolders();
@@ -396,7 +402,7 @@ export function createTauriPhotoService(
 			return stop;
 		},
 		derivativeUrl(reference: DerivativeReference) {
-			return `photo-derivative://localhost/${reference.assetId}/${reference.kind}/${reference.key}`;
+			return `${derivativeOrigin}/${reference.assetId}/${reference.kind}/${reference.key}`;
 		},
 		async listFolders() {
 			throw new PhotoServiceError(

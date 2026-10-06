@@ -1,3 +1,4 @@
+import { platform } from "@tauri-apps/plugin-os";
 import { describe, expect, it, vi } from "vitest";
 import { createPickListStore } from "../picks/usePickList";
 import { createInMemoryPhotoService } from "./inMemoryPhotoService";
@@ -13,6 +14,10 @@ import {
 	createTauriPhotoService,
 	type InvokeCommand,
 } from "./tauriPhotoService";
+
+vi.mock("@tauri-apps/plugin-os", () => ({
+	platform: vi.fn(() => "macos"),
+}));
 
 class FakeChannel<T> {
 	private handler: (response: T) => void;
@@ -743,6 +748,54 @@ describe("Tauri PhotoService", () => {
 			sampleProgressUpdate,
 		]);
 		stopSecond();
+	});
+
+	it("uses the Windows HTTP origin for derivative URLs", () => {
+		const service = createTauriPhotoService(
+			recordingInvoke([]),
+			undefined,
+			undefined,
+			"windows",
+		);
+
+		expect(
+			service.derivativeUrl({
+				assetId: "asset-a",
+				kind: "wallThumbnail",
+				key: "abc",
+			}),
+		).toBe("http://photo-derivative.localhost/asset-a/wallThumbnail/abc");
+	});
+
+	it("keeps the custom protocol URL on Linux", () => {
+		const service = createTauriPhotoService(
+			recordingInvoke([]),
+			undefined,
+			undefined,
+			"linux",
+		);
+
+		expect(
+			service.derivativeUrl({
+				assetId: "asset-a",
+				kind: "wallThumbnail",
+				key: "abc",
+			}),
+		).toBe("photo-derivative://localhost/asset-a/wallThumbnail/abc");
+	});
+
+	it("detects the native platform once when creating a service", () => {
+		vi.mocked(platform).mockClear();
+		const service = createTauriPhotoService(recordingInvoke([]));
+		const reference = {
+			assetId: "asset-a",
+			kind: "wallThumbnail" as const,
+			key: "abc",
+		};
+
+		service.derivativeUrl(reference);
+		service.derivativeUrl(reference);
+		expect(platform).toHaveBeenCalledTimes(1);
 	});
 
 	it("turns wall-update registration failure into a bounded resync", async () => {
