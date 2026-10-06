@@ -138,7 +138,7 @@ inspect() {
 	# Release binaries must not retain source/build directory strings either.
 	embedded_path=
 	if [ "$inspect_file" != "$binary" ]; then
-		embedded_path=$(strings "$inspect_file" | grep -v '^/tmp/libheif-XXXXXX$' | grep -E '/(Users|home|private/(tmp|var)|tmp)/|mote-build-heic-native\.' | head -n 1 || true)
+		embedded_path=$(strings "$inspect_file" | grep -Ev '/tmp/libheif-X+$' | grep -E '/(Users|home|private/(tmp|var)|tmp)/|mote-build-heic-native\.' | head -n 1 || true)
 	fi
 	if [ -n "$embedded_path" ]; then
 		reported_path=$embedded_path

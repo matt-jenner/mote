@@ -1062,6 +1062,13 @@ test("inspection permits the upstream temporary filename template but rejects em
 		assert.equal(inspect().status, 0);
 		fs.writeFileSync(
 			library,
+			"Read beyond fileInvalid input reader return valu/tmp/libheif-XXX\n",
+		);
+		assert.equal(inspect().status, 0);
+		fs.writeFileSync(library, "/tmp/libheif-XXX/source.cc\n");
+		assert.notEqual(inspect().status, 0);
+		fs.writeFileSync(
+			library,
 			"/private/tmp/mote-build-heic-native.abc/source.cc\n",
 		);
 		const rejected = inspect();
