@@ -2976,7 +2976,7 @@ dependencies = [
 
 [[package]]
 name = "photo-viewer-desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "photo-app-service",
  "photo-catalog",

@@ -23,6 +23,11 @@
     <control>touch</control>
   </supports>
   <releases>
+    <release version="0.1.1" date="2026-10-06">
+      <description>
+        <p>Restores remounted folders quickly by reusing unchanged catalogue data and clears stale source warnings when folders return.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-09-08">
       <description>
         <p>Initial private Linux test package.</p>
