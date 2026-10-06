@@ -702,6 +702,8 @@ async fn remounted_scan_marks_a_removed_asset_missing_only_on_completion() {
         .find(|asset| asset.display_name == "photo-000.jpg")
         .unwrap();
     let removed_id = AssetId::from_uuid(uuid::Uuid::parse_str(&removed.id).unwrap());
+    #[cfg(feature = "heic")]
+    wait_for_scan_cleanup(&first).await;
     drop(first);
 
     std::fs::remove_file(fixture.source.join("photo-000.jpg")).unwrap();
