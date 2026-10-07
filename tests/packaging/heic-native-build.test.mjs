@@ -1215,7 +1215,7 @@ function global:cmake {
     # Both source roots contain spaces; /FC makes __FILE__ an absolute path.
     if (-not $global:pathMapsChecked) {
         $source = Join-Path $build 'path map check source'
-        $output = Join-Path $build 'path map check output'
+        $output = Join-Path $PSScriptRoot 'path-map-build'
         New-Item -ItemType Directory -Force $source, $prefix | Out-Null
         $program = '#include <stdio.h>\nint main(void) { puts(__FILE__); return 0; }'
         Set-Content (Join-Path $source 'probe.c') $program
