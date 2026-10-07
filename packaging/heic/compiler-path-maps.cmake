@@ -2,6 +2,10 @@
 # list item so the generator quotes the complete option, including spaced roots.
 set(_mote_path_roots "${MOTE_HEIC_WORK_ROOT}" "${MOTE_HEIC_STAGE_ROOT}")
 list(REMOVE_DUPLICATES _mote_path_roots)
+if(MSVC)
+    # MSVC applies /pathmap to file references with deterministic compilation.
+    add_compile_options("/experimental:deterministic")
+endif()
 foreach(_mote_path_root IN LISTS _mote_path_roots)
     if(NOT IS_ABSOLUTE "${_mote_path_root}")
         message(FATAL_ERROR "Native path mapping requires absolute managed roots")
