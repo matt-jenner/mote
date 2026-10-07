@@ -21,6 +21,7 @@ import type {
 } from "../services/photoService";
 import "../styles/tokens.css";
 import "../styles/global.css";
+import styles from "../styles/photoViewer.module.css";
 import { GestureLifecycleHarness } from "../viewer/useViewerGestures.test";
 import { useViewerPreview } from "../viewer/useViewerPreview";
 import { useViewerTransform } from "../viewer/useViewerTransform";
@@ -920,6 +921,37 @@ describe("immersive photo viewer checkpoint", () => {
 	afterEach(() => {
 		document.documentElement.dataset.theme = "system";
 		document.documentElement.style.colorScheme = "light dark";
+	});
+
+	it("keeps the viewer canvas and chrome dark under system-light appearance", async () => {
+		const root = document.documentElement;
+		root.dataset.theme = "light";
+		root.style.colorScheme = "light";
+		const view = await render(
+			<section className={styles.viewerOverlay} data-testid="viewer-overlay">
+				<div className={styles.viewerStage} data-testid="viewer-canvas">
+					<div className={styles.viewerFrame} />
+				</div>
+				<div className={styles.viewerChrome}>
+					<button className={styles.viewerBack} type="button">
+						Back
+					</button>
+				</div>
+			</section>,
+		);
+		expect(
+			getComputedStyle(view.getByTestId("viewer-overlay").element())
+				.backgroundColor,
+		).toBe("rgb(8, 9, 11)");
+		expect(
+			getComputedStyle(view.getByTestId("viewer-canvas").element())
+				.backgroundColor,
+		).toBe("rgb(8, 9, 11)");
+		expect(
+			getComputedStyle(view.getByRole("button", { name: "Back" }).element())
+				.backgroundColor,
+		).toBe("rgba(8, 9, 11, 0.62)");
+		await view.unmount();
 	});
 
 	it("keeps the same transform when the screen preview replaces the thumbnail", async () => {

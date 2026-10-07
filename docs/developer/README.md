@@ -111,6 +111,10 @@ npm run test:browser
 npm run --workspace @photo-viewer/interface build
 ```
 
+On macOS, run the CI browser in Chromium with
+`MOTE_TEST_BROWSER=chromium npm run test:browser` after installing Chromium with
+Playwright.
+
 Run the Rust verification suite with:
 
 ```bash

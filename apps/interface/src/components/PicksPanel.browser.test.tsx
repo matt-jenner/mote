@@ -1228,13 +1228,18 @@ describe("responsive Picks panel", () => {
 	});
 
 	it("returns to the Pick panel launcher without moving the wall scroll", async () => {
+		await page.viewport(900, 600);
 		const { screen } = await renderPicksApp({ longWall: true });
 		const wall = screen
 			.getByTestId("photo-wall")
 			.element()
 			.querySelector<HTMLElement>("[aria-label='Photos']");
 		if (!wall) throw new Error("Missing scrollable photo wall");
+		await expect
+			.poll(() => wall.scrollHeight - wall.clientHeight)
+			.toBeGreaterThanOrEqual(160);
 		wall.scrollTop = 160;
+		expect(wall.scrollTop).toBe(160);
 		await screen.getByRole("button", { name: "Picks, 2 picks" }).click();
 		const panel = screen.getByRole("complementary", { name: "Picks" });
 		const review = panel.getByRole("button", { name: "Review picks" });

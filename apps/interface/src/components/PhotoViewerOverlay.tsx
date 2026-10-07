@@ -420,6 +420,11 @@ export function PhotoViewerOverlay({
 		backRef.current?.focus();
 		entryFocusPending.current = false;
 	}, []);
+	useLayoutEffect(() => {
+		// A newly disabled navigation button can leave focus on the document body.
+		if (currentIndex >= 0 && document.activeElement === document.body)
+			dialogRef.current?.focus({ preventScroll: true });
+	}, [currentIndex]);
 
 	const infoOpenRef = useRef(state.infoOpen);
 	const transformModeRef = useRef(transform.mode);
@@ -576,6 +581,9 @@ export function PhotoViewerOverlay({
 					if (entryFocusPending.current) return;
 					controlsFocused.current = true;
 					controls.keepVisible();
+				} else if (controlsFocused.current) {
+					controlsFocused.current = false;
+					controls.resume();
 				}
 			}}
 			onBlurCapture={(event) => {

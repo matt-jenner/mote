@@ -17,7 +17,10 @@ const testPublicDir = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
 	"../../runtime/test-photos",
 );
-const browser = process.platform === "darwin" ? "webkit" : "chromium";
+const browser =
+	process.env.MOTE_TEST_BROWSER === "chromium" || process.platform !== "darwin"
+		? "chromium"
+		: "webkit";
 const chromiumExecutablePath =
 	browser === "chromium"
 		? (process.env.MOTE_CHROMIUM_PATH ??
