@@ -6,7 +6,12 @@ import { playwright } from "@vitest/browser-playwright";
 import { defineConfig } from "vitest/config";
 
 const browserOptimizeDeps = {
-	include: ["@tauri-apps/api/core", "lucide-react", "react-dom/client"],
+	include: [
+		"@tauri-apps/api/core",
+		"@tauri-apps/plugin-os",
+		"lucide-react",
+		"react-dom/client",
+	],
 };
 const testPublicDir = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -24,7 +29,6 @@ const chromiumExecutablePath =
 		: undefined;
 
 export default defineConfig({
-	publicDir: testPublicDir,
 	plugins: [react()],
 	test: {
 		projects: [
@@ -37,6 +41,7 @@ export default defineConfig({
 				},
 			},
 			{
+				publicDir: testPublicDir,
 				plugins: [react()],
 				optimizeDeps: browserOptimizeDeps,
 				test: {
@@ -56,6 +61,7 @@ export default defineConfig({
 				},
 			},
 			{
+				publicDir: testPublicDir,
 				plugins: [react()],
 				optimizeDeps: browserOptimizeDeps,
 				test: {
@@ -75,6 +81,7 @@ export default defineConfig({
 				},
 			},
 			{
+				publicDir: testPublicDir,
 				plugins: [react()],
 				optimizeDeps: browserOptimizeDeps,
 				test: {

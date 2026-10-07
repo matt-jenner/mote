@@ -130,6 +130,9 @@ describe("photo tile pick lifecycle", () => {
 	});
 
 	it("reveals add-to-picks only after the preview becomes interactive", async () => {
+		const fixtureResponse = await fetch("/demo-photos/coast.jpg");
+		expect(fixtureResponse.status).toBe(200);
+		expect(fixtureResponse.headers.get("content-type")).toContain("image/jpeg");
 		const onTogglePick = vi.fn();
 		const service = photoService();
 		const placeholder = await render(
