@@ -1222,10 +1222,10 @@ function global:cmake {
         Set-Content (Join-Path $prefix 'probe.cpp') $program
         Set-Content (Join-Path $source 'CMakeLists.txt') 'cmake_minimum_required(VERSION 3.16)\nproject(pathmaps LANGUAGES C CXX)\nadd_compile_options(/FC /WX)\nadd_executable(c_probe probe.c)\nadd_executable(cxx_probe "\${CPP_SOURCE}")'
         $maps = @($args | Where-Object { $_ -match '^-D(CMAKE_C_FLAGS|CMAKE_CXX_FLAGS|CMAKE_PROJECT_INCLUDE|MOTE_HEIC_WORK_ROOT|MOTE_HEIC_STAGE_ROOT)=' })
-        & cmake.exe -G 'NMake Makefiles' -S $source -B $output "-DCPP_SOURCE=$(Join-Path $prefix 'probe.cpp')" @maps
-        if ($LASTEXITCODE -ne 0) { throw 'path map configuration failed' }
-        & cmake.exe --build $output
-        if ($LASTEXITCODE -ne 0) { throw 'path map compilation failed' }
+        $configureOutput = & cmake.exe -G 'NMake Makefiles' -S $source -B $output "-DCPP_SOURCE=$(Join-Path $prefix 'probe.cpp')" @maps 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "path map configuration failed: $($configureOutput -join [Environment]::NewLine)" }
+        $buildOutput = & cmake.exe --build $output 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "path map compilation failed: $($buildOutput -join [Environment]::NewLine)" }
         foreach ($probe in @('c_probe.exe', 'cxx_probe.exe')) {
             $mapped = & (Join-Path $output $probe)
             if ($LASTEXITCODE -ne 0 -or [System.IO.Path]::IsPathRooted($mapped) -or $mapped -notmatch 'probe\\.c(pp)?$') { throw "unmapped compiler source path: $mapped" }
