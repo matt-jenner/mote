@@ -118,8 +118,9 @@ npm run rust:verify
 ```
 
 The managed command uses a temporary Cargo target and removes it after the run.
-CI also tests HEIC-disabled builds, packaging contracts, hosted containers on
-AMD64 and ARM64, and Rust on Ubuntu, macOS, and Windows.
+CI tests HEIC-enabled packaging contracts, hosted containers on AMD64 and
+ARM64, and Rust on Ubuntu, macOS, and Windows. The `--no-heic` option remains
+available for local builds.
 
 ## Next references
 

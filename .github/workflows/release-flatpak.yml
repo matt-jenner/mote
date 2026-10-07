@@ -57,9 +57,6 @@ jobs:
             org.freedesktop.Sdk.Extension.node24//25.08 \
             org.freedesktop.Sdk.Extension.rust-stable//25.08
 
-      - name: Build and inspect HEIC-disabled Flatpak
-        run: MOTE_FLATPAK_BUNDLE_DIR="$RUNNER_TEMP/no-heic-flatpak" npm run flatpak -- package --no-heic
-
       - name: Build Flatpak
         run: npm run flatpak -- package
 

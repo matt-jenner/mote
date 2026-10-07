@@ -34,28 +34,27 @@ test("interface CI runs build contract tests immediately after installing depend
 	assert.equal(steps[installIndex + 1]?.run, "npm run test:build");
 });
 
-test("release validates the disabled package as well as the default package", () => {
-	const step = buildJob().steps.find((step) =>
-		step.run?.includes("package --no-heic"),
-	);
-	assert.ok(step, "missing disabled package inspection build");
+test("GitHub workflows build and inspect only HEIC-enabled packages", () => {
+	assert.ok(buildJob().steps.every((step) => !step.run?.includes("--no-heic")));
 	const ci = parse(
 		fs.readFileSync(path.join(root, ".github/workflows/ci.yml"), "utf8"),
 	);
 	assert.ok(
 		ci.jobs.interface.steps.some((step) => step.run === "npm run test:flatpak"),
 	);
-	assert.deepEqual(ci.jobs["hosted-container"].strategy.matrix.heic, [
-		"enabled",
-		"disabled",
-	]);
+	assert.equal(ci.jobs["hosted-container"].strategy.matrix.heic, undefined);
 	assert.deepEqual(ci.jobs["hosted-container"].strategy.matrix.os, [
 		"ubuntu-latest",
 		"ubuntu-24.04-arm",
 	]);
 	assert.ok(
-		ci.jobs["hosted-container"].steps.some((step) =>
-			step.run?.includes("hosted-smoke.sh --no-heic"),
+		ci.jobs["hosted-container"].steps.some(
+			(step) => step.run === "./scripts/hosted-smoke.sh",
+		),
+	);
+	assert.ok(
+		ci.jobs["hosted-container"].steps.every(
+			(step) => !step.run?.includes("--no-heic"),
 		),
 	);
 });

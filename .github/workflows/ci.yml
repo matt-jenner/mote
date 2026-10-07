@@ -7,7 +7,6 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        heic: [enabled, disabled]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -24,7 +23,7 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - name: Build pinned native decoders on Unix
-        if: matrix.heic == 'enabled' && runner.os != 'Windows'
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           platform=linux
@@ -38,58 +37,30 @@ jobs:
             printf 'LD_LIBRARY_PATH=%s\n' "$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
           fi
       - name: Build pinned native DLLs
-        if: matrix.heic == 'enabled' && runner.os == 'Windows'
+        if: runner.os == 'Windows'
         shell: pwsh
         run: ./packaging/heic/build-windows.ps1 -Arch x64
-      - if: matrix.heic == 'enabled'
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - if: matrix.heic == 'enabled' && runner.os != 'Windows'
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - if: runner.os != 'Windows'
         run: cargo test --workspace --all-features
-      - if: matrix.heic == 'enabled' && runner.os == 'Windows'
+      - if: runner.os == 'Windows'
         run: |
           cargo test --workspace --all-features --exclude photo-server -- --test-threads=1
           cargo test -p photo-server --all-features --lib -- --test-threads=1
-      - if: matrix.heic == 'enabled'
-        run: cargo test -p photo-codec --test heif_backend
-      - if: matrix.heic == 'enabled'
-        run: cargo build -p photo-server --locked
-      - if: matrix.heic == 'enabled' && runner.os != 'Windows'
+      - run: cargo test -p photo-codec --test heif_backend
+      - run: cargo build -p photo-server --locked
+      - if: runner.os != 'Windows'
         shell: bash
         run: packaging/heic/verify-native-deps.sh --prefix "$MOTE_HEIC_PREFIX" --binary target/debug/photo-server
-      - if: matrix.heic == 'enabled' && runner.os == 'Windows'
+      - if: runner.os == 'Windows'
         shell: pwsh
         run: ./packaging/heic/verify-native-deps.ps1 -Prefix $env:MOTE_HEIC_PREFIX -Binary target/debug/photo-server.exe
-      - if: matrix.heic == 'enabled'
-        run: cargo test -p catalog-bench --test benchmark_smoke
-      - name: Build and test without HEIC
-        if: matrix.heic == 'disabled'
-        run: cargo build -p photo-server --locked --no-default-features --features mote-defaults
-      - if: matrix.heic == 'disabled' && runner.os != 'Windows'
-        run: cargo test -p photo-server --no-default-features --features mote-defaults
-      - if: matrix.heic == 'disabled' && runner.os == 'Windows'
-        run: cargo test -p photo-server --no-default-features --features mote-defaults --lib
-      - if: matrix.heic == 'disabled'
-        run: cargo test -p photo-codec --no-default-features
-      - name: Check disabled dependency graph and binary on Unix
-        if: matrix.heic == 'disabled' && runner.os != 'Windows'
-        shell: bash
-        run: |
-          cargo tree -p photo-server --no-default-features --features mote-defaults > disabled-tree.txt
-          if grep -Ei 'libheif|libde265' disabled-tree.txt; then exit 1; fi
-          packaging/heic/verify-native-deps.sh --binary target/debug/photo-server --no-heic
-      - name: Check disabled dependency graph and binary on Windows
-        if: matrix.heic == 'disabled' && runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          cargo tree -p photo-server --no-default-features --features mote-defaults | Set-Content disabled-tree.txt
-          if ($LASTEXITCODE -ne 0) { throw 'cargo tree failed' }
-          if (Select-String -Path disabled-tree.txt -Pattern 'libheif|libde265') { throw 'HEIF dependency in disabled graph' }
-          ./packaging/heic/verify-native-deps.ps1 -Prefix target/debug -Binary target/debug/photo-server.exe -NoHeic
+      - run: cargo test -p catalog-bench --test benchmark_smoke
       - name: Packaging contracts
-        if: runner.os != 'Windows' && matrix.heic == 'enabled'
+        if: runner.os != 'Windows'
         run: node --test tests/packaging/heic-native-build.test.mjs
       - name: Windows packaging and cleanup contracts
-        if: runner.os == 'Windows' && matrix.heic == 'enabled'
+        if: runner.os == 'Windows'
         shell: pwsh
         run: node --test --test-name-pattern=Windows tests/packaging/heic-native-build.test.mjs
 
@@ -124,7 +95,6 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
-        heic: [enabled, disabled]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -138,10 +108,5 @@ jobs:
         env:
           CONTAINER_ENGINE: docker
       - run: ./scripts/hosted-smoke.sh
-        if: matrix.heic == 'enabled'
-        env:
-          CONTAINER_ENGINE: docker
-      - run: ./scripts/hosted-smoke.sh --no-heic
-        if: matrix.heic == 'disabled'
         env:
           CONTAINER_ENGINE: docker

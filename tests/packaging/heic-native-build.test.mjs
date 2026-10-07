@@ -890,22 +890,20 @@ test("decode-only source patch removes the unconditional mask encoder and fails 
 	}
 });
 
-test("every CI platform has enabled fixtures and inspected disabled binaries", () => {
+test("every CI platform builds and checks the enabled native decoders", () => {
 	const ci = readRepoFile(".github/workflows/ci.yml");
 	assert.match(ci, /os: \[ubuntu-latest, macos-latest, windows-latest\]/);
-	assert.match(ci, /heic: \[enabled, disabled\]/);
+	assert.doesNotMatch(ci, /heic: \[enabled, disabled\]/);
 	for (const command of [
 		/build-unix\.sh/,
 		/build-windows\.ps1/,
 		/--test heif_backend/,
-		/cargo tree[^\n]*--no-default-features --features mote-defaults/,
-		/verify-native-deps\.sh[^\n]*--no-heic/,
-		/verify-native-deps\.ps1[^\n]*-NoHeic/,
 		/clippy[^\n]*--all-features/,
 		/test --workspace --all-features/,
 	]) {
 		assert.match(ci, command);
 	}
+	assert.doesNotMatch(ci, /--no-heic|--no-default-features|matrix\.heic/);
 	assert.match(
 		ci,
 		/cargo test --workspace --all-features --exclude photo-server -- --test-threads=1/,
@@ -913,10 +911,6 @@ test("every CI platform has enabled fixtures and inspected disabled binaries", (
 	assert.match(
 		ci,
 		/cargo test -p photo-server --all-features --lib -- --test-threads=1/,
-	);
-	assert.match(
-		ci,
-		/cargo test -p photo-server --no-default-features --features mote-defaults --lib/,
 	);
 	const macos = readRepoFile(".github/workflows/build-macos.yml");
 	assert.match(

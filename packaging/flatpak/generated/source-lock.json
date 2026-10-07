@@ -5,9 +5,9 @@
   },
   "cargoGenerator": "scripts/flatpak-source-lock.mjs",
   "lockfiles": {
-    "package-lock.json": "5cf27dbea664812afe0de69f1eeb2fa312b24c2df370f5d19f031613d54f5907",
+    "package-lock.json": "ad2a2cc2f161cd4d68755c34dcea2fec2594d68312afe999158fa3b103d6d54b",
     "Cargo.lock": "79d66e33f3f2f11c741bed9d2d4eb59a61759450f5b266d804a66a1029c12e14",
-    "apps/desktop/src-tauri/Cargo.lock": "f917e45a4c8d87aaf5e4581d589a0f050e88a717d4410c3917ae1918077a829d",
+    "apps/desktop/src-tauri/Cargo.lock": "91d395f70779a8c7e0ec69898c38688353fe6029a121b36487657867e638dc66",
     "packaging/heic/versions.env": "29fd3e8fbb85816a5eaac80f48392b26fa21961b5f8cf8c1e9e1ee0db5c89eef"
   },
   "native": {

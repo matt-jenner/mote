@@ -158,7 +158,5 @@ Publishing a GitHub Release whose tag exactly matches `v` plus the version in
 `.github/workflows/release-flatpak.yml`. The workflow validates the tag before
 installing the Flatpak runtimes, builds the bundle with the same non-interactive
 helper used locally, and attaches the `.flatpak` to the existing GitHub Release.
-It first builds and inspects the disabled variant in the runner's temporary
-directory. Hosted CI runs enabled and disabled smoke tests on AMD64 and ARM64.
-It has no manual trigger, so ordinary pushes and draft releases do not consume a
-Flatpak build.
+Hosted CI runs HEIC-enabled smoke tests on AMD64 and ARM64. The release workflow
+also accepts a manual dispatch; ordinary pushes and draft releases do not run it.
