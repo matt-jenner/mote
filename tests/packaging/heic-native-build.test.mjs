@@ -1261,7 +1261,7 @@ Set-Content $marker 'keep'
 foreach ($failure in @('build', 'interrupt', 'runtime', 'publication', 'publication-interrupt')) {
     $env:MOTE_TEST_FAILURE = if ($failure -in @('build', 'interrupt')) { $failure } else { '' }
     $env:MOTE_TEST_PUBLICATION = if ($failure -like 'publication*') { $failure } else { '' }
-    $env:MOTE_TEST_ENCODERS = if ($failure -eq 'runtime') { '1' } else { '' }
+    $env:MOTE_TEST_ENCODERS = if ($failure -eq 'runtime') { '1' } else { $null }
     $failed = $false
     try { & $builder } catch { $failed = $true }
     if (-not $failed) { throw 'failure was ignored' }
@@ -1269,9 +1269,9 @@ foreach ($failure in @('build', 'interrupt', 'runtime', 'publication', 'publicat
     if (@(Get-ChildItem $nativeRoot -Force | Where-Object Name -Like '*.stage.*').Count) { throw 'staging leaked' }
 }
 $env:MOTE_TEST_FAILURE = ''
-$env:MOTE_TEST_ENCODERS = ''
+$env:MOTE_TEST_ENCODERS = $null
 $env:MOTE_TEST_PUBLICATION = ''
-if ($global:publicationFailures -ne 2 -or $global:rollbacks -ne 2) { throw 'publication rollback phases not exercised' }
+if ($global:publicationFailures -ne 2 -or $global:rollbacks -ne 2) { throw "publication rollback phases not exercised: failures=$($global:publicationFailures), rollbacks=$($global:rollbacks)" }
 & $builder
 if (Test-Path $marker) { throw 'old prefix was not replaced' }
 if (@(Get-ChildItem $nativeRoot -Force | Where-Object Name -Like '*.stage.*').Count) { throw 'staging leaked' }
